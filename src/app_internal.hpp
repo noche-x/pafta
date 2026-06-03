@@ -29,8 +29,10 @@ struct LoadedAsset {
 struct GpuBuildingMeshChunk {
     Mesh mesh{};
     Material material{};
+    Texture2D source_texture{};
     std::uint32_t material_id{};
     bool textured{};
+    bool window_material{};
 
     GpuBuildingMeshChunk() = default;
     GpuBuildingMeshChunk(const GpuBuildingMeshChunk&) = delete;
@@ -39,12 +41,16 @@ struct GpuBuildingMeshChunk {
     GpuBuildingMeshChunk(GpuBuildingMeshChunk&& other) noexcept
         : mesh(other.mesh),
           material(other.material),
+          source_texture(other.source_texture),
           material_id(other.material_id),
-          textured(other.textured) {
+          textured(other.textured),
+          window_material(other.window_material) {
         other.mesh = {};
         other.material = {};
+        other.source_texture = {};
         other.material_id = 0;
         other.textured = false;
+        other.window_material = false;
     }
 
     GpuBuildingMeshChunk& operator=(GpuBuildingMeshChunk&& other) noexcept {
@@ -52,12 +58,16 @@ struct GpuBuildingMeshChunk {
             unload();
             mesh = other.mesh;
             material = other.material;
+            source_texture = other.source_texture;
             material_id = other.material_id;
             textured = other.textured;
+            window_material = other.window_material;
             other.mesh = {};
             other.material = {};
+            other.source_texture = {};
             other.material_id = 0;
             other.textured = false;
+            other.window_material = false;
         }
         return *this;
     }
@@ -245,9 +255,16 @@ void service_render_rebuild(EditorProject& project);
 void invalidate_portal_render_models(EditorProject& project);
 GpuBuildingRenderModel upload_building_render_model(const BuildingRenderBuffer& buffer, const SbbBuilding& building, const EditorProject& project);
 GpuBuildingRenderModel& building_tool_floor_preview_model(EditorProject& project, std::size_t building_index, std::uint32_t floor);
+Texture2D load_city_window_gradient_texture();
 void draw_mesh_faces(const SblBlockMesh& mesh, float scale, Color fill);
 void draw_sbb_scene_for_app(const SbbBuilding& building, GpuBuildingRenderModel& model, const SbbCell* selected);
-void draw_city_building_model(const SbbBuilding& template_file, GpuBuildingRenderModel& model, const SbcBuilding& placement, bool selected, bool use_lod);
+void draw_city_building_model(
+    const SbbBuilding& template_file,
+    GpuBuildingRenderModel& model,
+    const SbcBuilding& placement,
+    bool selected,
+    bool use_lod,
+    const Texture2D* city_window_texture = nullptr);
 void draw_city_piece_voxels(EditorProject& project, bool textured, std::optional<std::size_t> selected_portal = std::nullopt);
 void draw_city_scene(const MapScene& scene, const SbcStreet* selected_street);
 void draw_city_cursor(CityGridPoint point, float unit_size, CityEditMode mode);
@@ -304,6 +321,7 @@ void mark_block_changed(EditorProject& project, EditorUi& ui, SblBlockMesh& bloc
 void draw_portal_details(const SbcPortal& portal);
 void draw_building_asset_panel(EditorProject& project, EditorUi& ui);
 void draw_buildblock_gallery(EditorProject& project, EditorUi& ui);
+void draw_buildblock_preview_panel(EditorProject& project, EditorUi& ui);
 void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& status);
 void draw_block_inspector(EditorProject& project, EditorUi& ui, std::string& status);
 void draw_buildblock_inspector(EditorProject& project, EditorUi& ui, std::string& status);

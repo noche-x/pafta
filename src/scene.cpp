@@ -4,6 +4,8 @@
 #include <cmath>
 #include <limits>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 
 namespace map_editor {
@@ -122,6 +124,36 @@ const SblBlockMesh* find_block_mesh(const std::vector<NamedBlockMesh>& block_mes
     return match == block_meshes.end() ? nullptr : &match->mesh;
 }
 
+SblBlockMesh make_native_builtin_block_mesh_impl() {
+    SblBlockMesh mesh{};
+    // VERIFY: the native decomp copies g_Block_Width/Height/Depth before disk
+    // LoadBlock_SBL; the existing TS/importer parity notes treat the built-in
+    // primitive as 1x1x1.
+    mesh.width = 1U;
+    mesh.height = 1U;
+    mesh.depth = 1U;
+    mesh.exterior_flags[0] = 1U;
+    refresh_sbl_block_faces(mesh);
+    return mesh;
+}
+
+const SblBlockMesh& native_builtin_block_mesh_singleton() {
+    static const auto mesh = make_native_builtin_block_mesh_impl();
+    return mesh;
+}
+
+bool begins_with_native_builtin_block_meshes(const std::vector<NamedBlockMesh>& block_meshes) {
+    if (block_meshes.size() < native_builtin_block_mesh_count) {
+        return false;
+    }
+    return std::ranges::all_of(
+        block_meshes.begin(),
+        block_meshes.begin() + static_cast<std::ptrdiff_t>(native_builtin_block_mesh_count),
+        [](const NamedBlockMesh& entry) {
+            return entry.name.empty();
+        });
+}
+
 const SblBlockMesh* resolve_building_block_mesh(
     const std::vector<NamedBlockMesh>& block_meshes,
     const std::vector<std::string>& local_names,
@@ -131,7 +163,10 @@ const SblBlockMesh* resolve_building_block_mesh(
             return mesh;
         }
     }
-    return block_meshes.empty() ? nullptr : &block_meshes.front().mesh;
+    if (begins_with_native_builtin_block_meshes(block_meshes) && local_index < block_meshes.size()) {
+        return &block_meshes[local_index].mesh;
+    }
+    return &native_builtin_block_mesh_singleton();
 }
 
 const SblTemplate* find_buildblock_template(const std::vector<NamedBuildblockTemplate>& templates, std::string_view name) {
@@ -197,9 +232,6 @@ const SbbCell* find_cell_at(const CellIndexMap& index, std::uint32_t x, std::uin
 // Building Render Buffer Helpers
 // -----------------------------------------------------------------------------
 
-// BuildBuildingBlockRenderBuffers_1400799d0.c:203 adds g_portalInsetDepth
-// (DAT_1400ec8e8) along the emitted face normal for itemset/buildblock borders.
-constexpr auto native_portal_inset_depth = 1.0F / 256.0F;
 constexpr auto native_preview_floor_y = 1.0F / 16.0F;
 constexpr auto native_preview_ceiling_y = 7.0F / 8.0F;
 constexpr auto native_preview_inset_depth = 1.0F / 16.0F;
@@ -469,48 +501,21 @@ std::array<Vec3, 4> face_rect_vertices(
     }
 }
 
-Vec3 normal_for_building_side(BuildingFaceSide side) {
-    switch (side) {
-        case BuildingFaceSide::West:
-            return {-1.0F, 0.0F, 0.0F};
-        case BuildingFaceSide::East:
-            return {1.0F, 0.0F, 0.0F};
-        case BuildingFaceSide::North:
-            return {0.0F, 0.0F, -1.0F};
-        case BuildingFaceSide::South:
-            return {0.0F, 0.0F, 1.0F};
-        case BuildingFaceSide::Down:
-            return {0.0F, -1.0F, 0.0F};
-        case BuildingFaceSide::Up:
-        default:
-            return {0.0F, 1.0F, 0.0F};
-    }
-}
-
-std::array<Vec3, 4> offset_vertices_along_normal(std::array<Vec3, 4> vertices, BuildingFaceSide side, float distance) {
-    const auto normal = normal_for_building_side(side);
-    for (auto& vertex : vertices) {
-        vertex.x += normal.x * distance;
-        vertex.y += normal.y * distance;
-        vertex.z += normal.z * distance;
-    }
-    return vertices;
-}
-
 void add_quad(
     BuildingRenderBuffer& buffer,
     VertexIndexMap& vertex_indices,
     const std::array<Vec3, 4>& vertices,
     const std::array<Vec2f, 4>& uvs,
-    std::uint32_t material) {
+    std::uint32_t material,
+    bool city_window_surface = false) {
     const std::array indices{
         add_indexed_vertex(buffer, vertex_indices, vertices[0], uvs[0]),
         add_indexed_vertex(buffer, vertex_indices, vertices[1], uvs[1]),
         add_indexed_vertex(buffer, vertex_indices, vertices[2], uvs[2]),
         add_indexed_vertex(buffer, vertex_indices, vertices[3], uvs[3]),
     };
-    buffer.triangles.push_back({{indices[0], indices[1], indices[2]}, material});
-    buffer.triangles.push_back({{indices[0], indices[2], indices[3]}, material});
+    buffer.triangles.push_back({{indices[0], indices[1], indices[2]}, material, city_window_surface});
+    buffer.triangles.push_back({{indices[0], indices[2], indices[3]}, material, city_window_surface});
     buffer.wire_lines.push_back({vertices[0], vertices[1]});
     buffer.wire_lines.push_back({vertices[1], vertices[2]});
     buffer.wire_lines.push_back({vertices[2], vertices[3]});
@@ -903,22 +908,121 @@ std::array<Vec2f, 4> quad_uvs(float u, float width, float v, float height) {
     }};
 }
 
+std::optional<PortalSide> portal_side_for_building_face(BuildingFaceSide side) {
+    switch (side) {
+        case BuildingFaceSide::South:
+            return PortalSide::South;
+        case BuildingFaceSide::West:
+            return PortalSide::West;
+        case BuildingFaceSide::North:
+            return PortalSide::North;
+        case BuildingFaceSide::East:
+            return PortalSide::East;
+        case BuildingFaceSide::Up:
+        case BuildingFaceSide::Down:
+        default:
+            return std::nullopt;
+    }
+}
+
+std::uint32_t city_buildblock_side_code_for_face(
+    const SbbCell& cell,
+    const SbbCell* east,
+    BuildingFaceSide side) {
+    switch (side) {
+        case BuildingFaceSide::South:
+        case BuildingFaceSide::North:
+            return cell.exterior_portal_face();
+        case BuildingFaceSide::West:
+            return cell.interior_portal_face();
+        case BuildingFaceSide::East:
+            return east == nullptr ? 0U : east->interior_portal_face();
+        case BuildingFaceSide::Up:
+        case BuildingFaceSide::Down:
+        default:
+            return 0U;
+    }
+}
+
+const SblLayer* buildblock_layer_for_side_code(const SblTemplate* template_file, std::uint32_t side_code) {
+    if (template_file == nullptr || side_code < 3U || side_code > 15U) {
+        return nullptr;
+    }
+    const auto layer_index = static_cast<std::size_t>(side_code - 3U);
+    return layer_index < template_file->layers.size() ? &template_file->layers[layer_index] : nullptr;
+}
+
+std::vector<PortalRect> city_buildblock_window_rects(const SblLayer& layer, PortalSide side) {
+    const auto bounds = portal_rect_for_side(layer, side, layer.bounds[0], layer.bounds[1], layer.bounds[2], layer.bounds[3]);
+    if (!bounds.has_value()) {
+        return {};
+    }
+
+    std::vector<PortalRect> rects;
+    for (const auto& window : layer.windows) {
+        const auto rect = portal_rect_for_side(layer, side, window.x, window.width, window.y, window.height);
+        if (rect.has_value() && rects_intersect(*bounds, *rect)) {
+            rects.push_back(*rect);
+        }
+    }
+    return rects;
+}
+
+std::vector<PortalRect> subtract_city_window_rects(const std::vector<PortalRect>& windows) {
+    std::vector<PortalRect> walls{unit_portal_rect()};
+    for (const auto& window : windows) {
+        std::vector<PortalRect> next;
+        for (const auto& wall : walls) {
+            auto fragments = subtract_portal_rect(wall, window);
+            next.insert(next.end(), fragments.begin(), fragments.end());
+        }
+        walls = std::move(next);
+    }
+    return walls;
+}
+
+void add_city_building_face_rect(
+    BuildingRenderBuffer& buffer,
+    VertexIndexMap& vertex_indices,
+    BuildingFaceSide side,
+    float cx,
+    float cy,
+    float cz,
+    const PortalRect& rect,
+    std::uint32_t material,
+    bool city_window_surface) {
+    add_quad(
+        buffer,
+        vertex_indices,
+        face_rect_vertices(side, cx, cy, cz, rect.x, rect.width, rect.y, rect.height, buffer.unit_size),
+        quad_uvs(rect.x, rect.width, rect.y, rect.height),
+        material,
+        city_window_surface);
+}
+
 void sort_triangles_into_native_material_runs(BuildingRenderBuffer& buffer) {
     std::stable_sort(buffer.triangles.begin(), buffer.triangles.end(), [](const RenderBufferTriangle& left, const RenderBufferTriangle& right) {
-        return left.material < right.material;
+        if (left.material != right.material) {
+            return left.material < right.material;
+        }
+        return !left.city_window_surface && right.city_window_surface;
     });
 
     buffer.material_runs.clear();
     for (std::size_t index = 0; index < buffer.triangles.size();) {
         const auto material = buffer.triangles[index].material;
+        const auto city_window_surface = buffer.triangles[index].city_window_surface;
         const auto first = index;
-        while (index < buffer.triangles.size() && buffer.triangles[index].material == material) {
+        while (index < buffer.triangles.size() &&
+               buffer.triangles[index].material == material &&
+               buffer.triangles[index].city_window_surface == city_window_surface) {
             ++index;
         }
         buffer.material_runs.push_back({
             material,
             static_cast<std::uint32_t>(first),
             static_cast<std::uint32_t>(index - first),
+            city_window_surface,
         });
     }
 }
@@ -1004,6 +1108,22 @@ PortalWallRects build_portal_wall_rects_for_edge(const SblTemplate& template_fil
 // Building Scene and Render Buffers
 // -----------------------------------------------------------------------------
 
+SblBlockMesh make_native_builtin_block_mesh() {
+    return make_native_builtin_block_mesh_impl();
+}
+
+std::vector<NamedBlockMesh> build_native_block_mesh_catalog(const std::vector<NamedBlockMesh>& file_block_meshes) {
+    std::vector<NamedBlockMesh> catalog;
+    catalog.reserve(native_builtin_block_mesh_count + file_block_meshes.size());
+
+    const auto built_in_mesh = make_native_builtin_block_mesh();
+    for (std::size_t index = 0; index < native_builtin_block_mesh_count; ++index) {
+        catalog.push_back({"", built_in_mesh});
+    }
+    catalog.insert(catalog.end(), file_block_meshes.begin(), file_block_meshes.end());
+    return catalog;
+}
+
 SbbScene build_sbb_scene(const SbbBuilding& building) {
     return build_sbb_scene(building, {}, {});
 }
@@ -1027,8 +1147,8 @@ SbbScene build_sbb_scene(
         }
 
         const auto piece_payload = exterior_piece_payload(cell);
-        if (piece_payload.has_value() && piece_payload->index < building.piece_names.size()) {
-            if (const auto* mesh = find_block_mesh(block_meshes, building.piece_names[piece_payload->index])) {
+        if (piece_payload.has_value()) {
+            if (const auto* mesh = resolve_building_block_mesh(block_meshes, building.piece_names, piece_payload->index)) {
                 scene.pieces.push_back({
                     .origin = {
                         (static_cast<float>(cell.x) - static_cast<float>(building.anchor_x)) * scene.unit_size,
@@ -1124,26 +1244,23 @@ BuildingRenderBuffer build_native_building_render_buffer(
         const auto* north = find_cell_at(cell_index, cell.x, cell.y, cell.z - 1U);
         const auto* south = find_cell_at(cell_index, cell.x, cell.y, cell.z + 1U);
         const auto* up = find_cell_at(cell_index, cell.x, cell.y + 1U, cell.z);
-
-        const auto* template_file = cell.interior_block() == 0xffffU
-            ? resolve_building_buildblock_template(buildblock_templates, building.block_names, cell.cell_type())
-            : nullptr;
+        const auto* template_file = resolve_building_buildblock_template(
+            buildblock_templates,
+            building.block_names,
+            cell.cell_type());
 
         struct NativeSideCheck {
             BuildingFaceSide side;
-            PortalSide portal_side;
             const SbbCell* neighbor;
-            std::uint32_t side_code;
         };
-        const auto side_codes = native_edge_side_codes(cell, east);
         // BuildBuildingBlockRenderBuffers_1400799d0.c:144-146 iterates native
         // faces 1..5 only. Down/face 0 is intentionally absent here.
         const std::array native_sides{
-            NativeSideCheck{BuildingFaceSide::South, PortalSide::South, south, side_codes.south},
-            NativeSideCheck{BuildingFaceSide::West, PortalSide::West, west, side_codes.west},
-            NativeSideCheck{BuildingFaceSide::North, PortalSide::North, north, side_codes.north},
-            NativeSideCheck{BuildingFaceSide::East, PortalSide::East, east, side_codes.east},
-            NativeSideCheck{BuildingFaceSide::Up, PortalSide::North, up, 0U},
+            NativeSideCheck{BuildingFaceSide::South, south},
+            NativeSideCheck{BuildingFaceSide::West, west},
+            NativeSideCheck{BuildingFaceSide::North, north},
+            NativeSideCheck{BuildingFaceSide::East, east},
+            NativeSideCheck{BuildingFaceSide::Up, up},
         };
 
         for (const auto& side : native_sides) {
@@ -1151,34 +1268,45 @@ BuildingRenderBuffer build_native_building_render_buffer(
                 continue;
             }
 
-            add_quad(
-                buffer,
-                vertex_indices,
-                face_rect_vertices(side.side, cx, cy, cz, 0.0F, 1.0F, 0.0F, 1.0F, unit_size),
-                quad_uvs(0.0F, 1.0F, 0.0F, 1.0F),
-                material_for_cell_side(cell, side.side));
-
-            if (template_file == nullptr || side.side == BuildingFaceSide::Up || side.side_code < 3U || side.side_code > 15U) {
-                continue;
+            std::vector<PortalRect> window_rects;
+            const auto portal_side = portal_side_for_building_face(side.side);
+            if (portal_side.has_value()) {
+                const auto side_code = city_buildblock_side_code_for_face(cell, east, side.side);
+                if (const auto* layer = buildblock_layer_for_side_code(template_file, side_code)) {
+                    // FUN_140051c60 emits layer window rects as buildblock opening
+                    // geometry; BuildBuildingBlockRenderBuffers tags itemset/opening
+                    // quads with slot 0x100. Only these rects get the city window texture.
+                    window_rects = city_buildblock_window_rects(*layer, *portal_side);
+                }
             }
 
-            const auto layer_index = static_cast<std::size_t>(side.side_code - 3U);
-            if (layer_index >= template_file->layers.size()) {
-                continue;
-            }
-            const auto& layer = template_file->layers[layer_index];
-            for (const auto& rect : build_portal_overlay_rects(layer, side.portal_side)) {
-                // BuildBuildingBlockRenderBuffers_1400799d0.c:177-208 emits
-                // the same sc-3 layer bounds as an inset material 0x100 quad.
-                add_quad(
+            const auto wall_material = material_for_cell_side(cell, side.side);
+            const auto wall_rects = window_rects.empty()
+                ? std::vector<PortalRect>{unit_portal_rect()}
+                : subtract_city_window_rects(window_rects);
+            for (const auto& rect : wall_rects) {
+                add_city_building_face_rect(
                     buffer,
                     vertex_indices,
-                    offset_vertices_along_normal(
-                        face_rect_vertices(side.side, cx, cy, cz, rect.x, rect.width, rect.y, rect.height, unit_size),
-                        side.side,
-                        native_portal_inset_depth),
-                    quad_uvs(0.0F, 1.0F, 0.0F, 1.0F),
-                    0x100U);
+                    side.side,
+                    cx,
+                    cy,
+                    cz,
+                    rect,
+                    wall_material,
+                    false);
+            }
+            for (const auto& rect : window_rects) {
+                add_city_building_face_rect(
+                    buffer,
+                    vertex_indices,
+                    side.side,
+                    cx,
+                    cy,
+                    cz,
+                    rect,
+                    0x100U,
+                    true);
             }
         }
     }
@@ -1398,27 +1526,85 @@ std::optional<CellPick> pick_building_cell(
 // City Scene Builders
 // -----------------------------------------------------------------------------
 
-Vec3 native_city_building_render_origin(const SbcBuilding& placement, float unit_size) {
-    auto x_offset = 0;
-    auto z_offset = 0;
-    switch (placement.rotation & 3) {
+CityBuildingBasis native_city_building_rotation_basis(std::int32_t rotation) {
+    const auto effective_rotation = (4 - (rotation & 3)) & 3;
+    switch (effective_rotation) {
         case 1:
-            x_offset = 1;
+            return {
+                {0.0F, 0.0F, -1.0F},
+                {0.0F, 1.0F, 0.0F},
+                {1.0F, 0.0F, 0.0F},
+            };
+        case 2:
+            return {
+                {-1.0F, 0.0F, 0.0F},
+                {0.0F, 1.0F, 0.0F},
+                {0.0F, 0.0F, -1.0F},
+            };
+        case 3:
+            return {
+                {0.0F, 0.0F, 1.0F},
+                {0.0F, 1.0F, 0.0F},
+                {-1.0F, 0.0F, 0.0F},
+            };
+        default:
+            return {};
+    }
+}
+
+Vec3 native_city_rotate_local(Vec3 local, std::int32_t rotation) {
+    const auto basis = native_city_building_rotation_basis(rotation);
+    return {
+        local.x * basis.x_axis.x + local.y * basis.y_axis.x + local.z * basis.z_axis.x,
+        local.x * basis.x_axis.y + local.y * basis.y_axis.y + local.z * basis.z_axis.y,
+        local.x * basis.x_axis.z + local.y * basis.y_axis.z + local.z * basis.z_axis.z,
+    };
+}
+
+namespace {
+
+Vec3 native_city_editor_offset_cell(std::int32_t rotation) {
+    auto x = 0;
+    auto z = 0;
+    // StreetPieceTool_CanvasRender_14006c400 applies only this rotation grid
+    // correction before RenderBuildingTemplatePreview. LoadCity_SBC stores an
+    // extent-center triplet for bounds/placement bookkeeping, but the rendered
+    // template mesh is already recentered by BuildBuildingBlockRenderBuffers.
+    switch (rotation & 3) {
+        case 1:
+            x = 1;
             break;
         case 2:
-            x_offset = 1;
-            z_offset = 1;
+            x = 1;
+            z = 1;
             break;
         case 3:
-            z_offset = 1;
+            z = 1;
             break;
         default:
             break;
     }
+    return {static_cast<float>(x), 0.0F, static_cast<float>(z)};
+}
+
+} // namespace
+
+Vec3 native_city_building_render_origin(const SbcBuilding& placement, float unit_size) {
+    const auto offset = native_city_editor_offset_cell(placement.rotation);
     return {
-        static_cast<float>(placement.x + x_offset) * unit_size,
+        (static_cast<float>(placement.x) + offset.x) * unit_size,
         static_cast<float>(placement.y) * unit_size,
-        static_cast<float>(placement.z + z_offset) * unit_size,
+        (static_cast<float>(placement.z) + offset.z) * unit_size,
+    };
+}
+
+Vec3 native_city_building_transform_point(const SbcBuilding& placement, Vec3 local, float unit_size) {
+    const auto origin = native_city_building_render_origin(placement, unit_size);
+    const auto rotated = native_city_rotate_local(local, placement.rotation);
+    return {
+        origin.x + rotated.x,
+        origin.y + rotated.y,
+        origin.z + rotated.z,
     };
 }
 

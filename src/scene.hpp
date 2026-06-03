@@ -2,7 +2,9 @@
 
 #include "formats.hpp"
 
+#include <cstddef>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace map_editor {
@@ -61,12 +63,14 @@ struct RenderBufferVertex {
 struct RenderBufferTriangle {
     std::array<std::uint32_t, 3> indices{};
     std::uint32_t material{};
+    bool city_window_surface{};
 };
 
 struct RenderBufferMaterialRun {
     std::uint32_t material{};
     std::uint32_t first_triangle{};
     std::uint32_t triangle_count{};
+    bool city_window_surface{};
 };
 
 struct RenderLine {
@@ -164,6 +168,12 @@ struct RenderBuildingPlacement {
     float rotation{};
 };
 
+struct CityBuildingBasis {
+    Vec3 x_axis{1.0F, 0.0F, 0.0F};
+    Vec3 y_axis{0.0F, 1.0F, 0.0F};
+    Vec3 z_axis{0.0F, 0.0F, 1.0F};
+};
+
 struct MapBounds {
     float min_x{};
     float max_x{};
@@ -217,6 +227,13 @@ struct CityBlockPreviewScene {
     std::vector<CityBlockPreviewPiece> pieces;
 };
 
+// VERIFY: LoadAndInitBlockTemplates_SBL @ 14004d4c0 assigns 16 + 4 + 4 low
+// built-in indices before file SBL blocks; the visible default-mesh loop in the
+// current decomp explicitly walks the first 16-slot table.
+inline constexpr std::size_t native_builtin_block_mesh_count = 24U;
+
+SblBlockMesh make_native_builtin_block_mesh();
+std::vector<NamedBlockMesh> build_native_block_mesh_catalog(const std::vector<NamedBlockMesh>& file_block_meshes);
 SbbScene build_sbb_scene(const SbbBuilding& building);
 SbbScene build_sbb_scene(const SbbBuilding& building, const std::vector<NamedBlockMesh>& block_meshes);
 SbbScene build_sbb_scene(
@@ -242,7 +259,10 @@ std::optional<CellPick> pick_building_cell(
     const Vec3& ray_origin,
     const Vec3& ray_dir,
     float unit_size);
+CityBuildingBasis native_city_building_rotation_basis(std::int32_t rotation);
+Vec3 native_city_rotate_local(Vec3 local, std::int32_t rotation);
 Vec3 native_city_building_render_origin(const SbcBuilding& placement, float unit_size = 4.0F);
+Vec3 native_city_building_transform_point(const SbcBuilding& placement, Vec3 local, float unit_size = 4.0F);
 MapScene build_map_scene(const SbcMap& map);
 BuildblockPreviewScene build_buildblock_preview_scene(const SblTemplate& buildblock);
 CityBlockPreviewScene build_city_block_preview_scene(const SbcCityBlock& city_block, const std::vector<NamedBlockMesh>& block_meshes);

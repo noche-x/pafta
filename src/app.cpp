@@ -203,7 +203,7 @@ std::vector<NamedBlockMesh> block_meshes(const EditorProject& project) {
     for (const auto& block : project.blocks) {
         meshes.push_back({block.name, block.data});
     }
-    return meshes;
+    return build_native_block_mesh_catalog(meshes);
 }
 
 std::vector<NamedBuildblockTemplate> buildblock_templates(const EditorProject& project) {
@@ -261,7 +261,10 @@ std::vector<std::string> city_building_names(const SbcMap& map) {
     return names;
 }
 
-void draw_city_building_models_full_detail(EditorProject& project, const SbcBuilding* selected_building) {
+void draw_city_building_models_full_detail(
+    EditorProject& project,
+    const SbcBuilding* selected_building,
+    const Texture2D* city_window_texture) {
     if (!project.city) {
         return;
     }
@@ -285,7 +288,8 @@ void draw_city_building_models_full_detail(EditorProject& project, const SbcBuil
             project.building_gpu_models[asset_index],
             placement,
             selected_building == &placement,
-            false);
+            false,
+            city_window_texture);
     }
 }
 
@@ -1032,6 +1036,7 @@ int run_editor_app() {
 
     RenderTexture2D viewport_texture = LoadRenderTexture(1280, 800);
     Vector2 last_viewport_size = { 1280, 800 };
+    Texture2D city_window_texture = load_city_window_gradient_texture();
 
     bool show_demo_window = false;
 
@@ -1051,6 +1056,10 @@ int run_editor_app() {
         static Vector2 virtual_mouse_pos = {0, 0};
         static Vector2 viewport_mouse_pos = {0, 0};
         static bool is_viewport_hovered = false;
+        const bool show_3d_viewport = !(project && ui.tab == EditorTab::Buildblocks);
+        if (!show_3d_viewport) {
+            is_viewport_hovered = false;
+        }
 
         if (is_viewport_hovered && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
             DisableCursor();
@@ -1065,7 +1074,7 @@ int run_editor_app() {
             update_free_fly_camera(camera, ui.camera_fly_speed);
         }
 
-        if (last_viewport_size.x > 0 && last_viewport_size.y > 0) {
+        if (show_3d_viewport && last_viewport_size.x > 0 && last_viewport_size.y > 0) {
             BeginTextureMode(viewport_texture);
             ClearBackground(Color{24, 27, 30, 255});
 
@@ -1080,7 +1089,7 @@ int run_editor_app() {
                         ? nullptr
                         : &project->city->data.streets[std::min(ui.selected_city_street, project->city->data.streets.size() - 1U)];
                     draw_city_scene(build_map_scene(project->city->data), selected_street);
-                    draw_city_building_models_full_detail(*project, selected_building);
+                    draw_city_building_models_full_detail(*project, selected_building, &city_window_texture);
                     draw_city_piece_voxels(*project, ui.portal_preview_textured);
                     
                     const auto city_cursor = city_grid_point_under_mouse(camera, virtual_mouse_pos);
@@ -1112,11 +1121,6 @@ int run_editor_app() {
                 } else if (ui.tab == EditorTab::Blocks && !project->blocks.empty()) {
                     ui.selected_block = std::min(ui.selected_block, project->blocks.size() - 1U);
                     draw_mesh_faces(project->blocks[ui.selected_block].data, 4.0F, {98, 148, 204, 220});
-                } else if (ui.tab == EditorTab::Buildblocks && !project->buildblocks.empty()) {
-                    ui.selected_buildblock = std::min(ui.selected_buildblock, project->buildblocks.size() - 1U);
-                    const auto& buildblock = project->buildblocks[ui.selected_buildblock].data;
-                    DrawGrid(64, 4.0F);
-                    draw_buildblock_preview_3d(build_buildblock_preview_scene(buildblock));
                 } else {
                     DrawGrid(64, 4.0F);
                 }
@@ -1127,7 +1131,7 @@ int run_editor_app() {
             EndTextureMode();
         }
 
-        if (project && is_viewport_hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !IsCursorHidden()) {
+        if (show_3d_viewport && project && is_viewport_hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !IsCursorHidden()) {
             if (ui.tab == EditorTab::City && project->city) {
                 const auto city_cursor = city_grid_point_under_mouse(camera, virtual_mouse_pos);
                 if (city_cursor.has_value()) {
@@ -1199,29 +1203,32 @@ int run_editor_app() {
             load_default_imgui_layout();
         }
 
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-        ImGui::Begin("Viewport 3D");
-        {
-            is_viewport_hovered = ImGui::IsWindowHovered();
-            ImVec2 size = ImGui::GetContentRegionAvail();
-            
-            if ((size.x != last_viewport_size.x || size.y != last_viewport_size.y) && size.x > 0 && size.y > 0) {
-                UnloadRenderTexture(viewport_texture);
-                viewport_texture = LoadRenderTexture(static_cast<int>(size.x), static_cast<int>(size.y));
-                last_viewport_size = { size.x, size.y };
+        is_viewport_hovered = false;
+        if (show_3d_viewport) {
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+            ImGui::Begin("Viewport 3D");
+            {
+                is_viewport_hovered = ImGui::IsWindowHovered();
+                ImVec2 size = ImGui::GetContentRegionAvail();
+
+                if ((size.x != last_viewport_size.x || size.y != last_viewport_size.y) && size.x > 0 && size.y > 0) {
+                    UnloadRenderTexture(viewport_texture);
+                    viewport_texture = LoadRenderTexture(static_cast<int>(size.x), static_cast<int>(size.y));
+                    last_viewport_size = { size.x, size.y };
+                }
+
+                rlImGuiImageRenderTexture(&viewport_texture);
+
+                ImVec2 min_pos = ImGui::GetWindowPos();
+                min_pos.x += ImGui::GetWindowContentRegionMin().x;
+                min_pos.y += ImGui::GetWindowContentRegionMin().y;
+
+                virtual_mouse_pos = get_virtual_mouse_position(Vector2{min_pos.x, min_pos.y}, Vector2{size.x, size.y});
+                viewport_mouse_pos = get_viewport_mouse_position(Vector2{min_pos.x, min_pos.y}, Vector2{size.x, size.y});
             }
-
-            rlImGuiImageRenderTexture(&viewport_texture);
-
-            ImVec2 min_pos = ImGui::GetWindowPos();
-            min_pos.x += ImGui::GetWindowContentRegionMin().x;
-            min_pos.y += ImGui::GetWindowContentRegionMin().y;
-
-            virtual_mouse_pos = get_virtual_mouse_position(Vector2{min_pos.x, min_pos.y}, Vector2{size.x, size.y});
-            viewport_mouse_pos = get_viewport_mouse_position(Vector2{min_pos.x, min_pos.y}, Vector2{size.x, size.y});
+            ImGui::End();
+            ImGui::PopStyleVar();
         }
-        ImGui::End();
-        ImGui::PopStyleVar();
 
         ImGui::Begin("Asset Browser");
         if (!project) {
@@ -1619,6 +1626,12 @@ int run_editor_app() {
             ImGui::End();
         }
 
+        if (project && ui.tab == EditorTab::Buildblocks) {
+            ImGui::Begin("Buildblock 2D Preview");
+            draw_buildblock_preview_panel(*project, ui);
+            ImGui::End();
+        }
+
         ImGui::Begin("Console / Status");
         ImGui::Text("Status: %s", status.c_str());
         if (project) {
@@ -1657,6 +1670,9 @@ int run_editor_app() {
     }
 
     UnloadRenderTexture(viewport_texture);
+    if (city_window_texture.id != 0U) {
+        UnloadTexture(city_window_texture);
+    }
     if (IsCursorHidden()) {
         EnableCursor();
     }

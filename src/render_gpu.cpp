@@ -38,6 +38,50 @@ std::string format_bytes(std::size_t bytes) {
     return stream.str();
 }
 
+Color lerp_color(Color from, Color to, float t) {
+    auto lerp_channel = [t](unsigned char a, unsigned char b) {
+        return static_cast<unsigned char>(
+            static_cast<float>(a) + (static_cast<float>(b) - static_cast<float>(a)) * t);
+    };
+    return {
+        lerp_channel(from.r, to.r),
+        lerp_channel(from.g, to.g),
+        lerp_channel(from.b, to.b),
+        lerp_channel(from.a, to.a),
+    };
+}
+
+Texture2D load_city_window_gradient_texture() {
+    constexpr auto width = 32;
+    constexpr auto height = 96;
+    constexpr auto mullion_step_x = 8;
+    constexpr auto mullion_step_y = 16;
+    const auto bottom = Color{21, 39, 63, 255};
+    const auto top = Color{92, 205, 226, 255};
+    Image image = GenImageColor(width, height, bottom);
+    for (auto y = 0; y < height; ++y) {
+        const auto t = 1.0F - static_cast<float>(y) / static_cast<float>(height - 1);
+        for (auto x = 0; x < width; ++x) {
+            auto color = lerp_color(bottom, top, t);
+            if ((x % mullion_step_x) == 0 || (y % mullion_step_y) == 0) {
+                color = lerp_color(color, Color{8, 18, 30, 255}, 0.45F);
+            }
+            if (((x + y) % 19) == 0) {
+                color = lerp_color(color, Color{180, 238, 246, 255}, 0.18F);
+            }
+            ImageDrawPixel(&image, x, y, color);
+        }
+    }
+
+    auto texture = LoadTextureFromImage(image);
+    if (texture.id != 0U) {
+        SetTextureFilter(texture, TEXTURE_FILTER_BILINEAR);
+        SetTextureWrap(texture, TEXTURE_WRAP_REPEAT);
+    }
+    UnloadImage(image);
+    return texture;
+}
+
 void append_render_log(EditorProject& project, std::string message) {
     std::cerr << "[render] " << message << '\n';
     project.render_logs.push_back(std::move(message));
@@ -252,21 +296,8 @@ Vector3 scaled(Vec3f value, Vec3 origin, float scale) {
     };
 }
 
-Vector3 rotate_city_local(Vector3 value, std::int32_t rotation) {
-    switch (rotation & 3) {
-        case 1:
-            return {value.z, value.y, -value.x};
-        case 2:
-            return {-value.x, value.y, -value.z};
-        case 3:
-            return {-value.z, value.y, value.x};
-        default:
-            return value;
-    }
-}
-
 Vector3 city_transform(Vector3 origin, Vector3 local, std::int32_t rotation) {
-    const auto rotated = rotate_city_local(local, rotation);
+    const auto rotated = native_city_rotate_local({local.x, local.y, local.z}, rotation);
     return {origin.x + rotated.x, origin.y + rotated.y, origin.z + rotated.z};
 }
 
@@ -295,12 +326,15 @@ void draw_mesh_faces(const SblBlockMesh& mesh, float scale, Color fill) {
     draw_mesh_faces(mesh, {}, scale, fill);
 }
 
-Color native_material_color(std::uint32_t material, bool selected) {
+Color native_material_color(std::uint32_t material, bool selected, bool window_material = false) {
     if (selected) {
         return {235, 194, 82, 210};
     }
     if (material == 0x100U) {
         return {0, 0, 0, 191};
+    }
+    if (window_material) {
+        return {92, 205, 226, 185};
     }
     switch (material % 6U) {
         case 1:
@@ -350,10 +384,12 @@ GpuBuildingMeshChunk upload_mesh_chunk(
     std::uint32_t first_triangle,
     std::uint32_t triangle_count,
     std::uint32_t material_id,
-    const Texture2D* texture
+    const Texture2D* texture,
+    bool window_material = false
 ) {
     GpuBuildingMeshChunk chunk;
     chunk.material_id = material_id;
+    chunk.window_material = window_material;
 
     const auto clamped_end = std::min<std::uint32_t>(
         first_triangle + triangle_count,
@@ -366,6 +402,7 @@ GpuBuildingMeshChunk upload_mesh_chunk(
     auto upload_unindexed_chunk = [&]() {
         GpuBuildingMeshChunk fallback;
         fallback.material_id = material_id;
+        fallback.window_material = window_material;
         fallback.mesh.vertexCount = static_cast<int>(clamped_count * 3U);
         fallback.mesh.triangleCount = static_cast<int>(clamped_count);
         fallback.mesh.vertices = static_cast<float*>(MemAlloc(static_cast<unsigned int>(fallback.mesh.vertexCount * 3 * sizeof(float))));
@@ -403,9 +440,10 @@ GpuBuildingMeshChunk upload_mesh_chunk(
 
         UploadMesh(&fallback.mesh, false);
         fallback.material = LoadMaterialDefault();
-        fallback.material.maps[MATERIAL_MAP_DIFFUSE].color = native_material_color(material_id, false);
+        fallback.material.maps[MATERIAL_MAP_DIFFUSE].color = native_material_color(material_id, false, window_material);
         if (texture != nullptr && texture->id != 0U) {
             fallback.material.maps[MATERIAL_MAP_DIFFUSE].texture = *texture;
+            fallback.source_texture = *texture;
             fallback.textured = true;
         }
         return fallback;
@@ -482,9 +520,10 @@ GpuBuildingMeshChunk upload_mesh_chunk(
 
     UploadMesh(&chunk.mesh, false);
     chunk.material = LoadMaterialDefault();
-    chunk.material.maps[MATERIAL_MAP_DIFFUSE].color = native_material_color(material_id, false);
+    chunk.material.maps[MATERIAL_MAP_DIFFUSE].color = native_material_color(material_id, false, window_material);
     if (texture != nullptr && texture->id != 0U) {
         chunk.material.maps[MATERIAL_MAP_DIFFUSE].texture = *texture;
+        chunk.source_texture = *texture;
         chunk.textured = true;
     }
     return chunk;
@@ -495,7 +534,13 @@ GpuBuildingRenderModel upload_building_render_model(const BuildingRenderBuffer& 
     model.wire_lines = buffer.wire_lines;
     model.chunks.reserve(buffer.material_runs.size());
     for (const auto& run : buffer.material_runs) {
-        auto chunk = upload_mesh_chunk(buffer, run.first_triangle, run.triangle_count, run.material, texture_for_material(project, building, run.material));
+        auto chunk = upload_mesh_chunk(
+            buffer,
+            run.first_triangle,
+            run.triangle_count,
+            run.material,
+            texture_for_material(project, building, run.material),
+            run.city_window_surface);
         if (chunk.mesh.vertexCount > 0) {
             model.uploaded_vertices += static_cast<std::size_t>(chunk.mesh.vertexCount);
             model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.vertexCount) * 3U * sizeof(float);
@@ -515,34 +560,11 @@ Vector3 transform_buffer_vertex(Vec3 value, Vector3 origin, std::int32_t rotatio
 }
 
 Matrix building_transform_matrix(Vector3 origin, std::int32_t rotation) {
-    float xx = 1.0F;
-    float xz = 0.0F;
-    float zx = 0.0F;
-    float zz = 1.0F;
-    switch (rotation & 3) {
-        case 1:
-            xx = 0.0F;
-            xz = 1.0F;
-            zx = -1.0F;
-            zz = 0.0F;
-            break;
-        case 2:
-            xx = -1.0F;
-            zz = -1.0F;
-            break;
-        case 3:
-            xx = 0.0F;
-            xz = -1.0F;
-            zx = 1.0F;
-            zz = 0.0F;
-            break;
-        default:
-            break;
-    }
+    const auto basis = native_city_building_rotation_basis(rotation);
     return Matrix{
-        xx, 0.0F, xz, origin.x,
-        0.0F, 1.0F, 0.0F, origin.y,
-        zx, 0.0F, zz, origin.z,
+        basis.x_axis.x, basis.y_axis.x, basis.z_axis.x, origin.x,
+        basis.x_axis.y, basis.y_axis.y, basis.z_axis.y, origin.y,
+        basis.x_axis.z, basis.y_axis.z, basis.z_axis.z, origin.z,
         0.0F, 0.0F, 0.0F, 1.0F,
     };
 }
@@ -552,7 +574,8 @@ void draw_gpu_building_model(
     Vector3 origin,
     std::int32_t rotation,
     bool selected,
-    bool draw_wires
+    bool draw_wires,
+    const Texture2D* city_window_texture = nullptr
 ) {
     const auto transform = building_transform_matrix(origin, rotation);
     rlDisableBackfaceCulling();
@@ -560,9 +583,15 @@ void draw_gpu_building_model(
         if (chunk.material.maps == nullptr || chunk.mesh.vertexCount <= 0) {
             continue;
         }
-        chunk.material.maps[MATERIAL_MAP_DIFFUSE].color = chunk.textured
+        const auto use_window_texture = city_window_texture != nullptr &&
+            city_window_texture->id != 0U &&
+            chunk.window_material;
+        chunk.material.maps[MATERIAL_MAP_DIFFUSE].texture = use_window_texture
+            ? *city_window_texture
+            : chunk.source_texture;
+        chunk.material.maps[MATERIAL_MAP_DIFFUSE].color = (chunk.textured || use_window_texture)
             ? (selected ? Color{255, 236, 170, 255} : WHITE)
-            : native_material_color(chunk.material_id, selected);
+            : native_material_color(chunk.material_id, selected, false);
         DrawMesh(chunk.mesh, chunk.material, transform);
     }
     rlEnableBackfaceCulling();
@@ -603,10 +632,11 @@ void draw_city_building_model(
     GpuBuildingRenderModel& model,
     const SbcBuilding& placement,
     bool selected,
-    bool use_lod) {
+    bool use_lod,
+    const Texture2D* city_window_texture) {
     constexpr auto unit_size = 4.0F;
-    const auto native_origin = native_city_building_render_origin(placement, unit_size);
-    const auto origin = Vector3{native_origin.x, native_origin.y, native_origin.z};
+    const auto render_origin = native_city_building_render_origin(placement, unit_size);
+    const auto origin = Vector3{render_origin.x, render_origin.y, render_origin.z};
     const auto fill = selected ? Color{235, 194, 82, 210} : Color{126, 151, 174, 170};
     const auto wire = selected ? Color{255, 240, 150, 255} : Color{30, 36, 42, 170};
 
@@ -670,7 +700,7 @@ void draw_city_building_model(
         DrawLine3D(world_corners[2], world_corners[6], wire);
         DrawLine3D(world_corners[3], world_corners[7], wire);
     } else {
-        draw_gpu_building_model(model, origin, placement.rotation, selected, selected);
+        draw_gpu_building_model(model, origin, placement.rotation, selected, selected, city_window_texture);
     }
 
     if (selected) {
@@ -693,8 +723,8 @@ void draw_city_building_models(EditorProject& project, const SbcBuilding* select
             continue;
         }
 
-        const auto native_origin = native_city_building_render_origin(placement, unit_size);
-        const auto origin = Vector3{native_origin.x, native_origin.y, native_origin.z};
+        const auto render_origin = native_city_building_render_origin(placement, unit_size);
+        const auto origin = Vector3{render_origin.x, render_origin.y, render_origin.z};
         const float dx = camera.position.x - origin.x;
         const float dy = camera.position.y - origin.y;
         const float dz = camera.position.z - origin.z;
@@ -706,7 +736,8 @@ void draw_city_building_models(EditorProject& project, const SbcBuilding* select
             project.building_gpu_models[asset_index],
             placement,
             selected_building == &placement,
-            use_lod);
+            use_lod,
+            nullptr);
     }
 }
 

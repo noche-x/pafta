@@ -9,6 +9,7 @@
 #include <cmath>
 #include <iomanip>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -20,18 +21,6 @@ std::string hex_u32(std::uint32_t value) {
     std::ostringstream stream;
     stream << "0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << value;
     return stream.str();
-}
-
-std::string clipped_label(std::string_view value, std::size_t max_chars) {
-    if (value.size() <= max_chars) {
-        return std::string{value};
-    }
-    if (max_chars <= 3U) {
-        return std::string{value.substr(0, max_chars)};
-    }
-    std::string clipped{value.substr(0, max_chars - 3U)};
-    clipped += "...";
-    return clipped;
 }
 
 const char* building_cell_field_label(std::size_t field_index) {
@@ -107,6 +96,14 @@ struct PortalSideInspectorRow {
     const char* source{};
 };
 
+struct PreviewExtents {
+    float min_x{std::numeric_limits<float>::max()};
+    float min_y{std::numeric_limits<float>::max()};
+    float max_x{std::numeric_limits<float>::lowest()};
+    float max_y{std::numeric_limits<float>::lowest()};
+    bool has_content{};
+};
+
 std::array<PortalSideInspectorRow, 4> portal_side_rows(const SbbBuilding& building, const SbbCell& cell) {
     const auto* east = cell_at_or_null(building, cell.x + 1U, cell.y, cell.z);
     return {
@@ -150,6 +147,106 @@ void property_row(std::string_view label, std::string_view value) {
     ImGui::TextUnformatted(label.data(), label.data() + label.size());
     ImGui::TableNextColumn();
     ImGui::TextUnformatted(value.data(), value.data() + value.size());
+}
+
+void include_preview_point(PreviewExtents& extents, float x, float y) {
+    extents.min_x = std::min(extents.min_x, x);
+    extents.min_y = std::min(extents.min_y, y);
+    extents.max_x = std::max(extents.max_x, x);
+    extents.max_y = std::max(extents.max_y, y);
+    extents.has_content = true;
+}
+
+bool preview_layer_matches(std::optional<std::size_t> layer_index, std::size_t candidate) {
+    return !layer_index.has_value() || *layer_index == candidate;
+}
+
+ImU32 buildblock_rect_fill_color(BuildblockPreviewRectKind kind) {
+    switch (kind) {
+        case BuildblockPreviewRectKind::Bounds:
+            return IM_COL32(63, 183, 184, 95);
+        case BuildblockPreviewRectKind::Window:
+            return IM_COL32(92, 154, 222, 145);
+        case BuildblockPreviewRectKind::Beam:
+            return IM_COL32(216, 136, 68, 150);
+    }
+    return IM_COL32(160, 160, 160, 130);
+}
+
+ImU32 buildblock_rect_border_color(BuildblockPreviewRectKind kind) {
+    switch (kind) {
+        case BuildblockPreviewRectKind::Bounds:
+            return IM_COL32(63, 183, 184, 255);
+        case BuildblockPreviewRectKind::Window:
+            return IM_COL32(92, 154, 222, 255);
+        case BuildblockPreviewRectKind::Beam:
+            return IM_COL32(216, 136, 68, 255);
+    }
+    return IM_COL32(160, 160, 160, 255);
+}
+
+void draw_buildblock_preview_contents(
+    ImDrawList* draw_list,
+    const BuildblockPreviewScene& scene,
+    std::optional<std::size_t> layer_index,
+    ImVec2 canvas_min,
+    ImVec2 canvas_max) {
+    draw_list->AddRectFilled(canvas_min, canvas_max, IM_COL32(13, 15, 17, 255), 3.0F);
+
+    PreviewExtents extents;
+    for (const auto& rect : scene.rects) {
+        if (!preview_layer_matches(layer_index, rect.layer_index)) {
+            continue;
+        }
+        include_preview_point(extents, rect.center.x - rect.size.x * 0.5F, rect.center.y - rect.size.y * 0.5F);
+        include_preview_point(extents, rect.center.x + rect.size.x * 0.5F, rect.center.y + rect.size.y * 0.5F);
+    }
+    for (const auto& door : scene.doors) {
+        if (!preview_layer_matches(layer_index, door.layer_index)) {
+            continue;
+        }
+        include_preview_point(extents, door.position.x - 0.25F, door.position.y - 0.25F);
+        include_preview_point(extents, door.position.x + 0.25F, door.position.y + 0.25F);
+    }
+    if (!extents.has_content) {
+        include_preview_point(extents, 0.0F, 0.0F);
+        include_preview_point(extents, 4.0F, 4.0F);
+    }
+
+    const auto range_x = std::max(0.001F, extents.max_x - extents.min_x);
+    const auto range_y = std::max(0.001F, extents.max_y - extents.min_y);
+    const auto pad = 8.0F;
+    const auto canvas_w = std::max(1.0F, canvas_max.x - canvas_min.x - pad * 2.0F);
+    const auto canvas_h = std::max(1.0F, canvas_max.y - canvas_min.y - pad * 2.0F);
+    const auto scale = std::min(canvas_w / range_x, canvas_h / range_y);
+    const auto origin = ImVec2{
+        canvas_min.x + pad + (canvas_w - range_x * scale) * 0.5F,
+        canvas_min.y + pad + (canvas_h - range_y * scale) * 0.5F,
+    };
+    auto map_point = [&](float x, float y) {
+        return ImVec2{
+            origin.x + (x - extents.min_x) * scale,
+            origin.y + (extents.max_y - y) * scale,
+        };
+    };
+
+    for (const auto& rect : scene.rects) {
+        if (!preview_layer_matches(layer_index, rect.layer_index)) {
+            continue;
+        }
+        const auto a = map_point(rect.center.x - rect.size.x * 0.5F, rect.center.y + rect.size.y * 0.5F);
+        const auto b = map_point(rect.center.x + rect.size.x * 0.5F, rect.center.y - rect.size.y * 0.5F);
+        draw_list->AddRectFilled(a, b, buildblock_rect_fill_color(rect.kind), 1.0F);
+        draw_list->AddRect(a, b, buildblock_rect_border_color(rect.kind), 1.0F);
+    }
+    for (const auto& door : scene.doors) {
+        if (!preview_layer_matches(layer_index, door.layer_index)) {
+            continue;
+        }
+        const auto center = map_point(door.position.x, door.position.y);
+        draw_list->AddCircleFilled(center, 3.5F, IM_COL32(180, 108, 225, 230));
+        draw_list->AddCircle(center, 3.5F, IM_COL32(245, 245, 245, 230));
+    }
 }
 
 void draw_payload_table(const SbbBuilding& building, const SbbCell& cell) {
@@ -239,110 +336,60 @@ void draw_portal_side_table(const EditorProject& project, const SbbBuilding& bui
     ImGui::EndTable();
 }
 
-void draw_buildblock_thumbnail(
+void reset_buildblock_template_selection(EditorUi& ui, std::size_t buildblock_index) {
+    ui.selected_buildblock = buildblock_index;
+    ui.selected_buildblock_layer = 0;
+    ui.selected_buildblock_door = 0;
+    ui.selected_buildblock_window = 0;
+    ui.selected_buildblock_beam = 0;
+    ui.selected_buildblock_field = 0;
+}
+
+void select_buildblock_face(EditorUi& ui, std::size_t face_index) {
+    ui.selected_buildblock_layer = face_index;
+    ui.selected_buildblock_door = 0;
+    ui.selected_buildblock_window = 0;
+    ui.selected_buildblock_beam = 0;
+}
+
+void draw_buildblock_face_preview(
     ImDrawList* draw_list,
-    const SblTemplate& buildblock,
+    const BuildblockPreviewScene& scene,
+    const SblLayer& layer,
+    std::size_t face_index,
     ImVec2 min,
     ImVec2 max,
     bool selected,
-    bool hovered,
-    std::string_view label) {
-    const auto bg = selected ? IM_COL32(40, 58, 61, 255) : (hovered ? IM_COL32(30, 38, 41, 255) : IM_COL32(20, 23, 25, 255));
-    const auto border = selected ? IM_COL32(255, 225, 80, 255) : IM_COL32(67, 78, 83, 255);
+    bool hovered) {
+    const auto bg = selected ? IM_COL32(37, 54, 57, 255) : (hovered ? IM_COL32(29, 36, 39, 255) : IM_COL32(18, 21, 23, 255));
+    const auto border = selected ? IM_COL32(255, 225, 80, 255) : IM_COL32(65, 74, 78, 255);
     draw_list->AddRectFilled(min, max, bg, 5.0F);
     draw_list->AddRect(min, max, border, 5.0F, 0, selected ? 2.0F : 1.0F);
 
-    const auto canvas_min = ImVec2{min.x + 8.0F, min.y + 8.0F};
-    const auto canvas_max = ImVec2{max.x - 8.0F, max.y - 28.0F};
-    draw_list->AddRectFilled(canvas_min, canvas_max, IM_COL32(13, 15, 17, 255), 3.0F);
-
-    const auto scene = build_buildblock_preview_scene(buildblock);
-    float min_x = std::numeric_limits<float>::max();
-    float min_y = std::numeric_limits<float>::max();
-    float max_x = std::numeric_limits<float>::lowest();
-    float max_y = std::numeric_limits<float>::lowest();
-    auto include_point = [&](float x, float y) {
-        min_x = std::min(min_x, x);
-        min_y = std::min(min_y, y);
-        max_x = std::max(max_x, x);
-        max_y = std::max(max_y, y);
-    };
-    for (const auto& rect : scene.rects) {
-        include_point(rect.center.x - rect.size.x * 0.5F, rect.center.y - rect.size.y * 0.5F);
-        include_point(rect.center.x + rect.size.x * 0.5F, rect.center.y + rect.size.y * 0.5F);
-    }
-    for (const auto& door : scene.doors) {
-        include_point(door.position.x - 0.25F, door.position.y - 0.25F);
-        include_point(door.position.x + 0.25F, door.position.y + 0.25F);
-    }
-    if (min_x > max_x || min_y > max_y) {
-        min_x = 0.0F;
-        min_y = 0.0F;
-        max_x = 4.0F;
-        max_y = 4.0F;
-    }
-
-    const auto range_x = std::max(0.001F, max_x - min_x);
-    const auto range_y = std::max(0.001F, max_y - min_y);
-    const auto pad = 8.0F;
-    const auto canvas_w = std::max(1.0F, canvas_max.x - canvas_min.x - pad * 2.0F);
-    const auto canvas_h = std::max(1.0F, canvas_max.y - canvas_min.y - pad * 2.0F);
-    const auto scale = std::min(canvas_w / range_x, canvas_h / range_y);
-    const auto origin = ImVec2{
-        canvas_min.x + pad + (canvas_w - range_x * scale) * 0.5F,
-        canvas_min.y + pad + (canvas_h - range_y * scale) * 0.5F,
-    };
-    auto map_point = [&](float x, float y) {
-        return ImVec2{
-            origin.x + (x - min_x) * scale,
-            origin.y + (max_y - y) * scale,
-        };
-    };
-
-    auto rect_color = [](BuildblockPreviewRectKind kind) {
-        switch (kind) {
-            case BuildblockPreviewRectKind::Bounds:
-                return IM_COL32(63, 183, 184, 95);
-            case BuildblockPreviewRectKind::Window:
-                return IM_COL32(92, 154, 222, 145);
-            case BuildblockPreviewRectKind::Beam:
-                return IM_COL32(216, 136, 68, 150);
-        }
-        return IM_COL32(160, 160, 160, 130);
-    };
-    auto rect_border_color = [](BuildblockPreviewRectKind kind) {
-        switch (kind) {
-            case BuildblockPreviewRectKind::Bounds:
-                return IM_COL32(63, 183, 184, 255);
-            case BuildblockPreviewRectKind::Window:
-                return IM_COL32(92, 154, 222, 255);
-            case BuildblockPreviewRectKind::Beam:
-                return IM_COL32(216, 136, 68, 255);
-        }
-        return IM_COL32(160, 160, 160, 255);
-    };
-
-    for (const auto& rect : scene.rects) {
-        const auto a = map_point(rect.center.x - rect.size.x * 0.5F, rect.center.y + rect.size.y * 0.5F);
-        const auto b = map_point(rect.center.x + rect.size.x * 0.5F, rect.center.y - rect.size.y * 0.5F);
-        draw_list->AddRectFilled(a, b, rect_color(rect.kind), 1.0F);
-        draw_list->AddRect(a, b, rect_border_color(rect.kind), 1.0F);
-    }
-    for (const auto& door : scene.doors) {
-        const auto center = map_point(door.position.x, door.position.y);
-        draw_list->AddCircleFilled(center, 3.5F, IM_COL32(180, 108, 225, 230));
-        draw_list->AddCircle(center, 3.5F, IM_COL32(245, 245, 245, 230));
-    }
-
-    const auto visible_label = clipped_label(label, 22U);
+    const auto title = "Face " + std::to_string(face_index);
+    const auto title_width = ImGui::CalcTextSize(title.c_str()).x;
     draw_list->AddText(
         ImGui::GetFont(),
         ImGui::GetFontSize(),
-        ImVec2{min.x + 8.0F, max.y - 22.0F},
-        IM_COL32(220, 228, 229, 255),
-        visible_label.c_str(),
-        visible_label.c_str() + visible_label.size(),
-        max.x - min.x - 16.0F);
+        ImVec2{min.x + 8.0F, min.y + 6.0F},
+        IM_COL32(229, 234, 235, 255),
+        title.c_str(),
+        title.c_str() + title.size());
+    const auto type = "type " + std::to_string(layer.portal_type);
+    const auto type_width = ImGui::CalcTextSize(type.c_str()).x;
+    if (title_width + type_width + 28.0F <= max.x - min.x) {
+        draw_list->AddText(
+            ImGui::GetFont(),
+            ImGui::GetFontSize(),
+            ImVec2{max.x - type_width - 8.0F, min.y + 6.0F},
+            IM_COL32(139, 153, 157, 255),
+            type.c_str(),
+            type.c_str() + type.size());
+    }
+
+    const auto canvas_min = ImVec2{min.x + 8.0F, min.y + 28.0F};
+    const auto canvas_max = ImVec2{max.x - 8.0F, max.y - 8.0F};
+    draw_buildblock_preview_contents(draw_list, scene, std::optional<std::size_t>{layer.index}, canvas_min, canvas_max);
 }
 
 void draw_building_asset_panel(EditorProject& project, EditorUi& ui) {
@@ -429,41 +476,116 @@ void draw_buildblock_gallery(EditorProject& project, EditorUi& ui) {
     }
 
     ui.selected_buildblock = std::min(ui.selected_buildblock, project.buildblocks.size() - 1U);
-    const auto spacing = ImGui::GetStyle().ItemSpacing.x;
-    const auto avail_x = std::max(1.0F, ImGui::GetContentRegionAvail().x);
-    const auto min_tile_w = 118.0F;
-    const auto columns = std::max(1, static_cast<int>((avail_x + spacing) / (min_tile_w + spacing)));
-    const auto tile_w = std::floor((avail_x - spacing * static_cast<float>(columns - 1)) / static_cast<float>(columns));
-    const auto tile_h = 126.0F;
-    if (ImGui::BeginChild("##buildblock_gallery_panel", ImVec2(0, 0), true)) {
-        for (std::size_t i = 0; i < project.buildblocks.size(); ++i) {
-            ImGui::PushID(static_cast<int>(i));
-            const auto min = ImGui::GetCursorScreenPos();
-            const auto size = ImVec2{tile_w, tile_h};
-            ImGui::InvisibleButton("##buildblock_thumb", size);
-            if (ImGui::IsItemClicked()) {
-                ui.selected_buildblock = i;
-                ui.selected_buildblock_layer = 0;
-                ui.selected_buildblock_door = 0;
-                ui.selected_buildblock_window = 0;
-                ui.selected_buildblock_beam = 0;
-                ui.selected_buildblock_field = 0;
+    const auto total_y = std::max(1.0F, ImGui::GetContentRegionAvail().y);
+    const auto list_height = std::clamp(total_y * 0.36F, 120.0F, 220.0F);
+    if (ImGui::BeginChild("##buildblock_list_panel", ImVec2(0, list_height), true)) {
+        if (ImGui::BeginTable("##buildblock_list_table", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollY)) {
+            ImGui::TableSetupColumn("Name");
+            ImGui::TableSetupColumn("Faces", ImGuiTableColumnFlags_WidthFixed, 56.0F);
+            ImGui::TableHeadersRow();
+            for (std::size_t i = 0; i < project.buildblocks.size(); ++i) {
+                ImGui::PushID(static_cast<int>(i));
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                const bool selected = ui.selected_buildblock == i;
+                if (ImGui::Selectable(project.buildblocks[i].name.c_str(), selected, ImGuiSelectableFlags_SpanAllColumns)) {
+                    if (ui.selected_buildblock != i) {
+                        reset_buildblock_template_selection(ui, i);
+                    } else {
+                        ui.selected_buildblock = i;
+                    }
+                }
+                ImGui::TableNextColumn();
+                ImGui::Text("%zu", project.buildblocks[i].data.layers.size());
+                ImGui::PopID();
             }
-            draw_buildblock_thumbnail(
-                ImGui::GetWindowDrawList(),
-                project.buildblocks[i].data,
-                min,
-                ImVec2{min.x + size.x, min.y + size.y},
-                ui.selected_buildblock == i,
-                ImGui::IsItemHovered(),
-                project.buildblocks[i].name);
-            if ((static_cast<int>(i) + 1) % columns != 0) {
-                ImGui::SameLine();
-            }
-            ImGui::PopID();
+            ImGui::EndTable();
         }
     }
     ImGui::EndChild();
+
+    ui.selected_buildblock = std::min(ui.selected_buildblock, project.buildblocks.size() - 1U);
+    const auto& selected_asset = project.buildblocks[ui.selected_buildblock];
+    const auto& buildblock = selected_asset.data;
+    ImGui::SeparatorText("Portal Faces");
+    if (buildblock.layers.empty()) {
+        ImGui::TextUnformatted("Selected buildblock has no portal faces.");
+        return;
+    }
+
+    ui.selected_buildblock_layer = std::min(ui.selected_buildblock_layer, buildblock.layers.size() - 1U);
+    const auto scene = build_buildblock_preview_scene(buildblock);
+    const auto spacing = ImGui::GetStyle().ItemSpacing.x;
+    const auto avail_x = std::max(1.0F, ImGui::GetContentRegionAvail().x);
+    const auto min_tile_w = 92.0F;
+    auto columns = std::max(1, static_cast<int>((avail_x + spacing) / (min_tile_w + spacing)));
+    columns = std::min(columns, static_cast<int>(buildblock.layers.size()));
+    const auto rows = std::max(1, static_cast<int>((buildblock.layers.size() + static_cast<std::size_t>(columns) - 1U) / static_cast<std::size_t>(columns)));
+    const auto grid_avail_y = std::max(1.0F, ImGui::GetContentRegionAvail().y);
+    const auto fit_tile_h = (grid_avail_y - spacing * static_cast<float>(rows - 1)) / static_cast<float>(rows);
+    const auto tile_h = std::clamp(fit_tile_h, 74.0F, 116.0F);
+    const auto tile_w = std::max(1.0F, std::floor((avail_x - spacing * static_cast<float>(columns - 1)) / static_cast<float>(columns)));
+
+    ImGui::PushID("buildblock_faces");
+    for (std::size_t i = 0; i < buildblock.layers.size(); ++i) {
+        const auto min = ImGui::GetCursorScreenPos();
+        const auto size = ImVec2{tile_w, tile_h};
+        const auto id = "##face" + std::to_string(i);
+        ImGui::InvisibleButton(id.c_str(), size);
+        if (ImGui::IsItemClicked()) {
+            select_buildblock_face(ui, i);
+        }
+        draw_buildblock_face_preview(
+            ImGui::GetWindowDrawList(),
+            scene,
+            buildblock.layers[i],
+            i,
+            min,
+            ImVec2{min.x + size.x, min.y + size.y},
+            ui.selected_buildblock_layer == i,
+            ImGui::IsItemHovered());
+        if (i + 1U < buildblock.layers.size() && (static_cast<int>(i) + 1) % columns != 0) {
+            ImGui::SameLine();
+        }
+    }
+    ImGui::PopID();
+}
+
+void draw_buildblock_preview_panel(EditorProject& project, EditorUi& ui) {
+    if (project.buildblocks.empty()) {
+        ImGui::TextUnformatted("No buildblocks loaded.");
+        return;
+    }
+
+    ui.selected_buildblock = std::min(ui.selected_buildblock, project.buildblocks.size() - 1U);
+    const auto& asset = project.buildblocks[ui.selected_buildblock];
+    const auto& buildblock = asset.data;
+    if (buildblock.layers.empty()) {
+        ImGui::Text("Buildblock: %s", asset.name.c_str());
+        ImGui::TextUnformatted("No portal faces.");
+        return;
+    }
+
+    ui.selected_buildblock_layer = std::min(ui.selected_buildblock_layer, buildblock.layers.size() - 1U);
+    const auto layer_id = buildblock.layers[ui.selected_buildblock_layer].index;
+    ImGui::Text("Buildblock: %s", asset.name.c_str());
+    ImGui::SameLine();
+    ImGui::TextDisabled("Face %zu", layer_id);
+
+    const auto scene = build_buildblock_preview_scene(buildblock);
+    const auto canvas_min = ImGui::GetCursorScreenPos();
+    const auto avail = ImGui::GetContentRegionAvail();
+    const auto canvas_size = ImVec2{
+        std::max(160.0F, avail.x),
+        std::max(180.0F, avail.y),
+    };
+    ImGui::InvisibleButton("##buildblock_2d_preview_canvas", canvas_size);
+    draw_buildblock_preview_contents(
+        ImGui::GetWindowDrawList(),
+        scene,
+        std::optional<std::size_t>{layer_id},
+        canvas_min,
+        ImVec2{canvas_min.x + canvas_size.x, canvas_min.y + canvas_size.y});
 }
 
 void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& status) {
@@ -1071,6 +1193,12 @@ Pos=322,19
 Size=756,663
 Collapsed=0
 DockId=0x00000005,1
+
+[Window][Buildblock 2D Preview]
+Pos=322,19
+Size=756,663
+Collapsed=0
+DockId=0x00000005,2
 
 [Docking][Data]
 DockSpace       ID=0x08BD597D Window=0x1BBC0F80 Pos=0,19 Size=1440,881 Split=X Selected=0x13DC1525

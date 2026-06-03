@@ -53,9 +53,40 @@ bool all_buffer_positions_on_x(const map_editor::BuildingRenderBuffer& buffer, f
     });
 }
 
+bool all_buffer_positions_on_y(const map_editor::BuildingRenderBuffer& buffer, float y) {
+    return !buffer.vertices.empty() && std::ranges::all_of(buffer.vertices, [&](const map_editor::RenderBufferVertex& vertex) {
+        return close_to(vertex.position.y, y);
+    });
+}
+
 bool all_buffer_positions_on_z(const map_editor::BuildingRenderBuffer& buffer, float z) {
     return !buffer.vertices.empty() && std::ranges::all_of(buffer.vertices, [&](const map_editor::RenderBufferVertex& vertex) {
         return close_to(vertex.position.z, z);
+    });
+}
+
+bool point_in_triangle_2d(float px, float py, map_editor::Vec3 a, map_editor::Vec3 b, map_editor::Vec3 c) {
+    const auto area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    if (std::fabs(area) < 0.0001F) {
+        return false;
+    }
+    const auto s = ((a.y - c.y) * (px - c.x) + (c.x - a.x) * (py - c.y)) / area;
+    const auto t = ((c.y - b.y) * (px - c.x) + (b.x - c.x) * (py - c.y)) / area;
+    const auto u = 1.0F - s - t;
+    return s >= -0.0001F && t >= -0.0001F && u >= -0.0001F;
+}
+
+bool buffer_has_triangle_covering_z_point(
+    const map_editor::BuildingRenderBuffer& buffer,
+    float z,
+    float x,
+    float y) {
+    return std::ranges::any_of(buffer.triangles, [&](const map_editor::RenderBufferTriangle& triangle) {
+        const auto& a = buffer.vertices[triangle.indices[0]].position;
+        const auto& b = buffer.vertices[triangle.indices[1]].position;
+        const auto& c = buffer.vertices[triangle.indices[2]].position;
+        return close_to(a.z, z) && close_to(b.z, z) && close_to(c.z, z) &&
+            point_in_triangle_2d(x, y, a, b, c);
     });
 }
 
@@ -717,7 +748,10 @@ void builds_native_building_render_buffer_from_piece_meshes() {
     assert(!buffer.material_runs.empty());
     assert(buffer.material_runs.front().first_triangle == 0U);
     for (std::size_t index = 1; index < buffer.material_runs.size(); ++index) {
-        assert(buffer.material_runs[index - 1].material < buffer.material_runs[index].material);
+        const auto& previous = buffer.material_runs[index - 1];
+        const auto& current = buffer.material_runs[index];
+        assert(previous.material < current.material ||
+            (previous.material == current.material && !previous.city_window_surface && current.city_window_surface));
         assert(buffer.material_runs[index - 1].first_triangle + buffer.material_runs[index - 1].triangle_count ==
                buffer.material_runs[index].first_triangle);
     }
@@ -832,7 +866,56 @@ void native_building_render_buffer_uses_cell_material_slots() {
     assert(material_run->triangle_count == 2U);
 }
 
-void native_building_render_buffer_uses_portal_trim_material_bucket() {
+void native_city_building_render_buffer_keeps_plain_buildblock_walls_untextured() {
+    map_editor::SblLayer layer{};
+    layer.index = 1;
+    layer.portal_type = 0;
+    layer.bounds = {0.25F, 0.5F, 0.25F, 0.5F};
+
+    map_editor::SblTemplate buildblock{};
+    buildblock.version = 1;
+    buildblock.layers.resize(2);
+    buildblock.layers[1] = layer;
+
+    map_editor::SbbBuilding building{};
+    building.extent_x = 1;
+    building.extent_y = 1;
+    building.extent_z = 1;
+    building.block_names = {"portal"};
+    auto cell = map_editor::SbbCell{
+        0,
+        0,
+        0,
+        0,
+        {0x40000000U, 0xffffU, 0U, 4U, 0U, 0U},
+        0,
+        true,
+        {},
+    };
+    cell.shorts[2] = 12U;
+    building.cells.push_back(cell);
+
+    const auto buffer = map_editor::build_native_building_render_buffer(
+        building,
+        {},
+        {map_editor::NamedBuildblockTemplate{"portal", buildblock}});
+
+    const auto frame_run = std::ranges::find_if(buffer.material_runs, [](const map_editor::RenderBufferMaterialRun& run) {
+        return run.material == 12U;
+    });
+    assert(frame_run != buffer.material_runs.end());
+    assert(frame_run->triangle_count == 2U);
+    assert(buffer.triangles.size() == 10U);
+    assert(std::ranges::none_of(buffer.material_runs, [](const map_editor::RenderBufferMaterialRun& run) {
+        return run.material == 0x100U;
+    }));
+    assert(std::ranges::none_of(buffer.material_runs, [](const map_editor::RenderBufferMaterialRun& run) {
+        return run.city_window_surface;
+    }));
+    assert(!buffer.wire_lines.empty());
+}
+
+void native_building_tool_preview_uses_frame_faces_for_buildblock_opening() {
     map_editor::SblLayer layer{};
     layer.index = 1;
     layer.portal_type = 0;
@@ -850,7 +933,7 @@ void native_building_render_buffer_uses_portal_trim_material_bucket() {
     building.extent_y = 1;
     building.extent_z = 1;
     building.block_names = {"portal"};
-    building.cells.push_back({
+    auto cell = map_editor::SbbCell{
         0,
         0,
         0,
@@ -858,26 +941,60 @@ void native_building_render_buffer_uses_portal_trim_material_bucket() {
         {0x40000000U, 0xffffU, 0U, 4U, 0U, 0U},
         0,
         true,
-        {},
-    });
+        {map_editor::SbbCellPayload{map_editor::PayloadKind::Block, 0x40000000U, 0U}},
+    };
+    cell.shorts[14] = 46U;
+    building.cells.push_back(cell);
 
-    const auto buffer = map_editor::build_native_building_render_buffer(
+    const auto buffer = map_editor::build_native_building_tool_preview_render_buffer(
         building,
         {},
-        {map_editor::NamedBuildblockTemplate{"portal", buildblock}});
+        {map_editor::NamedBuildblockTemplate{"portal", buildblock}},
+        0U);
 
-    const auto trim_run = std::ranges::find_if(buffer.material_runs, [](const map_editor::RenderBufferMaterialRun& run) {
-        return run.material == 0x100U;
-    });
-    assert(trim_run != buffer.material_runs.end());
-    assert(trim_run->triangle_count == 4U);
-    assert(std::ranges::any_of(buffer.vertices, [](const map_editor::RenderBufferVertex& vertex) {
-        return close_to(vertex.position.z, -0.00390625F);
+    assert(buffer.triangles.size() > 10U);
+    assert(has_buffer_position(buffer, 0.0F, 0.0F, 0.25F));
+    assert(std::ranges::any_of(buffer.material_runs, [](const map_editor::RenderBufferMaterialRun& run) {
+        return run.material == 46U;
     }));
-    assert(std::ranges::any_of(buffer.vertices, [](const map_editor::RenderBufferVertex& vertex) {
-        return close_to(vertex.position.z, 4.00390625F);
-    }));
-    assert(!buffer.wire_lines.empty());
+}
+
+void native_building_tool_preview_leaves_buildblock_opening_empty() {
+    map_editor::SblLayer layer{};
+    layer.index = 1;
+    layer.portal_type = 0;
+    layer.bounds = {0.25F, 0.5F, 0.25F, 0.5F};
+
+    map_editor::SblTemplate buildblock{};
+    buildblock.version = 1;
+    buildblock.layers.resize(2);
+    buildblock.layers[1] = layer;
+
+    map_editor::SbbBuilding building{};
+    building.extent_x = 1;
+    building.extent_y = 1;
+    building.extent_z = 1;
+    building.block_names = {"portal"};
+    auto cell = map_editor::SbbCell{
+        0,
+        0,
+        0,
+        0,
+        {0x40000000U, 0xffffU, 0U, 4U, 0U, 0U},
+        0,
+        true,
+        {map_editor::SbbCellPayload{map_editor::PayloadKind::Block, 0x40000000U, 0U}},
+    };
+    cell.shorts[14] = 46U;
+    building.cells.push_back(cell);
+
+    const auto buffer = map_editor::build_native_building_tool_preview_render_buffer(
+        building,
+        {},
+        {map_editor::NamedBuildblockTemplate{"portal", buildblock}},
+        0U);
+
+    assert(!buffer_has_triangle_covering_z_point(buffer, 0.25F, 2.0F, 2.0F));
 }
 
 void picks_nearest_occupied_building_cell_with_native_anchor() {
@@ -1416,7 +1533,7 @@ void native_building_render_buffer_rotates_piece_material_slots_and_uvs() {
     }));
 }
 
-void native_building_render_buffer_falls_back_to_first_block_mesh_for_unresolved_piece_refs() {
+void native_building_render_buffer_uses_generated_builtin_block_for_unresolved_piece_refs() {
     map_editor::SblBlockMesh fallback_mesh{};
     fallback_mesh.width = 1;
     fallback_mesh.height = 1;
@@ -1454,6 +1571,7 @@ void native_building_render_buffer_falls_back_to_first_block_mesh_for_unresolved
         true,
         {map_editor::SbbCellPayload{map_editor::PayloadKind::Piece, 0x80000000U, 0U}},
     };
+    cell.shorts[0] = 44U;
     cell.shorts[1] = 33U;
     building.cells.push_back(cell);
 
@@ -1464,7 +1582,29 @@ void native_building_render_buffer_falls_back_to_first_block_mesh_for_unresolved
 
     assert(buffer.triangles.size() == 2U);
     assert(buffer.material_runs.size() == 1U);
-    assert(buffer.material_runs[0].material == 33U);
+    assert(buffer.material_runs[0].material == 44U);
+    assert(all_buffer_positions_on_y(buffer, 0.25F));
+}
+
+void native_block_mesh_catalog_seeds_builtin_blocks_before_file_blocks() {
+    map_editor::SblBlockMesh file_mesh{};
+    file_mesh.width = 2U;
+    file_mesh.height = 3U;
+    file_mesh.depth = 4U;
+
+    const auto catalog = map_editor::build_native_block_mesh_catalog({map_editor::NamedBlockMesh{"file_block", file_mesh}});
+
+    assert(catalog.size() == map_editor::native_builtin_block_mesh_count + 1U);
+    for (std::size_t index = 0; index < map_editor::native_builtin_block_mesh_count; ++index) {
+        assert(catalog[index].name.empty());
+        assert(catalog[index].mesh.width == 1U);
+        assert(catalog[index].mesh.height == 1U);
+        assert(catalog[index].mesh.depth == 1U);
+        assert(catalog[index].mesh.faces.size() == 1U);
+        assert(close_to(catalog[index].mesh.faces[0].vertices[0].y, 0.0625F));
+    }
+    assert(catalog[map_editor::native_builtin_block_mesh_count].name == "file_block");
+    assert(catalog[map_editor::native_builtin_block_mesh_count].mesh.width == 2U);
 }
 
 void native_block_rotation_uses_positive_rotated_bounds() {
@@ -1937,7 +2077,7 @@ void native_portal_render_buffer_clamps_face_material_slots() {
     assert(buffer.material_names[0] == "extra1");
 }
 
-void native_city_building_render_origin_applies_rotation_offsets() {
+void native_city_building_render_origin_applies_editor_rotation_offsets() {
     map_editor::SbcBuilding building{};
     building.x = 10;
     building.y = 2;
@@ -1963,6 +2103,124 @@ void native_city_building_render_origin_applies_rotation_offsets() {
     origin = map_editor::native_city_building_render_origin(building);
     assert(close_to(origin.x, 40.0F));
     assert(close_to(origin.z, 84.0F));
+}
+
+void native_city_building_basis_uses_inverted_rotation_with_editor_offsets() {
+    map_editor::SbcBuilding building{};
+    building.x = 10;
+    building.y = 2;
+    building.z = 20;
+
+    building.rotation = 1;
+    auto basis = map_editor::native_city_building_rotation_basis(building.rotation);
+    assert(close_to(basis.x_axis.x, 0.0F));
+    assert(close_to(basis.x_axis.y, 0.0F));
+    assert(close_to(basis.x_axis.z, 1.0F));
+    assert(close_to(basis.z_axis.x, -1.0F));
+    assert(close_to(basis.z_axis.y, 0.0F));
+    assert(close_to(basis.z_axis.z, 0.0F));
+
+    auto transformed = map_editor::native_city_building_transform_point(building, {1.0F, 2.0F, 3.0F});
+    assert(close_to(transformed.x, 41.0F));
+    assert(close_to(transformed.y, 10.0F));
+    assert(close_to(transformed.z, 81.0F));
+
+    building.rotation = 2;
+    basis = map_editor::native_city_building_rotation_basis(building.rotation);
+    assert(close_to(basis.x_axis.x, -1.0F));
+    assert(close_to(basis.z_axis.z, -1.0F));
+
+    transformed = map_editor::native_city_building_transform_point(building, {1.0F, 2.0F, 3.0F});
+    assert(close_to(transformed.x, 43.0F));
+    assert(close_to(transformed.y, 10.0F));
+    assert(close_to(transformed.z, 81.0F));
+
+    building.rotation = 3;
+    basis = map_editor::native_city_building_rotation_basis(building.rotation);
+    assert(close_to(basis.x_axis.x, 0.0F));
+    assert(close_to(basis.x_axis.z, -1.0F));
+    assert(close_to(basis.z_axis.x, 1.0F));
+
+    transformed = map_editor::native_city_building_transform_point(building, {1.0F, 2.0F, 3.0F});
+    assert(close_to(transformed.x, 43.0F));
+    assert(close_to(transformed.y, 10.0F));
+    assert(close_to(transformed.z, 83.0F));
+}
+
+void native_city_render_buffer_does_not_tag_plain_upper_walls_as_windows() {
+    map_editor::SbbBuilding building{};
+    building.extent_x = 1;
+    building.extent_y = 2;
+    building.extent_z = 1;
+    building.size_x = 1;
+    building.size_y = 1;
+    building.size_z = 2;
+    building.cells.push_back({0, 0, 0, 0, {0x40000000U, 0xffffU, 0U, 0U, 0U, 0U}, 0, true, {}});
+    building.cells.push_back({1, 0, 1, 0, {0x40000000U, 0xffffU, 0U, 0U, 0U, 0U}, 0, true, {}});
+
+    const auto buffer = map_editor::build_native_building_render_buffer(building, {}, {});
+    assert(std::ranges::none_of(buffer.triangles, [](const map_editor::RenderBufferTriangle& triangle) {
+        return triangle.city_window_surface;
+    }));
+    assert(std::ranges::none_of(buffer.material_runs, [](const map_editor::RenderBufferMaterialRun& run) {
+        return run.city_window_surface;
+    }));
+}
+
+void native_city_render_buffer_tags_buildblock_window_openings_only() {
+    map_editor::SblLayer layer{};
+    layer.index = 1;
+    layer.portal_type = 0;
+    layer.bounds = {0.25F, 0.5F, 0.25F, 0.5F};
+    layer.windows.push_back({0U, 0.375F, 0.25F, 0.4F, 0.2F});
+
+    map_editor::SblTemplate buildblock{};
+    buildblock.version = 1;
+    buildblock.layers.resize(2);
+    buildblock.layers[1] = layer;
+
+    map_editor::SbbBuilding building{};
+    building.extent_x = 1;
+    building.extent_y = 1;
+    building.extent_z = 1;
+    building.block_names = {"portal"};
+    building.cells.push_back({
+        0,
+        0,
+        0,
+        0,
+        {0x40000000U, 0xffffU, 0U, 4U, 0U, 0U},
+        0,
+        true,
+        {},
+    });
+
+    const auto buffer = map_editor::build_native_building_render_buffer(
+        building,
+        {},
+        {map_editor::NamedBuildblockTemplate{"portal", buildblock}});
+
+    assert(std::ranges::any_of(buffer.triangles, [](const map_editor::RenderBufferTriangle& triangle) {
+        return triangle.city_window_surface && triangle.material == 0x100U;
+    }));
+    assert(std::ranges::any_of(buffer.material_runs, [](const map_editor::RenderBufferMaterialRun& run) {
+        return run.city_window_surface && run.material == 0x100U;
+    }));
+    for (const auto& triangle : buffer.triangles) {
+        if (!triangle.city_window_surface) {
+            assert(triangle.material != 0x100U);
+            continue;
+        }
+        assert(triangle.material == 0x100U);
+        const auto& a = buffer.vertices[triangle.indices[0]].position;
+        const auto& b = buffer.vertices[triangle.indices[1]].position;
+        const auto& c = buffer.vertices[triangle.indices[2]].position;
+        const auto north_face = close_to(a.z, 0.0F) && close_to(b.z, 0.0F) && close_to(c.z, 0.0F);
+        const auto south_face = close_to(a.z, 4.0F) && close_to(b.z, 4.0F) && close_to(c.z, 4.0F);
+        assert(north_face || south_face);
+        assert(a.y >= 1.5F && b.y >= 1.5F && c.y >= 1.5F);
+        assert(a.y <= 2.5F && b.y <= 2.5F && c.y <= 2.5F);
+    }
 }
 
 void rebuilds_sbc_layout_with_new_records() {
@@ -2195,7 +2453,9 @@ int main() {
     native_building_render_buffer_never_emits_down_face();
     native_building_render_buffer_uses_editor_face_order_and_uvs();
     native_building_render_buffer_uses_cell_material_slots();
-    native_building_render_buffer_uses_portal_trim_material_bucket();
+    native_city_building_render_buffer_keeps_plain_buildblock_walls_untextured();
+    native_building_tool_preview_uses_frame_faces_for_buildblock_opening();
+    native_building_tool_preview_leaves_buildblock_opening_empty();
     picks_nearest_occupied_building_cell_with_native_anchor();
     edits_selected_sbb_cell_state();
     edits_selected_sbc_building_state();
@@ -2218,7 +2478,8 @@ int main() {
     applies_native_sbl_authored_uv_orientation_flags();
     applies_native_sbl_authored_auto_orientation_flag();
     native_building_render_buffer_rotates_piece_material_slots_and_uvs();
-    native_building_render_buffer_falls_back_to_first_block_mesh_for_unresolved_piece_refs();
+    native_building_render_buffer_uses_generated_builtin_block_for_unresolved_piece_refs();
+    native_block_mesh_catalog_seeds_builtin_blocks_before_file_blocks();
     native_block_rotation_uses_positive_rotated_bounds();
     tessellates_authored_sbl_patches();
     emits_sbl_v2_light_record_faces();
@@ -2237,7 +2498,10 @@ int main() {
     native_portal_render_buffer_uses_city_block_name_mesh_and_layer_materials();
     native_portal_render_buffer_skips_texture_only_city_blocks();
     native_portal_render_buffer_clamps_face_material_slots();
-    native_city_building_render_origin_applies_rotation_offsets();
+    native_city_building_render_origin_applies_editor_rotation_offsets();
+    native_city_building_basis_uses_inverted_rotation_with_editor_offsets();
+    native_city_render_buffer_does_not_tag_plain_upper_walls_as_windows();
+    native_city_render_buffer_tags_buildblock_window_openings_only();
     rebuilds_sbc_layout_with_new_records();
     rebuilds_sbc_as_native_v12();
     rebuilds_old_sbc_as_native_v12_without_legacy_portal_arrays();

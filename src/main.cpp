@@ -245,24 +245,30 @@ int set_sbl_layer_portal_command(
     return 0;
 }
 
-std::vector<map_editor::NamedBlockMesh> load_sibling_block_meshes(const std::filesystem::path& sbb_path, const map_editor::SbbBuilding& building) {
+std::vector<map_editor::NamedBlockMesh> load_sibling_block_meshes(const std::filesystem::path& sbb_path) {
     const auto building_dir = sbb_path.parent_path();
     const auto map_dir = building_dir.filename() == "building" ? building_dir.parent_path() : building_dir;
     const auto block_dir = map_dir / "block";
     std::vector<map_editor::NamedBlockMesh> meshes;
+    std::vector<std::filesystem::path> paths;
 
-    for (const auto& name : building.piece_names) {
-        const auto path = block_dir / (name + ".sbl");
-        if (!std::filesystem::exists(path)) {
-            continue;
+    if (std::filesystem::is_directory(block_dir)) {
+        for (const auto& entry : std::filesystem::directory_iterator{block_dir}) {
+            if (entry.is_regular_file() && has_extension(entry.path(), ".sbl")) {
+                paths.push_back(entry.path());
+            }
         }
+    }
+    std::ranges::sort(paths);
+
+    for (const auto& path : paths) {
         const auto parsed = map_editor::parse_sbl_file(path);
         if (parsed.block.has_value()) {
-            meshes.push_back({name, *parsed.block});
+            meshes.push_back({path.stem().string(), *parsed.block});
         }
     }
 
-    return meshes;
+    return map_editor::build_native_block_mesh_catalog(meshes);
 }
 
 std::vector<map_editor::NamedBuildblockTemplate> load_sibling_buildblock_templates(
@@ -295,7 +301,7 @@ int print_file_summary(const std::filesystem::path& path) {
 
     if (is_sbb) {
         const auto building = map_editor::parse_sbb_file(path);
-        const auto block_meshes = load_sibling_block_meshes(path, building);
+        const auto block_meshes = load_sibling_block_meshes(path);
         const auto buildblock_templates = load_sibling_buildblock_templates(path, building);
         const auto scene = map_editor::build_sbb_scene(building, block_meshes, buildblock_templates);
         std::cout << "SBB " << path

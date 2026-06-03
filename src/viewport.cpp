@@ -12,7 +12,7 @@ namespace {
 constexpr Vector3 kWorldUp{0.0F, 1.0F, 0.0F};
 constexpr float kMinFlySpeed = 2.0F;
 constexpr float kMaxFlySpeed = 512.0F;
-constexpr float kFlySpeedWheelStep = 1.2F;
+constexpr float kFlySpeedWheelStep = 1.1F;
 constexpr float kMouseLookRadiansPerPixel = 0.0035F;
 constexpr float kMaxPitchRadians = 1.55334306F; // 89 degrees.
 
