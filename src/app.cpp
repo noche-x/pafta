@@ -1092,9 +1092,11 @@ int run_editor_app() {
                     const auto* selected_street = project->city->data.streets.empty()
                         ? nullptr
                         : &project->city->data.streets[std::min(ui.selected_city_street, project->city->data.streets.size() - 1U)];
-                    draw_city_scene(build_map_scene(project->city->data), selected_street);
+                    const auto city_scene = build_map_scene(project->city->data);
+                    draw_city_scene(city_scene, selected_street);
                     draw_city_building_models_full_detail(*project, selected_building, &city_window_texture);
                     draw_city_piece_voxels(*project, ui.portal_preview_textured);
+                    draw_city_traffic_light_poles(city_scene);
                     
                     const auto city_cursor = city_grid_point_under_mouse(camera, virtual_mouse_pos);
                     if (city_cursor.has_value()) {

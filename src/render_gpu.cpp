@@ -835,18 +835,95 @@ void draw_city_piece_voxels(EditorProject& project, bool textured, std::optional
     draw_gpu_building_model(model, {0.0F, 0.0F, 0.0F}, 0, false, true);
 }
 
-void draw_city_scene(const MapScene& scene, const SbcStreet* selected_street) {
-    DrawGrid(256, scene.unit_size * 4.0F);
-    for (const auto& road : scene.roads) {
-        const auto selected = selected_street != nullptr && road.source == selected_street;
-        DrawLine3D(to_raylib(road.from), to_raylib(road.to), selected ? Color{245, 205, 82, 255} : Color{74, 80, 86, 255});
-        if (selected) {
-            DrawSphere(to_raylib(road.from), scene.unit_size * 0.8F, {245, 205, 82, 220});
-            DrawSphere(to_raylib(road.to), scene.unit_size * 0.8F, {245, 205, 82, 220});
+Color city_tile_material_color(const BuildingRenderBuffer& buffer, std::uint32_t material) {
+    if (material < buffer.material_names.size()) {
+        const auto& name = buffer.material_names[material];
+        if (name == "city_curb_concrete") {
+            return {150, 154, 151, 255};
+        }
+        if (name == "city_road_asphalt") {
+            return {43, 47, 50, 255};
         }
     }
-    for (const auto& intersection : scene.intersections) {
-        DrawCubeV(to_raylib(intersection.position), {intersection.width, 0.25F, intersection.width}, {88, 96, 104, 210});
+    return {88, 96, 104, 255};
+}
+
+void draw_render_buffer_faces_by_material(const BuildingRenderBuffer& buffer) {
+    rlDisableBackfaceCulling();
+    for (const auto& triangle : buffer.triangles) {
+        if (triangle.indices[0] >= buffer.vertices.size() ||
+            triangle.indices[1] >= buffer.vertices.size() ||
+            triangle.indices[2] >= buffer.vertices.size()) {
+            continue;
+        }
+        const auto a = to_raylib(buffer.vertices[triangle.indices[0]].position);
+        const auto b = to_raylib(buffer.vertices[triangle.indices[1]].position);
+        const auto c = to_raylib(buffer.vertices[triangle.indices[2]].position);
+        DrawTriangle3D(a, b, c, city_tile_material_color(buffer, triangle.material));
+    }
+    rlEnableBackfaceCulling();
+}
+
+void draw_city_terrain(const MapScene& scene) {
+    if (!scene.terrain.has_value()) {
+        return;
+    }
+    const auto& terrain = *scene.terrain;
+    const auto width = terrain.max_x - terrain.min_x;
+    const auto depth = terrain.max_z - terrain.min_z;
+    if (width <= 0.0F || depth <= 0.0F) {
+        return;
+    }
+
+    DrawCubeV(
+        {
+            (terrain.min_x + terrain.max_x) * 0.5F,
+            terrain.base_y - 0.04F,
+            (terrain.min_z + terrain.max_z) * 0.5F,
+        },
+        {width, 0.08F, depth},
+        {64, 83, 67, 255});
+}
+
+void draw_city_scene(const MapScene& scene, const SbcStreet* selected_street) {
+    draw_city_terrain(scene);
+    draw_render_buffer_faces_by_material(scene.city_tile_buffer);
+
+    for (const auto& road : scene.roads) {
+        const auto selected = selected_street != nullptr && road.source == selected_street;
+        if (selected) {
+            auto from = to_raylib(road.from);
+            auto to = to_raylib(road.to);
+            from.y += scene.unit_size * 1.1F;
+            to.y += scene.unit_size * 1.1F;
+            DrawSphere(from, scene.unit_size * 0.35F, {245, 205, 82, 220});
+            DrawSphere(to, scene.unit_size * 0.35F, {245, 205, 82, 220});
+        }
+    }
+}
+
+void draw_city_traffic_light_poles(const MapScene& scene) {
+    const auto pole_radius = scene.unit_size * 0.045F;
+    const auto pole_height = scene.unit_size * 1.75F;
+    const auto arm_length = scene.unit_size * 0.85F;
+    for (const auto& pole : scene.traffic_light_poles) {
+        const auto base = to_raylib(pole.base);
+        const auto top = Vector3{base.x, base.y + pole_height, base.z};
+        const auto arm_end = Vector3{
+            top.x + pole.arm_direction.x * arm_length,
+            top.y,
+            top.z + pole.arm_direction.z * arm_length,
+        };
+        DrawCylinderEx(base, top, pole_radius, pole_radius, 10, {45, 48, 50, 255});
+        DrawCylinderEx(top, arm_end, pole_radius * 0.8F, pole_radius * 0.8F, 10, {45, 48, 50, 255});
+        DrawCubeV(
+            {
+                arm_end.x + pole.arm_direction.x * scene.unit_size * 0.08F,
+                arm_end.y - scene.unit_size * 0.12F,
+                arm_end.z + pole.arm_direction.z * scene.unit_size * 0.08F,
+            },
+            {scene.unit_size * 0.18F, scene.unit_size * 0.34F, scene.unit_size * 0.18F},
+            {28, 31, 32, 255});
     }
 }
 

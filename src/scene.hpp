@@ -162,6 +162,31 @@ struct RenderRoad {
     float width{};
 };
 
+enum class CityTileKind {
+    Road,
+    Curb,
+};
+
+struct CityTileCell {
+    std::int32_t x{};
+    std::int32_t y{};
+    std::int32_t z{};
+    CityTileKind kind{CityTileKind::Road};
+};
+
+struct CityTerrain {
+    float base_y{};
+    float min_x{};
+    float max_x{};
+    float min_z{};
+    float max_z{};
+};
+
+struct CityTrafficLightPole {
+    Vec3 base{};
+    Vec3 arm_direction{};
+};
+
 struct RenderBuildingPlacement {
     const SbcBuilding* source{};
     Vec3 position{};
@@ -185,6 +210,10 @@ struct MapScene {
     float unit_size{4.0F};
     std::vector<RenderIntersection> intersections;
     std::vector<RenderRoad> roads;
+    std::vector<CityTileCell> city_tiles;
+    BuildingRenderBuffer city_tile_buffer;
+    std::optional<CityTerrain> terrain;
+    std::vector<CityTrafficLightPole> traffic_light_poles;
     std::vector<RenderBuildingPlacement> buildings;
     MapBounds bounds{};
 };

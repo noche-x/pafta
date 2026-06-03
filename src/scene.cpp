@@ -1262,6 +1262,350 @@ PortalWallRects build_portal_wall_rects_for_edge(const SblTemplate& template_fil
     };
 }
 
+struct CityTileKey {
+    std::int32_t x{};
+    std::int32_t y{};
+    std::int32_t z{};
+
+    friend bool operator==(const CityTileKey&, const CityTileKey&) = default;
+};
+
+struct CityTileKeyHash {
+    std::size_t operator()(const CityTileKey& key) const noexcept {
+        auto value = static_cast<std::uint64_t>(static_cast<std::uint32_t>(key.x));
+        value ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(key.y)) + 0x9e3779b97f4a7c15ULL + (value << 6U) + (value >> 2U);
+        value ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(key.z)) + 0x9e3779b97f4a7c15ULL + (value << 6U) + (value >> 2U);
+        return static_cast<std::size_t>(value);
+    }
+};
+
+using CityTileMap = std::unordered_map<CityTileKey, CityTileKind, CityTileKeyHash>;
+
+bool city_tile_kind_overrides(CityTileKind incoming, CityTileKind current) {
+    return incoming == CityTileKind::Road && current == CityTileKind::Curb;
+}
+
+void set_city_tile(CityTileMap& tiles, std::int32_t x, std::int32_t y, std::int32_t z, CityTileKind kind) {
+    const CityTileKey key{x, y, z};
+    const auto [match, inserted] = tiles.emplace(key, kind);
+    if (!inserted && city_tile_kind_overrides(kind, match->second)) {
+        match->second = kind;
+    }
+}
+
+int positive_street_width(const SbcStreet& street) {
+    return std::max(0, street.left_width) + std::max(0, street.right_width);
+}
+
+void place_city_street_tiles(
+    CityTileMap& tiles,
+    const SbcStreet& street,
+    const SbcIntersection& from,
+    const SbcIntersection& to) {
+    const auto dx = to.x - from.x;
+    const auto dz = to.z - from.z;
+    const auto east_west = std::abs(dx) >= std::abs(dz);
+    const auto length = std::abs(east_west ? dx : dz);
+    const auto step_x = east_west ? (dx >= 0 ? 1 : -1) : 0;
+    const auto step_z = east_west ? 0 : (dz >= 0 ? 1 : -1);
+    const auto width = positive_street_width(street);
+    if (width <= 0 || (step_x == 0 && step_z == 0)) {
+        return;
+    }
+
+    const auto right_x = -step_z;
+    const auto right_z = step_x;
+    const auto left_width = std::max(0, street.left_width);
+    const auto right_width = std::max(0, street.right_width);
+
+    for (auto along = 0; along <= length; ++along) {
+        const auto center_x = from.x + step_x * along;
+        const auto center_z = from.z + step_z * along;
+        for (auto offset = -left_width; offset < right_width; ++offset) {
+            set_city_tile(
+                tiles,
+                center_x + right_x * offset,
+                from.y,
+                center_z + right_z * offset,
+                CityTileKind::Road);
+        }
+        set_city_tile(
+            tiles,
+            center_x + right_x * (-left_width - 1),
+            from.y,
+            center_z + right_z * (-left_width - 1),
+            CityTileKind::Curb);
+        set_city_tile(
+            tiles,
+            center_x + right_x * right_width,
+            from.y,
+            center_z + right_z * right_width,
+            CityTileKind::Curb);
+    }
+}
+
+enum class CityIntersectionSide {
+    East,
+    South,
+    West,
+    North,
+};
+
+struct CityIntersectionFootprint {
+    std::int32_t min_offset{};
+    std::int32_t max_offset{};
+    std::array<bool, 4> connected{};
+};
+
+std::size_t side_index(CityIntersectionSide side) {
+    return static_cast<std::size_t>(side);
+}
+
+CityIntersectionSide side_from_intersection_delta(std::int32_t dx, std::int32_t dz) {
+    if (std::abs(dx) >= std::abs(dz)) {
+        return dx >= 0 ? CityIntersectionSide::East : CityIntersectionSide::West;
+    }
+    return dz >= 0 ? CityIntersectionSide::South : CityIntersectionSide::North;
+}
+
+CityIntersectionFootprint city_intersection_footprint(const SbcMap& map, const SbcIntersection& intersection) {
+    auto width = 1;
+    CityIntersectionFootprint footprint;
+    for (const auto& street : map.streets) {
+        if (street.from_intersection < 0 || street.to_intersection < 0) {
+            continue;
+        }
+        const auto from_index = static_cast<std::size_t>(street.from_intersection);
+        const auto to_index = static_cast<std::size_t>(street.to_intersection);
+        if (from_index >= map.intersections.size() || to_index >= map.intersections.size()) {
+            continue;
+        }
+        const auto connects_from = street.from_intersection == static_cast<std::int32_t>(intersection.index);
+        const auto connects_to = street.to_intersection == static_cast<std::int32_t>(intersection.index);
+        if (!connects_from && !connects_to) {
+            continue;
+        }
+
+        width = std::max(width, positive_street_width(street));
+        const auto& other = connects_from ? map.intersections[to_index] : map.intersections[from_index];
+        const auto side = side_from_intersection_delta(other.x - intersection.x, other.z - intersection.z);
+        footprint.connected[side_index(side)] = true;
+    }
+
+    // VERIFY(subrosa.exe MapConnector_PlaceIntersectionPerimeterTiles @20130):
+    // exact odd/even footprint anchoring is not re-decompiled in this run. This
+    // keeps a grid square with total lane width, matching street strips and the
+    // existing editor width contract before adding no-connection curb perimeter.
+    footprint.min_offset = -(width / 2);
+    footprint.max_offset = footprint.min_offset + width - 1;
+    return footprint;
+}
+
+void place_city_intersection_tiles(CityTileMap& tiles, const SbcMap& map, const SbcIntersection& intersection) {
+    const auto footprint = city_intersection_footprint(map, intersection);
+    for (auto x = footprint.min_offset; x <= footprint.max_offset; ++x) {
+        for (auto z = footprint.min_offset; z <= footprint.max_offset; ++z) {
+            set_city_tile(tiles, intersection.x + x, intersection.y, intersection.z + z, CityTileKind::Road);
+        }
+    }
+
+    if (!footprint.connected[side_index(CityIntersectionSide::North)]) {
+        for (auto x = footprint.min_offset; x <= footprint.max_offset; ++x) {
+            set_city_tile(tiles, intersection.x + x, intersection.y, intersection.z + footprint.min_offset - 1, CityTileKind::Curb);
+        }
+    }
+    if (!footprint.connected[side_index(CityIntersectionSide::South)]) {
+        for (auto x = footprint.min_offset; x <= footprint.max_offset; ++x) {
+            set_city_tile(tiles, intersection.x + x, intersection.y, intersection.z + footprint.max_offset + 1, CityTileKind::Curb);
+        }
+    }
+    if (!footprint.connected[side_index(CityIntersectionSide::West)]) {
+        for (auto z = footprint.min_offset; z <= footprint.max_offset; ++z) {
+            set_city_tile(tiles, intersection.x + footprint.min_offset - 1, intersection.y, intersection.z + z, CityTileKind::Curb);
+        }
+    }
+    if (!footprint.connected[side_index(CityIntersectionSide::East)]) {
+        for (auto z = footprint.min_offset; z <= footprint.max_offset; ++z) {
+            set_city_tile(tiles, intersection.x + footprint.max_offset + 1, intersection.y, intersection.z + z, CityTileKind::Curb);
+        }
+    }
+}
+
+std::vector<CityTileCell> build_city_tile_cells(const SbcMap& map) {
+    CityTileMap tile_map;
+    for (const auto& street : map.streets) {
+        if (street.from_intersection < 0 || street.to_intersection < 0) {
+            continue;
+        }
+        const auto from_index = static_cast<std::size_t>(street.from_intersection);
+        const auto to_index = static_cast<std::size_t>(street.to_intersection);
+        if (from_index >= map.intersections.size() || to_index >= map.intersections.size()) {
+            continue;
+        }
+        place_city_street_tiles(tile_map, street, map.intersections[from_index], map.intersections[to_index]);
+    }
+
+    for (const auto& intersection : map.intersections) {
+        place_city_intersection_tiles(tile_map, map, intersection);
+    }
+
+    std::vector<CityTileCell> tiles;
+    tiles.reserve(tile_map.size());
+    for (const auto& [key, kind] : tile_map) {
+        tiles.push_back({key.x, key.y, key.z, kind});
+    }
+    std::ranges::sort(tiles, [](const CityTileCell& left, const CityTileCell& right) {
+        if (left.y != right.y) {
+            return left.y < right.y;
+        }
+        if (left.z != right.z) {
+            return left.z < right.z;
+        }
+        if (left.x != right.x) {
+            return left.x < right.x;
+        }
+        return static_cast<int>(left.kind) < static_cast<int>(right.kind);
+    });
+    return tiles;
+}
+
+BuildingRenderBuffer build_city_tile_render_buffer(const std::vector<CityTileCell>& tiles, float unit_size) {
+    BuildingRenderBuffer buffer;
+    buffer.unit_size = unit_size;
+    if (tiles.empty()) {
+        return buffer;
+    }
+
+    VertexIndexMap vertex_indices;
+    std::vector<SbbCell> cells;
+    cells.reserve(tiles.size());
+    std::unordered_map<CityTileKey, std::size_t, CityTileKeyHash> tile_indices;
+    tile_indices.reserve(tiles.size());
+    for (std::size_t index = 0; index < tiles.size(); ++index) {
+        const auto& tile = tiles[index];
+        auto cell = native_city_block_solid_cell();
+        cell.index = index;
+        cell.occupied = true;
+        cells.push_back(cell);
+        tile_indices.emplace(CityTileKey{tile.x, tile.y, tile.z}, index);
+    }
+
+    auto cell_at = [&](std::int32_t x, std::int32_t y, std::int32_t z) -> const SbbCell* {
+        const auto match = tile_indices.find(CityTileKey{x, y, z});
+        return match == tile_indices.end() ? nullptr : &cells[match->second];
+    };
+
+    const auto road_material = material_id_for_name(buffer, "city_road_asphalt");
+    const auto curb_material = material_id_for_name(buffer, "city_curb_concrete");
+    for (std::size_t index = 0; index < tiles.size(); ++index) {
+        const auto& tile = tiles[index];
+        const auto& cell = cells[index];
+        const auto* west = cell_at(tile.x - 1, tile.y, tile.z);
+        const auto* east = cell_at(tile.x + 1, tile.y, tile.z);
+        const auto* north = cell_at(tile.x, tile.y, tile.z - 1);
+        const auto* south = cell_at(tile.x, tile.y, tile.z + 1);
+        const auto* up = cell_at(tile.x, tile.y + 1, tile.z);
+        const auto material = tile.kind == CityTileKind::Curb ? curb_material : road_material;
+        const auto cx = (static_cast<float>(tile.x) + 0.5F) * unit_size;
+        const auto cy = (static_cast<float>(tile.y) + 0.5F) * unit_size;
+        const auto cz = (static_cast<float>(tile.z) + 0.5F) * unit_size;
+
+        const std::array<SolidCellFaceCheck, 5> native_sides{{
+            {BuildingFaceSide::South, south},
+            {BuildingFaceSide::West, west},
+            {BuildingFaceSide::North, north},
+            {BuildingFaceSide::East, east},
+            {BuildingFaceSide::Up, up},
+        }};
+
+        add_native_solid_cell_faces(
+            buffer,
+            vertex_indices,
+            cell,
+            cx,
+            cy,
+            cz,
+            native_sides,
+            east,
+            nullptr,
+            [material](BuildingFaceSide) {
+                return material;
+            });
+    }
+
+    sort_triangles_into_native_material_runs(buffer);
+    return buffer;
+}
+
+std::optional<CityTerrain> build_city_terrain(const SbcMap& map, float unit_size) {
+    if (map.intersections.empty()) {
+        return std::nullopt;
+    }
+
+    auto min_x = std::numeric_limits<std::int32_t>::max();
+    auto max_x = std::numeric_limits<std::int32_t>::lowest();
+    auto min_y = std::numeric_limits<std::int32_t>::max();
+    auto min_z = std::numeric_limits<std::int32_t>::max();
+    auto max_z = std::numeric_limits<std::int32_t>::lowest();
+    for (const auto& intersection : map.intersections) {
+        min_x = std::min(min_x, intersection.x);
+        max_x = std::max(max_x, intersection.x);
+        min_y = std::min(min_y, intersection.y);
+        min_z = std::min(min_z, intersection.z);
+        max_z = std::max(max_z, intersection.z);
+    }
+
+    constexpr auto terrain_padding_tiles = 10.0F;
+    const auto padding = terrain_padding_tiles * unit_size;
+    return CityTerrain{
+        static_cast<float>(min_y) * unit_size,
+        static_cast<float>(min_x) * unit_size - padding,
+        static_cast<float>(max_x) * unit_size + padding,
+        static_cast<float>(min_z) * unit_size - padding,
+        static_cast<float>(max_z) * unit_size + padding,
+    };
+}
+
+Vec3 normalized_xz(Vec3 value) {
+    const auto length = std::sqrt(value.x * value.x + value.z * value.z);
+    if (length <= 0.0001F) {
+        return {1.0F, 0.0F, 0.0F};
+    }
+    return {value.x / length, 0.0F, value.z / length};
+}
+
+std::vector<CityTrafficLightPole> build_city_traffic_light_poles(const SbcMap& map, float unit_size) {
+    std::vector<CityTrafficLightPole> poles;
+    poles.reserve(map.intersections.size() * 4U);
+    for (const auto& intersection : map.intersections) {
+        const auto footprint = city_intersection_footprint(map, intersection);
+        const auto base_y = (static_cast<float>(intersection.y) + 1.0F) * unit_size;
+        const auto min_x = static_cast<float>(intersection.x + footprint.min_offset) * unit_size;
+        const auto max_x = static_cast<float>(intersection.x + footprint.max_offset + 1) * unit_size;
+        const auto min_z = static_cast<float>(intersection.z + footprint.min_offset) * unit_size;
+        const auto max_z = static_cast<float>(intersection.z + footprint.max_offset + 1) * unit_size;
+        const auto center = Vec3{
+            static_cast<float>(intersection.x) * unit_size,
+            base_y,
+            static_cast<float>(intersection.z) * unit_size,
+        };
+        const std::array corners{
+            Vec3{min_x, base_y, min_z},
+            Vec3{max_x, base_y, min_z},
+            Vec3{max_x, base_y, max_z},
+            Vec3{min_x, base_y, max_z},
+        };
+
+        for (const auto& corner : corners) {
+            poles.push_back({
+                corner,
+                normalized_xz({center.x - corner.x, 0.0F, center.z - corner.z}),
+            });
+        }
+    }
+    return poles;
+}
+
 } // namespace
 
 // -----------------------------------------------------------------------------
@@ -1738,6 +2082,10 @@ Vec3 native_city_building_transform_point(const SbcBuilding& placement, Vec3 loc
 
 MapScene build_map_scene(const SbcMap& map) {
     MapScene scene;
+    scene.city_tiles = build_city_tile_cells(map);
+    scene.city_tile_buffer = build_city_tile_render_buffer(scene.city_tiles, scene.unit_size);
+    scene.terrain = build_city_terrain(map, scene.unit_size);
+    scene.traffic_light_poles = build_city_traffic_light_poles(map, scene.unit_size);
 
     for (const auto& street : map.streets) {
         if (street.from_intersection < 0 || street.to_intersection < 0) {
@@ -1813,8 +2161,15 @@ MapScene build_map_scene(const SbcMap& map) {
     for (const auto& building : scene.buildings) {
         include(building.position);
     }
+    for (const auto& tile : scene.city_tiles) {
+        include({
+            static_cast<float>(tile.x) * scene.unit_size,
+            static_cast<float>(tile.y) * scene.unit_size,
+            static_cast<float>(tile.z) * scene.unit_size,
+        });
+    }
 
-    if (scene.intersections.empty() && scene.buildings.empty()) {
+    if (scene.intersections.empty() && scene.buildings.empty() && scene.city_tiles.empty()) {
         min_x = 0.0F;
         max_x = 0.0F;
         min_z = 0.0F;

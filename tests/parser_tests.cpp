@@ -90,6 +90,26 @@ bool buffer_has_triangle_covering_z_point(
     });
 }
 
+bool has_city_tile(
+    const map_editor::MapScene& scene,
+    std::int32_t x,
+    std::int32_t y,
+    std::int32_t z,
+    map_editor::CityTileKind kind) {
+    return std::ranges::any_of(scene.city_tiles, [&](const map_editor::CityTileCell& cell) {
+        return cell.x == x && cell.y == y && cell.z == z && cell.kind == kind;
+    });
+}
+
+std::size_t count_city_tiles_at_x(
+    const map_editor::MapScene& scene,
+    std::int32_t x,
+    map_editor::CityTileKind kind) {
+    return static_cast<std::size_t>(std::ranges::count_if(scene.city_tiles, [&](const map_editor::CityTileCell& cell) {
+        return cell.x == x && cell.kind == kind;
+    }));
+}
+
 void append_u32(std::vector<std::uint8_t>& bytes, std::uint32_t value) {
     bytes.push_back(static_cast<std::uint8_t>(value & 0xffU));
     bytes.push_back(static_cast<std::uint8_t>((value >> 8U) & 0xffU));
@@ -1194,6 +1214,85 @@ void builds_map_scene() {
     assert(scene.bounds.max_z > scene.bounds.min_z);
     assert(scene.roads[0].width == static_cast<float>(
         map.streets[0].left_width + map.streets[0].right_width + 2) * scene.unit_size);
+}
+
+void builds_grid_aligned_city_street_tile_strip() {
+    map_editor::SbcMap map{};
+    map.intersections.push_back({0U, 0, 0, 0});
+    map.intersections.push_back({1U, 4, 0, 0});
+    map.streets.push_back({0U, 0, 1, 0, 1, 2, "East"});
+
+    const auto scene = map_editor::build_map_scene(map);
+
+    for (std::int32_t x = 0; x <= 4; ++x) {
+        assert(has_city_tile(scene, x, 0, -1, map_editor::CityTileKind::Road));
+        assert(has_city_tile(scene, x, 0, 0, map_editor::CityTileKind::Road));
+        assert(has_city_tile(scene, x, 0, 1, map_editor::CityTileKind::Road));
+    }
+    assert(has_city_tile(scene, 2, 0, -2, map_editor::CityTileKind::Curb));
+    assert(has_city_tile(scene, 2, 0, 2, map_editor::CityTileKind::Curb));
+    assert(count_city_tiles_at_x(scene, 2, map_editor::CityTileKind::Road) == 3U);
+    assert(scene.city_tile_buffer.triangles.size() > 0U);
+    assert(std::ranges::any_of(scene.city_tile_buffer.material_names, [](const std::string& name) {
+        return name == "city_road_asphalt";
+    }));
+    assert(std::ranges::any_of(scene.city_tile_buffer.material_names, [](const std::string& name) {
+        return name == "city_curb_concrete";
+    }));
+}
+
+void fills_intersection_footprint_and_closes_missing_sides_with_curbs() {
+    map_editor::SbcMap map{};
+    map.intersections.push_back({0U, 0, 0, 0});
+    map.intersections.push_back({1U, 4, 0, 0});
+    map.streets.push_back({0U, 0, 1, 0, 1, 2, "East"});
+
+    const auto scene = map_editor::build_map_scene(map);
+
+    assert(has_city_tile(scene, 0, 0, -1, map_editor::CityTileKind::Road));
+    assert(has_city_tile(scene, 0, 0, 0, map_editor::CityTileKind::Road));
+    assert(has_city_tile(scene, 0, 0, 1, map_editor::CityTileKind::Road));
+    assert(has_city_tile(scene, -2, 0, -1, map_editor::CityTileKind::Curb));
+    assert(has_city_tile(scene, -2, 0, 0, map_editor::CityTileKind::Curb));
+    assert(has_city_tile(scene, -2, 0, 1, map_editor::CityTileKind::Curb));
+    assert(has_city_tile(scene, 0, 0, -2, map_editor::CityTileKind::Curb));
+    assert(has_city_tile(scene, 0, 0, 2, map_editor::CityTileKind::Curb));
+}
+
+void city_terrain_is_flat_and_padded_to_city_bounds() {
+    map_editor::SbcMap map{};
+    map.intersections.push_back({0U, 10, 2, 20});
+    map.intersections.push_back({1U, 14, 2, 20});
+    map.streets.push_back({0U, 0, 1, 0, 1, 1, "Flat"});
+
+    const auto scene = map_editor::build_map_scene(map);
+
+    assert(scene.terrain.has_value());
+    assert(close_to(scene.terrain->base_y, 8.0F));
+    assert(close_to(scene.terrain->min_x, 0.0F));
+    assert(close_to(scene.terrain->max_x, 96.0F));
+    assert(close_to(scene.terrain->min_z, 40.0F));
+    assert(close_to(scene.terrain->max_z, 120.0F));
+}
+
+void places_traffic_light_poles_at_intersection_corners() {
+    map_editor::SbcMap map{};
+    map.intersections.push_back({0U, 0, 0, 0});
+    map.intersections.push_back({1U, 4, 0, 0});
+    map.streets.push_back({0U, 0, 1, 0, 1, 1, "East"});
+
+    const auto scene = map_editor::build_map_scene(map);
+
+    assert(scene.traffic_light_poles.size() == 8U);
+    assert(std::ranges::none_of(scene.traffic_light_poles, [](const map_editor::CityTrafficLightPole& pole) {
+        return close_to(pole.base.x, 0.0F) && close_to(pole.base.z, 0.0F);
+    }));
+    assert(std::ranges::any_of(scene.traffic_light_poles, [](const map_editor::CityTrafficLightPole& pole) {
+        return close_to(pole.base.x, -4.0F) && close_to(pole.base.y, 4.0F) && close_to(pole.base.z, -4.0F);
+    }));
+    assert(std::ranges::any_of(scene.traffic_light_poles, [](const map_editor::CityTrafficLightPole& pole) {
+        return close_to(pole.base.x, 20.0F) && close_to(pole.base.y, 4.0F) && close_to(pole.base.z, 4.0F);
+    }));
 }
 
 void parses_buildblock_sbl_fixture() {
@@ -2524,6 +2623,10 @@ int main() {
     parses_sbc_v10_without_city_blocks();
     rejects_unsupported_sbc_version();
     builds_map_scene();
+    builds_grid_aligned_city_street_tile_strip();
+    fills_intersection_footprint_and_closes_missing_sides_with_curbs();
+    city_terrain_is_flat_and_padded_to_city_bounds();
+    places_traffic_light_poles_at_intersection_corners();
     parses_buildblock_sbl_fixture();
     builds_buildblock_preview_scene();
     city_block_preview_treats_unmatched_record_name_as_solid_not_layer_meshes();

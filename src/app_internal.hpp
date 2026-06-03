@@ -267,6 +267,7 @@ void draw_city_building_model(
     const Texture2D* city_window_texture = nullptr);
 void draw_city_piece_voxels(EditorProject& project, bool textured, std::optional<std::size_t> selected_portal = std::nullopt);
 void draw_city_scene(const MapScene& scene, const SbcStreet* selected_street);
+void draw_city_traffic_light_poles(const MapScene& scene);
 void draw_city_cursor(CityGridPoint point, float unit_size, CityEditMode mode);
 void draw_city_block_preview(const SbcCityBlock& city_block, const std::vector<NamedBlockMesh>& meshes, std::size_t selected_layer, std::size_t selected_slot);
 void draw_buildblock_preview_3d(const BuildblockPreviewScene& scene);
