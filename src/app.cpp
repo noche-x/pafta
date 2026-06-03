@@ -47,6 +47,10 @@ std::string lower_name(std::string_view value) {
     return lowered;
 }
 
+std::string city_block_label(const SbcCityBlock& city_block) {
+    return std::string{city_block_display_name(city_block)};
+}
+
 std::uint32_t read_le_u32(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
     if (offset + 4U > bytes.size()) {
         return 0U;
@@ -306,7 +310,7 @@ std::vector<std::string> city_block_names(const SbcMap& map) {
     std::vector<std::string> names;
     names.reserve(map.city_blocks.size());
     for (const auto& city_block : map.city_blocks) {
-        names.push_back(std::to_string(city_block.index) + " " + city_block.name);
+        names.push_back(std::to_string(city_block.index) + " " + city_block_label(city_block));
     }
     return names;
 }
@@ -1483,9 +1487,10 @@ int run_editor_app() {
                 } else if (ui.city_mode == CityEditMode::Pieces && !project->city->data.city_blocks.empty()) {
                     ui.selected_city_block = std::min(ui.selected_city_block, project->city->data.city_blocks.size() - 1U);
                     auto& city_block = project->city->data.city_blocks[ui.selected_city_block];
+                    const auto block_label = city_block_label(city_block);
                     ImGui::Text("City Piece Placement");
                     ImGui::Separator();
-                    ImGui::Text("Block Name: %s", city_block.name.c_str());
+                    ImGui::Text("Block Name: %s", block_label.c_str());
                     ImGui::Text("Layer: %zu | Rotation: %zu", ui.selected_city_block_layer, ui.selected_piece_rotation);
                     if (!project->city->data.portals.empty()) {
                         ui.selected_portal = std::min(ui.selected_portal, project->city->data.portals.size() - 1U);
@@ -1520,8 +1525,9 @@ int run_editor_app() {
             } else if (ui.tab == EditorTab::Pieces && project->city && !project->city->data.city_blocks.empty()) {
                 ui.selected_city_block = std::min(ui.selected_city_block, project->city->data.city_blocks.size() - 1U);
                 auto& city_block = project->city->data.city_blocks[ui.selected_city_block];
+                const auto block_label = city_block_label(city_block);
                 
-                ImGui::Text("City Block: %s", city_block.name.c_str());
+                ImGui::Text("City Block: %s", block_label.c_str());
                 ImGui::Separator();
                 
                 if (!city_block.layers.empty()) {

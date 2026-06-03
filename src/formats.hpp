@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace map_editor {
@@ -120,6 +121,12 @@ struct SbcCityBlock {
     std::string name;
     std::vector<std::array<std::string, 8>> layers;
 };
+
+inline constexpr std::string_view native_default_city_block_display_name = "nblock";
+
+inline std::string_view city_block_display_name(const SbcCityBlock& city_block) {
+    return city_block.name.empty() ? native_default_city_block_display_name : std::string_view{city_block.name};
+}
 
 struct SbcPortal {
     std::size_t index{};

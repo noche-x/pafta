@@ -169,6 +169,15 @@ const SblBlockMesh* resolve_building_block_mesh(
     return &native_builtin_block_mesh_singleton();
 }
 
+const SblBlockMesh* resolve_city_block_mesh(
+    const SbcCityBlock& city_block,
+    const std::vector<NamedBlockMesh>& block_meshes) {
+    if (city_block.name.empty()) {
+        return &native_builtin_block_mesh_singleton();
+    }
+    return find_block_mesh(block_meshes, city_block.name);
+}
+
 const SblTemplate* find_buildblock_template(const std::vector<NamedBuildblockTemplate>& templates, std::string_view name) {
     const auto match = std::ranges::find_if(templates, [name](const NamedBuildblockTemplate& entry) {
         return entry.name == name;
@@ -1462,20 +1471,18 @@ BuildingRenderBuffer build_native_portal_render_buffer(
             };
 
             const auto& city_block = map.city_blocks[city_block_index];
-            if (!city_block.name.empty()) {
-                if (const auto* mesh = find_block_mesh(block_meshes, city_block.name)) {
-                    add_rotated_block_mesh_to_buffer(
-                        buffer,
-                        vertex_indices,
-                        *mesh,
-                        origin,
-                        rotation,
-                        [&](BuildingRenderBuffer&, const SblBlockFace&, const NativeRotatedBlockFace& rotated_face) {
-                            const auto material_slot = std::min<std::uint32_t>(rotated_face.material, 7U);
-                            return layer_slot_material(city_block, layer_index, material_slot);
-                    });
-                    continue;
-                }
+            if (const auto* mesh = resolve_city_block_mesh(city_block, block_meshes)) {
+                add_rotated_block_mesh_to_buffer(
+                    buffer,
+                    vertex_indices,
+                    *mesh,
+                    origin,
+                    rotation,
+                    [&](BuildingRenderBuffer&, const SblBlockFace&, const NativeRotatedBlockFace& rotated_face) {
+                        const auto material_slot = std::min<std::uint32_t>(rotated_face.material, 7U);
+                        return layer_slot_material(city_block, layer_index, material_slot);
+                });
+                continue;
             }
         }
     }
@@ -1746,17 +1753,15 @@ CityBlockPreviewScene build_city_block_preview_scene(const SbcCityBlock& city_bl
     CityBlockPreviewScene scene;
     constexpr auto slots_per_row = 4U;
 
-    if (!city_block.name.empty()) {
-        if (const auto* mesh = find_block_mesh(block_meshes, city_block.name)) {
-            scene.pieces.push_back({
-                0,
-                0,
-                city_block.name,
-                {},
-                *mesh,
-            });
-            return scene;
-        }
+    if (const auto* mesh = resolve_city_block_mesh(city_block, block_meshes)) {
+        scene.pieces.push_back({
+            0,
+            0,
+            std::string{city_block_display_name(city_block)},
+            {},
+            *mesh,
+        });
+        return scene;
     }
 
     for (std::size_t layer = 0; layer < city_block.layers.size(); ++layer) {

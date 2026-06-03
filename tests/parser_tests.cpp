@@ -1281,6 +1281,23 @@ void city_block_preview_prefers_native_record_name_mesh() {
     assert(scene.pieces[0].slot_index == 0);
 }
 
+void city_block_preview_uses_nblock_builtin_cube_for_empty_name() {
+    map_editor::SbcCityBlock city_block{};
+    city_block.index = 0;
+
+    const auto builtin = map_editor::make_native_builtin_block_mesh();
+    const auto scene = map_editor::build_city_block_preview_scene(city_block, {});
+
+    assert(scene.pieces.size() == 1);
+    assert(scene.pieces[0].name == "nblock");
+    assert(scene.pieces[0].layer_index == 0);
+    assert(scene.pieces[0].slot_index == 0);
+    assert(scene.pieces[0].mesh.width == builtin.width);
+    assert(scene.pieces[0].mesh.height == builtin.height);
+    assert(scene.pieces[0].mesh.depth == builtin.depth);
+    assert(scene.pieces[0].mesh.faces.size() == builtin.faces.size());
+}
+
 void builds_portal_wall_rects_from_sbl_layer() {
     const auto template_file = map_editor::parse_sbl_file(
         fixture_root() / "server/data/test2/buildblock/test.sbl");
@@ -2014,7 +2031,7 @@ void native_portal_render_buffer_uses_city_block_name_mesh_and_layer_materials()
     assert(has_buffer_vertex(buffer, 64.0F, 96.0F, 132.0F, 0.0F, 0.0F));
 }
 
-void native_portal_render_buffer_skips_texture_only_city_blocks() {
+void native_portal_render_buffer_uses_builtin_cube_for_unnamed_city_block() {
     map_editor::SbcMap map{};
     map.city_blocks.push_back({
         0,
@@ -2029,8 +2046,12 @@ void native_portal_render_buffer_skips_texture_only_city_blocks() {
 
     const auto buffer = map_editor::build_native_portal_render_buffer(map, {});
 
-    assert(buffer.triangles.empty());
-    assert(buffer.material_names.empty());
+    const auto builtin = map_editor::make_native_builtin_block_mesh();
+    assert(buffer.triangles.size() == builtin.faces.size() * 2U);
+    assert(buffer.material_names.size() == 1U);
+    assert(!builtin.faces.empty());
+    const auto material_slot = std::min<std::uint32_t>(builtin.faces[0].material, 7U);
+    assert(buffer.material_names[0] == map.city_blocks[0].layers[0][material_slot]);
 }
 
 void native_portal_render_buffer_clamps_face_material_slots() {
@@ -2468,6 +2489,7 @@ int main() {
     builds_buildblock_preview_scene();
     builds_city_block_preview_scene();
     city_block_preview_prefers_native_record_name_mesh();
+    city_block_preview_uses_nblock_builtin_cube_for_empty_name();
     builds_portal_wall_rects_from_sbl_layer();
     builds_native_portal_overlay_rect_from_sbl_layer();
     parses_block_sbl_fixture();
@@ -2496,7 +2518,7 @@ int main() {
     patches_sbc_city_block_layers();
     patches_sbc_portal_blocks();
     native_portal_render_buffer_uses_city_block_name_mesh_and_layer_materials();
-    native_portal_render_buffer_skips_texture_only_city_blocks();
+    native_portal_render_buffer_uses_builtin_cube_for_unnamed_city_block();
     native_portal_render_buffer_clamps_face_material_slots();
     native_city_building_render_origin_applies_editor_rotation_offsets();
     native_city_building_basis_uses_inverted_rotation_with_editor_offsets();
