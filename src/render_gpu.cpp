@@ -326,6 +326,24 @@ void draw_mesh_faces(const SblBlockMesh& mesh, float scale, Color fill) {
     draw_mesh_faces(mesh, {}, scale, fill);
 }
 
+void draw_render_buffer_faces(const BuildingRenderBuffer& buffer, Color fill) {
+    for (const auto& triangle : buffer.triangles) {
+        if (triangle.indices[0] >= buffer.vertices.size() ||
+            triangle.indices[1] >= buffer.vertices.size() ||
+            triangle.indices[2] >= buffer.vertices.size()) {
+            continue;
+        }
+        const auto a = to_raylib(buffer.vertices[triangle.indices[0]].position);
+        const auto b = to_raylib(buffer.vertices[triangle.indices[1]].position);
+        const auto c = to_raylib(buffer.vertices[triangle.indices[2]].position);
+        DrawTriangle3D(a, b, c, fill);
+        DrawTriangle3D(c, b, a, fill);
+    }
+    for (const auto& line : buffer.wire_lines) {
+        DrawLine3D(to_raylib(line.from), to_raylib(line.to), Color{20, 23, 26, 255});
+    }
+}
+
 Color native_material_color(std::uint32_t material, bool selected, bool window_material = false) {
     if (selected) {
         return {235, 194, 82, 210};
@@ -853,6 +871,9 @@ void draw_city_cursor(CityGridPoint point, float unit_size, CityEditMode mode) {
 void draw_city_block_preview(const SbcCityBlock& city_block, const std::vector<NamedBlockMesh>& meshes, std::size_t selected_layer, std::size_t selected_slot) {
     DrawGrid(24, 4.0F);
     const auto scene = build_city_block_preview_scene(city_block, meshes);
+    if (scene.solid_cell.has_value()) {
+        draw_render_buffer_faces(scene.solid_cell->buffer, {98, 148, 204, 220});
+    }
     for (const auto& piece : scene.pieces) {
         draw_mesh_faces(piece.mesh, piece.origin, scene.unit_size, {98, 148, 204, 220});
     }

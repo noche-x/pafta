@@ -222,8 +222,14 @@ struct CityBlockPreviewPiece {
     SblBlockMesh mesh;
 };
 
+struct CityBlockPreviewSolidCell {
+    std::string name;
+    BuildingRenderBuffer buffer;
+};
+
 struct CityBlockPreviewScene {
     float unit_size{4.0F};
+    std::optional<CityBlockPreviewSolidCell> solid_cell;
     std::vector<CityBlockPreviewPiece> pieces;
 };
 
