@@ -2664,7 +2664,31 @@ void rebuilds_csx_directory() {
 
 }
 
+void city_scene_fingerprint_changes_only_with_scene_inputs() {
+    map_editor::SbcMap map{};
+    map.intersections.push_back({0, 0, 0, 0});
+    map.intersections.push_back({1, 4, 1, 0});
+    map.streets.push_back({0, 0, 1, 0, 2, 2, "main"});
+    map.buildings.push_back({0, "base01", 8, 2, 8, 0});
+
+    const auto base = map_editor::city_scene_fingerprint(map);
+    assert(map_editor::city_scene_fingerprint(map) == base);
+
+    auto moved = map;
+    moved.buildings[0].x += 1;
+    assert(map_editor::city_scene_fingerprint(moved) != base);
+
+    auto raised = map;
+    raised.intersections[1].y += 1;
+    assert(map_editor::city_scene_fingerprint(raised) != base);
+
+    auto renamed = map;
+    renamed.buildings[0].name = "tower07";
+    assert(map_editor::city_scene_fingerprint(renamed) == base);
+}
+
 int main() {
+    city_scene_fingerprint_changes_only_with_scene_inputs();
     parses_sbb_fixture();
     parses_sbb_v12_without_anchor_words();
     parses_sbb_cell_words_in_native_file_order();

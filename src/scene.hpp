@@ -304,6 +304,7 @@ Vec3 native_city_rotate_local(Vec3 local, std::int32_t rotation);
 Vec3 native_city_building_render_origin(const SbcBuilding& placement, float unit_size = 4.0F);
 Vec3 native_city_building_transform_point(const SbcBuilding& placement, Vec3 local, float unit_size = 4.0F);
 MapScene build_map_scene(const SbcMap& map);
+std::uint64_t city_scene_fingerprint(const SbcMap& map);
 std::uint32_t terrain_noise_hash(std::int32_t x, std::int32_t y, std::uint32_t mask);
 float terrain_height_at(const CityTerrain& terrain, float world_x, float world_z);
 BuildblockPreviewScene build_buildblock_preview_scene(const SblTemplate& buildblock);

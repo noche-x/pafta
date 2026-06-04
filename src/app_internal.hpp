@@ -293,6 +293,9 @@ struct EditorProject {
     std::uint32_t building_floor_preview_floor{};
     bool building_floor_preview_dirty{true};
     bool render_buffers_dirty{true};
+    MapScene city_scene_cache;
+    std::uint64_t city_scene_cache_fingerprint{};
+    bool city_scene_cache_valid{false};
     bool portal_render_dirty{true};
     bool portal_preview_render_dirty{true};
     bool portal_render_textured{};

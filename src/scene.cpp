@@ -2221,6 +2221,43 @@ Vec3 native_city_building_transform_point(const SbcBuilding& placement, Vec3 loc
     };
 }
 
+std::uint64_t city_scene_fingerprint(const SbcMap& map) {
+    // FNV-1a over the fields the city scene is built from: intersections (terrain
+    // + tile grid + poles), streets (road tiles), and building placements. Anything
+    // that changes the rendered city changes one of these, so a mismatch is the
+    // signal to rebuild the cached MapScene.
+    std::uint64_t hash = 1469598103934665603ULL;
+    const auto mix = [&hash](std::int64_t value) {
+        auto bits = static_cast<std::uint64_t>(value);
+        for (int byte = 0; byte < 8; ++byte) {
+            hash ^= bits & 0xFFU;
+            hash *= 1099511628211ULL;
+            bits >>= 8;
+        }
+    };
+    mix(static_cast<std::int64_t>(map.intersections.size()));
+    for (const auto& it : map.intersections) {
+        mix(it.x);
+        mix(it.y);
+        mix(it.z);
+    }
+    mix(static_cast<std::int64_t>(map.streets.size()));
+    for (const auto& street : map.streets) {
+        mix(street.from_intersection);
+        mix(street.to_intersection);
+        mix(street.left_width);
+        mix(street.right_width);
+    }
+    mix(static_cast<std::int64_t>(map.buildings.size()));
+    for (const auto& building : map.buildings) {
+        mix(building.x);
+        mix(building.y);
+        mix(building.z);
+        mix(building.rotation);
+    }
+    return hash;
+}
+
 MapScene build_map_scene(const SbcMap& map) {
     MapScene scene;
     scene.terrain = build_city_terrain(map, scene.unit_size);

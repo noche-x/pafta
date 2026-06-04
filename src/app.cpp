@@ -1290,7 +1290,14 @@ int run_editor_app() {
                         const auto* selected_street = project->city->data.streets.empty()
                             ? nullptr
                             : &project->city->data.streets[std::min(ui.selected_city_street, project->city->data.streets.size() - 1U)];
-                        const auto city_scene = build_map_scene(project->city->data);
+                        const auto scene_fingerprint = city_scene_fingerprint(project->city->data);
+                        if (!project->city_scene_cache_valid ||
+                            project->city_scene_cache_fingerprint != scene_fingerprint) {
+                            project->city_scene_cache = build_map_scene(project->city->data);
+                            project->city_scene_cache_fingerprint = scene_fingerprint;
+                            project->city_scene_cache_valid = true;
+                        }
+                        const auto& city_scene = project->city_scene_cache;
                         draw_city_scene(city_scene, selected_street);
                         {
                             GfxDebugScopedTimer timer{gfx_debug_stats, GfxDebugTimingPhase::BuildingDraw};
