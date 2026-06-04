@@ -508,6 +508,15 @@ NativeRotatedBlockFace rotate_block_face_native_impl(const SblBlockMesh& mesh, c
     return rotated;
 }
 
+// Tilts a cell's TOP surface to a grade. dy_x / dy_z are the world-Y rise per +1
+// cell along each axis; only vertices on the cell top (y == max_y) are displaced,
+// so the box keeps a flat bottom and the upper edges of its side walls follow the
+// slope. Default-constructed (all zero) leaves geometry axis-aligned.
+struct CellTopSlope {
+    float dy_x{};
+    float dy_z{};
+};
+
 std::array<Vec3, 4> face_rect_vertices(
     BuildingFaceSide side,
     float cx,
@@ -517,7 +526,8 @@ std::array<Vec3, 4> face_rect_vertices(
     float width,
     float v,
     float height,
-    float unit_size) {
+    float unit_size,
+    CellTopSlope top_slope = {}) {
     const auto half = unit_size * 0.5F;
     const auto min_x = cx - half;
     const auto max_x = cx + half;
@@ -532,21 +542,40 @@ std::array<Vec3, 4> face_rect_vertices(
     const auto z0 = min_z + u * unit_size;
     const auto z1 = min_z + (u + width) * unit_size;
 
+    std::array<Vec3, 4> vertices{};
     switch (side) {
         case BuildingFaceSide::West:
-            return {Vec3{min_x, y1, z0}, Vec3{min_x, y1, z1}, Vec3{min_x, y0, z1}, Vec3{min_x, y0, z0}};
+            vertices = {Vec3{min_x, y1, z0}, Vec3{min_x, y1, z1}, Vec3{min_x, y0, z1}, Vec3{min_x, y0, z0}};
+            break;
         case BuildingFaceSide::East:
-            return {Vec3{max_x, y1, z1}, Vec3{max_x, y1, z0}, Vec3{max_x, y0, z0}, Vec3{max_x, y0, z1}};
+            vertices = {Vec3{max_x, y1, z1}, Vec3{max_x, y1, z0}, Vec3{max_x, y0, z0}, Vec3{max_x, y0, z1}};
+            break;
         case BuildingFaceSide::Down:
-            return {Vec3{x0, min_y, z1}, Vec3{x1, min_y, z1}, Vec3{x1, min_y, z0}, Vec3{x0, min_y, z0}};
+            vertices = {Vec3{x0, min_y, z1}, Vec3{x1, min_y, z1}, Vec3{x1, min_y, z0}, Vec3{x0, min_y, z0}};
+            break;
         case BuildingFaceSide::Up:
-            return {Vec3{x0, max_y, z0}, Vec3{x1, max_y, z0}, Vec3{x1, max_y, z1}, Vec3{x0, max_y, z1}};
+            vertices = {Vec3{x0, max_y, z0}, Vec3{x1, max_y, z0}, Vec3{x1, max_y, z1}, Vec3{x0, max_y, z1}};
+            break;
         case BuildingFaceSide::North:
-            return {Vec3{x1, y1, min_z}, Vec3{x0, y1, min_z}, Vec3{x0, y0, min_z}, Vec3{x1, y0, min_z}};
+            vertices = {Vec3{x1, y1, min_z}, Vec3{x0, y1, min_z}, Vec3{x0, y0, min_z}, Vec3{x1, y0, min_z}};
+            break;
         case BuildingFaceSide::South:
         default:
-            return {Vec3{x0, y1, max_z}, Vec3{x1, y1, max_z}, Vec3{x1, y0, max_z}, Vec3{x0, y0, max_z}};
+            vertices = {Vec3{x0, y1, max_z}, Vec3{x1, y1, max_z}, Vec3{x1, y0, max_z}, Vec3{x0, y0, max_z}};
+            break;
     }
+
+    if (top_slope.dy_x != 0.0F || top_slope.dy_z != 0.0F) {
+        for (auto& vertex : vertices) {
+            // Only the cell's top vertices ride the grade; the bottom stays flat
+            // so adjacent cells still share a watertight base.
+            if (vertex.y >= max_y) {
+                vertex.y += top_slope.dy_x * ((vertex.x - cx) / unit_size) +
+                    top_slope.dy_z * ((vertex.z - cz) / unit_size);
+            }
+        }
+    }
+    return vertices;
 }
 
 void add_quad(
@@ -1038,11 +1067,12 @@ void add_city_building_face_rect(
     float cz,
     const PortalRect& rect,
     std::uint32_t material,
-    bool city_window_surface) {
+    bool city_window_surface,
+    CellTopSlope top_slope = {}) {
     add_quad(
         buffer,
         vertex_indices,
-        face_rect_vertices(side, cx, cy, cz, rect.x, rect.width, rect.y, rect.height, buffer.unit_size),
+        face_rect_vertices(side, cx, cy, cz, rect.x, rect.width, rect.y, rect.height, buffer.unit_size, top_slope),
         quad_uvs(rect.x, rect.width, rect.y, rect.height),
         material,
         city_window_surface);
@@ -1064,7 +1094,8 @@ void add_native_solid_cell_faces(
     const std::array<SolidCellFaceCheck, 5>& native_sides,
     const SbbCell* east,
     const SblTemplate* template_file,
-    MaterialSelector select_material) {
+    MaterialSelector select_material,
+    CellTopSlope top_slope = {}) {
     for (const auto& side : native_sides) {
         if (cell_has_exterior_surface(side.neighbor)) {
             continue;
@@ -1096,7 +1127,8 @@ void add_native_solid_cell_faces(
                 cz,
                 rect,
                 wall_material,
-                false);
+                false,
+                top_slope);
         }
         for (const auto& rect : window_rects) {
             add_city_building_face_rect(
@@ -1108,7 +1140,8 @@ void add_native_solid_cell_faces(
                 cz,
                 rect,
                 0x100U,
-                true);
+                true,
+                top_slope);
         }
     }
 }
@@ -1298,6 +1331,10 @@ struct CityTileValue {
     // intersection endpoints (street A.y -> B.y). This is the real road height
     // the game tiles carry; terrain conforms to it, not the other way around.
     float authored_y{};
+    // World-Y gradient of the authored ramp, per +1 cell along each axis. Drives
+    // the tilted top surface so a sloping street reads as a continuous grade.
+    float slope_x{};
+    float slope_z{};
 };
 
 using CityTileMap = std::unordered_map<CityTileKey, CityTileValue, CityTileKeyHash>;
@@ -1306,12 +1343,22 @@ bool city_tile_kind_overrides(CityTileKind incoming, CityTileKind current) {
     return incoming == CityTileKind::Road && current == CityTileKind::Curb;
 }
 
-void set_city_tile(CityTileMap& tiles, std::int32_t x, std::int32_t y, std::int32_t z, CityTileKind kind, float authored_y) {
+void set_city_tile(
+    CityTileMap& tiles,
+    std::int32_t x,
+    std::int32_t y,
+    std::int32_t z,
+    CityTileKind kind,
+    float authored_y,
+    float slope_x = 0.0F,
+    float slope_z = 0.0F) {
     const CityTileKey key{x, y, z};
-    const auto [match, inserted] = tiles.emplace(key, CityTileValue{kind, authored_y});
+    const auto [match, inserted] = tiles.emplace(key, CityTileValue{kind, authored_y, slope_x, slope_z});
     if (!inserted && city_tile_kind_overrides(kind, match->second.kind)) {
         match->second.kind = kind;
         match->second.authored_y = authored_y;
+        match->second.slope_x = slope_x;
+        match->second.slope_z = slope_z;
     }
 }
 
@@ -1341,8 +1388,15 @@ void place_city_street_tiles(
     const auto right_width = std::max(0, street.right_width);
 
     // Roads carry the authored street height, ramped linearly from A.y to B.y
-    // (the game's streets slope between intersections at different heights).
+    // (the game's streets slope between intersections at different heights). The
+    // per-cell Y change along the run is the grade we tilt the cell tops to, so
+    // the surface reads as a slope instead of a staircase of flat box tops.
     const auto unit_size = 4.0F;
+    const auto rise_per_cell = length > 0
+        ? static_cast<float>(to.y - from.y) * unit_size / static_cast<float>(length)
+        : 0.0F;
+    const auto slope_x = static_cast<float>(step_x) * rise_per_cell;
+    const auto slope_z = static_cast<float>(step_z) * rise_per_cell;
     for (auto along = 0; along <= length; ++along) {
         const auto center_x = from.x + step_x * along;
         const auto center_z = from.z + step_z * along;
@@ -1355,7 +1409,9 @@ void place_city_street_tiles(
                 from.y,
                 center_z + right_z * offset,
                 CityTileKind::Road,
-                authored_y);
+                authored_y,
+                slope_x,
+                slope_z);
         }
         set_city_tile(
             tiles,
@@ -1363,14 +1419,18 @@ void place_city_street_tiles(
             from.y,
             center_z + right_z * (-left_width - 1),
             CityTileKind::Curb,
-            authored_y);
+            authored_y,
+            slope_x,
+            slope_z);
         set_city_tile(
             tiles,
             center_x + right_x * right_width,
             from.y,
             center_z + right_z * right_width,
             CityTileKind::Curb,
-            authored_y);
+            authored_y,
+            slope_x,
+            slope_z);
     }
 }
 
@@ -1523,7 +1583,7 @@ std::vector<CityTileCell> build_city_tile_cells(const SbcMap& map, const std::op
     for (const auto& [key, value] : tile_map) {
         // Use the authored road height (ramped between intersections), NOT the
         // noisy terrain: the road defines the surface, terrain conforms to it.
-        tiles.push_back({key.x, key.y, key.z, value.authored_y, value.kind});
+        tiles.push_back({key.x, key.y, key.z, value.authored_y, value.slope_x, value.slope_z, value.kind});
     }
     std::ranges::sort(tiles, [](const CityTileCell& left, const CityTileCell& right) {
         if (left.y != right.y) {
@@ -1601,7 +1661,8 @@ BuildingRenderBuffer build_city_tile_render_buffer(const std::vector<CityTileCel
             nullptr,
             [material](BuildingFaceSide) {
                 return material;
-            });
+            },
+            CellTopSlope{tile.slope_x, tile.slope_z});
     }
 
     sort_triangles_into_native_material_runs(buffer);

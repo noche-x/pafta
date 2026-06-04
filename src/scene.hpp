@@ -172,6 +172,11 @@ struct CityTileCell {
     std::int32_t y{};
     std::int32_t z{};
     float base_y{};
+    // Top-surface grade, in world-Y per +1 cell along each axis. A sloping street
+    // carries a non-zero gradient so the cell top is tilted to the grade instead
+    // of stepping flat; flat tiles (intersections) keep zero.
+    float slope_x{};
+    float slope_z{};
     CityTileKind kind{CityTileKind::Road};
 };
 

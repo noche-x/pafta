@@ -1346,6 +1346,23 @@ void city_road_tile_heights_ramp_between_intersection_heights() {
     assert(close_to(start->base_y, 0.0F));
     assert(close_to(end->base_y, 8.0F * unit));
     assert(middle->base_y > start->base_y && middle->base_y < end->base_y);  // ramps up
+
+    // The street runs east-west over 60 grid cells while climbing 8*unit=32 world
+    // units, so each cell carries a positive x grade and no z grade. This is the
+    // tilt the cell tops ride so the surface slopes instead of staircasing.
+    const auto expected_rise_per_cell = (8.0F * unit) / 60.0F;
+    assert(close_to(middle->slope_x, expected_rise_per_cell));
+    assert(close_to(middle->slope_z, 0.0F));
+
+    // The tilt reaches the geometry: the road buffer's highest top vertex sits
+    // above its lowest by close to the full authored climb, not stuck in steps.
+    auto min_top = std::numeric_limits<float>::max();
+    auto max_top = std::numeric_limits<float>::lowest();
+    for (const auto& vertex : scene.city_tile_buffer.vertices) {
+        min_top = std::min(min_top, vertex.position.y);
+        max_top = std::max(max_top, vertex.position.y);
+    }
+    assert(max_top - min_top > 8.0F * unit * 0.9F);
 }
 
 void traffic_light_poles_stand_at_corners_and_face_intersection_center() {
