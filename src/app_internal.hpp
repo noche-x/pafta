@@ -5,6 +5,9 @@
 
 #include <raylib.h>
 
+#include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -134,6 +137,118 @@ struct GpuBuildingRenderModel {
     std::size_t uploaded_indices{};
     std::size_t uploaded_bytes{};
 };
+
+enum class GfxDebugDrawCategory : std::size_t {
+    CityCells,
+    RoadsCurbs,
+    Terrain,
+    TrafficLightPoles,
+    Pieces,
+    WireOverlay,
+    Count,
+};
+
+enum class GfxDebugTimingPhase : std::size_t {
+    SceneRenderBufferBuild,
+    GpuUpload,
+    Draw3D,
+    TerrainDraw,
+    CityRoadDraw,
+    BuildingDraw,
+    PoleDraw,
+    ImGuiUi,
+    TotalFrame,
+    Count,
+};
+
+struct GfxDebugDrawCounter {
+    std::uint64_t triangles{};
+    std::uint64_t vertices{};
+    std::uint64_t draw_calls{};
+};
+
+struct GfxDebugUploadStats {
+    std::uint64_t uploaded_vertices{};
+    std::uint64_t uploaded_indices{};
+    std::uint64_t uploaded_bytes{};
+    std::uint64_t chunks{};
+};
+
+struct GfxDebugCounts {
+    std::uint64_t buildings{};
+    std::uint64_t city_tiles{};
+    std::uint64_t terrain_samples{};
+    std::uint64_t terrain_vertices{};
+    std::uint64_t traffic_light_poles{};
+    std::uint64_t total_scene_triangles{};
+};
+
+struct GfxDebugStats {
+    static constexpr std::size_t history_size = 120;
+    std::array<float, history_size> frame_time_history{};
+    std::size_t frame_time_index{};
+    std::size_t frame_time_count{};
+    std::array<GfxDebugDrawCounter, static_cast<std::size_t>(GfxDebugDrawCategory::Count)> draw{};
+    std::array<double, static_cast<std::size_t>(GfxDebugTimingPhase::Count)> phase_ms{};
+    std::array<double, static_cast<std::size_t>(GfxDebugTimingPhase::Count)> phase_avg_ms{};
+    GfxDebugUploadStats uploads{};
+    GfxDebugCounts counts{};
+
+    void reset_frame() {
+        draw = {};
+        phase_ms = {};
+        uploads = {};
+        counts = {};
+    }
+
+    void push_frame_time(float ms) {
+        frame_time_history[frame_time_index] = ms;
+        frame_time_index = (frame_time_index + 1U) % frame_time_history.size();
+        frame_time_count = std::min(frame_time_count + 1U, frame_time_history.size());
+    }
+
+    void add_draw(GfxDebugDrawCategory category, std::uint64_t triangles, std::uint64_t vertices, std::uint64_t draw_calls) {
+        auto& counter = draw[static_cast<std::size_t>(category)];
+        counter.triangles += triangles;
+        counter.vertices += vertices;
+        counter.draw_calls += draw_calls;
+    }
+
+    void add_phase_ms(GfxDebugTimingPhase phase, double ms) {
+        auto& current = phase_ms[static_cast<std::size_t>(phase)];
+        current += ms;
+        auto& average = phase_avg_ms[static_cast<std::size_t>(phase)];
+        average = average == 0.0 ? current : average * 0.92 + current * 0.08;
+    }
+
+    [[nodiscard]] GfxDebugDrawCounter total_draw() const {
+        GfxDebugDrawCounter total{};
+        for (const auto& counter : draw) {
+            total.triangles += counter.triangles;
+            total.vertices += counter.vertices;
+            total.draw_calls += counter.draw_calls;
+        }
+        return total;
+    }
+};
+
+struct GfxDebugScopedTimer {
+    GfxDebugStats& stats;
+    GfxDebugTimingPhase phase;
+    std::chrono::steady_clock::time_point begin{std::chrono::steady_clock::now()};
+
+    GfxDebugScopedTimer(GfxDebugStats& target, GfxDebugTimingPhase target_phase)
+        : stats(target),
+          phase(target_phase) {}
+
+    ~GfxDebugScopedTimer() {
+        const auto end = std::chrono::steady_clock::now();
+        const auto ms = std::chrono::duration<double, std::milli>(end - begin).count();
+        stats.add_phase_ms(phase, ms);
+    }
+};
+
+extern GfxDebugStats* g_gfx_debug_stats;
 
 struct RenderBuildResult {
     std::uint64_t generation{};

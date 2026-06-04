@@ -8,7 +8,9 @@
 #include <portable-file-dialogs.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -18,12 +20,193 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
 
 namespace map_editor::app_internal {
+
+std::string gfx_debug_format_bytes(std::uint64_t bytes) {
+    std::ostringstream stream;
+    stream.setf(std::ios::fixed);
+    stream.precision(2);
+    if (bytes >= 1024ULL * 1024ULL) {
+        stream << static_cast<double>(bytes) / static_cast<double>(1024ULL * 1024ULL) << " MiB";
+    } else if (bytes >= 1024ULL) {
+        stream << static_cast<double>(bytes) / static_cast<double>(1024ULL) << " KiB";
+    } else {
+        stream << bytes << " B";
+    }
+    return stream.str();
+}
+
+void accumulate_gpu_model_upload_stats(GfxDebugStats& stats, const GpuBuildingRenderModel& model) {
+    stats.uploads.uploaded_vertices += model.uploaded_vertices;
+    stats.uploads.uploaded_indices += model.uploaded_indices;
+    stats.uploads.uploaded_bytes += model.uploaded_bytes;
+    stats.uploads.chunks += model.chunks.size();
+}
+
+void refresh_gfx_debug_counts(GfxDebugStats& stats, const EditorProject* project) {
+    if (project == nullptr) {
+        return;
+    }
+
+    if (project->city.has_value()) {
+        stats.counts.buildings = project->city->data.buildings.size();
+    } else {
+        stats.counts.buildings = project->buildings.size();
+    }
+
+    for (const auto& model : project->building_gpu_models) {
+        accumulate_gpu_model_upload_stats(stats, model);
+    }
+    accumulate_gpu_model_upload_stats(stats, project->portal_gpu_model);
+    accumulate_gpu_model_upload_stats(stats, project->portal_preview_gpu_model);
+    accumulate_gpu_model_upload_stats(stats, project->building_floor_preview_gpu_model);
+}
+
+const char* gfx_draw_category_name(GfxDebugDrawCategory category) {
+    switch (category) {
+        case GfxDebugDrawCategory::CityCells:
+            return "Building/city cells";
+        case GfxDebugDrawCategory::RoadsCurbs:
+            return "Roads/curbs";
+        case GfxDebugDrawCategory::Terrain:
+            return "Terrain mesh";
+        case GfxDebugDrawCategory::TrafficLightPoles:
+            return "Traffic-light poles";
+        case GfxDebugDrawCategory::Pieces:
+            return "Pieces";
+        case GfxDebugDrawCategory::WireOverlay:
+            return "Wire/overlay";
+        case GfxDebugDrawCategory::Count:
+            break;
+    }
+    return "Unknown";
+}
+
+const char* gfx_timing_phase_name(GfxDebugTimingPhase phase) {
+    switch (phase) {
+        case GfxDebugTimingPhase::SceneRenderBufferBuild:
+            return "render rebuild service";
+        case GfxDebugTimingPhase::GpuUpload:
+            return "gpu upload";
+        case GfxDebugTimingPhase::Draw3D:
+            return "3D draw total";
+        case GfxDebugTimingPhase::TerrainDraw:
+            return "terrain draw";
+        case GfxDebugTimingPhase::CityRoadDraw:
+            return "city/road draw";
+        case GfxDebugTimingPhase::BuildingDraw:
+            return "building draw";
+        case GfxDebugTimingPhase::PoleDraw:
+            return "pole draw";
+        case GfxDebugTimingPhase::ImGuiUi:
+            return "ImGui/UI";
+        case GfxDebugTimingPhase::TotalFrame:
+            return "total frame";
+        case GfxDebugTimingPhase::Count:
+            break;
+    }
+    return "unknown";
+}
+
+void draw_graphics_debug_window(bool& open, GfxDebugStats& stats) {
+    if (!open) {
+        return;
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(460, 560), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Graphics Debug", &open)) {
+        ImGui::End();
+        return;
+    }
+
+    const auto total = stats.total_draw();
+    const auto total_frame_ms = stats.phase_ms[static_cast<std::size_t>(GfxDebugTimingPhase::TotalFrame)];
+    ImGui::Text("FPS %d | frame %.2f ms", GetFPS(), GetFrameTime() * 1000.0F);
+
+    std::array<float, GfxDebugStats::history_size> ordered_history{};
+    const auto count = stats.frame_time_count;
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto source = (stats.frame_time_index + stats.frame_time_history.size() - count + i) %
+            stats.frame_time_history.size();
+        ordered_history[i] = stats.frame_time_history[source];
+    }
+    ImGui::PlotLines("frame ms", ordered_history.data(), static_cast<int>(count), 0, nullptr, 0.0F, 50.0F, ImVec2(-FLT_MIN, 64.0F));
+
+    ImGui::SeparatorText("Draw Stats");
+    ImGui::Text("Total: %llu tris | %llu verts | %llu calls",
+        static_cast<unsigned long long>(total.triangles),
+        static_cast<unsigned long long>(total.vertices),
+        static_cast<unsigned long long>(total.draw_calls));
+    if (ImGui::BeginTable("draw_breakdown", 4, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("Category");
+        ImGui::TableSetupColumn("Tris", ImGuiTableColumnFlags_WidthFixed, 82.0F);
+        ImGui::TableSetupColumn("Verts", ImGuiTableColumnFlags_WidthFixed, 82.0F);
+        ImGui::TableSetupColumn("Calls", ImGuiTableColumnFlags_WidthFixed, 68.0F);
+        ImGui::TableHeadersRow();
+        for (std::size_t i = 0; i < static_cast<std::size_t>(GfxDebugDrawCategory::Count); ++i) {
+            const auto category = static_cast<GfxDebugDrawCategory>(i);
+            const auto& counter = stats.draw[i];
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(gfx_draw_category_name(category));
+            ImGui::TableNextColumn();
+            ImGui::Text("%llu", static_cast<unsigned long long>(counter.triangles));
+            ImGui::TableNextColumn();
+            ImGui::Text("%llu", static_cast<unsigned long long>(counter.vertices));
+            ImGui::TableNextColumn();
+            ImGui::Text("%llu", static_cast<unsigned long long>(counter.draw_calls));
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::SeparatorText("GPU Upload");
+    ImGui::Text("%llu chunks | %llu verts | %llu indices | %s",
+        static_cast<unsigned long long>(stats.uploads.chunks),
+        static_cast<unsigned long long>(stats.uploads.uploaded_vertices),
+        static_cast<unsigned long long>(stats.uploads.uploaded_indices),
+        gfx_debug_format_bytes(stats.uploads.uploaded_bytes).c_str());
+
+    ImGui::SeparatorText("Timing");
+    if (ImGui::BeginTable("timing_breakdown", 4, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("Phase");
+        ImGui::TableSetupColumn("ms", ImGuiTableColumnFlags_WidthFixed, 72.0F);
+        ImGui::TableSetupColumn("avg", ImGuiTableColumnFlags_WidthFixed, 72.0F);
+        ImGui::TableSetupColumn("%", ImGuiTableColumnFlags_WidthFixed, 54.0F);
+        ImGui::TableHeadersRow();
+        for (std::size_t i = 0; i < static_cast<std::size_t>(GfxDebugTimingPhase::Count); ++i) {
+            const auto phase = static_cast<GfxDebugTimingPhase>(i);
+            const auto ms = stats.phase_ms[i];
+            const auto pct = total_frame_ms > 0.0 ? (ms / total_frame_ms) * 100.0 : 0.0;
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(gfx_timing_phase_name(phase));
+            ImGui::TableNextColumn();
+            ImGui::Text("%.2f", ms);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.2f", stats.phase_avg_ms[i]);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.0f", pct);
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::SeparatorText("Counts");
+    ImGui::Text("Buildings %llu | City tiles %llu | Poles %llu",
+        static_cast<unsigned long long>(stats.counts.buildings),
+        static_cast<unsigned long long>(stats.counts.city_tiles),
+        static_cast<unsigned long long>(stats.counts.traffic_light_poles));
+    ImGui::Text("Terrain samples %llu | vertices %llu",
+        static_cast<unsigned long long>(stats.counts.terrain_samples),
+        static_cast<unsigned long long>(stats.counts.terrain_vertices));
+    ImGui::Text("Total scene triangles %llu", static_cast<unsigned long long>(stats.counts.total_scene_triangles));
+    ImGui::End();
+}
 
 std::string lower_extension(const std::filesystem::path& path) {
     auto extension = path.extension().string();
@@ -1043,8 +1226,18 @@ int run_editor_app() {
     Texture2D city_window_texture = load_city_window_gradient_texture();
 
     bool show_demo_window = false;
+    bool show_graphics_debug = false;
+    GfxDebugStats gfx_debug_stats;
 
     while (!WindowShouldClose()) {
+        gfx_debug_stats.reset_frame();
+        gfx_debug_stats.push_frame_time(GetFrameTime() * 1000.0F);
+        gfx_debug_stats.add_phase_ms(GfxDebugTimingPhase::TotalFrame, GetFrameTime() * 1000.0);
+        g_gfx_debug_stats = &gfx_debug_stats;
+        if (IsKeyPressed(KEY_F3)) {
+            show_graphics_debug = !show_graphics_debug;
+        }
+
         if (auto folder = dropped_folder()) {
             project = load_project_folder(*folder, status);
             if (project) {
@@ -1083,55 +1276,71 @@ int run_editor_app() {
             ClearBackground(Color{24, 27, 30, 255});
 
             BeginMode3D(camera);
-            if (project) {
-                service_render_rebuild(*project);
-                if (ui.tab == EditorTab::City && project->city) {
-                    const auto* selected_building = project->city->data.buildings.empty()
-                        ? nullptr
-                        : &project->city->data.buildings[std::min(ui.selected_city_building, project->city->data.buildings.size() - 1U)];
-                    const auto* selected_street = project->city->data.streets.empty()
-                        ? nullptr
-                        : &project->city->data.streets[std::min(ui.selected_city_street, project->city->data.streets.size() - 1U)];
-                    const auto city_scene = build_map_scene(project->city->data);
-                    draw_city_scene(city_scene, selected_street);
-                    draw_city_building_models_full_detail(*project, selected_building, &city_window_texture);
-                    draw_city_piece_voxels(*project, ui.portal_preview_textured);
-                    draw_city_traffic_light_poles(city_scene);
-                    
-                    const auto city_cursor = city_grid_point_under_mouse(camera, virtual_mouse_pos);
-                    if (city_cursor.has_value()) {
-                        draw_city_cursor(*city_cursor, 4.0F, ui.city_mode);
+            {
+                GfxDebugScopedTimer draw_3d_timer{gfx_debug_stats, GfxDebugTimingPhase::Draw3D};
+                if (project) {
+                    {
+                        GfxDebugScopedTimer timer{gfx_debug_stats, GfxDebugTimingPhase::SceneRenderBufferBuild};
+                        service_render_rebuild(*project);
                     }
-                } else if (ui.tab == EditorTab::Buildings && !project->buildings.empty()) {
-                    ui.selected_building = std::min(ui.selected_building, project->buildings.size() - 1U);
-                    const auto occupied = occupied_cell_indices(project->buildings[ui.selected_building].data);
-                    const auto* selected = occupied.empty()
-                        ? nullptr
-                        : &project->buildings[ui.selected_building].data.cells[occupied[std::min(ui.selected_building_cell, occupied.size() - 1U)]];
-                    if (ui.selected_building < project->buildings.size()) {
-                        const auto preview_floor = selected != nullptr ? selected->y : 0U;
-                        auto& preview_model = building_tool_floor_preview_model(*project, ui.selected_building, preview_floor);
-                        draw_sbb_scene_for_app(
-                            project->buildings[ui.selected_building].data,
-                            preview_model,
-                            selected);
+                    if (ui.tab == EditorTab::City && project->city) {
+                        const auto* selected_building = project->city->data.buildings.empty()
+                            ? nullptr
+                            : &project->city->data.buildings[std::min(ui.selected_city_building, project->city->data.buildings.size() - 1U)];
+                        const auto* selected_street = project->city->data.streets.empty()
+                            ? nullptr
+                            : &project->city->data.streets[std::min(ui.selected_city_street, project->city->data.streets.size() - 1U)];
+                        const auto city_scene = build_map_scene(project->city->data);
+                        draw_city_scene(city_scene, selected_street);
+                        {
+                            GfxDebugScopedTimer timer{gfx_debug_stats, GfxDebugTimingPhase::BuildingDraw};
+                            draw_city_building_models_full_detail(*project, selected_building, &city_window_texture);
+                        }
+                        {
+                            GfxDebugScopedTimer timer{gfx_debug_stats, GfxDebugTimingPhase::BuildingDraw};
+                            draw_city_piece_voxels(*project, ui.portal_preview_textured);
+                        }
+                        {
+                            GfxDebugScopedTimer timer{gfx_debug_stats, GfxDebugTimingPhase::PoleDraw};
+                            draw_city_traffic_light_poles(city_scene);
+                        }
+
+                        const auto city_cursor = city_grid_point_under_mouse(camera, virtual_mouse_pos);
+                        if (city_cursor.has_value()) {
+                            draw_city_cursor(*city_cursor, 4.0F, ui.city_mode);
+                        }
+                    } else if (ui.tab == EditorTab::Buildings && !project->buildings.empty()) {
+                        ui.selected_building = std::min(ui.selected_building, project->buildings.size() - 1U);
+                        const auto occupied = occupied_cell_indices(project->buildings[ui.selected_building].data);
+                        const auto* selected = occupied.empty()
+                            ? nullptr
+                            : &project->buildings[ui.selected_building].data.cells[occupied[std::min(ui.selected_building_cell, occupied.size() - 1U)]];
+                        if (ui.selected_building < project->buildings.size()) {
+                            const auto preview_floor = selected != nullptr ? selected->y : 0U;
+                            auto& preview_model = building_tool_floor_preview_model(*project, ui.selected_building, preview_floor);
+                            GfxDebugScopedTimer timer{gfx_debug_stats, GfxDebugTimingPhase::BuildingDraw};
+                            draw_sbb_scene_for_app(
+                                project->buildings[ui.selected_building].data,
+                                preview_model,
+                                selected);
+                        }
+                    } else if (ui.tab == EditorTab::Pieces && project->city && !project->city->data.city_blocks.empty()) {
+                        ui.selected_city_block = std::min(ui.selected_city_block, project->city->data.city_blocks.size() - 1U);
+                        const auto& city_block = project->city->data.city_blocks[ui.selected_city_block];
+                        if (!city_block.layers.empty()) {
+                            ui.selected_city_block_layer = std::min(ui.selected_city_block_layer, city_block.layers.size() - 1U);
+                            ui.selected_city_block_slot = std::min<std::size_t>(ui.selected_city_block_slot, 7U);
+                        }
+                        draw_city_block_preview(city_block, block_meshes(*project), ui.selected_city_block_layer, ui.selected_city_block_slot);
+                    } else if (ui.tab == EditorTab::Blocks && !project->blocks.empty()) {
+                        ui.selected_block = std::min(ui.selected_block, project->blocks.size() - 1U);
+                        draw_mesh_faces(project->blocks[ui.selected_block].data, 4.0F, {98, 148, 204, 220});
+                    } else {
+                        DrawGrid(64, 4.0F);
                     }
-                } else if (ui.tab == EditorTab::Pieces && project->city && !project->city->data.city_blocks.empty()) {
-                    ui.selected_city_block = std::min(ui.selected_city_block, project->city->data.city_blocks.size() - 1U);
-                    const auto& city_block = project->city->data.city_blocks[ui.selected_city_block];
-                    if (!city_block.layers.empty()) {
-                        ui.selected_city_block_layer = std::min(ui.selected_city_block_layer, city_block.layers.size() - 1U);
-                        ui.selected_city_block_slot = std::min<std::size_t>(ui.selected_city_block_slot, 7U);
-                    }
-                    draw_city_block_preview(city_block, block_meshes(*project), ui.selected_city_block_layer, ui.selected_city_block_slot);
-                } else if (ui.tab == EditorTab::Blocks && !project->blocks.empty()) {
-                    ui.selected_block = std::min(ui.selected_block, project->blocks.size() - 1U);
-                    draw_mesh_faces(project->blocks[ui.selected_block].data, 4.0F, {98, 148, 204, 220});
                 } else {
                     DrawGrid(64, 4.0F);
                 }
-            } else {
-                DrawGrid(64, 4.0F);
             }
             EndMode3D();
             EndTextureMode();
@@ -1174,6 +1383,7 @@ int run_editor_app() {
         BeginDrawing();
         ClearBackground(DARKGRAY);
 
+        const auto imgui_begin = std::chrono::steady_clock::now();
         rlImGuiBegin();
 
         ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
@@ -1197,6 +1407,7 @@ int run_editor_app() {
                     reset_layout_requested = true;
                 }
                 ImGui::MenuItem("Show ImGui Demo Window", nullptr, &show_demo_window);
+                ImGui::MenuItem("Graphics Debug", "F3", &show_graphics_debug);
                 ImGui::EndMenu();
             }
             ImGui::EndMainMenuBar();
@@ -1658,6 +1869,14 @@ int run_editor_app() {
         ImGui::Text("Fly Speed: %.1f", ui.camera_fly_speed);
         ImGui::End();
 
+        const auto imgui_end = std::chrono::steady_clock::now();
+        gfx_debug_stats.add_phase_ms(
+            GfxDebugTimingPhase::ImGuiUi,
+            std::chrono::duration<double, std::milli>(imgui_end - imgui_begin).count());
+        refresh_gfx_debug_counts(gfx_debug_stats, project.has_value() ? &*project : nullptr);
+        gfx_debug_stats.counts.total_scene_triangles = gfx_debug_stats.total_draw().triangles;
+        draw_graphics_debug_window(show_graphics_debug, gfx_debug_stats);
+
         if (open_folder_requested) {
             auto result = pfd::select_folder("Open SRC map folder").result();
             if (!result.empty()) {
@@ -1675,6 +1894,7 @@ int run_editor_app() {
 
         rlImGuiEnd();
         EndDrawing();
+        g_gfx_debug_stats = nullptr;
     }
 
     UnloadRenderTexture(viewport_texture);

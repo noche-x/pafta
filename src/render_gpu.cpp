@@ -17,6 +17,8 @@
 
 namespace map_editor::app_internal {
 
+GfxDebugStats* g_gfx_debug_stats = nullptr;
+
 std::string format_ms(double ms) {
     std::ostringstream stream;
     stream.setf(std::ios::fixed);
@@ -270,7 +272,12 @@ void service_render_rebuild(EditorProject& project) {
     }
 
     if (!project.render_build_in_progress) {
-        upload_next_pending_building(project);
+        if (g_gfx_debug_stats != nullptr) {
+            GfxDebugScopedTimer timer{*g_gfx_debug_stats, GfxDebugTimingPhase::GpuUpload};
+            upload_next_pending_building(project);
+        } else {
+            upload_next_pending_building(project);
+        }
     }
 
     if (!project.render_build_in_progress &&
@@ -316,10 +323,16 @@ void draw_mesh_faces(const SblBlockMesh& mesh, Vec3 origin, float scale, Color f
         DrawTriangle3D(c, b, a, color);
         DrawTriangle3D(a, c, d, color);
         DrawTriangle3D(d, c, a, color);
+        if (g_gfx_debug_stats != nullptr) {
+            g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::Pieces, 4U, 12U, 4U);
+        }
         DrawLine3D(a, b, Color{20, 23, 26, 255});
         DrawLine3D(b, c, Color{20, 23, 26, 255});
         DrawLine3D(c, d, Color{20, 23, 26, 255});
         DrawLine3D(d, a, Color{20, 23, 26, 255});
+        if (g_gfx_debug_stats != nullptr) {
+            g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::WireOverlay, 0U, 8U, 4U);
+        }
     }
 }
 
@@ -594,7 +607,8 @@ void draw_gpu_building_model(
     std::int32_t rotation,
     bool selected,
     bool draw_wires,
-    const Texture2D* city_window_texture = nullptr
+    const Texture2D* city_window_texture = nullptr,
+    GfxDebugDrawCategory category = GfxDebugDrawCategory::CityCells
 ) {
     const auto transform = building_transform_matrix(origin, rotation);
     rlDisableBackfaceCulling();
@@ -612,6 +626,13 @@ void draw_gpu_building_model(
             ? (selected ? Color{255, 236, 170, 255} : WHITE)
             : native_material_color(chunk.material_id, selected, false);
         DrawMesh(chunk.mesh, chunk.material, transform);
+        if (g_gfx_debug_stats != nullptr) {
+            g_gfx_debug_stats->add_draw(
+                category,
+                static_cast<std::uint64_t>(std::max(chunk.mesh.triangleCount, 0)),
+                static_cast<std::uint64_t>(std::max(chunk.mesh.vertexCount, 0)),
+                1U);
+        }
     }
     rlEnableBackfaceCulling();
 
@@ -622,12 +643,19 @@ void draw_gpu_building_model(
     for (const auto& line : model.wire_lines) {
         DrawLine3D(transform_buffer_vertex(line.from, origin, rotation), transform_buffer_vertex(line.to, origin, rotation), wire);
     }
+    if (g_gfx_debug_stats != nullptr && !model.wire_lines.empty()) {
+        g_gfx_debug_stats->add_draw(
+            GfxDebugDrawCategory::WireOverlay,
+            0U,
+            static_cast<std::uint64_t>(model.wire_lines.size()) * 2U,
+            static_cast<std::uint64_t>(model.wire_lines.size()));
+    }
 }
 
 void draw_sbb_scene_for_app(const SbbBuilding& building, GpuBuildingRenderModel& model, const SbbCell* selected) {
     constexpr auto unit_size = 4.0F;
     DrawGrid(96, unit_size);
-    draw_gpu_building_model(model, Vector3{0.0F, 0.0F, 0.0F}, 0, false, true);
+    draw_gpu_building_model(model, Vector3{0.0F, 0.0F, 0.0F}, 0, false, true, nullptr, GfxDebugDrawCategory::CityCells);
 
     if (selected != nullptr) {
         const auto center = Vector3{
@@ -702,6 +730,9 @@ void draw_city_building_model(
         // Bottom face
         DrawTriangle3D(world_corners[4], world_corners[5], world_corners[1], fill);
         DrawTriangle3D(world_corners[4], world_corners[1], world_corners[0], fill);
+        if (g_gfx_debug_stats != nullptr) {
+            g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::CityCells, 12U, 36U, 12U);
+        }
 
         // Wireframe edges
         DrawLine3D(world_corners[0], world_corners[1], wire);
@@ -718,8 +749,11 @@ void draw_city_building_model(
         DrawLine3D(world_corners[1], world_corners[5], wire);
         DrawLine3D(world_corners[2], world_corners[6], wire);
         DrawLine3D(world_corners[3], world_corners[7], wire);
+        if (g_gfx_debug_stats != nullptr) {
+            g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::WireOverlay, 0U, 24U, 12U);
+        }
     } else {
-        draw_gpu_building_model(model, origin, placement.rotation, selected, selected, city_window_texture);
+        draw_gpu_building_model(model, origin, placement.rotation, selected, selected, city_window_texture, GfxDebugDrawCategory::CityCells);
     }
 
     if (selected) {
@@ -833,7 +867,7 @@ void draw_city_piece_voxels(EditorProject& project, bool textured, std::optional
         return;
     }
     auto& model = portal_render_model(project, textured, selected_portal);
-    draw_gpu_building_model(model, {0.0F, 0.0F, 0.0F}, 0, false, true);
+    draw_gpu_building_model(model, {0.0F, 0.0F, 0.0F}, 0, false, true, nullptr, GfxDebugDrawCategory::Pieces);
 }
 
 Color city_tile_material_color(const BuildingRenderBuffer& buffer, std::uint32_t material) {
@@ -861,6 +895,9 @@ void draw_render_buffer_faces_by_material(const BuildingRenderBuffer& buffer) {
         const auto b = to_raylib(buffer.vertices[triangle.indices[1]].position);
         const auto c = to_raylib(buffer.vertices[triangle.indices[2]].position);
         DrawTriangle3D(a, b, c, city_tile_material_color(buffer, triangle.material));
+        if (g_gfx_debug_stats != nullptr) {
+            g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::RoadsCurbs, 1U, 3U, 1U);
+        }
     }
     rlEnableBackfaceCulling();
 }
@@ -879,12 +916,33 @@ void draw_city_terrain(const MapScene& scene) {
         const auto b = to_raylib(terrain.mesh.vertices[triangle.indices[1]].position);
         const auto c = to_raylib(terrain.mesh.vertices[triangle.indices[2]].position);
         DrawTriangle3D(a, b, c, {64, 83, 67, 255});
+        if (g_gfx_debug_stats != nullptr) {
+            g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::Terrain, 1U, 3U, 1U);
+        }
     }
 }
 
 void draw_city_scene(const MapScene& scene, const SbcStreet* selected_street) {
-    draw_city_terrain(scene);
-    draw_render_buffer_faces_by_material(scene.city_tile_buffer);
+    if (g_gfx_debug_stats != nullptr) {
+        if (scene.terrain.has_value()) {
+            g_gfx_debug_stats->counts.terrain_vertices = scene.terrain->mesh.vertices.size();
+            g_gfx_debug_stats->counts.terrain_samples = scene.terrain->mesh.vertices.size();
+        }
+        g_gfx_debug_stats->counts.city_tiles = scene.city_tiles.size();
+        g_gfx_debug_stats->counts.traffic_light_poles = scene.traffic_light_poles.size();
+    }
+    if (g_gfx_debug_stats != nullptr) {
+        GfxDebugScopedTimer timer{*g_gfx_debug_stats, GfxDebugTimingPhase::TerrainDraw};
+        draw_city_terrain(scene);
+    } else {
+        draw_city_terrain(scene);
+    }
+    if (g_gfx_debug_stats != nullptr) {
+        GfxDebugScopedTimer timer{*g_gfx_debug_stats, GfxDebugTimingPhase::CityRoadDraw};
+        draw_render_buffer_faces_by_material(scene.city_tile_buffer);
+    } else {
+        draw_render_buffer_faces_by_material(scene.city_tile_buffer);
+    }
 
     for (const auto& road : scene.roads) {
         const auto selected = selected_street != nullptr && road.source == selected_street;
@@ -895,6 +953,9 @@ void draw_city_scene(const MapScene& scene, const SbcStreet* selected_street) {
             to.y += scene.unit_size * 1.1F;
             DrawSphere(from, scene.unit_size * 0.35F, {245, 205, 82, 220});
             DrawSphere(to, scene.unit_size * 0.35F, {245, 205, 82, 220});
+            if (g_gfx_debug_stats != nullptr) {
+                g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::WireOverlay, 0U, 2U, 2U);
+            }
         }
     }
 }
@@ -966,6 +1027,19 @@ void draw_city_traffic_light_poles(const MapScene& scene) {
         // arm points along -Z, so rotate about Y to aim it inward.
         const auto yaw = std::atan2(pole.arm_direction.x, -pole.arm_direction.z) * RAD2DEG;
         DrawModelEx(pole_model, base, Vector3{0.0F, 1.0F, 0.0F}, yaw, Vector3{1.0F, 1.0F, 1.0F}, WHITE);
+        if (g_gfx_debug_stats != nullptr) {
+            std::uint64_t triangles = 0;
+            std::uint64_t vertices = 0;
+            for (int mesh_index = 0; mesh_index < pole_model.meshCount; ++mesh_index) {
+                triangles += static_cast<std::uint64_t>(std::max(pole_model.meshes[mesh_index].triangleCount, 0));
+                vertices += static_cast<std::uint64_t>(std::max(pole_model.meshes[mesh_index].vertexCount, 0));
+            }
+            g_gfx_debug_stats->add_draw(
+                GfxDebugDrawCategory::TrafficLightPoles,
+                triangles,
+                vertices,
+                static_cast<std::uint64_t>(std::max(pole_model.meshCount, 0)));
+        }
     }
 }
 
