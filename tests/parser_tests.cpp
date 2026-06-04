@@ -1285,10 +1285,12 @@ void city_terrain_is_non_flat_noise_mesh_padded_to_city_bounds() {
     const auto scene = map_editor::build_map_scene(map);
 
     assert(scene.terrain.has_value());
-    assert(close_to(scene.terrain->min_x, 2360.0F));
-    assert(close_to(scene.terrain->max_x, 2680.0F));
-    assert(close_to(scene.terrain->min_z, 2360.0F));
-    assert(close_to(scene.terrain->max_z, 2440.0F));
+    // Intersections at grid x=600,660 / z=600 -> world 2400,2640 / 2400, padded
+    // by 24 tiles * 4 = 96 units on each side.
+    assert(close_to(scene.terrain->min_x, 2304.0F));
+    assert(close_to(scene.terrain->max_x, 2736.0F));
+    assert(close_to(scene.terrain->min_z, 2304.0F));
+    assert(close_to(scene.terrain->max_z, 2496.0F));
     assert(scene.terrain->sample_count_x > 2);
     assert(scene.terrain->sample_count_z > 2);
     assert(scene.terrain->mesh.triangles.size() > 0U);
@@ -1303,25 +1305,28 @@ void city_terrain_is_non_flat_noise_mesh_padded_to_city_bounds() {
     assert(max_height - min_height < 10.0F);
 }
 
-void city_road_tile_heights_follow_generated_terrain() {
+void city_road_tile_heights_ramp_between_intersection_heights() {
+    // Roads carry the AUTHORED street height, ramped linearly between the two
+    // intersection y values (the game's streets slope between intersections at
+    // different heights) — NOT the noisy terrain height.
     map_editor::SbcMap map{};
-    map.intersections.push_back({0U, 600, 0, 600});
-    map.intersections.push_back({1U, 660, 0, 600});
+    map.intersections.push_back({0U, 600, 0, 600});   // A: y=0
+    map.intersections.push_back({1U, 660, 8, 600});   // B: y=8 (uphill)
     map.streets.push_back({0U, 0, 1, 0, 1, 1, "Slope"});
 
     const auto scene = map_editor::build_map_scene(map);
 
-    assert(scene.terrain.has_value());
     const auto* start = find_city_tile(scene, 600, 600, map_editor::CityTileKind::Road);
     const auto* middle = find_city_tile(scene, 630, 600, map_editor::CityTileKind::Road);
     const auto* end = find_city_tile(scene, 660, 600, map_editor::CityTileKind::Road);
     assert(start != nullptr);
     assert(middle != nullptr);
     assert(end != nullptr);
-    assert(close_to(start->base_y, map_editor::terrain_height_at(*scene.terrain, 600.5F * scene.unit_size, 600.5F * scene.unit_size)));
-    assert(close_to(middle->base_y, map_editor::terrain_height_at(*scene.terrain, 630.5F * scene.unit_size, 600.5F * scene.unit_size)));
-    assert(close_to(end->base_y, map_editor::terrain_height_at(*scene.terrain, 660.5F * scene.unit_size, 600.5F * scene.unit_size)));
-    assert(std::abs(start->base_y - middle->base_y) > 0.05F || std::abs(middle->base_y - end->base_y) > 0.05F);
+    constexpr auto unit = 4.0F;
+    // A.y=0 -> start at 0; B.y=8 -> end at 8*unit=32; middle ~halfway.
+    assert(close_to(start->base_y, 0.0F));
+    assert(close_to(end->base_y, 8.0F * unit));
+    assert(middle->base_y > start->base_y && middle->base_y < end->base_y);  // ramps up
 }
 
 void traffic_light_poles_stand_at_corners_and_face_intersection_center() {
@@ -2678,7 +2683,7 @@ int main() {
     fills_intersection_footprint_and_closes_missing_sides_with_curbs();
     terrain_noise_hash_matches_native_32_bit_wraparound();
     city_terrain_is_non_flat_noise_mesh_padded_to_city_bounds();
-    city_road_tile_heights_follow_generated_terrain();
+    city_road_tile_heights_ramp_between_intersection_heights();
     traffic_light_poles_stand_at_corners_and_face_intersection_center();
     parses_buildblock_sbl_fixture();
     builds_buildblock_preview_scene();

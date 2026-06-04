@@ -1,6 +1,7 @@
 #include "app_internal.hpp"
 
 #include <rlgl.h>
+#include <raymath.h>
 
 #include <algorithm>
 #include <array>
@@ -898,28 +899,73 @@ void draw_city_scene(const MapScene& scene, const SbcStreet* selected_street) {
     }
 }
 
+// Builds the traffic-light pole as ONE reusable model (post + arm + signal-head
+// boxes, the game's 3-box shape), oriented along -Z so a Y-rotation can aim the
+// arm. Built once and instanced per pole via DrawModelEx, instead of re-emitting
+// cylinders/cubes per pole every frame.
+Model build_traffic_light_pole_model(float unit_size) {
+    const auto post_h = unit_size * 1.75F;
+    const auto post_w = unit_size * 0.10F;
+    const auto arm_len = unit_size * 0.85F;
+    const auto arm_w = unit_size * 0.08F;
+    const auto head_w = unit_size * 0.18F;
+    const auto head_h = unit_size * 0.34F;
+
+    // Three boxes in local space (+Y up, arm extends along -Z toward target):
+    Mesh post = GenMeshCube(post_w, post_h, post_w);
+    Mesh arm = GenMeshCube(arm_w, arm_w, arm_len);
+    Mesh head = GenMeshCube(head_w, head_h, head_w);
+    // Offset arm and head into place by baking translation into their vertices.
+    auto translate_mesh = [](Mesh& m, float dx, float dy, float dz) {
+        for (int i = 0; i < m.vertexCount; ++i) {
+            m.vertices[i * 3 + 0] += dx;
+            m.vertices[i * 3 + 1] += dy;
+            m.vertices[i * 3 + 2] += dz;
+        }
+        UpdateMeshBuffer(m, 0, m.vertices, m.vertexCount * 3 * static_cast<int>(sizeof(float)), 0);
+    };
+    UploadMesh(&post, false);
+    translate_mesh(post, 0.0F, post_h * 0.5F, 0.0F);
+    UploadMesh(&arm, false);
+    translate_mesh(arm, 0.0F, post_h, -arm_len * 0.5F);
+    UploadMesh(&head, false);
+    translate_mesh(head, 0.0F, post_h - head_h * 0.4F, -arm_len);
+
+    // Combine into one model with three meshes sharing one material.
+    Model model{};
+    model.transform = MatrixIdentity();
+    model.meshCount = 3;
+    model.materialCount = 1;
+    model.meshes = static_cast<Mesh*>(MemAlloc(3 * sizeof(Mesh)));
+    model.meshes[0] = post;
+    model.meshes[1] = arm;
+    model.meshes[2] = head;
+    model.materials = static_cast<Material*>(MemAlloc(sizeof(Material)));
+    model.materials[0] = LoadMaterialDefault();
+    model.materials[0].maps[MATERIAL_MAP_DIFFUSE].color = Color{42, 46, 48, 255};
+    model.meshMaterial = reinterpret_cast<int*>(MemAlloc(3 * sizeof(int)));
+    model.meshMaterial[0] = 0;
+    model.meshMaterial[1] = 0;
+    model.meshMaterial[2] = 0;
+    return model;
+}
+
 void draw_city_traffic_light_poles(const MapScene& scene) {
-    const auto pole_radius = scene.unit_size * 0.045F;
-    const auto pole_height = scene.unit_size * 1.75F;
-    const auto arm_length = scene.unit_size * 0.85F;
+    static float cached_unit = -1.0F;
+    static Model pole_model{};
+    if (cached_unit != scene.unit_size) {
+        if (cached_unit > 0.0F) {
+            UnloadModel(pole_model);
+        }
+        pole_model = build_traffic_light_pole_model(scene.unit_size);
+        cached_unit = scene.unit_size;
+    }
     for (const auto& pole : scene.traffic_light_poles) {
         const auto base = to_raylib(pole.base);
-        const auto top = Vector3{base.x, base.y + pole_height, base.z};
-        const auto arm_end = Vector3{
-            top.x + pole.arm_direction.x * arm_length,
-            top.y,
-            top.z + pole.arm_direction.z * arm_length,
-        };
-        DrawCylinderEx(base, top, pole_radius, pole_radius, 10, {45, 48, 50, 255});
-        DrawCylinderEx(top, arm_end, pole_radius * 0.8F, pole_radius * 0.8F, 10, {45, 48, 50, 255});
-        DrawCubeV(
-            {
-                arm_end.x + pole.arm_direction.x * scene.unit_size * 0.08F,
-                arm_end.y - scene.unit_size * 0.12F,
-                arm_end.z + pole.arm_direction.z * scene.unit_size * 0.08F,
-            },
-            {scene.unit_size * 0.18F, scene.unit_size * 0.34F, scene.unit_size * 0.18F},
-            {28, 31, 32, 255});
+        // arm_direction is the inward (toward-intersection) XZ vector; the model's
+        // arm points along -Z, so rotate about Y to aim it inward.
+        const auto yaw = std::atan2(pole.arm_direction.x, -pole.arm_direction.z) * RAD2DEG;
+        DrawModelEx(pole_model, base, Vector3{0.0F, 1.0F, 0.0F}, yaw, Vector3{1.0F, 1.0F, 1.0F}, WHITE);
     }
 }
 
