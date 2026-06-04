@@ -101,6 +101,17 @@ bool has_city_tile(
     });
 }
 
+const map_editor::CityTileCell* find_city_tile(
+    const map_editor::MapScene& scene,
+    std::int32_t x,
+    std::int32_t z,
+    map_editor::CityTileKind kind) {
+    const auto match = std::ranges::find_if(scene.city_tiles, [&](const map_editor::CityTileCell& cell) {
+        return cell.x == x && cell.z == z && cell.kind == kind;
+    });
+    return match == scene.city_tiles.end() ? nullptr : &*match;
+}
+
 std::size_t count_city_tiles_at_x(
     const map_editor::MapScene& scene,
     std::int32_t x,
@@ -1259,23 +1270,61 @@ void fills_intersection_footprint_and_closes_missing_sides_with_curbs() {
     assert(has_city_tile(scene, 0, 0, 2, map_editor::CityTileKind::Curb));
 }
 
-void city_terrain_is_flat_and_padded_to_city_bounds() {
+void terrain_noise_hash_matches_native_32_bit_wraparound() {
+    assert(map_editor::terrain_noise_hash(0, 0, 0x800U) == 0x57f78de6U);
+    assert(map_editor::terrain_noise_hash(640, 640, 0x800U) == 0x57f78de6U);
+    assert(map_editor::terrain_noise_hash(2048, 2048, 0x800U) == 0x05f78de6U);
+}
+
+void city_terrain_is_non_flat_noise_mesh_padded_to_city_bounds() {
     map_editor::SbcMap map{};
-    map.intersections.push_back({0U, 10, 2, 20});
-    map.intersections.push_back({1U, 14, 2, 20});
-    map.streets.push_back({0U, 0, 1, 0, 1, 1, "Flat"});
+    map.intersections.push_back({0U, 600, 0, 600});
+    map.intersections.push_back({1U, 660, 0, 600});
+    map.streets.push_back({0U, 0, 1, 0, 1, 1, "Noise"});
 
     const auto scene = map_editor::build_map_scene(map);
 
     assert(scene.terrain.has_value());
-    assert(close_to(scene.terrain->base_y, 8.0F));
-    assert(close_to(scene.terrain->min_x, 0.0F));
-    assert(close_to(scene.terrain->max_x, 96.0F));
-    assert(close_to(scene.terrain->min_z, 40.0F));
-    assert(close_to(scene.terrain->max_z, 120.0F));
+    assert(close_to(scene.terrain->min_x, 2360.0F));
+    assert(close_to(scene.terrain->max_x, 2680.0F));
+    assert(close_to(scene.terrain->min_z, 2360.0F));
+    assert(close_to(scene.terrain->max_z, 2440.0F));
+    assert(scene.terrain->sample_count_x > 2);
+    assert(scene.terrain->sample_count_z > 2);
+    assert(scene.terrain->mesh.triangles.size() > 0U);
+
+    auto min_height = std::numeric_limits<float>::max();
+    auto max_height = std::numeric_limits<float>::lowest();
+    for (const auto height : scene.terrain->heights) {
+        min_height = std::min(min_height, height);
+        max_height = std::max(max_height, height);
+    }
+    assert(max_height - min_height > 1.0F);
+    assert(max_height - min_height < 10.0F);
 }
 
-void places_traffic_light_poles_at_intersection_corners() {
+void city_road_tile_heights_follow_generated_terrain() {
+    map_editor::SbcMap map{};
+    map.intersections.push_back({0U, 600, 0, 600});
+    map.intersections.push_back({1U, 660, 0, 600});
+    map.streets.push_back({0U, 0, 1, 0, 1, 1, "Slope"});
+
+    const auto scene = map_editor::build_map_scene(map);
+
+    assert(scene.terrain.has_value());
+    const auto* start = find_city_tile(scene, 600, 600, map_editor::CityTileKind::Road);
+    const auto* middle = find_city_tile(scene, 630, 600, map_editor::CityTileKind::Road);
+    const auto* end = find_city_tile(scene, 660, 600, map_editor::CityTileKind::Road);
+    assert(start != nullptr);
+    assert(middle != nullptr);
+    assert(end != nullptr);
+    assert(close_to(start->base_y, map_editor::terrain_height_at(*scene.terrain, 600.5F * scene.unit_size, 600.5F * scene.unit_size)));
+    assert(close_to(middle->base_y, map_editor::terrain_height_at(*scene.terrain, 630.5F * scene.unit_size, 600.5F * scene.unit_size)));
+    assert(close_to(end->base_y, map_editor::terrain_height_at(*scene.terrain, 660.5F * scene.unit_size, 600.5F * scene.unit_size)));
+    assert(std::abs(start->base_y - middle->base_y) > 0.05F || std::abs(middle->base_y - end->base_y) > 0.05F);
+}
+
+void traffic_light_poles_stand_at_corners_and_face_intersection_center() {
     map_editor::SbcMap map{};
     map.intersections.push_back({0U, 0, 0, 0});
     map.intersections.push_back({1U, 4, 0, 0});
@@ -1288,10 +1337,12 @@ void places_traffic_light_poles_at_intersection_corners() {
         return close_to(pole.base.x, 0.0F) && close_to(pole.base.z, 0.0F);
     }));
     assert(std::ranges::any_of(scene.traffic_light_poles, [](const map_editor::CityTrafficLightPole& pole) {
-        return close_to(pole.base.x, -4.0F) && close_to(pole.base.y, 4.0F) && close_to(pole.base.z, -4.0F);
+        return close_to(pole.base.x, -4.0F) && close_to(pole.base.z, -4.0F) &&
+            pole.arm_direction.x > 0.5F && pole.arm_direction.z > 0.5F;
     }));
     assert(std::ranges::any_of(scene.traffic_light_poles, [](const map_editor::CityTrafficLightPole& pole) {
-        return close_to(pole.base.x, 20.0F) && close_to(pole.base.y, 4.0F) && close_to(pole.base.z, 4.0F);
+        return close_to(pole.base.x, 20.0F) && close_to(pole.base.z, 4.0F) &&
+            pole.arm_direction.x < -0.5F && pole.arm_direction.z < -0.5F;
     }));
 }
 
@@ -2625,8 +2676,10 @@ int main() {
     builds_map_scene();
     builds_grid_aligned_city_street_tile_strip();
     fills_intersection_footprint_and_closes_missing_sides_with_curbs();
-    city_terrain_is_flat_and_padded_to_city_bounds();
-    places_traffic_light_poles_at_intersection_corners();
+    terrain_noise_hash_matches_native_32_bit_wraparound();
+    city_terrain_is_non_flat_noise_mesh_padded_to_city_bounds();
+    city_road_tile_heights_follow_generated_terrain();
+    traffic_light_poles_stand_at_corners_and_face_intersection_center();
     parses_buildblock_sbl_fixture();
     builds_buildblock_preview_scene();
     city_block_preview_treats_unmatched_record_name_as_solid_not_layer_meshes();

@@ -9,6 +9,15 @@
 #include <unordered_map>
 
 namespace map_editor {
+
+std::uint32_t terrain_noise_hash(std::int32_t x, std::int32_t y, std::uint32_t mask) {
+    auto u = static_cast<std::uint32_t>((((y + 1) & static_cast<std::int32_t>(mask)) * 0x39) +
+        ((x + 1) & static_cast<std::int32_t>(mask)));
+    u = u ^ (u * 0x2000U);
+    const auto v = u * u * 0x3d73U + 0xc0ae5U;
+    return (v * v + 0xd208dd0dU) & 0x7fffffffU;
+}
+
 namespace {
 
 // -----------------------------------------------------------------------------
@@ -17,6 +26,10 @@ namespace {
 
 float clamp01(float value) {
     return std::clamp(value, 0.0F, 1.0F);
+}
+
+float lerp(float a, float b, float t) {
+    return a + (b - a) * t;
 }
 
 std::optional<PortalRect> portal_rect(float x, float width, float y, float height) {
@@ -1431,7 +1444,39 @@ void place_city_intersection_tiles(CityTileMap& tiles, const SbcMap& map, const 
     }
 }
 
-std::vector<CityTileCell> build_city_tile_cells(const SbcMap& map) {
+float terrain_noise_sample(float x, float z, float frequency) {
+    const auto sx = x * frequency;
+    const auto sz = z * frequency;
+    const auto x0 = static_cast<std::int32_t>(std::floor(sx));
+    const auto z0 = static_cast<std::int32_t>(std::floor(sz));
+    const auto tx = sx - static_cast<float>(x0);
+    const auto tz = sz - static_cast<float>(z0);
+    constexpr auto inv_max_hash = 1.0F / static_cast<float>(0x7fffffffU);
+    const auto n00 = static_cast<float>(terrain_noise_hash(x0, z0, 0x800U)) * inv_max_hash;
+    const auto n10 = static_cast<float>(terrain_noise_hash(x0 + 1, z0, 0x800U)) * inv_max_hash;
+    const auto n01 = static_cast<float>(terrain_noise_hash(x0, z0 + 1, 0x800U)) * inv_max_hash;
+    const auto n11 = static_cast<float>(terrain_noise_hash(x0 + 1, z0 + 1, 0x800U)) * inv_max_hash;
+    return lerp(lerp(n00, n10, tx), lerp(n01, n11, tx), tz);
+}
+
+float native_like_city_terrain_height(float world_x, float world_z) {
+    const auto gx = world_x * 0.25F;
+    const auto gy = world_z * 0.25F;
+    const auto dx = gx - 640.0F;
+    const auto dz = gy - 640.0F;
+    const auto radial = std::max(0.0F, std::sqrt(dx * dx + dz * dz) * 0.00390625F - 0.75F);
+    const auto radial2 = radial * radial;
+    const auto low = terrain_noise_sample(gx, gy, 16.0F);
+    const auto mid = terrain_noise_sample(gx + 173.0F, gy - 91.0F, 8.0F);
+    const auto broad = terrain_noise_sample(gx - 311.0F, gy + 47.0F, 4.0F);
+    // VERIFY(subrosa.exe Terrain_GenerateIslandHeightfield @56560): this keeps
+    // the decoded constants and native hash, but approximates the decompiled
+    // base-height blend until the full expression is ported.
+    return (low - 0.5F) * 7.0F + (mid - 0.5F) * 3.5F + (broad - 0.5F) * 2.0F +
+        radial2 * (low * 8.0F + 32.0F) + (mid + radial) * 0.35F;
+}
+
+std::vector<CityTileCell> build_city_tile_cells(const SbcMap& map, const std::optional<CityTerrain>& terrain, float unit_size) {
     CityTileMap tile_map;
     for (const auto& street : map.streets) {
         if (street.from_intersection < 0 || street.to_intersection < 0) {
@@ -1452,7 +1497,10 @@ std::vector<CityTileCell> build_city_tile_cells(const SbcMap& map) {
     std::vector<CityTileCell> tiles;
     tiles.reserve(tile_map.size());
     for (const auto& [key, kind] : tile_map) {
-        tiles.push_back({key.x, key.y, key.z, kind});
+        const auto base_y = terrain.has_value()
+            ? terrain_height_at(*terrain, (static_cast<float>(key.x) + 0.5F) * unit_size, (static_cast<float>(key.z) + 0.5F) * unit_size)
+            : static_cast<float>(key.y) * unit_size;
+        tiles.push_back({key.x, key.y, key.z, base_y, kind});
     }
     std::ranges::sort(tiles, [](const CityTileCell& left, const CityTileCell& right) {
         if (left.y != right.y) {
@@ -1507,7 +1555,7 @@ BuildingRenderBuffer build_city_tile_render_buffer(const std::vector<CityTileCel
         const auto* up = cell_at(tile.x, tile.y + 1, tile.z);
         const auto material = tile.kind == CityTileKind::Curb ? curb_material : road_material;
         const auto cx = (static_cast<float>(tile.x) + 0.5F) * unit_size;
-        const auto cy = (static_cast<float>(tile.y) + 0.5F) * unit_size;
+        const auto cy = tile.base_y + unit_size * 0.5F;
         const auto cz = (static_cast<float>(tile.z) + 0.5F) * unit_size;
 
         const std::array<SolidCellFaceCheck, 5> native_sides{{
@@ -1544,26 +1592,56 @@ std::optional<CityTerrain> build_city_terrain(const SbcMap& map, float unit_size
 
     auto min_x = std::numeric_limits<std::int32_t>::max();
     auto max_x = std::numeric_limits<std::int32_t>::lowest();
-    auto min_y = std::numeric_limits<std::int32_t>::max();
     auto min_z = std::numeric_limits<std::int32_t>::max();
     auto max_z = std::numeric_limits<std::int32_t>::lowest();
     for (const auto& intersection : map.intersections) {
         min_x = std::min(min_x, intersection.x);
         max_x = std::max(max_x, intersection.x);
-        min_y = std::min(min_y, intersection.y);
         min_z = std::min(min_z, intersection.z);
         max_z = std::max(max_z, intersection.z);
     }
 
     constexpr auto terrain_padding_tiles = 10.0F;
     const auto padding = terrain_padding_tiles * unit_size;
-    return CityTerrain{
-        static_cast<float>(min_y) * unit_size,
+    CityTerrain terrain{
         static_cast<float>(min_x) * unit_size - padding,
         static_cast<float>(max_x) * unit_size + padding,
         static_cast<float>(min_z) * unit_size - padding,
         static_cast<float>(max_z) * unit_size + padding,
+        0,
+        0,
+        unit_size * 4.0F,
+        {},
+        {},
     };
+    terrain.sample_count_x = std::max(2, static_cast<std::int32_t>(std::ceil((terrain.max_x - terrain.min_x) / terrain.sample_spacing)) + 1);
+    terrain.sample_count_z = std::max(2, static_cast<std::int32_t>(std::ceil((terrain.max_z - terrain.min_z) / terrain.sample_spacing)) + 1);
+    terrain.heights.reserve(static_cast<std::size_t>(terrain.sample_count_x * terrain.sample_count_z));
+    terrain.mesh.unit_size = unit_size;
+    terrain.mesh.material_names.push_back("city_terrain_grass");
+
+    for (auto z = 0; z < terrain.sample_count_z; ++z) {
+        for (auto x = 0; x < terrain.sample_count_x; ++x) {
+            const auto world_x = std::min(terrain.max_x, terrain.min_x + static_cast<float>(x) * terrain.sample_spacing);
+            const auto world_z = std::min(terrain.max_z, terrain.min_z + static_cast<float>(z) * terrain.sample_spacing);
+            const auto height = native_like_city_terrain_height(world_x, world_z);
+            terrain.heights.push_back(height);
+            terrain.mesh.vertices.push_back({{world_x, height - 0.05F, world_z}, 0.0F, 0.0F});
+        }
+    }
+
+    for (auto z = 0; z < terrain.sample_count_z - 1; ++z) {
+        for (auto x = 0; x < terrain.sample_count_x - 1; ++x) {
+            const auto i0 = static_cast<std::uint32_t>(z * terrain.sample_count_x + x);
+            const auto i1 = static_cast<std::uint32_t>(z * terrain.sample_count_x + x + 1);
+            const auto i2 = static_cast<std::uint32_t>((z + 1) * terrain.sample_count_x + x + 1);
+            const auto i3 = static_cast<std::uint32_t>((z + 1) * terrain.sample_count_x + x);
+            terrain.mesh.triangles.push_back({{i0, i1, i2}, 0U, false});
+            terrain.mesh.triangles.push_back({{i0, i2, i3}, 0U, false});
+        }
+    }
+
+    return terrain;
 }
 
 Vec3 normalized_xz(Vec3 value) {
@@ -1574,26 +1652,35 @@ Vec3 normalized_xz(Vec3 value) {
     return {value.x / length, 0.0F, value.z / length};
 }
 
-std::vector<CityTrafficLightPole> build_city_traffic_light_poles(const SbcMap& map, float unit_size) {
+std::vector<CityTrafficLightPole> build_city_traffic_light_poles(
+    const SbcMap& map,
+    float unit_size,
+    const std::optional<CityTerrain>& terrain) {
     std::vector<CityTrafficLightPole> poles;
     poles.reserve(map.intersections.size() * 4U);
     for (const auto& intersection : map.intersections) {
         const auto footprint = city_intersection_footprint(map, intersection);
-        const auto base_y = (static_cast<float>(intersection.y) + 1.0F) * unit_size;
         const auto min_x = static_cast<float>(intersection.x + footprint.min_offset) * unit_size;
         const auto max_x = static_cast<float>(intersection.x + footprint.max_offset + 1) * unit_size;
         const auto min_z = static_cast<float>(intersection.z + footprint.min_offset) * unit_size;
         const auto max_z = static_cast<float>(intersection.z + footprint.max_offset + 1) * unit_size;
+        auto corner_y = [&](float x, float z) {
+            return terrain.has_value()
+                ? terrain_height_at(*terrain, x, z) + unit_size
+                : (static_cast<float>(intersection.y) + 1.0F) * unit_size;
+        };
         const auto center = Vec3{
             static_cast<float>(intersection.x) * unit_size,
-            base_y,
+            terrain.has_value()
+                ? terrain_height_at(*terrain, static_cast<float>(intersection.x) * unit_size, static_cast<float>(intersection.z) * unit_size) + unit_size
+                : (static_cast<float>(intersection.y) + 1.0F) * unit_size,
             static_cast<float>(intersection.z) * unit_size,
         };
         const std::array corners{
-            Vec3{min_x, base_y, min_z},
-            Vec3{max_x, base_y, min_z},
-            Vec3{max_x, base_y, max_z},
-            Vec3{min_x, base_y, max_z},
+            Vec3{min_x, corner_y(min_x, min_z), min_z},
+            Vec3{max_x, corner_y(max_x, min_z), min_z},
+            Vec3{max_x, corner_y(max_x, max_z), max_z},
+            Vec3{min_x, corner_y(min_x, max_z), max_z},
         };
 
         for (const auto& corner : corners) {
@@ -1611,6 +1698,27 @@ std::vector<CityTrafficLightPole> build_city_traffic_light_poles(const SbcMap& m
 // -----------------------------------------------------------------------------
 // Building Scene and Render Buffers
 // -----------------------------------------------------------------------------
+
+float terrain_height_at(const CityTerrain& terrain, float world_x, float world_z) {
+    if (terrain.heights.empty() || terrain.sample_count_x <= 0 || terrain.sample_count_z <= 0 || terrain.sample_spacing <= 0.0F) {
+        return 0.0F;
+    }
+
+    const auto sx = std::clamp((world_x - terrain.min_x) / terrain.sample_spacing, 0.0F, static_cast<float>(terrain.sample_count_x - 1));
+    const auto sz = std::clamp((world_z - terrain.min_z) / terrain.sample_spacing, 0.0F, static_cast<float>(terrain.sample_count_z - 1));
+    const auto x0 = static_cast<std::int32_t>(std::floor(sx));
+    const auto z0 = static_cast<std::int32_t>(std::floor(sz));
+    const auto x1 = std::min(x0 + 1, terrain.sample_count_x - 1);
+    const auto z1 = std::min(z0 + 1, terrain.sample_count_z - 1);
+    const auto tx = sx - static_cast<float>(x0);
+    const auto tz = sz - static_cast<float>(z0);
+    auto height_at = [&](std::int32_t x, std::int32_t z) {
+        return terrain.heights[static_cast<std::size_t>(z * terrain.sample_count_x + x)];
+    };
+    const auto z0_height = height_at(x0, z0) + (height_at(x1, z0) - height_at(x0, z0)) * tx;
+    const auto z1_height = height_at(x0, z1) + (height_at(x1, z1) - height_at(x0, z1)) * tx;
+    return z0_height + (z1_height - z0_height) * tz;
+}
 
 SblBlockMesh make_native_builtin_block_mesh() {
     return make_native_builtin_block_mesh_impl();
@@ -2082,10 +2190,10 @@ Vec3 native_city_building_transform_point(const SbcBuilding& placement, Vec3 loc
 
 MapScene build_map_scene(const SbcMap& map) {
     MapScene scene;
-    scene.city_tiles = build_city_tile_cells(map);
-    scene.city_tile_buffer = build_city_tile_render_buffer(scene.city_tiles, scene.unit_size);
     scene.terrain = build_city_terrain(map, scene.unit_size);
-    scene.traffic_light_poles = build_city_traffic_light_poles(map, scene.unit_size);
+    scene.city_tiles = build_city_tile_cells(map, scene.terrain, scene.unit_size);
+    scene.city_tile_buffer = build_city_tile_render_buffer(scene.city_tiles, scene.unit_size);
+    scene.traffic_light_poles = build_city_traffic_light_poles(map, scene.unit_size, scene.terrain);
 
     for (const auto& street : map.streets) {
         if (street.from_intersection < 0 || street.to_intersection < 0) {
@@ -2103,12 +2211,16 @@ MapScene build_map_scene(const SbcMap& map) {
             &street,
             {
                 static_cast<float>(from.x) * scene.unit_size,
-                static_cast<float>(from.y) * scene.unit_size,
+                scene.terrain.has_value()
+                    ? terrain_height_at(*scene.terrain, static_cast<float>(from.x) * scene.unit_size, static_cast<float>(from.z) * scene.unit_size)
+                    : static_cast<float>(from.y) * scene.unit_size,
                 static_cast<float>(from.z) * scene.unit_size,
             },
             {
                 static_cast<float>(to.x) * scene.unit_size,
-                static_cast<float>(to.y) * scene.unit_size,
+                scene.terrain.has_value()
+                    ? terrain_height_at(*scene.terrain, static_cast<float>(to.x) * scene.unit_size, static_cast<float>(to.z) * scene.unit_size)
+                    : static_cast<float>(to.y) * scene.unit_size,
                 static_cast<float>(to.z) * scene.unit_size,
             },
             static_cast<float>(std::max(2, street.left_width + street.right_width + 2)) * scene.unit_size,
@@ -2128,7 +2240,9 @@ MapScene build_map_scene(const SbcMap& map) {
             &intersection,
             {
                 static_cast<float>(intersection.x) * scene.unit_size,
-                static_cast<float>(intersection.y) * scene.unit_size,
+                scene.terrain.has_value()
+                    ? terrain_height_at(*scene.terrain, static_cast<float>(intersection.x) * scene.unit_size, static_cast<float>(intersection.z) * scene.unit_size)
+                    : static_cast<float>(intersection.y) * scene.unit_size,
                 static_cast<float>(intersection.z) * scene.unit_size,
             },
             width,

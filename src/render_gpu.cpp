@@ -869,20 +869,16 @@ void draw_city_terrain(const MapScene& scene) {
         return;
     }
     const auto& terrain = *scene.terrain;
-    const auto width = terrain.max_x - terrain.min_x;
-    const auto depth = terrain.max_z - terrain.min_z;
-    if (width <= 0.0F || depth <= 0.0F) {
+    if (terrain.mesh.vertices.empty() || terrain.mesh.triangles.empty()) {
         return;
     }
 
-    DrawCubeV(
-        {
-            (terrain.min_x + terrain.max_x) * 0.5F,
-            terrain.base_y - 0.04F,
-            (terrain.min_z + terrain.max_z) * 0.5F,
-        },
-        {width, 0.08F, depth},
-        {64, 83, 67, 255});
+    for (const auto& triangle : terrain.mesh.triangles) {
+        const auto a = to_raylib(terrain.mesh.vertices[triangle.indices[0]].position);
+        const auto b = to_raylib(terrain.mesh.vertices[triangle.indices[1]].position);
+        const auto c = to_raylib(terrain.mesh.vertices[triangle.indices[2]].position);
+        DrawTriangle3D(a, b, c, {64, 83, 67, 255});
+    }
 }
 
 void draw_city_scene(const MapScene& scene, const SbcStreet* selected_street) {

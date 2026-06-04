@@ -171,15 +171,20 @@ struct CityTileCell {
     std::int32_t x{};
     std::int32_t y{};
     std::int32_t z{};
+    float base_y{};
     CityTileKind kind{CityTileKind::Road};
 };
 
 struct CityTerrain {
-    float base_y{};
     float min_x{};
     float max_x{};
     float min_z{};
     float max_z{};
+    std::int32_t sample_count_x{};
+    std::int32_t sample_count_z{};
+    float sample_spacing{};
+    std::vector<float> heights;
+    BuildingRenderBuffer mesh;
 };
 
 struct CityTrafficLightPole {
@@ -299,6 +304,8 @@ Vec3 native_city_rotate_local(Vec3 local, std::int32_t rotation);
 Vec3 native_city_building_render_origin(const SbcBuilding& placement, float unit_size = 4.0F);
 Vec3 native_city_building_transform_point(const SbcBuilding& placement, Vec3 local, float unit_size = 4.0F);
 MapScene build_map_scene(const SbcMap& map);
+std::uint32_t terrain_noise_hash(std::int32_t x, std::int32_t y, std::uint32_t mask);
+float terrain_height_at(const CityTerrain& terrain, float world_x, float world_z);
 BuildblockPreviewScene build_buildblock_preview_scene(const SblTemplate& buildblock);
 CityBlockPreviewScene build_city_block_preview_scene(const SbcCityBlock& city_block, const std::vector<NamedBlockMesh>& block_meshes);
 NativeRotatedBlockFace rotate_block_face_native(const SblBlockMesh& mesh, const SblBlockFace& face, std::int32_t rotation);
