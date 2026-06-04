@@ -1303,6 +1303,25 @@ void city_terrain_is_non_flat_noise_mesh_padded_to_city_bounds() {
     }
     assert(max_height - min_height > 1.0F);
     assert(max_height - min_height < 10.0F);
+
+    auto max_adjacent_delta = 0.0F;
+    for (auto z = 0; z < scene.terrain->sample_count_z; ++z) {
+        for (auto x = 0; x < scene.terrain->sample_count_x; ++x) {
+            const auto index = static_cast<std::size_t>(z * scene.terrain->sample_count_x + x);
+            if (x + 1 < scene.terrain->sample_count_x) {
+                max_adjacent_delta = std::max(
+                    max_adjacent_delta,
+                    std::abs(scene.terrain->heights[index + 1] - scene.terrain->heights[index]));
+            }
+            if (z + 1 < scene.terrain->sample_count_z) {
+                max_adjacent_delta = std::max(
+                    max_adjacent_delta,
+                    std::abs(scene.terrain->heights[index + static_cast<std::size_t>(scene.terrain->sample_count_x)] -
+                        scene.terrain->heights[index]));
+            }
+        }
+    }
+    assert(max_adjacent_delta < 3.0F);
 }
 
 void city_road_tile_heights_ramp_between_intersection_heights() {

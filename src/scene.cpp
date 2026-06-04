@@ -1469,12 +1469,14 @@ float terrain_noise_sample(float x, float z, float frequency) {
     const auto z0 = static_cast<std::int32_t>(std::floor(sz));
     const auto tx = sx - static_cast<float>(x0);
     const auto tz = sz - static_cast<float>(z0);
+    const auto ux = tx * tx * (3.0F - 2.0F * tx);
+    const auto uz = tz * tz * (3.0F - 2.0F * tz);
     constexpr auto inv_max_hash = 1.0F / static_cast<float>(0x7fffffffU);
     const auto n00 = static_cast<float>(terrain_noise_hash(x0, z0, 0x800U)) * inv_max_hash;
     const auto n10 = static_cast<float>(terrain_noise_hash(x0 + 1, z0, 0x800U)) * inv_max_hash;
     const auto n01 = static_cast<float>(terrain_noise_hash(x0, z0 + 1, 0x800U)) * inv_max_hash;
     const auto n11 = static_cast<float>(terrain_noise_hash(x0 + 1, z0 + 1, 0x800U)) * inv_max_hash;
-    return lerp(lerp(n00, n10, tx), lerp(n01, n11, tx), tz);
+    return lerp(lerp(n00, n10, ux), lerp(n01, n11, ux), uz);
 }
 
 float native_like_city_terrain_height(float world_x, float world_z) {
@@ -1484,14 +1486,17 @@ float native_like_city_terrain_height(float world_x, float world_z) {
     const auto dz = gy - 640.0F;
     const auto radial = std::max(0.0F, std::sqrt(dx * dx + dz * dz) * 0.00390625F - 0.75F);
     const auto radial2 = radial * radial;
-    const auto low = terrain_noise_sample(gx, gy, 16.0F);
-    const auto mid = terrain_noise_sample(gx + 173.0F, gy - 91.0F, 8.0F);
-    const auto broad = terrain_noise_sample(gx - 311.0F, gy + 47.0F, 4.0F);
+    const auto primary = terrain_noise_sample(gx, gy, 3.75F);
+    const auto secondary = terrain_noise_sample(gx + 173.0F, gy - 91.0F, 7.5F);
+    const auto broad = terrain_noise_sample(gx - 311.0F, gy + 47.0F, 15.0F);
     // VERIFY(subrosa.exe Terrain_GenerateIslandHeightfield @56560): this keeps
     // the decoded constants and native hash, but approximates the decompiled
-    // base-height blend until the full expression is ported.
-    return (low - 0.5F) * 7.0F + (mid - 0.5F) * 3.5F + (broad - 0.5F) * 2.0F +
-        radial2 * (low * 8.0F + 32.0F) + (mid + radial) * 0.35F;
+    // base-height blend/water-level terms until the full expression is ported.
+    // The city is inside the flat radial core, so use fractional value-noise
+    // scales against the native 0x800-masked hash: broad, low-amplitude rolls
+    // instead of per-sample hash jitter at terrain mesh vertices.
+    return (primary - 0.5F) * 7.0F + (secondary - 0.5F) * 3.5F + (broad - 0.5F) * 1.75F +
+        radial2 * (primary * 8.0F + 32.0F) + radial * 16.0F;
 }
 
 std::vector<CityTileCell> build_city_tile_cells(const SbcMap& map, const std::optional<CityTerrain>& terrain, float unit_size) {
