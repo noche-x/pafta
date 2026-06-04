@@ -1735,6 +1735,9 @@ std::optional<CityTerrain> build_city_terrain(const SbcMap& map, float unit_size
         }
     }
 
+    // One material run so the terrain mesh can be uploaded as a GPU chunk (it is
+    // a single grass material) instead of drawn triangle-by-triangle.
+    sort_triangles_into_native_material_runs(terrain.mesh);
     return terrain;
 }
 

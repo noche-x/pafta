@@ -250,6 +250,23 @@ struct GfxDebugScopedTimer {
 
 extern GfxDebugStats* g_gfx_debug_stats;
 
+// Times a phase only when the debug overlay is active; no-op otherwise. Lets draw
+// code use one RAII line instead of branching on g_gfx_debug_stats everywhere.
+struct GfxDebugMaybeTimer {
+    GfxDebugTimingPhase phase;
+    std::chrono::steady_clock::time_point begin{std::chrono::steady_clock::now()};
+
+    explicit GfxDebugMaybeTimer(GfxDebugTimingPhase target_phase) : phase(target_phase) {}
+
+    ~GfxDebugMaybeTimer() {
+        if (g_gfx_debug_stats != nullptr) {
+            const auto end = std::chrono::steady_clock::now();
+            const auto ms = std::chrono::duration<double, std::milli>(end - begin).count();
+            g_gfx_debug_stats->add_phase_ms(phase, ms);
+        }
+    }
+};
+
 struct RenderBuildResult {
     std::uint64_t generation{};
     std::vector<BuildingRenderBuffer> buffers;
@@ -296,6 +313,11 @@ struct EditorProject {
     MapScene city_scene_cache;
     std::uint64_t city_scene_cache_fingerprint{};
     bool city_scene_cache_valid{false};
+    // GPU meshes for the city road/curb tiles and terrain, uploaded once per scene
+    // rebuild instead of re-submitting every triangle in immediate mode each frame.
+    GpuBuildingRenderModel city_tile_gpu_model;
+    GpuBuildingRenderModel terrain_gpu_model;
+    bool city_scene_gpu_valid{false};
     bool portal_render_dirty{true};
     bool portal_preview_render_dirty{true};
     bool portal_render_textured{};
@@ -346,6 +368,11 @@ struct EditorUi {
     std::size_t selected_piece_rotation{};
     std::size_t selected_portal{};
     bool portal_preview_textured{true};
+    // City ground rendering toggles. On = full game roads/terrain meshes.
+    // render_roads off => flat rectangle/square blockout for roads+intersections.
+    // render_terrain off => terrain hidden entirely.
+    bool render_roads{true};
+    bool render_terrain{true};
     std::size_t selected_building_cell{};
     std::size_t selected_building_field{};
     std::size_t selected_buildblock_field{};
@@ -384,7 +411,15 @@ void draw_city_building_model(
     bool use_lod,
     const Texture2D* city_window_texture = nullptr);
 void draw_city_piece_voxels(EditorProject& project, bool textured, std::optional<std::size_t> selected_portal = std::nullopt);
-void draw_city_scene(const MapScene& scene, const SbcStreet* selected_street);
+GpuBuildingRenderModel upload_city_tile_model(const BuildingRenderBuffer& buffer, const EditorProject& project);
+GpuBuildingRenderModel upload_city_terrain_model(const BuildingRenderBuffer& buffer, const EditorProject& project);
+void unload_city_render_model(GpuBuildingRenderModel& model);
+void draw_city_scene(
+    EditorProject& project,
+    const MapScene& scene,
+    const SbcStreet* selected_street,
+    bool render_roads,
+    bool render_terrain);
 void draw_city_traffic_light_poles(const MapScene& scene);
 void draw_city_cursor(CityGridPoint point, float unit_size, CityEditMode mode);
 void draw_city_block_preview(const SbcCityBlock& city_block, const std::vector<NamedBlockMesh>& meshes, std::size_t selected_layer, std::size_t selected_slot);

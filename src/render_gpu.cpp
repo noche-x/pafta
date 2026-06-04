@@ -7,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <limits>
@@ -561,6 +562,118 @@ GpuBuildingMeshChunk upload_mesh_chunk(
     return chunk;
 }
 
+// Bakes a simple directional + ambient term for a world-space normal into a
+// brightness multiplier. One fixed sun direction; faces toward it are brighter,
+// faces away sit at the ambient floor. Cheap, asset-free shading that makes
+// terrain slopes, road grades, and curbs read as 3D without a custom GLSL shader.
+float baked_directional_light(Vector3 normal) {
+    constexpr Vector3 sun{0.40F, 0.82F, 0.41F};  // normalized-ish down-ish from one side
+    constexpr float ambient = 0.55F;
+    const auto len = std::sqrt(normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
+    if (len <= 0.0001F) {
+        return 1.0F;
+    }
+    const auto ndotl = (normal.x * sun.x + normal.y * sun.y + normal.z * sun.z) / len;
+    return ambient + (1.0F - ambient) * std::max(0.0F, ndotl);
+}
+
+Color shade_color(Color base, float light) {
+    const auto scale = [light](unsigned char c) {
+        return static_cast<unsigned char>(std::min(255.0F, static_cast<float>(c) * light));
+    };
+    return {scale(base.r), scale(base.g), scale(base.b), base.a};
+}
+
+// Uploads a whole city render buffer (roads/curbs or terrain) as GPU mesh chunks,
+// one per material run, with per-face directional lighting baked into vertex
+// colors. Replaces the per-triangle immediate-mode DrawTriangle3D path that was
+// submitting hundreds of thousands of tiny draw calls per frame.
+GpuBuildingRenderModel upload_city_buffer_model(
+    const BuildingRenderBuffer& buffer,
+    const EditorProject& project,
+    const std::function<Color(std::uint32_t)>& color_for_material) {
+    GpuBuildingRenderModel model;
+    model.wire_lines = buffer.wire_lines;
+    model.chunks.reserve(buffer.material_runs.size());
+
+    for (const auto& run : buffer.material_runs) {
+        const auto clamped_end = std::min<std::uint32_t>(
+            run.first_triangle + run.triangle_count,
+            static_cast<std::uint32_t>(buffer.triangles.size()));
+        if (clamped_end <= run.first_triangle) {
+            continue;
+        }
+        const auto tri_count = clamped_end - run.first_triangle;
+
+        // Per-face (unindexed) so each triangle keeps its own flat normal and
+        // hard edges shade crisply; terrain reads fine flat-shaded at this scale.
+        GpuBuildingMeshChunk chunk;
+        chunk.material_id = run.material;
+        chunk.window_material = run.city_window_surface;
+        chunk.mesh.vertexCount = static_cast<int>(tri_count * 3U);
+        chunk.mesh.triangleCount = static_cast<int>(tri_count);
+        chunk.mesh.vertices = static_cast<float*>(MemAlloc(static_cast<unsigned int>(chunk.mesh.vertexCount * 3 * sizeof(float))));
+        chunk.mesh.texcoords = static_cast<float*>(MemAlloc(static_cast<unsigned int>(chunk.mesh.vertexCount * 2 * sizeof(float))));
+        chunk.mesh.colors = static_cast<unsigned char*>(MemAlloc(static_cast<unsigned int>(chunk.mesh.vertexCount * 4 * sizeof(unsigned char))));
+        if (chunk.mesh.vertices == nullptr || chunk.mesh.texcoords == nullptr || chunk.mesh.colors == nullptr) {
+            if (chunk.mesh.vertices != nullptr) { MemFree(chunk.mesh.vertices); }
+            if (chunk.mesh.texcoords != nullptr) { MemFree(chunk.mesh.texcoords); }
+            if (chunk.mesh.colors != nullptr) { MemFree(chunk.mesh.colors); }
+            continue;
+        }
+
+        const auto base_color = color_for_material(run.material);
+        auto* out = chunk.mesh.vertices;
+        auto* out_uv = chunk.mesh.texcoords;
+        auto* out_col = chunk.mesh.colors;
+        for (auto triangle_index = run.first_triangle; triangle_index < clamped_end; ++triangle_index) {
+            const auto& triangle = buffer.triangles[triangle_index];
+            std::array<Vec3, 3> p{};
+            std::array<RenderBufferVertex, 3> v{};
+            for (int i = 0; i < 3; ++i) {
+                v[i] = triangle.indices[i] < buffer.vertices.size()
+                    ? buffer.vertices[triangle.indices[i]]
+                    : RenderBufferVertex{};
+                p[i] = v[i].position;
+            }
+            const Vector3 e1{p[1].x - p[0].x, p[1].y - p[0].y, p[1].z - p[0].z};
+            const Vector3 e2{p[2].x - p[0].x, p[2].y - p[0].y, p[2].z - p[0].z};
+            const Vector3 face_normal{
+                e1.y * e2.z - e1.z * e2.y,
+                e1.z * e2.x - e1.x * e2.z,
+                e1.x * e2.y - e1.y * e2.x,
+            };
+            const auto light = baked_directional_light(face_normal);
+            const auto shaded = shade_color(base_color, light);
+            for (int i = 0; i < 3; ++i) {
+                *out++ = p[i].x;
+                *out++ = p[i].y;
+                *out++ = p[i].z;
+                *out_uv++ = v[i].u;
+                *out_uv++ = v[i].v;
+                *out_col++ = shaded.r;
+                *out_col++ = shaded.g;
+                *out_col++ = shaded.b;
+                *out_col++ = shaded.a;
+            }
+        }
+
+        UploadMesh(&chunk.mesh, false);
+        chunk.material = LoadMaterialDefault();
+        chunk.material.maps[MATERIAL_MAP_DIFFUSE].color = WHITE;  // baked into vertex colors
+        if (const auto* texture = texture_for_buffer_material(project, buffer, run.material);
+            texture != nullptr && texture->id != 0U) {
+            chunk.material.maps[MATERIAL_MAP_DIFFUSE].texture = *texture;
+            chunk.source_texture = *texture;
+            chunk.textured = true;
+        }
+        model.uploaded_vertices += static_cast<std::size_t>(chunk.mesh.vertexCount);
+        model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.vertexCount) * (3U * sizeof(float) + 2U * sizeof(float) + 4U);
+        model.chunks.push_back(std::move(chunk));
+    }
+    return model;
+}
+
 GpuBuildingRenderModel upload_building_render_model(const BuildingRenderBuffer& buffer, const SbbBuilding& building, const EditorProject& project) {
     GpuBuildingRenderModel model;
     model.wire_lines = buffer.wire_lines;
@@ -883,46 +996,93 @@ Color city_tile_material_color(const BuildingRenderBuffer& buffer, std::uint32_t
     return {88, 96, 104, 255};
 }
 
-void draw_render_buffer_faces_by_material(const BuildingRenderBuffer& buffer) {
+Color terrain_material_color(const BuildingRenderBuffer&, std::uint32_t) {
+    return {64, 83, 67, 255};
+}
+
+// Draws pre-uploaded GPU chunks with an identity transform. One DrawMesh per
+// material run instead of one immediate-mode call per triangle.
+void draw_uploaded_city_model(GpuBuildingRenderModel& model, GfxDebugDrawCategory category) {
+    const auto transform = MatrixIdentity();
     rlDisableBackfaceCulling();
-    for (const auto& triangle : buffer.triangles) {
-        if (triangle.indices[0] >= buffer.vertices.size() ||
-            triangle.indices[1] >= buffer.vertices.size() ||
-            triangle.indices[2] >= buffer.vertices.size()) {
+    for (auto& chunk : model.chunks) {
+        if (chunk.material.maps == nullptr || chunk.mesh.vertexCount <= 0) {
             continue;
         }
-        const auto a = to_raylib(buffer.vertices[triangle.indices[0]].position);
-        const auto b = to_raylib(buffer.vertices[triangle.indices[1]].position);
-        const auto c = to_raylib(buffer.vertices[triangle.indices[2]].position);
-        DrawTriangle3D(a, b, c, city_tile_material_color(buffer, triangle.material));
+        DrawMesh(chunk.mesh, chunk.material, transform);
         if (g_gfx_debug_stats != nullptr) {
-            g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::RoadsCurbs, 1U, 3U, 1U);
+            g_gfx_debug_stats->add_draw(
+                category,
+                static_cast<std::uint64_t>(std::max(chunk.mesh.triangleCount, 0)),
+                static_cast<std::uint64_t>(std::max(chunk.mesh.vertexCount, 0)),
+                1U);
         }
     }
     rlEnableBackfaceCulling();
 }
 
-void draw_city_terrain(const MapScene& scene) {
-    if (!scene.terrain.has_value()) {
-        return;
+// Frees the GPU meshes/materials a city model owns before it is replaced, so the
+// per-edit re-upload doesn't leak VRAM. (Buffers are MemAlloc'd by UploadMesh.)
+void unload_city_render_model(GpuBuildingRenderModel& model) {
+    for (auto& chunk : model.chunks) {
+        if (chunk.mesh.vertexCount > 0) {
+            UnloadMesh(chunk.mesh);
+        }
+        if (chunk.material.maps != nullptr) {
+            // Don't unload the shared project texture; just the default material maps.
+            chunk.material.maps[MATERIAL_MAP_DIFFUSE].texture = Texture2D{};
+            UnloadMaterial(chunk.material);
+        }
     }
-    const auto& terrain = *scene.terrain;
-    if (terrain.mesh.vertices.empty() || terrain.mesh.triangles.empty()) {
-        return;
-    }
+    model.chunks.clear();
+    model.wire_lines.clear();
+    model.uploaded_vertices = 0;
+    model.uploaded_indices = 0;
+    model.uploaded_bytes = 0;
+}
 
-    for (const auto& triangle : terrain.mesh.triangles) {
-        const auto a = to_raylib(terrain.mesh.vertices[triangle.indices[0]].position);
-        const auto b = to_raylib(terrain.mesh.vertices[triangle.indices[1]].position);
-        const auto c = to_raylib(terrain.mesh.vertices[triangle.indices[2]].position);
-        DrawTriangle3D(a, b, c, {64, 83, 67, 255});
+GpuBuildingRenderModel upload_city_tile_model(const BuildingRenderBuffer& buffer, const EditorProject& project) {
+    return upload_city_buffer_model(buffer, project, [&buffer](std::uint32_t material) {
+        return city_tile_material_color(buffer, material);
+    });
+}
+
+GpuBuildingRenderModel upload_city_terrain_model(const BuildingRenderBuffer& buffer, const EditorProject& project) {
+    return upload_city_buffer_model(buffer, project, [&buffer](std::uint32_t material) {
+        return terrain_material_color(buffer, material);
+    });
+}
+
+// Simple-mode blockout: flat colored rectangles for road/curb tiles and flat
+// squares for intersections, drawn immediate-mode at the authored height. Only
+// used when the roads toggle is OFF, so the triangle count is small.
+void draw_city_roads_flat_blockout(const MapScene& scene) {
+    const auto half = scene.unit_size * 0.5F;
+    for (const auto& tile : scene.city_tiles) {
+        const auto cx = (static_cast<float>(tile.x) + 0.5F) * scene.unit_size;
+        const auto cz = (static_cast<float>(tile.z) + 0.5F) * scene.unit_size;
+        const auto y = tile.base_y + scene.unit_size + 0.05F;
+        const Vector3 a{cx - half, y, cz - half};
+        const Vector3 b{cx + half, y, cz - half};
+        const Vector3 c{cx + half, y, cz + half};
+        const Vector3 d{cx - half, y, cz + half};
+        const Color color = tile.kind == CityTileKind::Curb
+            ? Color{150, 154, 151, 255}
+            : Color{43, 47, 50, 255};
+        DrawTriangle3D(a, b, c, color);
+        DrawTriangle3D(a, c, d, color);
         if (g_gfx_debug_stats != nullptr) {
-            g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::Terrain, 1U, 3U, 1U);
+            g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::RoadsCurbs, 2U, 6U, 2U);
         }
     }
 }
 
-void draw_city_scene(const MapScene& scene, const SbcStreet* selected_street) {
+void draw_city_scene(
+    EditorProject& project,
+    const MapScene& scene,
+    const SbcStreet* selected_street,
+    bool render_roads,
+    bool render_terrain) {
     if (g_gfx_debug_stats != nullptr) {
         if (scene.terrain.has_value()) {
             g_gfx_debug_stats->counts.terrain_vertices = scene.terrain->mesh.vertices.size();
@@ -931,17 +1091,19 @@ void draw_city_scene(const MapScene& scene, const SbcStreet* selected_street) {
         g_gfx_debug_stats->counts.city_tiles = scene.city_tiles.size();
         g_gfx_debug_stats->counts.traffic_light_poles = scene.traffic_light_poles.size();
     }
-    if (g_gfx_debug_stats != nullptr) {
-        GfxDebugScopedTimer timer{*g_gfx_debug_stats, GfxDebugTimingPhase::TerrainDraw};
-        draw_city_terrain(scene);
-    } else {
-        draw_city_terrain(scene);
+
+    if (render_terrain) {
+        GfxDebugMaybeTimer timer{GfxDebugTimingPhase::TerrainDraw};
+        draw_uploaded_city_model(project.terrain_gpu_model, GfxDebugDrawCategory::Terrain);
     }
-    if (g_gfx_debug_stats != nullptr) {
-        GfxDebugScopedTimer timer{*g_gfx_debug_stats, GfxDebugTimingPhase::CityRoadDraw};
-        draw_render_buffer_faces_by_material(scene.city_tile_buffer);
-    } else {
-        draw_render_buffer_faces_by_material(scene.city_tile_buffer);
+
+    {
+        GfxDebugMaybeTimer timer{GfxDebugTimingPhase::CityRoadDraw};
+        if (render_roads) {
+            draw_uploaded_city_model(project.city_tile_gpu_model, GfxDebugDrawCategory::RoadsCurbs);
+        } else {
+            draw_city_roads_flat_blockout(scene);
+        }
     }
 
     for (const auto& road : scene.roads) {
