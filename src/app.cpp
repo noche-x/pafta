@@ -1296,9 +1296,21 @@ int run_editor_app() {
                             project->city_scene_cache = build_map_scene(project->city->data);
                             project->city_scene_cache_fingerprint = scene_fingerprint;
                             project->city_scene_cache_valid = true;
+                            project->city_scene_gpu_valid = false;
+                        }
+                        if (!project->city_scene_gpu_valid) {
+                            unload_city_render_model(project->city_tile_gpu_model);
+                            unload_city_render_model(project->terrain_gpu_model);
+                            project->city_tile_gpu_model =
+                                upload_city_tile_model(project->city_scene_cache.city_tile_buffer, *project);
+                            if (project->city_scene_cache.terrain.has_value()) {
+                                project->terrain_gpu_model =
+                                    upload_city_terrain_model(project->city_scene_cache.terrain->mesh, *project);
+                            }
+                            project->city_scene_gpu_valid = true;
                         }
                         const auto& city_scene = project->city_scene_cache;
-                        draw_city_scene(city_scene, selected_street);
+                        draw_city_scene(*project, city_scene, selected_street, ui.render_roads, ui.render_terrain);
                         {
                             GfxDebugScopedTimer timer{gfx_debug_stats, GfxDebugTimingPhase::BuildingDraw};
                             draw_city_building_models_full_detail(*project, selected_building, &city_window_texture);
@@ -1497,6 +1509,10 @@ int run_editor_app() {
                     ImGui::RadioButton("Pieces", &mode_idx, 2);
                     ui.city_mode = static_cast<CityEditMode>(mode_idx);
 
+                    ImGui::Separator();
+                    ImGui::TextUnformatted("Render:");
+                    ImGui::Checkbox("Roads##render_roads", &ui.render_roads); ImGui::SameLine();
+                    ImGui::Checkbox("Terrain##render_terrain", &ui.render_terrain);
                     ImGui::Separator();
 
                     if (ui.city_mode == CityEditMode::Roads && !project->city->data.streets.empty()) {
