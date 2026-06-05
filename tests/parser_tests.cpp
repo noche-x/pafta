@@ -1270,27 +1270,25 @@ void fills_intersection_footprint_and_closes_missing_sides_with_curbs() {
     assert(has_city_tile(scene, 0, 0, 2, map_editor::CityTileKind::Curb));
 }
 
-void terrain_noise_hash_matches_native_32_bit_wraparound() {
-    assert(map_editor::terrain_noise_hash(0, 0, 0x800U) == 0x57f78de6U);
-    assert(map_editor::terrain_noise_hash(640, 640, 0x800U) == 0x57f78de6U);
-    assert(map_editor::terrain_noise_hash(2048, 2048, 0x800U) == 0x05f78de6U);
+void terrain_noise_hash_matches_native_all_ones_mask() {
+    assert(map_editor::terrain_noise_hash(0, 0, 0xffffffffU) == 0x63faaa2eU);
+    assert(map_editor::terrain_noise_hash(640, 640, 0xffffffffU) == 0x432be22eU);
+    assert(map_editor::terrain_noise_hash(2048, 2048, 0xffffffffU) == 0x676c2a2eU);
+    assert(map_editor::terrain_noise_hash(640, 640, 0xffffffffU) !=
+        map_editor::terrain_noise_hash(0, 0, 0xffffffffU));
 }
 
 void city_terrain_is_non_flat_noise_mesh_padded_to_city_bounds() {
-    map_editor::SbcMap map{};
-    map.intersections.push_back({0U, 600, 0, 600});
-    map.intersections.push_back({1U, 660, 0, 600});
-    map.streets.push_back({0U, 0, 1, 0, 1, 1, "Noise"});
+    const auto map = map_editor::parse_sbc_file(
+        fixture_root() / "server/data/test2/city2.sbc");
 
     const auto scene = map_editor::build_map_scene(map);
 
     assert(scene.terrain.has_value());
-    // Intersections at grid x=600,660 / z=600 -> world 2400,2640 / 2400, padded
-    // by 24 tiles * 4 = 96 units on each side.
-    assert(close_to(scene.terrain->min_x, 2304.0F));
-    assert(close_to(scene.terrain->max_x, 2736.0F));
-    assert(close_to(scene.terrain->min_z, 2304.0F));
-    assert(close_to(scene.terrain->max_z, 2496.0F));
+    assert(close_to(scene.terrain->min_x, 928.0F));
+    assert(close_to(scene.terrain->max_x, 3008.0F));
+    assert(close_to(scene.terrain->min_z, 912.0F));
+    assert(close_to(scene.terrain->max_z, 2160.0F));
     assert(scene.terrain->sample_count_x > 2);
     assert(scene.terrain->sample_count_z > 2);
     assert(scene.terrain->mesh.triangles.size() > 0U);
@@ -1301,27 +1299,36 @@ void city_terrain_is_non_flat_noise_mesh_padded_to_city_bounds() {
         min_height = std::min(min_height, height);
         max_height = std::max(max_height, height);
     }
-    assert(max_height - min_height > 1.0F);
-    assert(max_height - min_height < 10.0F);
+    assert(min_height >= 23.0F);
+    assert(max_height < 190.0F);
+    assert(max_height - min_height > 80.0F);
+
+    map_editor::SbcMap smooth_map{};
+    smooth_map.intersections.push_back({0U, 360, 0, 704});
+    smooth_map.intersections.push_back({1U, 420, 0, 704});
+    smooth_map.streets.push_back({0U, 0, 1, 0, 1, 1, "Smooth"});
+
+    const auto smooth_scene = map_editor::build_map_scene(smooth_map);
+    assert(smooth_scene.terrain.has_value());
 
     auto max_adjacent_delta = 0.0F;
-    for (auto z = 0; z < scene.terrain->sample_count_z; ++z) {
-        for (auto x = 0; x < scene.terrain->sample_count_x; ++x) {
-            const auto index = static_cast<std::size_t>(z * scene.terrain->sample_count_x + x);
-            if (x + 1 < scene.terrain->sample_count_x) {
+    for (auto z = 0; z < smooth_scene.terrain->sample_count_z; ++z) {
+        for (auto x = 0; x < smooth_scene.terrain->sample_count_x; ++x) {
+            const auto index = static_cast<std::size_t>(z * smooth_scene.terrain->sample_count_x + x);
+            if (x + 1 < smooth_scene.terrain->sample_count_x) {
                 max_adjacent_delta = std::max(
                     max_adjacent_delta,
-                    std::abs(scene.terrain->heights[index + 1] - scene.terrain->heights[index]));
+                    std::abs(smooth_scene.terrain->heights[index + 1] - smooth_scene.terrain->heights[index]));
             }
-            if (z + 1 < scene.terrain->sample_count_z) {
+            if (z + 1 < smooth_scene.terrain->sample_count_z) {
                 max_adjacent_delta = std::max(
                     max_adjacent_delta,
-                    std::abs(scene.terrain->heights[index + static_cast<std::size_t>(scene.terrain->sample_count_x)] -
-                        scene.terrain->heights[index]));
+                    std::abs(smooth_scene.terrain->heights[index + static_cast<std::size_t>(smooth_scene.terrain->sample_count_x)] -
+                        smooth_scene.terrain->heights[index]));
             }
         }
     }
-    assert(max_adjacent_delta < 3.0F);
+    assert(max_adjacent_delta < 5.0F);
 }
 
 void city_road_tile_heights_ramp_between_intersection_heights() {
@@ -2741,7 +2748,7 @@ int main() {
     builds_map_scene();
     builds_grid_aligned_city_street_tile_strip();
     fills_intersection_footprint_and_closes_missing_sides_with_curbs();
-    terrain_noise_hash_matches_native_32_bit_wraparound();
+    terrain_noise_hash_matches_native_all_ones_mask();
     city_terrain_is_non_flat_noise_mesh_padded_to_city_bounds();
     city_road_tile_heights_ramp_between_intersection_heights();
     traffic_light_poles_stand_at_corners_and_face_intersection_center();

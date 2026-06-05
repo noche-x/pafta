@@ -11,8 +11,8 @@
 namespace map_editor {
 
 std::uint32_t terrain_noise_hash(std::int32_t x, std::int32_t y, std::uint32_t mask) {
-    auto u = static_cast<std::uint32_t>((((y + 1) & static_cast<std::int32_t>(mask)) * 0x39) +
-        ((x + 1) & static_cast<std::int32_t>(mask)));
+    auto u = ((static_cast<std::uint32_t>(y + 1) & mask) * 0x39U) +
+        (static_cast<std::uint32_t>(x + 1) & mask);
     u = u ^ (u * 0x2000U);
     const auto v = u * u * 0x3d73U + 0xc0ae5U;
     return (v * v + 0xd208dd0dU) & 0x7fffffffU;
@@ -1531,32 +1531,36 @@ float terrain_noise_sample(float x, float z, float frequency) {
     const auto tz = sz - static_cast<float>(z0);
     const auto ux = tx * tx * (3.0F - 2.0F * tx);
     const auto uz = tz * tz * (3.0F - 2.0F * tz);
-    constexpr auto inv_max_hash = 1.0F / static_cast<float>(0x7fffffffU);
-    const auto n00 = static_cast<float>(terrain_noise_hash(x0, z0, 0x800U)) * inv_max_hash;
-    const auto n10 = static_cast<float>(terrain_noise_hash(x0 + 1, z0, 0x800U)) * inv_max_hash;
-    const auto n01 = static_cast<float>(terrain_noise_hash(x0, z0 + 1, 0x800U)) * inv_max_hash;
-    const auto n11 = static_cast<float>(terrain_noise_hash(x0 + 1, z0 + 1, 0x800U)) * inv_max_hash;
+    const auto normalized_hash = [](std::int32_t hx, std::int32_t hz) {
+        constexpr auto inv_hash = 1.0F / static_cast<float>(0x7fffffffU);
+        return static_cast<float>(terrain_noise_hash(hx, hz, 0xffffffffU)) * inv_hash;
+    };
+    const auto n00 = normalized_hash(x0, z0);
+    const auto n10 = normalized_hash(x0 + 1, z0);
+    const auto n01 = normalized_hash(x0, z0 + 1);
+    const auto n11 = normalized_hash(x0 + 1, z0 + 1);
     return lerp(lerp(n00, n10, ux), lerp(n01, n11, ux), uz);
 }
 
 float native_like_city_terrain_height(float world_x, float world_z) {
     const auto gx = world_x * 0.25F;
     const auto gy = world_z * 0.25F;
-    const auto dx = gx - 640.0F;
-    const auto dz = gy - 640.0F;
-    const auto radial = std::max(0.0F, std::sqrt(dx * dx + dz * dz) * 0.00390625F - 0.75F);
-    const auto radial2 = radial * radial;
-    const auto primary = terrain_noise_sample(gx, gy, 3.75F);
-    const auto secondary = terrain_noise_sample(gx + 173.0F, gy - 91.0F, 7.5F);
-    const auto broad = terrain_noise_sample(gx - 311.0F, gy + 47.0F, 15.0F);
-    // VERIFY(subrosa.exe Terrain_GenerateIslandHeightfield @56560): this keeps
-    // the decoded constants and native hash, but approximates the decompiled
-    // base-height blend/water-level terms until the full expression is ported.
-    // The city is inside the flat radial core, so use fractional value-noise
-    // scales against the native 0x800-masked hash: broad, low-amplitude rolls
-    // instead of per-sample hash jitter at terrain mesh vertices.
-    return (primary - 0.5F) * 7.0F + (secondary - 0.5F) * 3.5F + (broad - 0.5F) * 1.75F +
-        radial2 * (primary * 8.0F + 32.0F) + radial * 16.0F;
+    const auto dx1 = gx - 640.0F;
+    const auto dz1 = gy - 640.0F;
+    const auto r1 = std::clamp(std::sqrt(dx1 * dx1 + dz1 * dz1) * 0.00390625F - 0.75F, 0.0F, 3.0F);
+    const auto r1sq = r1 * r1;
+
+    const auto noise1 = terrain_noise_sample(gx, gy, 0.015625F);
+    const auto noise2 = terrain_noise_sample(gx, gy, 0.5F);
+    const auto noise3 = terrain_noise_sample(gx, gy, 0.03125F);
+
+    const auto dx2 = gx - 704.0F;
+    const auto dz2 = gy - 704.0F;
+    const auto r2 = std::clamp((std::sqrt(dx2 * dx2 + dz2 * dz2) - 320.0F) * 0.015625F, 0.0F, 1.0F);
+
+    const auto base_blend =
+        noise3 * 8.0F + 23.75F + (noise1 + r1sq) * 16.0F + (noise2 * 32.0F + r1sq * 8.0F) * r1sq;
+    return base_blend * r2 + (1.0F - r2) * 23.875F;
 }
 
 std::vector<CityTileCell> build_city_tile_cells(const SbcMap& map, const std::optional<CityTerrain>& terrain, float unit_size) {
