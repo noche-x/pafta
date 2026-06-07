@@ -1122,6 +1122,39 @@ void draw_city_scene(
     }
 }
 
+void draw_city_editor_overlay(const EditorProject&, const MapScene& scene) {
+    GfxDebugMaybeTimer timer{GfxDebugTimingPhase::CityRoadDraw};
+    const auto marker_size = scene.unit_size * 0.42F;
+    const auto marker_lift = marker_size * 0.5F + 0.04F;
+    const auto marker_fill = Color{76, 139, 214, 170};
+    const auto marker_wire = Color{218, 236, 255, 235};
+    const auto segment_color = Color{255, 225, 112, 235};
+
+    DrawGrid(96, scene.unit_size);
+
+    for (const auto& intersection : scene.intersections) {
+        auto position = to_raylib(intersection.position);
+        position.y += marker_lift;
+        const Vector3 size{marker_size, marker_size, marker_size};
+        DrawCubeV(position, size, marker_fill);
+        DrawCubeWiresV(position, size, marker_wire);
+    }
+
+    for (const auto& road : scene.roads) {
+        DrawLine3D(to_raylib(road.from), to_raylib(road.to), segment_color);
+    }
+
+    if (g_gfx_debug_stats != nullptr) {
+        const auto marker_count = static_cast<std::uint64_t>(scene.intersections.size());
+        const auto segment_count = static_cast<std::uint64_t>(scene.roads.size());
+        g_gfx_debug_stats->add_draw(
+            GfxDebugDrawCategory::WireOverlay,
+            marker_count * 12U,
+            marker_count * 60U + segment_count * 2U,
+            marker_count * 2U + segment_count + 1U);
+    }
+}
+
 // Builds the traffic-light pole as ONE reusable model (post + arm + signal-head
 // boxes, the game's 3-box shape), oriented along -Z so a Y-rotation can aim the
 // arm. Built once and instanced per pole via DrawModelEx, instead of re-emitting

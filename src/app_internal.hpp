@@ -346,6 +346,11 @@ enum class CityEditMode {
     Pieces,
 };
 
+enum class CityViewMode {
+    GamePreview,
+    Editor,
+};
+
 struct EditorUi {
     EditorTab tab{EditorTab::City};
     std::size_t selected_building{};
@@ -359,6 +364,7 @@ struct EditorUi {
     std::size_t selected_buildblock_window{};
     std::size_t selected_buildblock_beam{};
     CityEditMode city_mode{CityEditMode::Roads};
+    CityViewMode city_view_mode{CityViewMode::GamePreview};
     std::size_t selected_city_street{};
     std::size_t selected_city_building{};
     std::optional<std::size_t> pending_road_intersection;
@@ -420,6 +426,7 @@ void draw_city_scene(
     const SbcStreet* selected_street,
     bool render_roads,
     bool render_terrain);
+void draw_city_editor_overlay(const EditorProject& project, const MapScene& scene);
 void draw_city_traffic_light_poles(const MapScene& scene);
 void draw_city_cursor(CityGridPoint point, float unit_size, CityEditMode mode);
 void draw_city_block_preview(const SbcCityBlock& city_block, const std::vector<NamedBlockMesh>& meshes, std::size_t selected_layer, std::size_t selected_slot);

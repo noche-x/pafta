@@ -1298,7 +1298,8 @@ int run_editor_app() {
                             project->city_scene_cache_valid = true;
                             project->city_scene_gpu_valid = false;
                         }
-                        if (!project->city_scene_gpu_valid) {
+                        const auto game_preview = ui.city_view_mode == CityViewMode::GamePreview;
+                        if (game_preview && !project->city_scene_gpu_valid) {
                             unload_city_render_model(project->city_tile_gpu_model);
                             unload_city_render_model(project->terrain_gpu_model);
                             project->city_tile_gpu_model =
@@ -1310,7 +1311,11 @@ int run_editor_app() {
                             project->city_scene_gpu_valid = true;
                         }
                         const auto& city_scene = project->city_scene_cache;
-                        draw_city_scene(*project, city_scene, selected_street, ui.render_roads, ui.render_terrain);
+                        if (game_preview) {
+                            draw_city_scene(*project, city_scene, selected_street, ui.render_roads, ui.render_terrain);
+                        } else {
+                            draw_city_editor_overlay(*project, city_scene);
+                        }
                         {
                             GfxDebugScopedTimer timer{gfx_debug_stats, GfxDebugTimingPhase::BuildingDraw};
                             draw_city_building_models_full_detail(*project, selected_building, &city_window_texture);
@@ -1319,7 +1324,7 @@ int run_editor_app() {
                             GfxDebugScopedTimer timer{gfx_debug_stats, GfxDebugTimingPhase::BuildingDraw};
                             draw_city_piece_voxels(*project, ui.portal_preview_textured);
                         }
-                        {
+                        if (game_preview) {
                             GfxDebugScopedTimer timer{gfx_debug_stats, GfxDebugTimingPhase::PoleDraw};
                             draw_city_traffic_light_poles(city_scene);
                         }
@@ -1510,7 +1515,13 @@ int run_editor_app() {
                     ui.city_mode = static_cast<CityEditMode>(mode_idx);
 
                     ImGui::Separator();
-                    ImGui::TextUnformatted("Render:");
+                    int view_idx = ui.city_view_mode == CityViewMode::GamePreview ? 0 : 1;
+                    ImGui::TextUnformatted("View:");
+                    ImGui::RadioButton("Game preview", &view_idx, 0); ImGui::SameLine();
+                    ImGui::RadioButton("Editor view", &view_idx, 1);
+                    ui.city_view_mode = view_idx == 0 ? CityViewMode::GamePreview : CityViewMode::Editor;
+
+                    ImGui::TextUnformatted("Game preview layers:");
                     ImGui::Checkbox("Roads##render_roads", &ui.render_roads); ImGui::SameLine();
                     ImGui::Checkbox("Terrain##render_terrain", &ui.render_terrain);
                     ImGui::Separator();
