@@ -1278,57 +1278,105 @@ void terrain_noise_hash_matches_native_all_ones_mask() {
         map_editor::terrain_noise_hash(0, 0, 0xffffffffU));
 }
 
-void city_terrain_is_non_flat_noise_mesh_padded_to_city_bounds() {
-    const auto map = map_editor::parse_sbc_file(
-        fixture_root() / "server/data/test2/city2.sbc");
+float authored_terrain_y(std::int32_t level) {
+    return static_cast<float>(level) * 4.0F + 4.25F;
+}
+
+map_editor::SbcMap authored_terrain_rectangle_map(std::array<std::int32_t, 4> levels) {
+    map_editor::SbcMap map{};
+    map.intersections.push_back({0U, 0, levels[0], 0});
+    map.intersections.push_back({1U, 10, levels[1], 0});
+    map.intersections.push_back({2U, 0, levels[2], 10});
+    map.intersections.push_back({3U, 10, levels[3], 10});
+    map.streets.push_back({0U, 0, 1, 0, 1, 1, "North"});
+    map.streets.push_back({1U, 0, 2, 0, 1, 1, "West"});
+    map.streets.push_back({2U, 1, 3, 0, 1, 1, "East"});
+    map.streets.push_back({3U, 2, 3, 0, 1, 1, "South"});
+    return map;
+}
+
+void city_terrain_uses_authored_intersection_bilinear_patch() {
+    const auto scene = map_editor::build_map_scene(authored_terrain_rectangle_map({0, 2, 4, 6}));
+
+    assert(scene.terrain.has_value());
+    assert(close_to(scene.terrain->sample_spacing, 4.0F));
+    assert(scene.terrain->mesh.triangles.size() > 0U);
+
+    const auto terrain_at = [&](float grid_x, float grid_z) {
+        return map_editor::terrain_height_at(*scene.terrain, grid_x * scene.unit_size, grid_z * scene.unit_size);
+    };
+
+    assert(close_to(terrain_at(0.0F, 0.0F), authored_terrain_y(0)));
+    assert(close_to(terrain_at(10.0F, 0.0F), authored_terrain_y(2)));
+    assert(close_to(terrain_at(0.0F, 10.0F), authored_terrain_y(4)));
+    assert(close_to(terrain_at(10.0F, 10.0F), authored_terrain_y(6)));
+
+    const auto expected_center = (authored_terrain_y(0) + authored_terrain_y(2) +
+        authored_terrain_y(4) + authored_terrain_y(6)) * 0.25F;
+    assert(close_to(terrain_at(5.0F, 5.0F), expected_center));
+    assert(!close_to(terrain_at(5.0F, 5.0F), 23.875F));
+}
+
+void city_terrain_equal_intersection_levels_make_flat_plateau() {
+    const auto scene = map_editor::build_map_scene(authored_terrain_rectangle_map({3, 3, 3, 3}));
+
+    assert(scene.terrain.has_value());
+    const auto terrain_at = [&](float grid_x, float grid_z) {
+        return map_editor::terrain_height_at(*scene.terrain, grid_x * scene.unit_size, grid_z * scene.unit_size);
+    };
+
+    assert(close_to(terrain_at(0.0F, 0.0F), authored_terrain_y(3)));
+    assert(close_to(terrain_at(5.0F, 5.0F), authored_terrain_y(3)));
+    assert(close_to(terrain_at(10.0F, 10.0F), authored_terrain_y(3)));
+}
+
+void city_terrain_height_query_matches_authored_road_surface() {
+    map_editor::SbcMap map{};
+    map.intersections.push_back({0U, 0, 1, 0});
+    map.intersections.push_back({1U, 10, 5, 0});
+    map.streets.push_back({0U, 0, 1, 0, 1, 1, "Slope"});
 
     const auto scene = map_editor::build_map_scene(map);
 
     assert(scene.terrain.has_value());
-    assert(close_to(scene.terrain->min_x, 928.0F));
-    assert(close_to(scene.terrain->max_x, 3008.0F));
-    assert(close_to(scene.terrain->min_z, 912.0F));
-    assert(close_to(scene.terrain->max_z, 2160.0F));
-    assert(scene.terrain->sample_count_x > 2);
-    assert(scene.terrain->sample_count_z > 2);
-    assert(scene.terrain->mesh.triangles.size() > 0U);
+    assert(scene.roads.size() == 1U);
+    assert(close_to(scene.roads[0].from.y, authored_terrain_y(1)));
+    assert(close_to(scene.roads[0].to.y, authored_terrain_y(5)));
 
-    auto min_height = std::numeric_limits<float>::max();
-    auto max_height = std::numeric_limits<float>::lowest();
-    for (const auto height : scene.terrain->heights) {
-        min_height = std::min(min_height, height);
-        max_height = std::max(max_height, height);
-    }
-    assert(min_height >= 23.0F);
-    assert(max_height < 190.0F);
-    assert(max_height - min_height > 80.0F);
+    const auto midpoint = map_editor::terrain_height_at(*scene.terrain, 5.0F * scene.unit_size, 0.0F);
+    const auto expected_midpoint = (authored_terrain_y(1) + authored_terrain_y(5)) * 0.5F;
+    assert(close_to(midpoint, expected_midpoint));
 
-    map_editor::SbcMap smooth_map{};
-    smooth_map.intersections.push_back({0U, 360, 0, 704});
-    smooth_map.intersections.push_back({1U, 420, 0, 704});
-    smooth_map.streets.push_back({0U, 0, 1, 0, 1, 1, "Smooth"});
+    const auto* start_tile = find_city_tile(scene, 0, 0, map_editor::CityTileKind::Road);
+    assert(start_tile != nullptr);
+    assert(close_to(
+        map_editor::terrain_height_at(*scene.terrain, 0.0F, 0.0F),
+        start_tile->base_y + scene.unit_size + 0.25F));
+}
 
-    const auto smooth_scene = map_editor::build_map_scene(smooth_map);
-    assert(smooth_scene.terrain.has_value());
+void city_terrain_authored_patch_has_bounded_adjacent_deltas() {
+    const auto scene = map_editor::build_map_scene(authored_terrain_rectangle_map({0, 2, 2, 4}));
+
+    assert(scene.terrain.has_value());
 
     auto max_adjacent_delta = 0.0F;
-    for (auto z = 0; z < smooth_scene.terrain->sample_count_z; ++z) {
-        for (auto x = 0; x < smooth_scene.terrain->sample_count_x; ++x) {
-            const auto index = static_cast<std::size_t>(z * smooth_scene.terrain->sample_count_x + x);
-            if (x + 1 < smooth_scene.terrain->sample_count_x) {
+    for (auto z = 0; z < scene.terrain->sample_count_z; ++z) {
+        for (auto x = 0; x < scene.terrain->sample_count_x; ++x) {
+            const auto index = static_cast<std::size_t>(z * scene.terrain->sample_count_x + x);
+            if (x + 1 < scene.terrain->sample_count_x) {
                 max_adjacent_delta = std::max(
                     max_adjacent_delta,
-                    std::abs(smooth_scene.terrain->heights[index + 1] - smooth_scene.terrain->heights[index]));
+                    std::abs(scene.terrain->heights[index + 1] - scene.terrain->heights[index]));
             }
-            if (z + 1 < smooth_scene.terrain->sample_count_z) {
+            if (z + 1 < scene.terrain->sample_count_z) {
                 max_adjacent_delta = std::max(
                     max_adjacent_delta,
-                    std::abs(smooth_scene.terrain->heights[index + static_cast<std::size_t>(smooth_scene.terrain->sample_count_x)] -
-                        smooth_scene.terrain->heights[index]));
+                    std::abs(scene.terrain->heights[index + static_cast<std::size_t>(scene.terrain->sample_count_x)] -
+                        scene.terrain->heights[index]));
             }
         }
     }
-    assert(max_adjacent_delta < 5.0F);
+    assert(max_adjacent_delta < 8.0F);
 }
 
 void city_road_tile_heights_ramp_between_intersection_heights() {
@@ -2749,7 +2797,10 @@ int main() {
     builds_grid_aligned_city_street_tile_strip();
     fills_intersection_footprint_and_closes_missing_sides_with_curbs();
     terrain_noise_hash_matches_native_all_ones_mask();
-    city_terrain_is_non_flat_noise_mesh_padded_to_city_bounds();
+    city_terrain_uses_authored_intersection_bilinear_patch();
+    city_terrain_equal_intersection_levels_make_flat_plateau();
+    city_terrain_height_query_matches_authored_road_surface();
+    city_terrain_authored_patch_has_bounded_adjacent_deltas();
     city_road_tile_heights_ramp_between_intersection_heights();
     traffic_light_poles_stand_at_corners_and_face_intersection_center();
     parses_buildblock_sbl_fixture();

@@ -1542,7 +1542,7 @@ float terrain_noise_sample(float x, float z, float frequency) {
     return lerp(lerp(n00, n10, ux), lerp(n01, n11, ux), uz);
 }
 
-float native_like_city_terrain_height(float world_x, float world_z) {
+[[maybe_unused]] float native_like_city_terrain_height(float world_x, float world_z) {
     const auto gx = world_x * 0.25F;
     const auto gy = world_z * 0.25F;
     const auto dx1 = gx - 640.0F;
@@ -1561,6 +1561,332 @@ float native_like_city_terrain_height(float world_x, float world_z) {
     const auto base_blend =
         noise3 * 8.0F + 23.75F + (noise1 + r1sq) * 16.0F + (noise2 * 32.0F + r1sq * 8.0F) * r1sq;
     return base_blend * r2 + (1.0F - r2) * 23.875F;
+}
+
+struct CityTerrainPatchConfig {
+    float base_height{23.875F};
+    float level_scale{4.0F};
+    float level_bias{4.25F};
+    float feather_falloff{0.0625F};
+    float mesh_y_offset{0.05F};
+};
+
+constexpr CityTerrainPatchConfig city_terrain_patch_config;
+
+float authored_city_terrain_height(std::int32_t level) {
+    return static_cast<float>(level) * city_terrain_patch_config.level_scale +
+        city_terrain_patch_config.level_bias;
+}
+
+float city_terrain_feather_weight(float distance) {
+    const auto t = clamp01(1.0F - distance * city_terrain_patch_config.feather_falloff);
+    return (3.0F - 2.0F * t) * t * t;
+}
+
+struct CityTerrainRectPatch {
+    float min_x{};
+    float max_x{};
+    float min_z{};
+    float max_z{};
+    float h00{};
+    float h10{};
+    float h01{};
+    float h11{};
+};
+
+struct CityTerrainStreetStrip {
+    float from_x{};
+    float from_z{};
+    float to_x{};
+    float to_z{};
+    float from_height{};
+    float to_height{};
+    float half_width{};
+};
+
+struct CityTerrainAuthoredSample {
+    float height{};
+    float distance{};
+};
+
+bool contains_city_terrain_rect(const CityTerrainRectPatch& patch, float world_x, float world_z) {
+    constexpr auto epsilon = 0.001F;
+    return world_x >= patch.min_x - epsilon && world_x <= patch.max_x + epsilon &&
+        world_z >= patch.min_z - epsilon && world_z <= patch.max_z + epsilon;
+}
+
+float city_terrain_rect_height_at(const CityTerrainRectPatch& patch, float world_x, float world_z) {
+    const auto x = std::clamp(world_x, patch.min_x, patch.max_x);
+    const auto z = std::clamp(world_z, patch.min_z, patch.max_z);
+    const auto tx = patch.max_x > patch.min_x
+        ? (x - patch.min_x) / (patch.max_x - patch.min_x)
+        : 0.0F;
+    const auto tz = patch.max_z > patch.min_z
+        ? (z - patch.min_z) / (patch.max_z - patch.min_z)
+        : 0.0F;
+    const auto z0_height = lerp(patch.h00, patch.h10, tx);
+    const auto z1_height = lerp(patch.h01, patch.h11, tx);
+    return lerp(z0_height, z1_height, tz);
+}
+
+CityTerrainAuthoredSample city_terrain_rect_sample(const CityTerrainRectPatch& patch, float world_x, float world_z) {
+    const auto nearest_x = std::clamp(world_x, patch.min_x, patch.max_x);
+    const auto nearest_z = std::clamp(world_z, patch.min_z, patch.max_z);
+    const auto dx = world_x - nearest_x;
+    const auto dz = world_z - nearest_z;
+    return {
+        city_terrain_rect_height_at(patch, nearest_x, nearest_z),
+        std::sqrt(dx * dx + dz * dz),
+    };
+}
+
+CityTerrainAuthoredSample city_terrain_street_sample(const CityTerrainStreetStrip& street, float world_x, float world_z) {
+    const auto dx = street.to_x - street.from_x;
+    const auto dz = street.to_z - street.from_z;
+    const auto length_sq = dx * dx + dz * dz;
+    const auto t = length_sq > 0.0001F
+        ? clamp01(((world_x - street.from_x) * dx + (world_z - street.from_z) * dz) / length_sq)
+        : 0.0F;
+    const auto nearest_x = street.from_x + dx * t;
+    const auto nearest_z = street.from_z + dz * t;
+    const auto offset_x = world_x - nearest_x;
+    const auto offset_z = world_z - nearest_z;
+    const auto center_distance = std::sqrt(offset_x * offset_x + offset_z * offset_z);
+    return {
+        lerp(street.from_height, street.to_height, t),
+        std::max(0.0F, center_distance - street.half_width),
+    };
+}
+
+void add_city_terrain_rect_patch(
+    std::vector<CityTerrainRectPatch>& patches,
+    float min_x,
+    float max_x,
+    float min_z,
+    float max_z,
+    float h00,
+    float h10,
+    float h01,
+    float h11) {
+    if (max_x - min_x <= 0.0001F || max_z - min_z <= 0.0001F) {
+        return;
+    }
+    if (std::ranges::any_of(patches, [&](const CityTerrainRectPatch& patch) {
+        return patch.min_x == min_x && patch.max_x == max_x &&
+            patch.min_z == min_z && patch.max_z == max_z;
+    })) {
+        return;
+    }
+    patches.push_back({min_x, max_x, min_z, max_z, h00, h10, h01, h11});
+}
+
+std::vector<CityTerrainRectPatch> build_city_terrain_intersection_plateaus(const SbcMap& map, float unit_size) {
+    std::vector<CityTerrainRectPatch> plateaus;
+    plateaus.reserve(map.intersections.size());
+    for (const auto& intersection : map.intersections) {
+        const auto footprint = city_intersection_footprint(map, intersection);
+        const auto min_x = static_cast<float>(intersection.x + footprint.min_offset) * unit_size;
+        const auto max_x = static_cast<float>(intersection.x + footprint.max_offset + 1) * unit_size;
+        const auto min_z = static_cast<float>(intersection.z + footprint.min_offset) * unit_size;
+        const auto max_z = static_cast<float>(intersection.z + footprint.max_offset + 1) * unit_size;
+        const auto height = authored_city_terrain_height(intersection.y);
+        add_city_terrain_rect_patch(plateaus, min_x, max_x, min_z, max_z, height, height, height, height);
+    }
+    return plateaus;
+}
+
+std::vector<CityTerrainStreetStrip> build_city_terrain_street_strips(const SbcMap& map, float unit_size) {
+    std::vector<CityTerrainStreetStrip> strips;
+    strips.reserve(map.streets.size());
+    for (const auto& street : map.streets) {
+        if (street.from_intersection < 0 || street.to_intersection < 0) {
+            continue;
+        }
+        const auto from_index = static_cast<std::size_t>(street.from_intersection);
+        const auto to_index = static_cast<std::size_t>(street.to_intersection);
+        if (from_index >= map.intersections.size() || to_index >= map.intersections.size()) {
+            continue;
+        }
+        const auto& from = map.intersections[from_index];
+        const auto& to = map.intersections[to_index];
+        const auto width = std::max(1, positive_street_width(street));
+        strips.push_back({
+            static_cast<float>(from.x) * unit_size,
+            static_cast<float>(from.z) * unit_size,
+            static_cast<float>(to.x) * unit_size,
+            static_cast<float>(to.z) * unit_size,
+            authored_city_terrain_height(from.y),
+            authored_city_terrain_height(to.y),
+            static_cast<float>(width) * unit_size * 0.5F,
+        });
+    }
+    return strips;
+}
+
+std::array<std::int32_t, 4> city_terrain_empty_adjacency() {
+    return {-1, -1, -1, -1};
+}
+
+CityIntersectionSide opposite_city_intersection_side(CityIntersectionSide side) {
+    switch (side) {
+        case CityIntersectionSide::East:
+            return CityIntersectionSide::West;
+        case CityIntersectionSide::South:
+            return CityIntersectionSide::North;
+        case CityIntersectionSide::West:
+            return CityIntersectionSide::East;
+        case CityIntersectionSide::North:
+        default:
+            return CityIntersectionSide::South;
+    }
+}
+
+const SbcIntersection* find_city_intersection_at(
+    const SbcMap& map,
+    std::int32_t x,
+    std::int32_t z) {
+    const auto match = std::ranges::find_if(map.intersections, [&](const SbcIntersection& intersection) {
+        return intersection.x == x && intersection.z == z;
+    });
+    return match == map.intersections.end() ? nullptr : &*match;
+}
+
+std::vector<CityTerrainRectPatch> build_city_terrain_block_patches(const SbcMap& map, float unit_size) {
+    std::vector<CityTerrainRectPatch> patches;
+    if (map.intersections.empty()) {
+        return patches;
+    }
+
+    std::vector<std::array<std::int32_t, 4>> adjacency(map.intersections.size(), city_terrain_empty_adjacency());
+    for (const auto& street : map.streets) {
+        if (street.from_intersection < 0 || street.to_intersection < 0) {
+            continue;
+        }
+        const auto from_index = static_cast<std::size_t>(street.from_intersection);
+        const auto to_index = static_cast<std::size_t>(street.to_intersection);
+        if (from_index >= map.intersections.size() || to_index >= map.intersections.size()) {
+            continue;
+        }
+
+        const auto& from = map.intersections[from_index];
+        const auto& to = map.intersections[to_index];
+        const auto side = side_from_intersection_delta(to.x - from.x, to.z - from.z);
+        const auto reverse_side = opposite_city_intersection_side(side);
+        adjacency[from_index][side_index(side)] = street.to_intersection;
+        adjacency[to_index][side_index(reverse_side)] = street.from_intersection;
+    }
+
+    for (std::size_t index = 0; index < map.intersections.size(); ++index) {
+        const auto east_index = adjacency[index][side_index(CityIntersectionSide::East)];
+        const auto south_index = adjacency[index][side_index(CityIntersectionSide::South)];
+        if (east_index < 0 || south_index < 0) {
+            continue;
+        }
+        const auto east = static_cast<std::size_t>(east_index);
+        const auto south = static_cast<std::size_t>(south_index);
+        if (east >= map.intersections.size() || south >= map.intersections.size()) {
+            continue;
+        }
+
+        const auto southeast_from_east = adjacency[east][side_index(CityIntersectionSide::South)];
+        const auto southeast_from_south = adjacency[south][side_index(CityIntersectionSide::East)];
+        if (southeast_from_east < 0 || southeast_from_east != southeast_from_south) {
+            continue;
+        }
+        const auto southeast = static_cast<std::size_t>(southeast_from_east);
+        if (southeast >= map.intersections.size()) {
+            continue;
+        }
+
+        const auto& a = map.intersections[index];
+        const auto& b = map.intersections[east];
+        const auto& c = map.intersections[south];
+        const auto& d = map.intersections[southeast];
+        const auto min_x_grid = std::min({a.x, b.x, c.x, d.x});
+        const auto max_x_grid = std::max({a.x, b.x, c.x, d.x});
+        const auto min_z_grid = std::min({a.z, b.z, c.z, d.z});
+        const auto max_z_grid = std::max({a.z, b.z, c.z, d.z});
+        const auto* h00 = find_city_intersection_at(map, min_x_grid, min_z_grid);
+        const auto* h10 = find_city_intersection_at(map, max_x_grid, min_z_grid);
+        const auto* h01 = find_city_intersection_at(map, min_x_grid, max_z_grid);
+        const auto* h11 = find_city_intersection_at(map, max_x_grid, max_z_grid);
+        if (h00 == nullptr || h10 == nullptr || h01 == nullptr || h11 == nullptr) {
+            continue;
+        }
+
+        add_city_terrain_rect_patch(
+            patches,
+            static_cast<float>(min_x_grid) * unit_size,
+            static_cast<float>(max_x_grid) * unit_size,
+            static_cast<float>(min_z_grid) * unit_size,
+            static_cast<float>(max_z_grid) * unit_size,
+            authored_city_terrain_height(h00->y),
+            authored_city_terrain_height(h10->y),
+            authored_city_terrain_height(h01->y),
+            authored_city_terrain_height(h11->y));
+    }
+
+    return patches;
+}
+
+std::optional<CityTerrainAuthoredSample> city_terrain_authored_sample(
+    const std::vector<CityTerrainRectPatch>& plateaus,
+    const std::vector<CityTerrainStreetStrip>& streets,
+    const std::vector<CityTerrainRectPatch>& block_patches,
+    float world_x,
+    float world_z) {
+    for (const auto& plateau : plateaus) {
+        if (contains_city_terrain_rect(plateau, world_x, world_z)) {
+            return CityTerrainAuthoredSample{city_terrain_rect_height_at(plateau, world_x, world_z), 0.0F};
+        }
+    }
+    for (const auto& street : streets) {
+        auto sample = city_terrain_street_sample(street, world_x, world_z);
+        if (sample.distance <= 0.0001F) {
+            sample.distance = 0.0F;
+            return sample;
+        }
+    }
+    for (const auto& patch : block_patches) {
+        if (contains_city_terrain_rect(patch, world_x, world_z)) {
+            return CityTerrainAuthoredSample{city_terrain_rect_height_at(patch, world_x, world_z), 0.0F};
+        }
+    }
+
+    std::optional<CityTerrainAuthoredSample> nearest;
+    auto consider = [&](CityTerrainAuthoredSample sample) {
+        if (!nearest.has_value() || sample.distance < nearest->distance) {
+            nearest = sample;
+        }
+    };
+    for (const auto& plateau : plateaus) {
+        consider(city_terrain_rect_sample(plateau, world_x, world_z));
+    }
+    for (const auto& street : streets) {
+        consider(city_terrain_street_sample(street, world_x, world_z));
+    }
+    for (const auto& patch : block_patches) {
+        consider(city_terrain_rect_sample(patch, world_x, world_z));
+    }
+    return nearest;
+}
+
+float evaluate_city_terrain_height(
+    const std::vector<CityTerrainRectPatch>& plateaus,
+    const std::vector<CityTerrainStreetStrip>& streets,
+    const std::vector<CityTerrainRectPatch>& block_patches,
+    float world_x,
+    float world_z) {
+    const auto sample = city_terrain_authored_sample(plateaus, streets, block_patches, world_x, world_z);
+    if (!sample.has_value()) {
+        return city_terrain_patch_config.base_height;
+    }
+    if (sample->distance <= 0.0001F) {
+        return sample->height;
+    }
+
+    const auto weight = city_terrain_feather_weight(sample->distance);
+    return lerp(city_terrain_patch_config.base_height, sample->height, weight);
 }
 
 std::vector<CityTileCell> build_city_tile_cells(const SbcMap& map, const std::optional<CityTerrain>& terrain, float unit_size) {
@@ -1708,7 +2034,7 @@ std::optional<CityTerrain> build_city_terrain(const SbcMap& map, float unit_size
         static_cast<float>(max_z) * unit_size + padding,
         0,
         0,
-        unit_size * 4.0F,
+        unit_size,
         {},
         {},
     };
@@ -1718,13 +2044,17 @@ std::optional<CityTerrain> build_city_terrain(const SbcMap& map, float unit_size
     terrain.mesh.unit_size = unit_size;
     terrain.mesh.material_names.push_back("city_terrain_grass");
 
+    const auto plateaus = build_city_terrain_intersection_plateaus(map, unit_size);
+    const auto streets = build_city_terrain_street_strips(map, unit_size);
+    const auto block_patches = build_city_terrain_block_patches(map, unit_size);
+
     for (auto z = 0; z < terrain.sample_count_z; ++z) {
         for (auto x = 0; x < terrain.sample_count_x; ++x) {
             const auto world_x = std::min(terrain.max_x, terrain.min_x + static_cast<float>(x) * terrain.sample_spacing);
             const auto world_z = std::min(terrain.max_z, terrain.min_z + static_cast<float>(z) * terrain.sample_spacing);
-            const auto height = native_like_city_terrain_height(world_x, world_z);
+            const auto height = evaluate_city_terrain_height(plateaus, streets, block_patches, world_x, world_z);
             terrain.heights.push_back(height);
-            terrain.mesh.vertices.push_back({{world_x, height - 0.05F, world_z}, 0.0F, 0.0F});
+            terrain.mesh.vertices.push_back({{world_x, height - city_terrain_patch_config.mesh_y_offset, world_z}, 0.0F, 0.0F});
         }
     }
 
