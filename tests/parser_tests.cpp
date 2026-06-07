@@ -1278,6 +1278,27 @@ void terrain_noise_hash_matches_native_all_ones_mask() {
         map_editor::terrain_noise_hash(0, 0, 0xffffffffU));
 }
 
+void terrain_noise_sample_uses_native_two_to_negative_thirty_normalizer() {
+    constexpr auto sx = 640.0F;
+    constexpr auto sz = 640.0F;
+    constexpr auto fx = 1.0F / 64.0F;
+    constexpr auto fz = 1.0F / 128.0F;
+    const auto expected = static_cast<float>(map_editor::terrain_noise_hash(10, 5, 0xffffffffU)) * 0x1p-30F;
+
+    assert(close_to(map_editor::terrain_noise_sample(sx, sz, fx, fz), expected));
+}
+
+void native_like_city_terrain_height_matches_native_core_and_far_island() {
+    assert(close_to(map_editor::native_like_city_terrain_height(0.0F, 0.0F), 23.875F));
+    assert(close_to(map_editor::native_like_city_terrain_height(1024.0F, 1024.0F), 23.875F));
+    assert(close_to(map_editor::native_like_city_terrain_height(1536.0F, 1536.0F), 23.875F));
+
+    const auto far_height = map_editor::native_like_city_terrain_height(4096.0F, 4096.0F);
+    assert(far_height > 60.0F);
+    assert(far_height < 260.0F);
+    assert(!close_to(far_height, 23.875F));
+}
+
 float authored_terrain_y(std::int32_t level) {
     return static_cast<float>(level) * 4.0F + 4.25F;
 }
@@ -2797,6 +2818,8 @@ int main() {
     builds_grid_aligned_city_street_tile_strip();
     fills_intersection_footprint_and_closes_missing_sides_with_curbs();
     terrain_noise_hash_matches_native_all_ones_mask();
+    terrain_noise_sample_uses_native_two_to_negative_thirty_normalizer();
+    native_like_city_terrain_height_matches_native_core_and_far_island();
     city_terrain_uses_authored_intersection_bilinear_patch();
     city_terrain_equal_intersection_levels_make_flat_plateau();
     city_terrain_height_query_matches_authored_road_surface();

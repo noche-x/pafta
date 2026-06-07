@@ -311,6 +311,8 @@ Vec3 native_city_building_transform_point(const SbcBuilding& placement, Vec3 loc
 MapScene build_map_scene(const SbcMap& map);
 std::uint64_t city_scene_fingerprint(const SbcMap& map);
 std::uint32_t terrain_noise_hash(std::int32_t x, std::int32_t y, std::uint32_t mask);
+float terrain_noise_sample(float x, float z, float frequency_x, float frequency_z);
+float native_like_city_terrain_height(float world_x, float world_z);
 float terrain_height_at(const CityTerrain& terrain, float world_x, float world_z);
 BuildblockPreviewScene build_buildblock_preview_scene(const SblTemplate& buildblock);
 CityBlockPreviewScene build_city_block_preview_scene(const SbcCityBlock& city_block, const std::vector<NamedBlockMesh>& block_meshes);

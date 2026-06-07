@@ -1522,9 +1522,11 @@ void place_city_intersection_tiles(CityTileMap& tiles, const SbcMap& map, const 
     }
 }
 
-float terrain_noise_sample(float x, float z, float frequency) {
-    const auto sx = x * frequency;
-    const auto sz = z * frequency;
+} // namespace
+
+float terrain_noise_sample(float x, float z, float frequency_x, float frequency_z) {
+    const auto sx = x * frequency_x;
+    const auto sz = z * frequency_z;
     const auto x0 = static_cast<std::int32_t>(std::floor(sx));
     const auto z0 = static_cast<std::int32_t>(std::floor(sz));
     const auto tx = sx - static_cast<float>(x0);
@@ -1532,8 +1534,7 @@ float terrain_noise_sample(float x, float z, float frequency) {
     const auto ux = tx * tx * (3.0F - 2.0F * tx);
     const auto uz = tz * tz * (3.0F - 2.0F * tz);
     const auto normalized_hash = [](std::int32_t hx, std::int32_t hz) {
-        constexpr auto inv_hash = 1.0F / static_cast<float>(0x7fffffffU);
-        return static_cast<float>(terrain_noise_hash(hx, hz, 0xffffffffU)) * inv_hash;
+        return static_cast<float>(terrain_noise_hash(hx, hz, 0xffffffffU)) * 0x1p-30F;
     };
     const auto n00 = normalized_hash(x0, z0);
     const auto n10 = normalized_hash(x0 + 1, z0);
@@ -1542,29 +1543,34 @@ float terrain_noise_sample(float x, float z, float frequency) {
     return lerp(lerp(n00, n10, ux), lerp(n01, n11, ux), uz);
 }
 
-[[maybe_unused]] float native_like_city_terrain_height(float world_x, float world_z) {
-    const auto gx = world_x * 0.25F;
-    const auto gy = world_z * 0.25F;
+float native_like_city_terrain_height(float world_x, float world_z) {
+    // Native runtime terrain samples use grid = world + 4096 at 1 sample per world
+    // unit. The base island formula below is the 2049^2 source heightfield, later
+    // upsampled 8x by the game, so the editor samples source = (world + 4096) / 8.
+    // That maps world origin to source (512,512), inside the flat city core.
+    const auto gx = (world_x + 4096.0F) * 0.125F;
+    const auto gz = (world_z + 4096.0F) * 0.125F;
     const auto dx1 = gx - 640.0F;
-    const auto dz1 = gy - 640.0F;
+    const auto dz1 = gz - 640.0F;
     const auto r1 = std::clamp(std::sqrt(dx1 * dx1 + dz1 * dz1) * 0.00390625F - 0.75F, 0.0F, 3.0F);
     const auto r1sq = r1 * r1;
 
-    const auto noise1 = terrain_noise_sample(gx, gy, 0.015625F);
-    const auto noise2 = terrain_noise_sample(gx, gy, 0.5F);
-    const auto noise3 = terrain_noise_sample(gx, gy, 0.03125F);
+    const auto noise1 = terrain_noise_sample(gx, gz, 1.0F / 64.0F, 1.0F / 128.0F);
+    const auto noise2 = terrain_noise_sample(gx, gz, 1.0F / 128.0F, 1.0F / 128.0F);
+    const auto noise3 = terrain_noise_sample(gx, gz, 1.0F / 64.0F, 1.0F / 64.0F);
 
     const auto dx2 = gx - 704.0F;
-    const auto dz2 = gy - 704.0F;
+    const auto dz2 = gz - 704.0F;
     const auto r2 = std::clamp((std::sqrt(dx2 * dx2 + dz2 * dz2) - 320.0F) * 0.015625F, 0.0F, 1.0F);
 
     const auto base_blend =
-        noise3 * 8.0F + 23.75F + (noise1 + r1sq) * 16.0F + (noise2 * 32.0F + r1sq * 8.0F) * r1sq;
+        noise3 * 8.0F + 23.8125F + (noise1 + r1sq) * 16.0F + (noise2 * 32.0F + r1sq * 8.0F) * r1sq;
     return base_blend * r2 + (1.0F - r2) * 23.875F;
 }
 
+namespace {
+
 struct CityTerrainPatchConfig {
-    float base_height{23.875F};
     float level_scale{4.0F};
     float level_bias{4.25F};
     float feather_falloff{0.0625F};
@@ -1574,6 +1580,9 @@ struct CityTerrainPatchConfig {
 constexpr CityTerrainPatchConfig city_terrain_patch_config;
 
 float authored_city_terrain_height(std::int32_t level) {
+    // Native patch corners are level*4.0 + 4.25. City road tiles store base_y as
+    // level*4.0; their top face is base_y + unit_size + 0.25, so terrain meets
+    // the drivable road surface instead of the tile base.
     return static_cast<float>(level) * city_terrain_patch_config.level_scale +
         city_terrain_patch_config.level_bias;
 }
@@ -1878,15 +1887,16 @@ float evaluate_city_terrain_height(
     float world_x,
     float world_z) {
     const auto sample = city_terrain_authored_sample(plateaus, streets, block_patches, world_x, world_z);
+    const auto base_height = native_like_city_terrain_height(world_x, world_z);
     if (!sample.has_value()) {
-        return city_terrain_patch_config.base_height;
+        return base_height;
     }
     if (sample->distance <= 0.0001F) {
         return sample->height;
     }
 
     const auto weight = city_terrain_feather_weight(sample->distance);
-    return lerp(city_terrain_patch_config.base_height, sample->height, weight);
+    return lerp(base_height, sample->height, weight);
 }
 
 std::vector<CityTileCell> build_city_tile_cells(const SbcMap& map, const std::optional<CityTerrain>& terrain, float unit_size) {
@@ -1908,6 +1918,7 @@ std::vector<CityTileCell> build_city_tile_cells(const SbcMap& map, const std::op
     }
 
     (void)terrain;
+    (void)unit_size;
     std::vector<CityTileCell> tiles;
     tiles.reserve(tile_map.size());
     for (const auto& [key, value] : tile_map) {
