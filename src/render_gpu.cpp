@@ -412,6 +412,9 @@ const Texture2D* texture_for_buffer_material(const EditorProject& project, const
     return find_project_texture(project, buffer.material_names[material_id]);
 }
 
+float baked_directional_light(Vector3 normal);
+Color shade_color(Color base, float light);
+
 GpuBuildingMeshChunk upload_mesh_chunk(
     const BuildingRenderBuffer& buffer,
     std::uint32_t first_triangle,
@@ -440,15 +443,20 @@ GpuBuildingMeshChunk upload_mesh_chunk(
         fallback.mesh.triangleCount = static_cast<int>(clamped_count);
         fallback.mesh.vertices = static_cast<float*>(MemAlloc(static_cast<unsigned int>(fallback.mesh.vertexCount * 3 * sizeof(float))));
         fallback.mesh.texcoords = static_cast<float*>(MemAlloc(static_cast<unsigned int>(fallback.mesh.vertexCount * 2 * sizeof(float))));
-        if (fallback.mesh.vertices == nullptr || fallback.mesh.texcoords == nullptr) {
+        fallback.mesh.colors = static_cast<unsigned char*>(MemAlloc(static_cast<unsigned int>(fallback.mesh.vertexCount * 4 * sizeof(unsigned char))));
+        if (fallback.mesh.vertices == nullptr || fallback.mesh.texcoords == nullptr || fallback.mesh.colors == nullptr) {
             if (fallback.mesh.vertices != nullptr) {
                 MemFree(fallback.mesh.vertices);
             }
             if (fallback.mesh.texcoords != nullptr) {
                 MemFree(fallback.mesh.texcoords);
             }
+            if (fallback.mesh.colors != nullptr) {
+                MemFree(fallback.mesh.colors);
+            }
             fallback.mesh.vertices = nullptr;
             fallback.mesh.texcoords = nullptr;
+            fallback.mesh.colors = nullptr;
             fallback.mesh.vertexCount = 0;
             fallback.mesh.triangleCount = 0;
             return fallback;
@@ -456,8 +464,33 @@ GpuBuildingMeshChunk upload_mesh_chunk(
 
         auto* out = fallback.mesh.vertices;
         auto* out_uv = fallback.mesh.texcoords;
+        auto* out_color = fallback.mesh.colors;
         for (auto triangle_index = first_triangle; triangle_index < clamped_end; ++triangle_index) {
             const auto& triangle = buffer.triangles[triangle_index];
+            std::array<RenderBufferVertex, 3> tri_vertices{};
+            std::array<Vec3, 3> positions{};
+            for (std::size_t index = 0; index < triangle.indices.size(); ++index) {
+                tri_vertices[index] = triangle.indices[index] < buffer.vertices.size()
+                    ? buffer.vertices[triangle.indices[index]]
+                    : RenderBufferVertex{};
+                positions[index] = tri_vertices[index].position;
+            }
+            const Vector3 e1{
+                positions[1].x - positions[0].x,
+                positions[1].y - positions[0].y,
+                positions[1].z - positions[0].z,
+            };
+            const Vector3 e2{
+                positions[2].x - positions[0].x,
+                positions[2].y - positions[0].y,
+                positions[2].z - positions[0].z,
+            };
+            const Vector3 face_normal{
+                e1.y * e2.z - e1.z * e2.y,
+                e1.z * e2.x - e1.x * e2.z,
+                e1.x * e2.y - e1.y * e2.x,
+            };
+            const auto vertex_light = shade_color(WHITE, baked_directional_light(face_normal));
             for (const auto vertex_index : triangle.indices) {
                 const auto vertex = vertex_index < buffer.vertices.size()
                     ? buffer.vertices[vertex_index]
@@ -468,6 +501,10 @@ GpuBuildingMeshChunk upload_mesh_chunk(
                 *out++ = position.z;
                 *out_uv++ = vertex.u;
                 *out_uv++ = vertex.v;
+                *out_color++ = vertex_light.r;
+                *out_color++ = vertex_light.g;
+                *out_color++ = vertex_light.b;
+                *out_color++ = vertex_light.a;
             }
         }
 
@@ -484,12 +521,40 @@ GpuBuildingMeshChunk upload_mesh_chunk(
 
     std::vector<float> vertices;
     std::vector<float> texcoords;
+    std::vector<unsigned char> colors;
     std::vector<unsigned short> indices;
     std::unordered_map<std::uint32_t, unsigned short> local_indices;
+    std::vector<Vector3> vertex_normals(buffer.vertices.size());
     vertices.reserve(static_cast<std::size_t>(clamped_count) * 9U);
     texcoords.reserve(static_cast<std::size_t>(clamped_count) * 6U);
+    colors.reserve(static_cast<std::size_t>(clamped_count) * 12U);
     indices.reserve(static_cast<std::size_t>(clamped_count) * 3U);
     local_indices.reserve(static_cast<std::size_t>(clamped_count) * 3U);
+
+    for (auto triangle_index = first_triangle; triangle_index < clamped_end; ++triangle_index) {
+        const auto& triangle = buffer.triangles[triangle_index];
+        if (triangle.indices[0] >= buffer.vertices.size() ||
+            triangle.indices[1] >= buffer.vertices.size() ||
+            triangle.indices[2] >= buffer.vertices.size()) {
+            continue;
+        }
+        const auto a = buffer.vertices[triangle.indices[0]].position;
+        const auto b = buffer.vertices[triangle.indices[1]].position;
+        const auto c = buffer.vertices[triangle.indices[2]].position;
+        const Vector3 e1{b.x - a.x, b.y - a.y, b.z - a.z};
+        const Vector3 e2{c.x - a.x, c.y - a.y, c.z - a.z};
+        const Vector3 face_normal{
+            e1.y * e2.z - e1.z * e2.y,
+            e1.z * e2.x - e1.x * e2.z,
+            e1.x * e2.y - e1.y * e2.x,
+        };
+        for (const auto vertex_index : triangle.indices) {
+            auto& normal = vertex_normals[vertex_index];
+            normal.x += face_normal.x;
+            normal.y += face_normal.y;
+            normal.z += face_normal.z;
+        }
+    }
 
     auto add_index = [&](std::uint32_t source_index) -> std::optional<unsigned short> {
         if (const auto existing = local_indices.find(source_index); existing != local_indices.end()) {
@@ -509,6 +574,14 @@ GpuBuildingMeshChunk upload_mesh_chunk(
         vertices.push_back(position.z);
         texcoords.push_back(vertex.u);
         texcoords.push_back(vertex.v);
+        const auto light = source_index < vertex_normals.size()
+            ? baked_directional_light(vertex_normals[source_index])
+            : 1.0F;
+        const auto vertex_light = shade_color(WHITE, light);
+        colors.push_back(vertex_light.r);
+        colors.push_back(vertex_light.g);
+        colors.push_back(vertex_light.b);
+        colors.push_back(vertex_light.a);
         local_indices.emplace(source_index, local_index);
         return local_index;
     };
@@ -528,19 +601,24 @@ GpuBuildingMeshChunk upload_mesh_chunk(
     chunk.mesh.triangleCount = static_cast<int>(indices.size() / 3U);
     chunk.mesh.vertices = static_cast<float*>(MemAlloc(static_cast<unsigned int>(vertices.size() * sizeof(float))));
     chunk.mesh.texcoords = static_cast<float*>(MemAlloc(static_cast<unsigned int>(texcoords.size() * sizeof(float))));
+    chunk.mesh.colors = static_cast<unsigned char*>(MemAlloc(static_cast<unsigned int>(colors.size() * sizeof(unsigned char))));
     chunk.mesh.indices = static_cast<unsigned short*>(MemAlloc(static_cast<unsigned int>(indices.size() * sizeof(unsigned short))));
-    if (chunk.mesh.vertices == nullptr || chunk.mesh.texcoords == nullptr || chunk.mesh.indices == nullptr) {
+    if (chunk.mesh.vertices == nullptr || chunk.mesh.texcoords == nullptr || chunk.mesh.colors == nullptr || chunk.mesh.indices == nullptr) {
         if (chunk.mesh.vertices != nullptr) {
             MemFree(chunk.mesh.vertices);
         }
         if (chunk.mesh.texcoords != nullptr) {
             MemFree(chunk.mesh.texcoords);
         }
+        if (chunk.mesh.colors != nullptr) {
+            MemFree(chunk.mesh.colors);
+        }
         if (chunk.mesh.indices != nullptr) {
             MemFree(chunk.mesh.indices);
         }
         chunk.mesh.vertices = nullptr;
         chunk.mesh.texcoords = nullptr;
+        chunk.mesh.colors = nullptr;
         chunk.mesh.indices = nullptr;
         chunk.mesh.vertexCount = 0;
         chunk.mesh.triangleCount = 0;
@@ -549,6 +627,7 @@ GpuBuildingMeshChunk upload_mesh_chunk(
 
     std::ranges::copy(vertices, chunk.mesh.vertices);
     std::ranges::copy(texcoords, chunk.mesh.texcoords);
+    std::ranges::copy(colors, chunk.mesh.colors);
     std::ranges::copy(indices, chunk.mesh.indices);
 
     UploadMesh(&chunk.mesh, false);
@@ -566,14 +645,27 @@ GpuBuildingMeshChunk upload_mesh_chunk(
 // brightness multiplier. One fixed sun direction; faces toward it are brighter,
 // faces away sit at the ambient floor. Cheap, asset-free shading that makes
 // terrain slopes, road grades, and curbs read as 3D without a custom GLSL shader.
+//
+// City slopes are shallow (1/16..1/7 grades, 3-8 degrees), so a physically
+// scaled term barely changes brightness; the horizontal normal components are
+// exaggerated before lighting so grades and terrain undulation actually read.
 float baked_directional_light(Vector3 normal) {
-    constexpr Vector3 sun{0.40F, 0.82F, 0.41F};  // normalized-ish down-ish from one side
-    constexpr float ambient = 0.55F;
+    constexpr Vector3 sun{0.52F, 0.64F, 0.57F};  // ~40 degree elevation, off-axis
+    constexpr float ambient = 0.42F;
+    constexpr float slope_boost = 3.0F;
     const auto len = std::sqrt(normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
     if (len <= 0.0001F) {
         return 1.0F;
     }
-    const auto ndotl = (normal.x * sun.x + normal.y * sun.y + normal.z * sun.z) / len;
+    Vector3 n{normal.x / len, normal.y / len, normal.z / len};
+    // Exaggerate tilt only for mostly-up faces (ground); walls keep their angle.
+    if (n.y > 0.7F) {
+        n.x *= slope_boost;
+        n.z *= slope_boost;
+        const auto boosted = std::sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+        n = {n.x / boosted, n.y / boosted, n.z / boosted};
+    }
+    const auto ndotl = n.x * sun.x + n.y * sun.y + n.z * sun.z;
     return ambient + (1.0F - ambient) * std::max(0.0F, ndotl);
 }
 
@@ -690,6 +782,9 @@ GpuBuildingRenderModel upload_building_render_model(const BuildingRenderBuffer& 
             model.uploaded_vertices += static_cast<std::size_t>(chunk.mesh.vertexCount);
             model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.vertexCount) * 3U * sizeof(float);
             model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.vertexCount) * 2U * sizeof(float);
+            if (chunk.mesh.colors != nullptr) {
+                model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.vertexCount) * 4U * sizeof(unsigned char);
+            }
             if (chunk.mesh.indices != nullptr) {
                 model.uploaded_indices += static_cast<std::size_t>(chunk.mesh.triangleCount) * 3U;
                 model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.triangleCount) * 3U * sizeof(unsigned short);
@@ -916,8 +1011,14 @@ GpuBuildingRenderModel upload_portal_render_model(const BuildingRenderBuffer& bu
         auto chunk = upload_mesh_chunk(buffer, run.first_triangle, run.triangle_count, run.material, texture);
         if (chunk.mesh.vertexCount > 0) {
             model.uploaded_vertices += static_cast<std::size_t>(chunk.mesh.vertexCount);
+            model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.vertexCount) * 3U * sizeof(float);
+            model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.vertexCount) * 2U * sizeof(float);
+            if (chunk.mesh.colors != nullptr) {
+                model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.vertexCount) * 4U * sizeof(unsigned char);
+            }
             if (chunk.mesh.indices != nullptr) {
                 model.uploaded_indices += static_cast<std::size_t>(chunk.mesh.triangleCount) * 3U;
+                model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.triangleCount) * 3U * sizeof(unsigned short);
             }
             model.chunks.push_back(std::move(chunk));
         }
@@ -980,7 +1081,9 @@ void draw_city_piece_voxels(EditorProject& project, bool textured, std::optional
         return;
     }
     auto& model = portal_render_model(project, textured, selected_portal);
-    draw_gpu_building_model(model, {0.0F, 0.0F, 0.0F}, 0, false, true, nullptr, GfxDebugDrawCategory::Pieces);
+    // Native world cells sit 0.25 above their level; without the lift the piece
+    // ground cells are coplanar with their stamped terrain plots and z-fight.
+    draw_gpu_building_model(model, {0.0F, 0.25F, 0.0F}, 0, false, true, nullptr, GfxDebugDrawCategory::Pieces);
 }
 
 Color city_tile_material_color(const BuildingRenderBuffer& buffer, std::uint32_t material) {
@@ -1160,49 +1263,54 @@ void draw_city_editor_overlay(const EditorProject&, const MapScene& scene) {
 // arm. Built once and instanced per pole via DrawModelEx, instead of re-emitting
 // cylinders/cubes per pole every frame.
 Model build_traffic_light_pole_model(float unit_size) {
-    const auto post_h = unit_size * 1.75F;
-    const auto post_w = unit_size * 0.10F;
-    const auto arm_len = unit_size * 0.85F;
-    const auto arm_w = unit_size * 0.08F;
-    const auto head_w = unit_size * 0.18F;
-    const auto head_h = unit_size * 0.34F;
-
-    // Three boxes in local space (+Y up, arm extends along -Z toward target):
-    Mesh post = GenMeshCube(post_w, post_h, post_w);
-    Mesh arm = GenMeshCube(arm_w, arm_w, arm_len);
-    Mesh head = GenMeshCube(head_w, head_h, head_w);
-    // Offset arm and head into place by baking translation into their vertices.
-    auto translate_mesh = [](Mesh& m, float dx, float dy, float dz) {
-        for (int i = 0; i < m.vertexCount; ++i) {
-            m.vertices[i * 3 + 0] += dx;
-            m.vertices[i * 3 + 1] += dy;
-            m.vertices[i * 3 + 2] += dz;
-        }
-        UpdateMeshBuffer(m, 0, m.vertices, m.vertexCount * 3 * static_cast<int>(sizeof(float)), 0);
+    (void)unit_size;
+    // Native street-object type 1 geometry (World_InitResourcePoolsAndCatalogs
+    // @13dcd0, BuildBlock_GenerateCubeVerticesFaces boxes, world units, centered
+    // boxes), expressed relative to the pole's ground point: a 6-tall post, a
+    // 10-long arm across the street at the post top, and two signal heads at 6
+    // and 10 units out — one over each lane. The arm extends along local -Z.
+    struct BoxSpec {
+        Vector3 center;
+        Vector3 size;
+        bool lens;
     };
-    UploadMesh(&post, false);
-    translate_mesh(post, 0.0F, post_h * 0.5F, 0.0F);
-    UploadMesh(&arm, false);
-    translate_mesh(arm, 0.0F, post_h, -arm_len * 0.5F);
-    UploadMesh(&head, false);
-    translate_mesh(head, 0.0F, post_h - head_h * 0.4F, -arm_len);
+    const std::array<BoxSpec, 6> boxes{{
+        {{0.0F, 3.0F, 0.0F}, {0.375F, 6.0F, 0.375F}, false},   // post
+        {{0.0F, 6.0F, -5.0F}, {0.25F, 0.25F, 10.0F}, false},   // arm
+        {{0.0F, 6.0F, -6.0F}, {0.3125F, 1.0F, 0.5F}, false},   // head over lane 1
+        {{0.0F, 6.0F, -10.0F}, {0.3125F, 1.0F, 0.5F}, false},  // head over lane 2
+        // Signal lenses (editor stand-in for the game's red default state
+        // texture): a thin band through each head, proud on the +/-x faces the
+        // signal textures occupy.
+        {{0.0F, 6.3F, -6.0F}, {0.36F, 0.26F, 0.3F}, true},
+        {{0.0F, 6.3F, -10.0F}, {0.36F, 0.26F, 0.3F}, true},
+    }};
 
-    // Combine into one model with three meshes sharing one material.
     Model model{};
     model.transform = MatrixIdentity();
-    model.meshCount = 3;
-    model.materialCount = 1;
-    model.meshes = static_cast<Mesh*>(MemAlloc(3 * sizeof(Mesh)));
-    model.meshes[0] = post;
-    model.meshes[1] = arm;
-    model.meshes[2] = head;
-    model.materials = static_cast<Material*>(MemAlloc(sizeof(Material)));
+    model.meshCount = static_cast<int>(boxes.size());
+    model.materialCount = 2;
+    model.meshes = static_cast<Mesh*>(MemAlloc(static_cast<unsigned int>(boxes.size() * sizeof(Mesh))));
+    model.meshMaterial = reinterpret_cast<int*>(MemAlloc(static_cast<unsigned int>(boxes.size() * sizeof(int))));
+    model.materials = static_cast<Material*>(MemAlloc(2 * sizeof(Material)));
     model.materials[0] = LoadMaterialDefault();
-    model.materials[0].maps[MATERIAL_MAP_DIFFUSE].color = Color{42, 46, 48, 255};
-    model.meshMaterial = reinterpret_cast<int*>(MemAlloc(3 * sizeof(int)));
-    model.meshMaterial[0] = 0;
-    model.meshMaterial[1] = 0;
-    model.meshMaterial[2] = 0;
+    model.materials[0].maps[MATERIAL_MAP_DIFFUSE].color = Color{40, 43, 45, 255};
+    model.materials[1] = LoadMaterialDefault();
+    model.materials[1].maps[MATERIAL_MAP_DIFFUSE].color = Color{205, 48, 38, 255};
+
+    for (std::size_t index = 0; index < boxes.size(); ++index) {
+        const auto& box = boxes[index];
+        Mesh mesh = GenMeshCube(box.size.x, box.size.y, box.size.z);
+        UploadMesh(&mesh, false);
+        for (int i = 0; i < mesh.vertexCount; ++i) {
+            mesh.vertices[i * 3 + 0] += box.center.x;
+            mesh.vertices[i * 3 + 1] += box.center.y;
+            mesh.vertices[i * 3 + 2] += box.center.z;
+        }
+        UpdateMeshBuffer(mesh, 0, mesh.vertices, mesh.vertexCount * 3 * static_cast<int>(sizeof(float)), 0);
+        model.meshes[index] = mesh;
+        model.meshMaterial[index] = box.lens ? 1 : 0;
+    }
     return model;
 }
 

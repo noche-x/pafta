@@ -1235,10 +1235,13 @@ void builds_grid_aligned_city_street_tile_strip() {
 
     const auto scene = map_editor::build_map_scene(map);
 
-    for (std::int32_t x = 0; x <= 4; ++x) {
-        assert(has_city_tile(scene, x, 0, -1, map_editor::CityTileKind::Road));
-        assert(has_city_tile(scene, x, 0, 0, map_editor::CityTileKind::Road));
-        assert(has_city_tile(scene, x, 0, 1, map_editor::CityTileKind::Road));
+    // Native semantics: cell level = sbc y - 1 (subrosa.exe loads unk0[2] as
+    // record y - 1). Lanes span [-leftWidth, rightWidth); curb plates sit one
+    // level above the lanes, one tile outside each edge.
+    for (std::int32_t x = 0; x <= 3; ++x) {
+        assert(has_city_tile(scene, x, -1, -1, map_editor::CityTileKind::Road));
+        assert(has_city_tile(scene, x, -1, 0, map_editor::CityTileKind::Road));
+        assert(has_city_tile(scene, x, -1, 1, map_editor::CityTileKind::Road));
     }
     assert(has_city_tile(scene, 2, 0, -2, map_editor::CityTileKind::Curb));
     assert(has_city_tile(scene, 2, 0, 2, map_editor::CityTileKind::Curb));
@@ -1256,18 +1259,21 @@ void fills_intersection_footprint_and_closes_missing_sides_with_curbs() {
     map_editor::SbcMap map{};
     map.intersections.push_back({0U, 0, 0, 0});
     map.intersections.push_back({1U, 4, 0, 0});
-    map.streets.push_back({0U, 0, 1, 0, 1, 2, "East"});
+    map.intersections.push_back({2U, 0, 0, 6});
+    map.streets.push_back({0U, 0, 1, 0, 1, 1, "East"});
+    map.streets.push_back({1U, 0, 2, 0, 1, 1, "South"});
 
     const auto scene = map_editor::build_map_scene(map);
 
-    assert(has_city_tile(scene, 0, 0, -1, map_editor::CityTileKind::Road));
-    assert(has_city_tile(scene, 0, 0, 0, map_editor::CityTileKind::Road));
-    assert(has_city_tile(scene, 0, 0, 1, map_editor::CityTileKind::Road));
-    assert(has_city_tile(scene, -2, 0, -1, map_editor::CityTileKind::Curb));
-    assert(has_city_tile(scene, -2, 0, 0, map_editor::CityTileKind::Curb));
+    // Footprint fill over the native extents (x: -ext_x_neg .. ext_x_pos - 1,
+    // z: -ext_z_neg .. ext_z_pos - 1) at level y - 1 = -1.
+    assert(has_city_tile(scene, -1, -1, -1, map_editor::CityTileKind::Road));
+    assert(has_city_tile(scene, 0, -1, 0, map_editor::CityTileKind::Road));
+    // Missing -x neighbor: curb row one level up at x = -ext_x_pos - 1.
+    assert(has_city_tile(scene, -2, 0, -2, map_editor::CityTileKind::Curb));
     assert(has_city_tile(scene, -2, 0, 1, map_editor::CityTileKind::Curb));
-    assert(has_city_tile(scene, 0, 0, -2, map_editor::CityTileKind::Curb));
-    assert(has_city_tile(scene, 0, 0, 2, map_editor::CityTileKind::Curb));
+    // Missing -z neighbor: curb row one level up at z = -ext_z_neg - 1.
+    assert(has_city_tile(scene, 1, 0, -2, map_editor::CityTileKind::Curb));
 }
 
 void terrain_noise_hash_matches_native_all_ones_mask() {
@@ -1289,7 +1295,9 @@ void terrain_noise_sample_uses_native_two_to_negative_thirty_normalizer() {
 }
 
 void native_like_city_terrain_height_matches_native_core_and_far_island() {
-    assert(close_to(map_editor::native_like_city_terrain_height(0.0F, 0.0F), 23.875F));
+    // World origin sits on the city-map shoreline shelf carved to 11.75; the
+    // city core (around world 1024..2592) stays on the flat 23.875 base.
+    assert(close_to(map_editor::native_like_city_terrain_height(0.0F, 0.0F), 11.75F));
     assert(close_to(map_editor::native_like_city_terrain_height(1024.0F, 1024.0F), 23.875F));
     assert(close_to(map_editor::native_like_city_terrain_height(1536.0F, 1536.0F), 23.875F));
 
@@ -1299,167 +1307,195 @@ void native_like_city_terrain_height_matches_native_core_and_far_island() {
     assert(!close_to(far_height, 23.875F));
 }
 
-float authored_terrain_y(std::int32_t level) {
-    return static_cast<float>(level) * 4.0F + 4.25F;
+float native_surface_y(std::int32_t sbc_y) {
+    // Native level = sbc y - 1; drivable surface = level * 4 + 4.25.
+    return static_cast<float>(sbc_y - 1) * 4.0F + 4.25F;
 }
 
-map_editor::SbcMap authored_terrain_rectangle_map(std::array<std::int32_t, 4> levels) {
+// City block whose north-east corner is intersection index 2 — one of the 28
+// hardcoded indices Terrain_RebuildLandTilesRoadPatchesAndChunkCaches patches.
+map_editor::SbcMap native_patch_block_map(std::array<std::int32_t, 4> sbc_levels) {
     map_editor::SbcMap map{};
-    map.intersections.push_back({0U, 0, levels[0], 0});
-    map.intersections.push_back({1U, 10, levels[1], 0});
-    map.intersections.push_back({2U, 0, levels[2], 10});
-    map.intersections.push_back({3U, 10, levels[3], 10});
-    map.streets.push_back({0U, 0, 1, 0, 1, 1, "North"});
-    map.streets.push_back({1U, 0, 2, 0, 1, 1, "West"});
-    map.streets.push_back({2U, 1, 3, 0, 1, 1, "East"});
-    map.streets.push_back({3U, 2, 3, 0, 1, 1, "South"});
+    map.intersections.push_back({0U, 632, sbc_levels[1], 600});  // B: +x of A
+    map.intersections.push_back({1U, 600, sbc_levels[2], 632});  // C: +z of A
+    map.intersections.push_back({2U, 600, sbc_levels[0], 600});  // A: patched index 2
+    map.intersections.push_back({3U, 632, sbc_levels[3], 632});  // D: diagonal
+    map.streets.push_back({0U, 2, 0, 0, 1, 1, "AB"});
+    map.streets.push_back({1U, 2, 1, 0, 1, 1, "AC"});
+    map.streets.push_back({2U, 1, 3, 0, 1, 1, "CD"});
+    map.streets.push_back({3U, 0, 3, 0, 1, 1, "BD"});
     return map;
 }
 
-void city_terrain_uses_authored_intersection_bilinear_patch() {
-    const auto scene = map_editor::build_map_scene(authored_terrain_rectangle_map({0, 2, 4, 6}));
+void city_terrain_patches_hardcoded_intersection_blocks() {
+    const auto scene = map_editor::build_map_scene(native_patch_block_map({5, 5, 5, 9}));
 
     assert(scene.terrain.has_value());
-    assert(close_to(scene.terrain->sample_spacing, 4.0F));
     assert(scene.terrain->mesh.triangles.size() > 0U);
 
-    const auto terrain_at = [&](float grid_x, float grid_z) {
-        return map_editor::terrain_height_at(*scene.terrain, grid_x * scene.unit_size, grid_z * scene.unit_size);
-    };
+    // Patch rect uses the +1-expanded extents: world [2408, 2520] on both axes.
+    // Corners pin to the intersection surfaces; the center is their bilinear mix.
+    const auto corner = map_editor::terrain_height_at(*scene.terrain, 2408.0F, 2408.0F);
+    assert(close_to(corner, native_surface_y(5)));
+    const auto center = map_editor::terrain_height_at(*scene.terrain, 2464.0F, 2464.0F);
+    const auto expected_center =
+        (3.0F * native_surface_y(5) + native_surface_y(9)) * 0.25F;
+    assert(close_to(center, expected_center));
 
-    assert(close_to(terrain_at(0.0F, 0.0F), authored_terrain_y(0)));
-    assert(close_to(terrain_at(10.0F, 0.0F), authored_terrain_y(2)));
-    assert(close_to(terrain_at(0.0F, 10.0F), authored_terrain_y(4)));
-    assert(close_to(terrain_at(10.0F, 10.0F), authored_terrain_y(6)));
-
-    const auto expected_center = (authored_terrain_y(0) + authored_terrain_y(2) +
-        authored_terrain_y(4) + authored_terrain_y(6)) * 0.25F;
-    assert(close_to(terrain_at(5.0F, 5.0F), expected_center));
-    assert(!close_to(terrain_at(5.0F, 5.0F), 23.875F));
+    // Outside the patched block the city core stays on the flat island base.
+    const auto outside = map_editor::terrain_height_at(*scene.terrain, 2300.0F, 2400.0F);
+    assert(close_to(outside, 23.875F));
 }
 
-void city_terrain_equal_intersection_levels_make_flat_plateau() {
-    const auto scene = map_editor::build_map_scene(authored_terrain_rectangle_map({3, 3, 3, 3}));
+void city_terrain_flat_block_patch_is_level() {
+    const auto scene = map_editor::build_map_scene(native_patch_block_map({5, 5, 5, 5}));
 
     assert(scene.terrain.has_value());
-    const auto terrain_at = [&](float grid_x, float grid_z) {
-        return map_editor::terrain_height_at(*scene.terrain, grid_x * scene.unit_size, grid_z * scene.unit_size);
-    };
-
-    assert(close_to(terrain_at(0.0F, 0.0F), authored_terrain_y(3)));
-    assert(close_to(terrain_at(5.0F, 5.0F), authored_terrain_y(3)));
-    assert(close_to(terrain_at(10.0F, 10.0F), authored_terrain_y(3)));
+    assert(close_to(map_editor::terrain_height_at(*scene.terrain, 2410.0F, 2410.0F), native_surface_y(5)));
+    assert(close_to(map_editor::terrain_height_at(*scene.terrain, 2464.0F, 2464.0F), native_surface_y(5)));
+    assert(close_to(map_editor::terrain_height_at(*scene.terrain, 2518.0F, 2518.0F), native_surface_y(5)));
 }
 
-void city_terrain_height_query_matches_authored_road_surface() {
-    map_editor::SbcMap map{};
-    map.intersections.push_back({0U, 0, 1, 0});
-    map.intersections.push_back({1U, 10, 5, 0});
-    map.streets.push_back({0U, 0, 1, 0, 1, 1, "Slope"});
+void city_terrain_inside_patch_conforms_to_piece_cells() {
+    // District/piece cells stamp the corner-height grid; inside a patched block
+    // the terrain re-seeds to the stamped cell levels instead of the bilinear.
+    auto map = native_patch_block_map({5, 5, 5, 5});
+    map_editor::SbcPortal portal;
+    portal.index = 0;
+    portal.fields = {0, 76, 1, 76};  // tiles 608..615, cell level 8 -> 32.0
+    portal.blocks.assign(512, 0U);
+    for (std::size_t voxel = 0; voxel < 64; ++voxel) {  // bottom layer occupied
+        portal.blocks[voxel] = 1U;
+    }
+    map.portals.push_back(portal);
 
     const auto scene = map_editor::build_map_scene(map);
-
     assert(scene.terrain.has_value());
-    assert(scene.roads.size() == 1U);
-    assert(close_to(scene.roads[0].from.y, authored_terrain_y(1)));
-    assert(close_to(scene.roads[0].to.y, authored_terrain_y(5)));
+    // World 2440 sits over a seeded tile: terrain matches the stamped level.
+    assert(close_to(map_editor::terrain_height_at(*scene.terrain, 2440.0F, 2440.0F), 32.0F));
+    // Far corner of the block stays on the bilinear surface.
+    assert(close_to(map_editor::terrain_height_at(*scene.terrain, 2518.0F, 2518.0F), native_surface_y(5)));
 
-    const auto midpoint = map_editor::terrain_height_at(*scene.terrain, 5.0F * scene.unit_size, 0.0F);
-    const auto expected_midpoint = (authored_terrain_y(1) + authored_terrain_y(5)) * 0.5F;
-    assert(close_to(midpoint, expected_midpoint));
-
-    const auto* start_tile = find_city_tile(scene, 0, 0, map_editor::CityTileKind::Road);
-    assert(start_tile != nullptr);
-    assert(close_to(
-        map_editor::terrain_height_at(*scene.terrain, 0.0F, 0.0F),
-        start_tile->base_y + scene.unit_size + 0.25F));
+    // The piece payload participates in the scene fingerprint.
+    const auto without = map_editor::city_scene_fingerprint(native_patch_block_map({5, 5, 5, 5}));
+    assert(map_editor::city_scene_fingerprint(map) != without);
 }
 
-void city_terrain_authored_patch_has_bounded_adjacent_deltas() {
-    const auto scene = map_editor::build_map_scene(authored_terrain_rectangle_map({0, 2, 2, 4}));
+void city_terrain_inside_patch_conforms_to_building_footprints() {
+    // Building instantiation stamps its anchor-layer footprint at record y*4;
+    // inside a patched block the terrain conforms to the building plot.
+    auto map = native_patch_block_map({5, 5, 5, 5});
+    map.buildings.push_back({0U, "plot", 610, 8, 610, 0});
 
-    assert(scene.terrain.has_value());
-
-    auto max_adjacent_delta = 0.0F;
-    for (auto z = 0; z < scene.terrain->sample_count_z; ++z) {
-        for (auto x = 0; x < scene.terrain->sample_count_x; ++x) {
-            const auto index = static_cast<std::size_t>(z * scene.terrain->sample_count_x + x);
-            if (x + 1 < scene.terrain->sample_count_x) {
-                max_adjacent_delta = std::max(
-                    max_adjacent_delta,
-                    std::abs(scene.terrain->heights[index + 1] - scene.terrain->heights[index]));
-            }
-            if (z + 1 < scene.terrain->sample_count_z) {
-                max_adjacent_delta = std::max(
-                    max_adjacent_delta,
-                    std::abs(scene.terrain->heights[index + static_cast<std::size_t>(scene.terrain->sample_count_x)] -
-                        scene.terrain->heights[index]));
-            }
+    map_editor::SbbBuilding building;
+    building.name = "plot";
+    building.anchor_x = 0;
+    building.anchor_y = 0;
+    building.anchor_z = 0;
+    for (std::uint32_t cx = 0; cx < 4; ++cx) {
+        for (std::uint32_t cz = 0; cz < 4; ++cz) {
+            map_editor::SbbCell cell;
+            cell.x = cx;
+            cell.y = 0;
+            cell.z = cz;
+            cell.occupied = true;
+            building.cells.push_back(cell);
         }
     }
-    assert(max_adjacent_delta < 8.0F);
+
+    const auto scene = map_editor::build_map_scene(map, {&building});
+    assert(scene.terrain.has_value());
+    // Tiles 610..613 stamped at 8*4=32: terrain over the plot follows it.
+    assert(close_to(map_editor::terrain_height_at(*scene.terrain, 2446.0F, 2446.0F), 32.0F));
+    // Without the resolved building, the block stays bilinear.
+    const auto plain = map_editor::build_map_scene(map);
+    assert(close_to(map_editor::terrain_height_at(*plain.terrain, 2446.0F, 2446.0F), native_surface_y(5)));
 }
 
-void city_road_tile_heights_ramp_between_intersection_heights() {
-    // Roads carry the AUTHORED street height, ramped linearly between the two
-    // intersection y values (the game's streets slope between intersections at
-    // different heights) — NOT the noisy terrain height.
+void city_road_tile_heights_follow_native_slope_region() {
+    // Native streets are flat at each end and ramp only inside the centered
+    // integer run-length slope region (MapConnector_PlaceStreetSegmentTilesAndSlopes
+    // @20580); the surface sits at level*4+4.25 with level = sbc y - 1.
     map_editor::SbcMap map{};
-    map.intersections.push_back({0U, 600, 0, 600});   // A: y=0
-    map.intersections.push_back({1U, 660, 8, 600});   // B: y=8 (uphill)
+    map.intersections.push_back({0U, 600, 1, 600});   // level 0, surface 4.25
+    map.intersections.push_back({1U, 660, 9, 600});   // level 8, surface 36.25
     map.streets.push_back({0U, 0, 1, 0, 1, 1, "Slope"});
 
     const auto scene = map_editor::build_map_scene(map);
 
     const auto* start = find_city_tile(scene, 600, 600, map_editor::CityTileKind::Road);
     const auto* middle = find_city_tile(scene, 630, 600, map_editor::CityTileKind::Road);
-    const auto* end = find_city_tile(scene, 660, 600, map_editor::CityTileKind::Road);
+    const auto* end = find_city_tile(scene, 659, 600, map_editor::CityTileKind::Road);
     assert(start != nullptr);
     assert(middle != nullptr);
     assert(end != nullptr);
-    constexpr auto unit = 4.0F;
-    // A.y=0 -> start at 0; B.y=8 -> end at 8*unit=32; middle ~halfway.
-    assert(close_to(start->base_y, 0.0F));
-    assert(close_to(end->base_y, 8.0F * unit));
-    assert(middle->base_y > start->base_y && middle->base_y < end->base_y);  // ramps up
 
-    // The street runs east-west over 60 grid cells while climbing 8*unit=32 world
-    // units, so each cell carries a positive x grade and no z grade. This is the
-    // tilt the cell tops ride so the surface slopes instead of staircasing.
-    const auto expected_rise_per_cell = (8.0F * unit) / 60.0F;
+    // Solid box bottoms: surface - 4.
+    assert(close_to(start->base_y, 0.25F));
+    assert(close_to(end->base_y, 32.25F));
+    assert(middle->base_y > start->base_y && middle->base_y < end->base_y);
+
+    // segLen=60, |delta|=8 -> runLen=7, slope region [2, 58): grade spans the
+    // 32-unit climb over 56 cells. End cells outside the region stay flat.
+    const auto expected_rise_per_cell = 32.0F / 56.0F;
     assert(close_to(middle->slope_x, expected_rise_per_cell));
     assert(close_to(middle->slope_z, 0.0F));
+    assert(close_to(start->slope_x, 0.0F));
 
-    // The tilt reaches the geometry: the road buffer's highest top vertex sits
-    // above its lowest by close to the full authored climb, not stuck in steps.
+    // Curb plates ride one level above the lanes.
+    assert(has_city_tile(scene, 600, 1, 598, map_editor::CityTileKind::Curb));
+    assert(has_city_tile(scene, 600, 1, 601, map_editor::CityTileKind::Curb));
+
+    // The grade reaches the geometry: the road buffer spans the full climb.
     auto min_top = std::numeric_limits<float>::max();
     auto max_top = std::numeric_limits<float>::lowest();
     for (const auto& vertex : scene.city_tile_buffer.vertices) {
         min_top = std::min(min_top, vertex.position.y);
         max_top = std::max(max_top, vertex.position.y);
     }
-    assert(max_top - min_top > 8.0F * unit * 0.9F);
+    assert(max_top - min_top > 32.0F * 0.9F);
 }
 
-void traffic_light_poles_stand_at_corners_and_face_intersection_center() {
-    map_editor::SbcMap map{};
-    map.intersections.push_back({0U, 0, 0, 0});
-    map.intersections.push_back({1U, 4, 0, 0});
-    map.streets.push_back({0U, 0, 1, 0, 1, 1, "East"});
+void traffic_light_poles_stand_at_native_corners_of_3way_plus_intersections() {
+    // Native corner objects only appear when more than two streets connect
+    // (MapConnector_PlaceIntersectionPerimeterTiles @20130).
+    map_editor::SbcMap two_way{};
+    two_way.intersections.push_back({0U, 600, 5, 600});
+    two_way.intersections.push_back({1U, 632, 5, 600});
+    two_way.streets.push_back({0U, 0, 1, 0, 1, 1, "East"});
+    assert(map_editor::build_map_scene(two_way).traffic_light_poles.empty());
 
-    const auto scene = map_editor::build_map_scene(map);
+    map_editor::SbcMap cross{};
+    cross.intersections.push_back({0U, 600, 5, 600});  // 4-way center
+    cross.intersections.push_back({1U, 632, 5, 600});
+    cross.intersections.push_back({2U, 600, 5, 632});
+    cross.intersections.push_back({3U, 568, 5, 600});
+    cross.intersections.push_back({4U, 600, 5, 568});
+    cross.streets.push_back({0U, 0, 1, 0, 1, 1, "E"});
+    cross.streets.push_back({1U, 0, 2, 0, 1, 1, "S"});
+    cross.streets.push_back({2U, 3, 0, 0, 1, 1, "W"});
+    cross.streets.push_back({3U, 4, 0, 0, 1, 1, "N"});
 
-    assert(scene.traffic_light_poles.size() == 8U);
-    assert(std::ranges::none_of(scene.traffic_light_poles, [](const map_editor::CityTrafficLightPole& pole) {
-        return close_to(pole.base.x, 0.0F) && close_to(pole.base.z, 0.0F);
+    const auto scene = map_editor::build_map_scene(cross);
+    assert(scene.traffic_light_poles.size() == 4U);
+    // One pole per present neighbor: post at the corner cell center shifted one
+    // unit toward the street its arm crosses (the native type-1 local offset
+    // (0, 3.25, -1) rotated per corner), arm axis-aligned over the lanes.
+    assert(std::ranges::any_of(scene.traffic_light_poles, [](const map_editor::CityTrafficLightPole& pole) {
+        return close_to(pole.base.x, 2406.0F) && close_to(pole.base.z, 2405.0F) &&
+            close_to(pole.arm_direction.x, 0.0F) && pole.arm_direction.z < -0.5F;
     }));
     assert(std::ranges::any_of(scene.traffic_light_poles, [](const map_editor::CityTrafficLightPole& pole) {
-        return close_to(pole.base.x, -4.0F) && close_to(pole.base.z, -4.0F) &&
-            pole.arm_direction.x > 0.5F && pole.arm_direction.z > 0.5F;
+        return close_to(pole.base.x, 2394.0F) && close_to(pole.base.z, 2395.0F) &&
+            close_to(pole.arm_direction.x, 0.0F) && pole.arm_direction.z > 0.5F;
     }));
     assert(std::ranges::any_of(scene.traffic_light_poles, [](const map_editor::CityTrafficLightPole& pole) {
-        return close_to(pole.base.x, 20.0F) && close_to(pole.base.z, 4.0F) &&
-            pole.arm_direction.x < -0.5F && pole.arm_direction.z < -0.5F;
+        return close_to(pole.base.x, 2395.0F) && close_to(pole.base.z, 2406.0F) &&
+            pole.arm_direction.x > 0.5F && close_to(pole.arm_direction.z, 0.0F);
+    }));
+    assert(std::ranges::any_of(scene.traffic_light_poles, [](const map_editor::CityTrafficLightPole& pole) {
+        return close_to(pole.base.x, 2405.0F) && close_to(pole.base.z, 2394.0F) &&
+            pole.arm_direction.x < -0.5F && close_to(pole.arm_direction.z, 0.0F);
     }));
 }
 
@@ -2413,7 +2449,8 @@ void native_city_building_render_origin_applies_editor_rotation_offsets() {
     building.rotation = 0;
     auto origin = map_editor::native_city_building_render_origin(building);
     assert(close_to(origin.x, 40.0F));
-    assert(close_to(origin.y, 8.0F));
+    // y*4 plus the native 0.25 cell lift (world cells span L*4+0.25..L*4+4.25).
+    assert(close_to(origin.y, 8.25F));
     assert(close_to(origin.z, 80.0F));
 
     building.rotation = 1;
@@ -2449,7 +2486,7 @@ void native_city_building_basis_uses_inverted_rotation_with_editor_offsets() {
 
     auto transformed = map_editor::native_city_building_transform_point(building, {1.0F, 2.0F, 3.0F});
     assert(close_to(transformed.x, 41.0F));
-    assert(close_to(transformed.y, 10.0F));
+    assert(close_to(transformed.y, 10.25F));
     assert(close_to(transformed.z, 81.0F));
 
     building.rotation = 2;
@@ -2459,7 +2496,7 @@ void native_city_building_basis_uses_inverted_rotation_with_editor_offsets() {
 
     transformed = map_editor::native_city_building_transform_point(building, {1.0F, 2.0F, 3.0F});
     assert(close_to(transformed.x, 43.0F));
-    assert(close_to(transformed.y, 10.0F));
+    assert(close_to(transformed.y, 10.25F));
     assert(close_to(transformed.z, 81.0F));
 
     building.rotation = 3;
@@ -2470,7 +2507,7 @@ void native_city_building_basis_uses_inverted_rotation_with_editor_offsets() {
 
     transformed = map_editor::native_city_building_transform_point(building, {1.0F, 2.0F, 3.0F});
     assert(close_to(transformed.x, 43.0F));
-    assert(close_to(transformed.y, 10.0F));
+    assert(close_to(transformed.y, 10.25F));
     assert(close_to(transformed.z, 83.0F));
 }
 
@@ -2820,12 +2857,12 @@ int main() {
     terrain_noise_hash_matches_native_all_ones_mask();
     terrain_noise_sample_uses_native_two_to_negative_thirty_normalizer();
     native_like_city_terrain_height_matches_native_core_and_far_island();
-    city_terrain_uses_authored_intersection_bilinear_patch();
-    city_terrain_equal_intersection_levels_make_flat_plateau();
-    city_terrain_height_query_matches_authored_road_surface();
-    city_terrain_authored_patch_has_bounded_adjacent_deltas();
-    city_road_tile_heights_ramp_between_intersection_heights();
-    traffic_light_poles_stand_at_corners_and_face_intersection_center();
+    city_terrain_patches_hardcoded_intersection_blocks();
+    city_terrain_flat_block_patch_is_level();
+    city_terrain_inside_patch_conforms_to_piece_cells();
+    city_terrain_inside_patch_conforms_to_building_footprints();
+    city_road_tile_heights_follow_native_slope_region();
+    traffic_light_poles_stand_at_native_corners_of_3way_plus_intersections();
     parses_buildblock_sbl_fixture();
     builds_buildblock_preview_scene();
     city_block_preview_treats_unmatched_record_name_as_solid_not_layer_meshes();

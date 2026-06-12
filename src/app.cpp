@@ -1293,7 +1293,22 @@ int run_editor_app() {
                         const auto scene_fingerprint = city_scene_fingerprint(project->city->data);
                         if (!project->city_scene_cache_valid ||
                             project->city_scene_cache_fingerprint != scene_fingerprint) {
-                            project->city_scene_cache = build_map_scene(project->city->data);
+                            // Resolve each placement's .sbb so the scene builder
+                            // can stamp building ground footprints into the
+                            // terrain corner-height grid (same lookup as the
+                            // city building draw path).
+                            std::vector<const SbbBuilding*> placement_buildings;
+                            placement_buildings.reserve(project->city->data.buildings.size());
+                            for (const auto& placement : project->city->data.buildings) {
+                                const auto asset = std::ranges::find_if(
+                                    project->buildings,
+                                    [&placement](const LoadedAsset<SbbBuilding>& candidate) {
+                                        return candidate.name == placement.name || candidate.data.name == placement.name;
+                                    });
+                                placement_buildings.push_back(
+                                    asset == project->buildings.end() ? nullptr : &asset->data);
+                            }
+                            project->city_scene_cache = build_map_scene(project->city->data, placement_buildings);
                             project->city_scene_cache_fingerprint = scene_fingerprint;
                             project->city_scene_cache_valid = true;
                             project->city_scene_gpu_valid = false;

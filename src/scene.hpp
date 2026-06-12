@@ -309,6 +309,10 @@ Vec3 native_city_rotate_local(Vec3 local, std::int32_t rotation);
 Vec3 native_city_building_render_origin(const SbcBuilding& placement, float unit_size = 4.0F);
 Vec3 native_city_building_transform_point(const SbcBuilding& placement, Vec3 local, float unit_size = 4.0F);
 MapScene build_map_scene(const SbcMap& map);
+// placement_buildings[i] resolves map.buildings[i] to its loaded .sbb data
+// (nullptr when unresolved); used to stamp building ground footprints into the
+// terrain corner-height grid like the native instantiation does.
+MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*>& placement_buildings);
 std::uint64_t city_scene_fingerprint(const SbcMap& map);
 std::uint32_t terrain_noise_hash(std::int32_t x, std::int32_t y, std::uint32_t mask);
 float terrain_noise_sample(float x, float z, float frequency_x, float frequency_z);
