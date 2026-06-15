@@ -1103,18 +1103,81 @@ void duplicate_city_street(EditorProject& project, EditorUi& ui) {
     ui.city_dirty = true;
 }
 
+// Nearest existing intersection to a grid point within snap_cells, or nullopt.
+// Lets a road click reuse an existing junction instead of stacking a new node on
+// top of it (editor.exe behavior).
+std::optional<std::size_t> nearest_city_intersection(const SbcMap& map, CityGridPoint point, std::int32_t snap_cells) {
+    std::optional<std::size_t> best;
+    std::int64_t best_dist_sq = static_cast<std::int64_t>(snap_cells) * snap_cells;
+    for (std::size_t i = 0; i < map.intersections.size(); ++i) {
+        const auto& it = map.intersections[i];
+        const std::int64_t dx = it.x - point.x;
+        const std::int64_t dz = it.z - point.z;
+        const auto dist_sq = dx * dx + dz * dz;
+        if (dist_sq <= best_dist_sq) {
+            best_dist_sq = dist_sq;
+            best = i;
+        }
+    }
+    return best;
+}
+
+// Constrains an end point to be axis-aligned with a start node: locks whichever
+// of X/Z moved less, so the segment runs straight along the dominant axis. Roads
+// are never diagonal.
+CityGridPoint snap_to_axis(CityGridPoint start, CityGridPoint target) {
+    const auto dx = std::abs(target.x - start.x);
+    const auto dz = std::abs(target.z - start.z);
+    if (dx >= dz) {
+        return CityGridPoint{target.x, target.y, start.z};
+    }
+    return CityGridPoint{start.x, target.y, target.z};
+}
+
+// Resolves a click to an intersection index: snaps to a nearby existing node, or
+// creates a new one at the given point. New nodes pick up terrain height so the
+// road can run up or down with the land.
+std::size_t resolve_or_create_intersection(EditorProject& project, CityGridPoint point) {
+    auto& map = project.city->data;
+    if (const auto existing = nearest_city_intersection(map, point, 1)) {
+        return *existing;
+    }
+    CityGridPoint placed = point;
+    if (project.city_scene_cache_valid && project.city_scene_cache.terrain.has_value()) {
+        const auto unit = project.city_scene_cache.unit_size;
+        const auto h = terrain_height_at(*project.city_scene_cache.terrain,
+            static_cast<float>(point.x) * unit, static_cast<float>(point.z) * unit);
+        placed.y = static_cast<std::int32_t>(std::lround(h / unit));
+    }
+    return add_city_intersection(map, placed);
+}
+
 void append_city_road_point(EditorProject& project, EditorUi& ui, CityGridPoint point) {
     if (!project.city) {
         return;
     }
 
     auto& map = project.city->data;
-    const auto intersection_index = add_city_intersection(map, point);
+
+    // First click of a chain: pick the start node (existing or new). No segment
+    // yet; the next click closes a segment to here.
     if (!ui.pending_road_intersection.has_value()) {
-        ui.pending_road_intersection = intersection_index;
+        ui.pending_road_intersection = resolve_or_create_intersection(project, point);
         ui.city_dirty = true;
         return;
     }
+
+    // Clicking the active start node again ends the chain without a 0-length road.
+    const auto& start_node = map.intersections[*ui.pending_road_intersection];
+    if (start_node.x == point.x && start_node.z == point.z) {
+        ui.pending_road_intersection.reset();
+        return;
+    }
+
+    // Axis-lock the end relative to the start, then resolve/create that node.
+    const CityGridPoint start_point{start_node.x, start_node.y, start_node.z};
+    const auto end_point = snap_to_axis(start_point, point);
+    const auto end_index = resolve_or_create_intersection(project, end_point);
 
     SbcStreet street{};
     if (!map.streets.empty()) {
@@ -1126,11 +1189,17 @@ void append_city_road_point(EditorProject& project, EditorUi& ui, CityGridPoint 
     }
     street.index = map.streets.size();
     street.from_intersection = static_cast<std::int32_t>(*ui.pending_road_intersection);
-    street.to_intersection = static_cast<std::int32_t>(intersection_index);
+    street.to_intersection = static_cast<std::int32_t>(end_index);
     map.streets.push_back(std::move(street));
     ui.selected_city_street = map.streets.size() - 1U;
-    ui.pending_road_intersection = intersection_index;
+    // The new end node becomes the next start: chained laying.
+    ui.pending_road_intersection = end_index;
     ui.city_dirty = true;
+}
+
+// Ends the current road-laying chain (Esc, or mode/selection change).
+void end_road_chain(EditorUi& ui) {
+    ui.pending_road_intersection.reset();
 }
 
 std::int32_t floor_div8(std::int32_t value) {
@@ -1490,6 +1559,36 @@ void apply_building_gizmo_drag(EditorProject& project, EditorUi& ui, const Camer
     }
 }
 
+// Overlay (not road rendering) showing the active road-laying chain: a marker on
+// the pending start node and an axis-snapped preview line to the cursor, so you
+// see the segment before clicking. Drawn inside the City 3D pass.
+void draw_road_lay_preview(const EditorProject& project, const EditorUi& ui, std::optional<CityGridPoint> cursor) {
+    if (ui.city_mode != CityEditMode::Roads || !ui.pending_road_intersection.has_value() || !project.city) {
+        return;
+    }
+    const auto& map = project.city->data;
+    if (*ui.pending_road_intersection >= map.intersections.size()) {
+        return;
+    }
+    const auto unit = project.city_scene_cache_valid ? project.city_scene_cache.unit_size : 4.0F;
+    const auto& start = map.intersections[*ui.pending_road_intersection];
+    const auto ground = [&](std::int32_t gx, std::int32_t gz, std::int32_t fallback_level) {
+        const auto base = project.city_scene_cache_valid && project.city_scene_cache.terrain.has_value()
+            ? terrain_height_at(*project.city_scene_cache.terrain, static_cast<float>(gx) * unit, static_cast<float>(gz) * unit)
+            : static_cast<float>(fallback_level) * unit;
+        return base + unit * 0.6F;
+    };
+    const Vector3 start_pos{static_cast<float>(start.x) * unit, ground(start.x, start.z, start.y), static_cast<float>(start.z) * unit};
+    DrawSphere(start_pos, unit * 0.4F, Color{120, 230, 130, 235});
+
+    if (cursor.has_value()) {
+        const auto end = snap_to_axis(CityGridPoint{start.x, start.y, start.z}, *cursor);
+        const Vector3 end_pos{static_cast<float>(end.x) * unit, ground(end.x, end.z, start.y), static_cast<float>(end.z) * unit};
+        DrawLine3D(start_pos, end_pos, Color{255, 240, 140, 255});
+        DrawSphere(end_pos, unit * 0.3F, Color{255, 220, 110, 220});
+    }
+}
+
 // Collapsible reference of the controls active for the current tab/mode. Lives
 // at the top of the Inspector so the keyboard map is discoverable without leaving
 // the editing surface. Collapsed by default; a short fixed list, no scrolling.
@@ -1511,7 +1610,8 @@ void draw_controls_help(const EditorUi& ui) {
                 k(KEY_R).c_str(), k(KEY_R).c_str());
             ImGui::Text("%s+D duplicate  |  Del delete", k(KEY_LEFT_CONTROL).c_str());
         } else if (ui.city_mode == CityEditMode::Roads) {
-            ImGui::TextUnformatted("Click select  |  Shift+Click add road point");
+            ImGui::TextUnformatted("Click lays road chain (axis-locked, snaps to nodes)  |  Esc ends");
+            ImGui::TextUnformatted("Shift+Click selects a road to edit");
             ImGui::Text("Arrows from/to nodes  |  %s %s left width  |  %s %s right width",
                 k(KEY_LEFT_BRACKET).c_str(), k(KEY_RIGHT_BRACKET).c_str(),
                 k(KEY_SEMICOLON).c_str(), k(KEY_APOSTROPHE).c_str());
@@ -1557,6 +1657,11 @@ void handle_editor_hotkeys(EditorProject& project, EditorUi& ui, Camera3D& camer
             placement.rotation = ui.gizmo_drag_origin_rot;
         }
         ui.gizmo_active = GizmoAxis::None;
+        return;
+    }
+    // Esc ends an in-progress road-laying chain.
+    if (IsKeyPressed(KEY_ESCAPE) && ui.pending_road_intersection.has_value()) {
+        end_road_chain(ui);
         return;
     }
 
@@ -1821,6 +1926,7 @@ int run_editor_app() {
                         if (city_cursor.has_value()) {
                             draw_city_cursor(*city_cursor, 4.0F, ui.city_mode);
                         }
+                        draw_road_lay_preview(*project, ui, city_cursor);
 
                         // Drag gizmo on the selected building. Hover-highlights the
                         // handle under the cursor unless a drag is already active.
@@ -1907,16 +2013,16 @@ int run_editor_app() {
                         }
                     }
                 } else if (ui.city_mode == CityEditMode::Roads) {
-                    // Plain click selects the road under the cursor; Shift appends a
-                    // road point/intersection at the cursor.
+                    // Plain click lays the road chain (snap to a node or create one,
+                    // axis-aligned, chained). Shift+click selects a road to edit.
                     if (shift) {
-                        if (city_cursor.has_value()) append_city_road_point(*project, ui, *city_cursor);
-                    } else {
                         const auto picked = pick_city_road(
                             project->city->data, project->city_scene_cache, ray_origin, ray_dir);
                         if (picked.has_value()) {
                             ui.selected_city_street = *picked;
                         }
+                    } else {
+                        if (city_cursor.has_value()) append_city_road_point(*project, ui, *city_cursor);
                     }
                 } else if (ui.city_mode == CityEditMode::Pieces) {
                     // Plain click selects/moves the grid cursor; Shift stamps a
@@ -2062,12 +2168,20 @@ int run_editor_app() {
                     ImGui::RadioButton("Roads", &mode_idx, 0); ImGui::SameLine();
                     ImGui::RadioButton("Buildings", &mode_idx, 1); ImGui::SameLine();
                     ImGui::RadioButton("Pieces", &mode_idx, 2);
-                    ui.city_mode = static_cast<CityEditMode>(mode_idx);
+                    const auto new_mode = static_cast<CityEditMode>(mode_idx);
+                    if (new_mode != ui.city_mode) {
+                        end_road_chain(ui);  // don't carry a pending start across modes
+                    }
+                    ui.city_mode = new_mode;
 
                     if (ui.city_mode == CityEditMode::Buildings) {
                         ImGui::TextDisabled("Click: select / drag gizmo  |  Shift+Click: move  |  Ctrl+Shift+Click: copy");
                     } else if (ui.city_mode == CityEditMode::Roads) {
-                        ImGui::TextDisabled("Click: select road  |  Shift+Click: add road point");
+                        if (ui.pending_road_intersection.has_value()) {
+                            ImGui::TextDisabled("Click: extend (axis-locked)  |  click start node or Esc: end  |  Shift+Click: select");
+                        } else {
+                            ImGui::TextDisabled("Click: start road (snaps to node)  |  Shift+Click: select road");
+                        }
                     } else {
                         ImGui::TextDisabled("Shift+Click: place  |  Ctrl+Click: clear  |  %s: rotate", key_label(KEY_R).c_str());
                     }
