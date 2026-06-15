@@ -506,6 +506,49 @@ std::vector<const SbbBuilding*> resolve_placement_buildings(const EditorProject&
     return placement_buildings;
 }
 
+// Launches a background rebuild of the city scene (roads + terrain field +
+// footprint stamping) for the given fingerprint. The worker owns copies of the
+// map and the resolved .sbb data so nothing it touches can be mutated or freed by
+// the main thread mid-build. GPU upload stays on the main thread (see the caller).
+void start_city_scene_rebuild(EditorProject& project, std::uint64_t fingerprint) {
+    if (!project.city) {
+        return;
+    }
+    auto map_copy = project.city->data;
+    // Copy each resolved building by value; the worker rebuilds the pointer view
+    // over its own owned copies so the pointers cannot dangle. resolved[i] marks
+    // whether placement i resolved to a real .sbb (else the slot is a nullptr).
+    auto owned = std::make_shared<std::vector<SbbBuilding>>();
+    std::vector<char> resolved;
+    owned->reserve(project.city->data.buildings.size());
+    resolved.reserve(project.city->data.buildings.size());
+    for (const auto& placement : project.city->data.buildings) {
+        const auto asset = std::ranges::find_if(
+            project.buildings,
+            [&placement](const LoadedAsset<SbbBuilding>& candidate) {
+                return candidate.name == placement.name || candidate.data.name == placement.name;
+            });
+        const bool found = asset != project.buildings.end();
+        owned->push_back(found ? asset->data : SbbBuilding{});
+        resolved.push_back(found ? 1 : 0);
+    }
+
+    project.city_scene_build_in_progress = true;
+    project.city_scene_build_target_fingerprint = fingerprint;
+    const auto generation = ++project.city_scene_build_generation;
+    project.city_scene_build_future = std::async(
+        std::launch::async,
+        [map = std::move(map_copy), owned, resolved = std::move(resolved), generation]() {
+            std::vector<const SbbBuilding*> placement_buildings;
+            placement_buildings.reserve(owned->size());
+            for (std::size_t i = 0; i < owned->size(); ++i) {
+                placement_buildings.push_back(resolved[i] != 0 ? &(*owned)[i] : nullptr);
+            }
+            (void)generation;
+            return build_map_scene(map, placement_buildings);
+        });
+}
+
 void draw_city_building_models_full_detail(
     EditorProject& project,
     const SbcBuilding* selected_building,
@@ -1712,17 +1755,36 @@ int run_editor_app() {
                             ? nullptr
                             : &project->city->data.streets[std::min(ui.selected_city_street, project->city->data.streets.size() - 1U)];
                         const auto scene_fingerprint = city_scene_fingerprint(project->city->data);
-                        if (!project->city_scene_cache_valid ||
-                            project->city_scene_cache_fingerprint != scene_fingerprint) {
-                            // Resolve each placement's .sbb so the scene builder
-                            // can stamp building ground footprints into the
-                            // terrain corner-height grid (same lookup as the
-                            // city building draw path and the viewport picker).
+                        if (!project->city_scene_cache_valid) {
+                            // First scene for this project: build synchronously so
+                            // there is always something to show on load. Only edits
+                            // (below) go to the background worker.
                             const auto placement_buildings = resolve_placement_buildings(*project);
                             project->city_scene_cache = build_map_scene(project->city->data, placement_buildings);
                             project->city_scene_cache_fingerprint = scene_fingerprint;
                             project->city_scene_cache_valid = true;
                             project->city_scene_gpu_valid = false;
+                        } else if (project->city_scene_cache_fingerprint != scene_fingerprint &&
+                                   !project->city_scene_build_in_progress) {
+                            // The map changed: rebuild the scene (roads + terrain
+                            // field + footprint stamping) on a worker thread. The
+                            // last-good scene keeps rendering until it is ready.
+                            start_city_scene_rebuild(*project, scene_fingerprint);
+                        }
+
+                        // Adopt a finished background rebuild if it still matches
+                        // the current map; otherwise discard it as stale and let the
+                        // next frame kick a fresh build.
+                        if (project->city_scene_build_future.has_value() &&
+                            project->city_scene_build_future->wait_for(std::chrono::milliseconds{0}) == std::future_status::ready) {
+                            auto built = project->city_scene_build_future->get();
+                            project->city_scene_build_future.reset();
+                            project->city_scene_build_in_progress = false;
+                            if (project->city_scene_build_target_fingerprint == scene_fingerprint) {
+                                project->city_scene_cache = std::move(built);
+                                project->city_scene_cache_fingerprint = scene_fingerprint;
+                                project->city_scene_gpu_valid = false;
+                            }
                         }
                         const auto game_preview = ui.city_view_mode == CityViewMode::GamePreview;
                         if (game_preview && !project->city_scene_gpu_valid) {

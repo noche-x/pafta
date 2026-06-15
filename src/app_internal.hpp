@@ -313,6 +313,13 @@ struct EditorProject {
     MapScene city_scene_cache;
     std::uint64_t city_scene_cache_fingerprint{};
     bool city_scene_cache_valid{false};
+    // Background city-scene rebuild. build_map_scene (roads + terrain field +
+    // footprint stamping) runs on a worker thread so editing never blocks the
+    // frame; the last-good scene keeps rendering until the new one is ready.
+    bool city_scene_build_in_progress{};
+    std::uint64_t city_scene_build_generation{};
+    std::uint64_t city_scene_build_target_fingerprint{};
+    std::optional<std::future<MapScene>> city_scene_build_future;
     // GPU meshes for the city road/curb tiles and terrain, uploaded once per scene
     // rebuild instead of re-submitting every triangle in immediate mode each frame.
     GpuBuildingRenderModel city_tile_gpu_model;
