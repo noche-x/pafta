@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace map_editor {
 
@@ -2238,10 +2239,25 @@ std::optional<CityTerrain> build_city_terrain(
     const SbcMap& map,
     const NativeCityGraph& expanded_graph,
     const CityCornerStampMap& stamps,
+    const std::vector<CityTileCell>& tile_cells,
     float unit_size) {
     if (map.intersections.empty()) {
         return std::nullopt;
     }
+
+    // The game removes the terrain surface under road/curb tiles entirely — the
+    // drivable asphalt IS the ground there. Without this, the flat terrain plane
+    // (sitting at the same patched level as the road tops) z-fights the road on
+    // the lowest, flattest blocks. Build a covered-cell set so terrain quads
+    // fully under tiles are skipped.
+    std::unordered_set<std::uint64_t> covered_cells;
+    covered_cells.reserve(tile_cells.size());
+    for (const auto& tile : tile_cells) {
+        covered_cells.insert(CityCornerStampMap::key(tile.x, tile.z));
+    }
+    auto cell_covered = [&](std::int32_t gx, std::int32_t gz) {
+        return covered_cells.contains(CityCornerStampMap::key(gx, gz));
+    };
 
     auto min_x = std::numeric_limits<std::int32_t>::max();
     auto max_x = std::numeric_limits<std::int32_t>::lowest();
@@ -2321,6 +2337,29 @@ std::optional<CityTerrain> build_city_terrain(
 
     for (auto z = 0; z < terrain.sample_count_z - 1; ++z) {
         for (auto x = 0; x < terrain.sample_count_x - 1; ++x) {
+            // Skip terrain quads that sit under a road/curb tile — the tile's top
+            // surface is the ground there, and the coincident terrain plane
+            // z-fights it. The quad's footprint (2 units) fits inside one 4-unit
+            // tile cell; test the four corners and skip only when all are covered
+            // so the cut follows the tile footprint without leaving holes.
+            const auto quad_min_x = terrain.min_x + static_cast<float>(x) * terrain.sample_spacing;
+            const auto quad_min_z = terrain.min_z + static_cast<float>(z) * terrain.sample_spacing;
+            const auto quad_max_x = quad_min_x + terrain.sample_spacing;
+            const auto quad_max_z = quad_min_z + terrain.sample_spacing;
+            const auto cell_of = [&](float wx, float wz) {
+                return cell_covered(
+                    static_cast<std::int32_t>(std::floor(wx / unit_size)),
+                    static_cast<std::int32_t>(std::floor(wz / unit_size)));
+            };
+            // Sample just inside each corner so a quad flush against a tile edge
+            // resolves to the cell it actually overlaps.
+            constexpr auto eps = 0.01F;
+            if (cell_of(quad_min_x + eps, quad_min_z + eps) &&
+                cell_of(quad_max_x - eps, quad_min_z + eps) &&
+                cell_of(quad_min_x + eps, quad_max_z - eps) &&
+                cell_of(quad_max_x - eps, quad_max_z - eps)) {
+                continue;
+            }
             const auto i0 = static_cast<std::uint32_t>(z * terrain.sample_count_x + x);
             const auto i1 = static_cast<std::uint32_t>(z * terrain.sample_count_x + x + 1);
             const auto i2 = static_cast<std::uint32_t>((z + 1) * terrain.sample_count_x + x + 1);
@@ -2807,6 +2846,125 @@ std::optional<CellPick> pick_building_cell(
     return nearest;
 }
 
+std::optional<Vec3> ray_ground_hit(const Vec3& ray_origin, const Vec3& ray_dir) {
+    if (std::abs(ray_dir.y) < 0.0001F) {
+        return std::nullopt;
+    }
+    const auto t = -ray_origin.y / ray_dir.y;
+    if (t < 0.0F) {
+        return std::nullopt;
+    }
+    return add_scaled(ray_origin, ray_dir, t);
+}
+
+std::optional<std::size_t> pick_city_building(
+    const SbcMap& map,
+    const std::vector<const SbbBuilding*>& placement_buildings,
+    const Vec3& ray_origin,
+    const Vec3& ray_dir,
+    float unit_size) {
+    if (unit_size <= 0.0F) {
+        return std::nullopt;
+    }
+
+    const auto half = unit_size * 0.5F;
+    std::optional<std::size_t> nearest;
+    float nearest_t = std::numeric_limits<float>::max();
+    for (std::size_t index = 0; index < map.buildings.size(); ++index) {
+        const auto& placement = map.buildings[index];
+        const auto* building = index < placement_buildings.size() ? placement_buildings[index] : nullptr;
+
+        // World AABB over the placement's occupied cells (so the pick box hugs the
+        // actual footprint), or a single placement cell box when the .sbb is
+        // unresolved. Cell-to-world uses the same transform as the draw/stamp path.
+        Vec3 box_min{std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
+        Vec3 box_max{std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest()};
+        bool has_box = false;
+        if (building != nullptr) {
+            for (const auto& cell : building->cells) {
+                if (!cell.occupied) {
+                    continue;
+                }
+                const Vec3 local{
+                    (static_cast<float>(cell.x) - static_cast<float>(building->anchor_x) + 0.5F) * unit_size,
+                    (static_cast<float>(cell.y) - static_cast<float>(building->anchor_y) + 0.5F) * unit_size,
+                    (static_cast<float>(cell.z) - static_cast<float>(building->anchor_z) + 0.5F) * unit_size,
+                };
+                const auto center = native_city_building_transform_point(placement, local, unit_size);
+                box_min = Vec3{std::min(box_min.x, center.x - half), std::min(box_min.y, center.y - half), std::min(box_min.z, center.z - half)};
+                box_max = Vec3{std::max(box_max.x, center.x + half), std::max(box_max.y, center.y + half), std::max(box_max.z, center.z + half)};
+                has_box = true;
+            }
+        }
+        if (!has_box) {
+            const auto origin = native_city_building_render_origin(placement, unit_size);
+            box_min = Vec3{origin.x - half, origin.y, origin.z - half};
+            box_max = Vec3{origin.x + half, origin.y + unit_size, origin.z + half};
+        }
+
+        const auto t = ray_aabb_intersection_t(ray_origin, ray_dir, box_min, box_max);
+        if (!t.has_value() || *t >= nearest_t) {
+            continue;
+        }
+        nearest = index;
+        nearest_t = *t;
+    }
+
+    return nearest;
+}
+
+std::optional<std::size_t> pick_city_road(
+    const SbcMap& map,
+    const MapScene& scene,
+    const Vec3& ray_origin,
+    const Vec3& ray_dir) {
+    const auto hit = ray_ground_hit(ray_origin, ray_dir);
+    if (!hit.has_value()) {
+        return std::nullopt;
+    }
+
+    // Distance from the ground hit to each road segment; the nearest segment
+    // within its drawn half-width wins. scene.roads[i].source back-references the
+    // SBC street, resolved to an index into map.streets.
+    std::optional<std::size_t> nearest;
+    float nearest_dist = std::numeric_limits<float>::max();
+    for (const auto& road : scene.roads) {
+        const auto ax = road.from.x;
+        const auto az = road.from.z;
+        const auto bx = road.to.x;
+        const auto bz = road.to.z;
+        const auto dx = bx - ax;
+        const auto dz = bz - az;
+        const auto seg_len_sq = dx * dx + dz * dz;
+        auto u = seg_len_sq > 0.000001F
+            ? ((hit->x - ax) * dx + (hit->z - az) * dz) / seg_len_sq
+            : 0.0F;
+        u = std::clamp(u, 0.0F, 1.0F);
+        const auto cx = ax + dx * u;
+        const auto cz = az + dz * u;
+        const auto dist = std::sqrt((hit->x - cx) * (hit->x - cx) + (hit->z - cz) * (hit->z - cz));
+        const auto half_width = std::max(road.width, scene.unit_size) * 0.5F;
+        if (dist > half_width || dist >= nearest_dist) {
+            continue;
+        }
+
+        std::optional<std::size_t> street_index;
+        for (std::size_t i = 0; i < map.streets.size(); ++i) {
+            if (&map.streets[i] == road.source) {
+                street_index = i;
+                break;
+            }
+        }
+        if (!street_index.has_value()) {
+            continue;
+        }
+        nearest = *street_index;
+        nearest_dist = dist;
+    }
+
+    return nearest;
+}
+
 // -----------------------------------------------------------------------------
 // City Scene Builders
 // -----------------------------------------------------------------------------
@@ -2961,7 +3119,7 @@ MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*
     stamp_city_building_footprints(corner_stamps, map, placement_buildings);
     scene.traffic_light_poles = build_city_traffic_light_poles(graph, scene.unit_size);
     expand_native_city_extents(graph);
-    scene.terrain = build_city_terrain(map, graph, corner_stamps, scene.unit_size);
+    scene.terrain = build_city_terrain(map, graph, corner_stamps, scene.city_tiles, scene.unit_size);
     scene.city_tile_buffer = build_city_tile_render_buffer(scene.city_tiles, scene.unit_size);
 
     for (const auto& street : map.streets) {

@@ -60,7 +60,27 @@ On Windows with Visual Studio, use the `dev-msvc` preset instead. The CTest suit
 
 Drop a map folder into the window or click `Open Folder`. The expected folder layout is the native editor layout: `city2.sbc`, `building/*.sbb`, `block/*.sbl`, and `buildblock/*.sbl`.
 
-Camera control is freecam: hold right mouse, then use mouse look plus WASD-style movement.
+### Controls
+
+Camera (freecam): hold **right mouse**, then **WASD** to move, **Space/Shift** for up/down, **Ctrl** for 2x speed, and the **mouse wheel** to change fly speed. The keyboard edit shortcuts below are inactive while flying or while typing in a field.
+
+Selection is click-to-select: a plain left-click in the viewport selects whatever is under the cursor, and placement actions sit on modifiers so they no longer fight selection. The selected building, road, or piece gets a pulsing glow outline. The Inspector buttons remain as a secondary path and show their hotkey in tooltips; a collapsible **Controls** section at the top of the Inspector lists the bindings for the current tab/mode.
+
+Key labels in the help text and tooltips are localized to your keyboard layout (an AZERTY user sees ZQSD, not WASD). The keys still fire on the same physical positions on every layout — only the printed labels change.
+
+A selected city building shows a **drag gizmo**: grab the red/green/blue axis handles to slide it on X/Y/Z, or the yellow handle to rotate it to face the cursor. **Esc** cancels an in-progress drag (it does not quit the app).
+
+Closing the window, **Alt+F4**, or File → Exit is blocked while there are unsaved changes: a prompt offers **Save & Exit**, **Discard & Exit**, or **Cancel**. Saving writes the usual `*.edited.*` copies.
+
+Global: **Ctrl+S** saves the active tab's `*.edited.*` copy, **F** focuses the camera on the city, **Ctrl+O** opens a folder.
+
+City tab:
+
+- **Buildings** mode: click selects a placement; **Shift+click** moves the selected one to the cursor; **Ctrl+Shift+click** stamps a copy. Arrows move X/Z, **PgUp/PgDn** move Y, **R** rotates (**Shift+R** reverses), **Ctrl+D** duplicates, **Del** deletes.
+- **Roads** mode: click selects a road; **Shift+click** adds a road point/intersection. Arrows adjust the from/to nodes, **`[` `]`** the left width, **`;` `'`** the right width, **`-` `=`** the district, **Ctrl+D** duplicates, **Del** deletes.
+- **Pieces** mode: **Shift+click** places a voxel, **Ctrl+click** clears it, **R** rotates the voxel before placing.
+
+Buildings / Blocks / Buildblocks tabs: **Left/Right** nudge the selected field, **Up/Down** take the coarser step (and cycle the active field on the Buildings tab), **Tab/Shift+Tab** cycle the selected cell/field/layer record, and **Ctrl+S** saves the `*.edited.*` copy.
 
 The argument-based file viewer and edit commands are retained as dev/test utilities so CTest can validate binary parsing and patching behavior; they are not the main editor workflow.
 

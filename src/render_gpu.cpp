@@ -297,6 +297,23 @@ Vector3 to_raylib(Vec3 value) {
     return {value.x, value.y, value.z};
 }
 
+// Unified selection highlight: a pulsing, layered wireframe box that reads as a
+// glow without needing a framebuffer bloom pass (which would mean a shader over
+// the whole scene and a fragile cross-platform GL path). Drawn for the selected
+// building, road, and piece so selection feedback is consistent everywhere.
+void draw_selection_glow_box(Vector3 center, Vector3 size, Color tint) {
+    const auto pulse = 0.5F + 0.5F * static_cast<float>(std::sin(GetTime() * 4.0));
+    const auto inner = Color{tint.r, tint.g, tint.b, static_cast<unsigned char>(235)};
+    const auto outer = Color{tint.r, tint.g, tint.b, static_cast<unsigned char>(60 + 70 * pulse)};
+    // Two concentric boxes: a crisp inner edge plus a softer, larger pulsing halo.
+    DrawCubeWiresV(center, size, inner);
+    const auto halo = Vector3{size.x + 1.4F + pulse, size.y + 1.4F + pulse, size.z + 1.4F + pulse};
+    DrawCubeWiresV(center, halo, outer);
+    if (g_gfx_debug_stats != nullptr) {
+        g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::WireOverlay, 0U, 48U, 24U);
+    }
+}
+
 Vector3 scaled(Vec3f value, Vec3 origin, float scale) {
     return {
         origin.x + value.x * scale,
@@ -658,6 +675,13 @@ float baked_directional_light(Vector3 normal) {
         return 1.0F;
     }
     Vector3 n{normal.x / len, normal.y / len, normal.z / len};
+    // Backface culling is off and the terrain/tile top faces wind so their
+    // geometric normal points DOWN (e1xe2 = -Y). Lighting must treat these as
+    // up-facing, so flip any downward normal — otherwise every ground face
+    // clamps to the ambient floor and slopes read flat.
+    if (n.y < 0.0F) {
+        n = {-n.x, -n.y, -n.z};
+    }
     // Exaggerate tilt only for mostly-up faces (ground); walls keep their angle.
     if (n.y > 0.7F) {
         n.x *= slope_boost;
@@ -871,7 +895,7 @@ void draw_sbb_scene_for_app(const SbbBuilding& building, GpuBuildingRenderModel&
             (static_cast<float>(selected->y) - static_cast<float>(building.anchor_y) + 0.5F) * unit_size,
             (static_cast<float>(selected->z) - static_cast<float>(building.anchor_z) + 0.5F) * unit_size,
         };
-        DrawCubeWiresV(center, {unit_size * 1.16F, unit_size * 1.16F, unit_size * 1.16F}, {255, 225, 80, 255});
+        draw_selection_glow_box(center, {unit_size, unit_size, unit_size}, Color{255, 225, 90, 255});
     }
 }
 
@@ -965,7 +989,14 @@ void draw_city_building_model(
     }
 
     if (selected) {
-        DrawCubeWiresV(origin, {unit_size * 2.0F, unit_size * 2.0F, unit_size * 2.0F}, fill);
+        // Glow box sized to the building footprint, centered on its bounds.
+        const auto sx = static_cast<float>(std::max(1U, template_file.size_x)) * unit_size;
+        const auto sy = static_cast<float>(std::max(1U, template_file.size_y)) * unit_size;
+        const auto sz = static_cast<float>(std::max(1U, template_file.size_z)) * unit_size;
+        const auto center = Vector3{origin.x, origin.y + sy * 0.5F, origin.z};
+        const auto rotated = (placement.rotation & 1) != 0;
+        const auto box = Vector3{rotated ? sz : sx, sy, rotated ? sx : sz};
+        draw_selection_glow_box(center, box, Color{255, 225, 90, 255});
     }
 }
 
@@ -1084,6 +1115,21 @@ void draw_city_piece_voxels(EditorProject& project, bool textured, std::optional
     // Native world cells sit 0.25 above their level; without the lift the piece
     // ground cells are coplanar with their stamped terrain plots and z-fight.
     draw_gpu_building_model(model, {0.0F, 0.25F, 0.0F}, 0, false, true, nullptr, GfxDebugDrawCategory::Pieces);
+
+    // Glow box over the selected portal's 8x8x8 voxel volume so the active piece
+    // selection reads the same way buildings and roads do.
+    if (selected_portal.has_value() && *selected_portal < project.city->data.portals.size()) {
+        const auto& portal = project.city->data.portals[*selected_portal];
+        constexpr auto unit_size = 4.0F;
+        constexpr auto span = 8.0F;
+        const auto center = Vector3{
+            (static_cast<float>(portal.fields[1]) * span + span * 0.5F) * unit_size,
+            (static_cast<float>(portal.fields[2]) * span + span * 0.5F) * unit_size,
+            (static_cast<float>(portal.fields[3]) * span + span * 0.5F) * unit_size,
+        };
+        const auto box = Vector3{span * unit_size, span * unit_size, span * unit_size};
+        draw_selection_glow_box(center, box, Color{120, 210, 255, 255});
+    }
 }
 
 Color city_tile_material_color(const BuildingRenderBuffer& buffer, std::uint32_t material) {
@@ -1127,16 +1173,12 @@ void draw_uploaded_city_model(GpuBuildingRenderModel& model, GfxDebugDrawCategor
 // Frees the GPU meshes/materials a city model owns before it is replaced, so the
 // per-edit re-upload doesn't leak VRAM. (Buffers are MemAlloc'd by UploadMesh.)
 void unload_city_render_model(GpuBuildingRenderModel& model) {
-    for (auto& chunk : model.chunks) {
-        if (chunk.mesh.vertexCount > 0) {
-            UnloadMesh(chunk.mesh);
-        }
-        if (chunk.material.maps != nullptr) {
-            // Don't unload the shared project texture; just the default material maps.
-            chunk.material.maps[MATERIAL_MAP_DIFFUSE].texture = Texture2D{};
-            UnloadMaterial(chunk.material);
-        }
-    }
+    // GpuBuildingMeshChunk owns its mesh/material via RAII: its destructor calls
+    // UnloadMesh and MemFree(material.maps) (and intentionally leaves the shared
+    // project texture alone). Clearing the vector runs those destructors. A manual
+    // UnloadMesh here would leave each mesh's stale vbo/vertex pointers in place,
+    // so the chunk destructor would then UnloadMesh the same buffers a second time
+    // and abort with a double free.
     model.chunks.clear();
     model.wire_lines.clear();
     model.uploaded_vertices = 0;
@@ -1216,10 +1258,15 @@ void draw_city_scene(
             auto to = to_raylib(road.to);
             from.y += scene.unit_size * 1.1F;
             to.y += scene.unit_size * 1.1F;
-            DrawSphere(from, scene.unit_size * 0.35F, {245, 205, 82, 220});
-            DrawSphere(to, scene.unit_size * 0.35F, {245, 205, 82, 220});
+            const auto pulse = 0.5F + 0.5F * static_cast<float>(std::sin(GetTime() * 4.0));
+            const auto glow = Color{255, 215, 90, static_cast<unsigned char>(170 + 70 * pulse)};
+            DrawSphere(from, scene.unit_size * (0.32F + 0.08F * pulse), glow);
+            DrawSphere(to, scene.unit_size * (0.32F + 0.08F * pulse), glow);
+            // Bright pulsing centerline so the whole selected segment reads, not
+            // just its endpoints.
+            DrawLine3D(from, to, Color{255, 235, 140, 255});
             if (g_gfx_debug_stats != nullptr) {
-                g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::WireOverlay, 0U, 2U, 2U);
+                g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::WireOverlay, 0U, 4U, 3U);
             }
         }
     }
@@ -1326,9 +1373,10 @@ void draw_city_traffic_light_poles(const MapScene& scene) {
     }
     for (const auto& pole : scene.traffic_light_poles) {
         const auto base = to_raylib(pole.base);
-        // arm_direction is the inward (toward-intersection) XZ vector; the model's
-        // arm points along -Z, so rotate about Y to aim it inward.
-        const auto yaw = std::atan2(pole.arm_direction.x, -pole.arm_direction.z) * RAD2DEG;
+        // The model's arm points along -Z; raylib's +Y rotation is right-handed
+        // (yaw +90 maps -Z to -X), so the X component is negated to aim the arm
+        // along arm_direction (same handedness flip as the building rotations).
+        const auto yaw = std::atan2(-pole.arm_direction.x, -pole.arm_direction.z) * RAD2DEG;
         DrawModelEx(pole_model, base, Vector3{0.0F, 1.0F, 0.0F}, yaw, Vector3{1.0F, 1.0F, 1.0F}, WHITE);
         if (g_gfx_debug_stats != nullptr) {
             std::uint64_t triangles = 0;

@@ -643,13 +643,13 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
         mark_building_changed(project, ui);
     }
     if (ImGui::Button("-1")) nudge_building_cell(project, ui, -1);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Decrement selected field");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Decrement selected field (Left)");
     ImGui::SameLine();
     if (ImGui::Button("+1")) nudge_building_cell(project, ui, 1);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Increment selected field");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Increment selected field (Right)");
     ImGui::SameLine();
     if (ImGui::Button("+16")) nudge_building_cell(project, ui, 16);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Increment selected field by 16");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Increment selected field by 16 (=)");
 
     if (ImGui::CollapsingHeader("Blocks", ImGuiTreeNodeFlags_DefaultOpen)) {
         draw_payload_table(building, cell);
@@ -830,6 +830,7 @@ void draw_block_inspector(EditorProject& project, EditorUi& ui, std::string& sta
     }
     ImGui::Text("Selected Value: %s", block_field_value(block, ui).c_str());
     if (ImGui::Button("-1")) nudge_block(project, ui, -1);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Decrement (Left); Up/Down = -/+4, Tab cycles field");
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Decrement selected property");
     ImGui::SameLine();
     if (ImGui::Button("+1")) nudge_block(project, ui, 1);
@@ -1047,6 +1048,7 @@ void draw_buildblock_inspector(EditorProject& project, EditorUi& ui, std::string
         ui.selected_buildblock_field = static_cast<std::size_t>(active_field);
     }
     if (ImGui::Button("-1/16")) nudge_buildblock_geometry(project, ui, -1);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Decrement (Left); Up/Down = -/+4/16, Tab cycles layer");
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Nudge selected geometry field -1/16 unit");
     ImGui::SameLine();
     if (ImGui::Button("+1/16")) nudge_buildblock_geometry(project, ui, 1);

@@ -304,6 +304,25 @@ std::optional<CellPick> pick_building_cell(
     const Vec3& ray_origin,
     const Vec3& ray_dir,
     float unit_size);
+// Intersection of a world-space ray with the y=0 ground plane, or nullopt when
+// the ray is parallel to it or only hits behind the origin.
+std::optional<Vec3> ray_ground_hit(const Vec3& ray_origin, const Vec3& ray_dir);
+// Returns the index into map.buildings whose placed footprint the ray hits
+// nearest, or nullopt. placement_buildings[i] resolves each placement's loaded
+// .sbb (nullptr when unresolved -> a single placement cell box is used).
+std::optional<std::size_t> pick_city_building(
+    const SbcMap& map,
+    const std::vector<const SbbBuilding*>& placement_buildings,
+    const Vec3& ray_origin,
+    const Vec3& ray_dir,
+    float unit_size);
+// Returns the index into map.streets of the road segment whose ground footprint
+// (segment within its drawn width) the ray's ground hit lands on, or nullopt.
+std::optional<std::size_t> pick_city_road(
+    const SbcMap& map,
+    const MapScene& scene,
+    const Vec3& ray_origin,
+    const Vec3& ray_dir);
 CityBuildingBasis native_city_building_rotation_basis(std::int32_t rotation);
 Vec3 native_city_rotate_local(Vec3 local, std::int32_t rotation);
 Vec3 native_city_building_render_origin(const SbcBuilding& placement, float unit_size = 4.0F);

@@ -26,7 +26,44 @@
 #include <unordered_map>
 #include <vector>
 
+// raylib's bundled GLFW desktop backend exports these (they are defined in
+// libraylib.a and raylib calls glfwGetKeyName internally), but raylib does not
+// re-export them. Forward-declaring lets us show layout-correct key labels
+// without pulling in the GLFW header or touching the build graph.
+extern "C" const char* glfwGetKeyName(int key, int scancode);
+extern "C" int glfwGetKeyScancode(int key);
+
 namespace map_editor::app_internal {
+
+// Display label for a key, localized to the user's keyboard layout. raylib's
+// IsKeyPressed checks physical key POSITION (US-QWERTY scancodes), so the
+// movement/edit keys keep the same physical spots on every layout; this only
+// changes what we PRINT, e.g. the physical W position shows "Z" on AZERTY.
+// glfwGetKeyName returns the layout label for printable keys and null for
+// non-printable ones (arrows, Tab, Delete...), which fall back to a fixed name.
+std::string key_label(int key) {
+    if (const char* name = glfwGetKeyName(key, glfwGetKeyScancode(key)); name != nullptr && name[0] != '\0') {
+        std::string label{name};
+        for (auto& ch : label) {
+            ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        }
+        return label;
+    }
+    switch (key) {
+        case KEY_LEFT: return "Left";
+        case KEY_RIGHT: return "Right";
+        case KEY_UP: return "Up";
+        case KEY_DOWN: return "Down";
+        case KEY_PAGE_UP: return "PgUp";
+        case KEY_PAGE_DOWN: return "PgDn";
+        case KEY_DELETE: return "Del";
+        case KEY_TAB: return "Tab";
+        case KEY_SPACE: return "Space";
+        case KEY_LEFT_SHIFT: return "Shift";
+        case KEY_LEFT_CONTROL: return "Ctrl";
+        default: return "?";
+    }
+}
 
 std::string gfx_debug_format_bytes(std::uint64_t bytes) {
     std::ostringstream stream;
@@ -446,6 +483,26 @@ std::vector<std::string> city_building_names(const SbcMap& map) {
         names.push_back(std::to_string(building.index) + " " + building.name);
     }
     return names;
+}
+
+// Resolves each city placement to its loaded .sbb (nullptr when the name does
+// not resolve), parallel to map.buildings. Shared by the scene-cache rebuild and
+// the viewport building picker so both see the same footprint geometry.
+std::vector<const SbbBuilding*> resolve_placement_buildings(const EditorProject& project) {
+    std::vector<const SbbBuilding*> placement_buildings;
+    if (!project.city) {
+        return placement_buildings;
+    }
+    placement_buildings.reserve(project.city->data.buildings.size());
+    for (const auto& placement : project.city->data.buildings) {
+        const auto asset = std::ranges::find_if(
+            project.buildings,
+            [&placement](const LoadedAsset<SbbBuilding>& candidate) {
+                return candidate.name == placement.name || candidate.data.name == placement.name;
+            });
+        placement_buildings.push_back(asset == project.buildings.end() ? nullptr : &asset->data);
+    }
+    return placement_buildings;
 }
 
 void draw_city_building_models_full_detail(
@@ -1197,6 +1254,341 @@ void mark_block_changed(EditorProject& project, EditorUi& ui, SblBlockMesh& bloc
     invalidate_portal_render_models(project);
 }
 
+// Saves whichever tab's edited copy is active, mirroring the Inspector Save
+// buttons. Used by the Ctrl+S hotkey.
+void save_active_tab(EditorProject& project, EditorUi& ui, std::string& status) {
+    switch (ui.tab) {
+        case EditorTab::City:
+            save_city(project, ui, status);
+            break;
+        case EditorTab::Pieces:
+            save_city(project, ui, status);
+            break;
+        case EditorTab::Buildings:
+            save_building(project, ui, status);
+            break;
+        case EditorTab::Blocks:
+            save_block(project, ui, status);
+            break;
+        case EditorTab::Buildblocks:
+            save_buildblock(project, ui, status);
+            break;
+    }
+}
+
+bool has_unsaved_changes(const EditorUi& ui) {
+    return ui.city_dirty || ui.building_dirty || ui.block_dirty || ui.buildblock_dirty;
+}
+
+// Saves every category that has pending edits, using the same per-asset save path
+// as the Inspector buttons (each writes the currently-selected asset of its kind).
+void save_all_dirty(EditorProject& project, EditorUi& ui, std::string& status) {
+    if (ui.city_dirty) {
+        save_city(project, ui, status);
+    }
+    if (ui.building_dirty) {
+        save_building(project, ui, status);
+    }
+    if (ui.block_dirty) {
+        save_block(project, ui, status);
+    }
+    if (ui.buildblock_dirty) {
+        save_buildblock(project, ui, status);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Building drag gizmo
+// -----------------------------------------------------------------------------
+
+// Geometry of the gizmo handles for a selected city building, in world space.
+// Three move handles sit at the tip of short axis arms; the rotate handle is an
+// offset ring marker. Sizes scale with the unit grid so the gizmo stays readable.
+struct GizmoLayout {
+    Vector3 origin{};
+    Vector3 tip_x{};
+    Vector3 tip_y{};
+    Vector3 tip_z{};
+    Vector3 tip_rot{};
+    float handle_radius{};
+    float arm_length{};
+};
+
+GizmoLayout building_gizmo_layout(const SbcBuilding& placement) {
+    constexpr auto unit_size = 4.0F;
+    const auto o = native_city_building_render_origin(placement, unit_size);
+    const auto arm = unit_size * 2.5F;
+    const Vector3 origin{o.x, o.y + unit_size * 0.5F, o.z};
+    return GizmoLayout{
+        origin,
+        {origin.x + arm, origin.y, origin.z},
+        {origin.x, origin.y + arm, origin.z},
+        {origin.x, origin.y, origin.z + arm},
+        {origin.x + arm * 0.7F, origin.y, origin.z + arm * 0.7F},
+        unit_size * 0.45F,
+        arm,
+    };
+}
+
+// Nearest gizmo handle hit by the cursor ray, or None. A small sphere test at
+// each handle tip is enough; the arms are only a visual guide.
+GizmoAxis pick_building_gizmo(const Camera3D& camera, Vector2 virtual_mouse_pos, const SbcBuilding& placement) {
+    const auto layout = building_gizmo_layout(placement);
+    const auto ray = GetMouseRay(virtual_mouse_pos, camera);
+    const std::array<std::pair<GizmoAxis, Vector3>, 4> handles{{
+        {GizmoAxis::MoveX, layout.tip_x},
+        {GizmoAxis::MoveY, layout.tip_y},
+        {GizmoAxis::MoveZ, layout.tip_z},
+        {GizmoAxis::Rotate, layout.tip_rot},
+    }};
+    GizmoAxis best = GizmoAxis::None;
+    float best_t = std::numeric_limits<float>::max();
+    for (const auto& [axis, tip] : handles) {
+        const auto hit = GetRayCollisionSphere(ray, tip, layout.handle_radius);
+        if (hit.hit && hit.distance < best_t) {
+            best_t = hit.distance;
+            best = axis;
+        }
+    }
+    return best;
+}
+
+void draw_building_gizmo(const SbcBuilding& placement, GizmoAxis active) {
+    const auto layout = building_gizmo_layout(placement);
+    const auto axis_color = [active](GizmoAxis axis, Color base) {
+        return active == axis ? Color{255, 255, 255, 255} : base;
+    };
+    const Color red{235, 92, 88, 255};
+    const Color green{120, 220, 110, 255};
+    const Color blue{96, 156, 235, 255};
+    const Color yellow{245, 210, 90, 255};
+
+    DrawLine3D(layout.origin, layout.tip_x, axis_color(GizmoAxis::MoveX, red));
+    DrawLine3D(layout.origin, layout.tip_y, axis_color(GizmoAxis::MoveY, green));
+    DrawLine3D(layout.origin, layout.tip_z, axis_color(GizmoAxis::MoveZ, blue));
+    DrawSphere(layout.tip_x, layout.handle_radius, axis_color(GizmoAxis::MoveX, red));
+    DrawSphere(layout.tip_y, layout.handle_radius, axis_color(GizmoAxis::MoveY, green));
+    DrawSphere(layout.tip_z, layout.handle_radius, axis_color(GizmoAxis::MoveZ, blue));
+    // Rotate handle: a torus-like marker (sphere stand-in for portability).
+    DrawSphere(layout.tip_rot, layout.handle_radius * 0.9F, axis_color(GizmoAxis::Rotate, yellow));
+    DrawCircle3D(layout.origin, layout.arm_length * 0.7F, {1.0F, 0.0F, 0.0F}, 90.0F,
+        axis_color(GizmoAxis::Rotate, yellow));
+}
+
+// Maps the cursor's ground (or vertical) position during a gizmo drag to an
+// absolute grid cell, then applies it via the existing edit functions. Uses the
+// drag-start origin captured in ui so motion is absolute, not accumulated.
+void apply_building_gizmo_drag(EditorProject& project, EditorUi& ui, const Camera3D& camera, Vector2 virtual_mouse_pos) {
+    if (!project.city || project.city->data.buildings.empty()) {
+        return;
+    }
+    ui.selected_city_building = std::min(ui.selected_city_building, project.city->data.buildings.size() - 1U);
+    auto& placement = project.city->data.buildings[ui.selected_city_building];
+    constexpr auto unit_size = 4.0F;
+    const auto ray = GetMouseRay(virtual_mouse_pos, camera);
+    const Vec3 ro{ray.position.x, ray.position.y, ray.position.z};
+    const Vec3 rd{ray.direction.x, ray.direction.y, ray.direction.z};
+
+    switch (ui.gizmo_active) {
+        case GizmoAxis::MoveX:
+        case GizmoAxis::MoveZ: {
+            const auto hit = ray_ground_hit(ro, rd);
+            if (!hit.has_value()) {
+                return;
+            }
+            if (ui.gizmo_active == GizmoAxis::MoveX) {
+                placement.x = static_cast<std::int32_t>(std::lround(hit->x / unit_size));
+            } else {
+                placement.z = static_cast<std::int32_t>(std::lround(hit->z / unit_size));
+            }
+            ui.city_dirty = true;
+            break;
+        }
+        case GizmoAxis::MoveY: {
+            // Project the ray onto the vertical line through the building origin
+            // and read the height; vertical drag needs the camera-facing plane.
+            const auto origin = native_city_building_render_origin(placement, unit_size);
+            if (std::abs(rd.z) < 0.0001F && std::abs(rd.x) < 0.0001F) {
+                return;
+            }
+            // Intersect with a plane that contains the Y axis and faces the camera
+            // (use the X=origin.x plane unless the ray is parallel to it).
+            float t;
+            if (std::abs(rd.x) > 0.0001F) {
+                t = (origin.x - ro.x) / rd.x;
+            } else {
+                t = (origin.z - ro.z) / rd.z;
+            }
+            if (t < 0.0F) {
+                return;
+            }
+            const auto world_y = ro.y + rd.y * t;
+            placement.y = static_cast<std::int32_t>(std::lround(world_y / unit_size));
+            ui.city_dirty = true;
+            break;
+        }
+        case GizmoAxis::Rotate: {
+            // Rotate snaps to 90deg steps based on the cursor angle around origin.
+            const auto hit = ray_ground_hit(ro, rd);
+            if (!hit.has_value()) {
+                return;
+            }
+            const auto origin = native_city_building_render_origin(placement, unit_size);
+            const auto angle = std::atan2(hit->z - origin.z, hit->x - origin.x);
+            // Snap the building's facing to the cursor's quadrant around origin.
+            const auto step = static_cast<int>(std::lround(angle / (3.14159265F * 0.5F))) & 3;
+            placement.rotation = step;
+            ui.city_dirty = true;
+            break;
+        }
+        case GizmoAxis::None:
+            break;
+    }
+}
+
+// Collapsible reference of the controls active for the current tab/mode. Lives
+// at the top of the Inspector so the keyboard map is discoverable without leaving
+// the editing surface. Collapsed by default; a short fixed list, no scrolling.
+void draw_controls_help(const EditorUi& ui) {
+    if (!ImGui::CollapsingHeader("Controls")) {
+        return;
+    }
+    const auto k = [](int key) { return key_label(key); };
+    ImGui::TextDisabled(
+        "Camera: hold Right-Mouse + %s%s%s%s, Space/Shift up/down, Ctrl 2x, wheel speed",
+        k(KEY_W).c_str(), k(KEY_A).c_str(), k(KEY_S).c_str(), k(KEY_D).c_str());
+    ImGui::TextDisabled("Global: %s+S save  |  %s focus  |  %s+O open",
+        k(KEY_LEFT_CONTROL).c_str(), k(KEY_F).c_str(), k(KEY_LEFT_CONTROL).c_str());
+    ImGui::Separator();
+    if (ui.tab == EditorTab::City) {
+        if (ui.city_mode == CityEditMode::Buildings) {
+            ImGui::TextUnformatted("Click select / drag gizmo  |  Shift+Click move  |  Ctrl+Shift+Click copy");
+            ImGui::Text("Arrows move X/Z  |  PgUp/PgDn move Y  |  %s rotate (Shift+%s back)",
+                k(KEY_R).c_str(), k(KEY_R).c_str());
+            ImGui::Text("%s+D duplicate  |  Del delete", k(KEY_LEFT_CONTROL).c_str());
+        } else if (ui.city_mode == CityEditMode::Roads) {
+            ImGui::TextUnformatted("Click select  |  Shift+Click add road point");
+            ImGui::Text("Arrows from/to nodes  |  %s %s left width  |  %s %s right width",
+                k(KEY_LEFT_BRACKET).c_str(), k(KEY_RIGHT_BRACKET).c_str(),
+                k(KEY_SEMICOLON).c_str(), k(KEY_APOSTROPHE).c_str());
+            ImGui::Text("%s %s district  |  %s+D duplicate  |  Del delete",
+                k(KEY_MINUS).c_str(), k(KEY_EQUAL).c_str(), k(KEY_LEFT_CONTROL).c_str());
+        } else {
+            ImGui::Text("Shift+Click place piece  |  Ctrl+Click clear  |  %s rotate", k(KEY_R).c_str());
+        }
+    } else if (ui.tab == EditorTab::Buildings) {
+        ImGui::TextUnformatted("Click select cell  |  Tab/Shift+Tab next/prev cell");
+        ImGui::Text("Left/Right field -1/+1  |  %s +16  |  Up/Down change field", k(KEY_EQUAL).c_str());
+    } else if (ui.tab == EditorTab::Blocks) {
+        ImGui::TextUnformatted("Left/Right value -1/+1  |  Up/Down -4/+4  |  Tab cycle field");
+    } else if (ui.tab == EditorTab::Buildblocks) {
+        ImGui::TextUnformatted("Left/Right -1/16 +1/16  |  Up/Down -4/16 +4/16  |  Tab cycle layer");
+    } else {
+        ImGui::TextUnformatted("Click slot select  |  Shift+Click cycle mesh");
+    }
+}
+
+// Translates keyboard input into the same edit operations the Inspector buttons
+// drive. Runs only when ImGui does not want the keyboard and the freecam is not
+// flying, so it never collides with text fields or WASD movement.
+void handle_editor_hotkeys(EditorProject& project, EditorUi& ui, Camera3D& camera, std::string& status) {
+    const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+    const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+
+    // Global shortcuts.
+    if (ctrl && IsKeyPressed(KEY_S)) {
+        save_active_tab(project, ui, status);
+        return;
+    }
+    if (IsKeyPressed(KEY_F)) {
+        focus_camera_on_city(camera, project);
+    }
+    // Esc cancels an in-progress gizmo drag, restoring the captured position.
+    if (IsKeyPressed(KEY_ESCAPE) && ui.gizmo_active != GizmoAxis::None) {
+        if (project.city && !project.city->data.buildings.empty()) {
+            auto& placement = project.city->data.buildings[std::min(ui.selected_city_building, project.city->data.buildings.size() - 1U)];
+            placement.x = ui.gizmo_drag_origin_x;
+            placement.y = ui.gizmo_drag_origin_y;
+            placement.z = ui.gizmo_drag_origin_z;
+            placement.rotation = ui.gizmo_drag_origin_rot;
+        }
+        ui.gizmo_active = GizmoAxis::None;
+        return;
+    }
+
+    if (ui.tab == EditorTab::City && project.city) {
+        if (ui.city_mode == CityEditMode::Buildings && !project.city->data.buildings.empty()) {
+            if (IsKeyPressed(KEY_LEFT)) nudge_city_building(project, ui, -1, 0, 0, 0);
+            if (IsKeyPressed(KEY_RIGHT)) nudge_city_building(project, ui, 1, 0, 0, 0);
+            if (IsKeyPressed(KEY_UP)) nudge_city_building(project, ui, 0, 0, -1, 0);
+            if (IsKeyPressed(KEY_DOWN)) nudge_city_building(project, ui, 0, 0, 1, 0);
+            if (IsKeyPressed(KEY_PAGE_UP)) nudge_city_building(project, ui, 0, 1, 0, 0);
+            if (IsKeyPressed(KEY_PAGE_DOWN)) nudge_city_building(project, ui, 0, -1, 0, 0);
+            if (IsKeyPressed(KEY_R)) nudge_city_building(project, ui, 0, 0, 0, shift ? 3 : 1);
+            if (ctrl && IsKeyPressed(KEY_D)) duplicate_city_building(project, ui);
+            if (IsKeyPressed(KEY_DELETE)) delete_city_building(project, ui);
+        } else if (ui.city_mode == CityEditMode::Roads && !project.city->data.streets.empty()) {
+            if (IsKeyPressed(KEY_LEFT)) nudge_city_street_endpoint(project, ui, 0, -1);
+            if (IsKeyPressed(KEY_RIGHT)) nudge_city_street_endpoint(project, ui, 0, 1);
+            if (IsKeyPressed(KEY_UP)) nudge_city_street_endpoint(project, ui, 1, 1);
+            if (IsKeyPressed(KEY_DOWN)) nudge_city_street_endpoint(project, ui, 1, -1);
+            if (IsKeyPressed(KEY_LEFT_BRACKET)) nudge_city_street_width(project, ui, 0, -1);
+            if (IsKeyPressed(KEY_RIGHT_BRACKET)) nudge_city_street_width(project, ui, 0, 1);
+            if (IsKeyPressed(KEY_SEMICOLON)) nudge_city_street_width(project, ui, 1, -1);
+            if (IsKeyPressed(KEY_APOSTROPHE)) nudge_city_street_width(project, ui, 1, 1);
+            if (IsKeyPressed(KEY_MINUS)) nudge_city_street_district(project, ui, -1);
+            if (IsKeyPressed(KEY_EQUAL)) nudge_city_street_district(project, ui, 1);
+            if (ctrl && IsKeyPressed(KEY_D)) duplicate_city_street(project, ui);
+            if (IsKeyPressed(KEY_DELETE)) delete_city_street(project, ui);
+        } else if (ui.city_mode == CityEditMode::Pieces) {
+            if (IsKeyPressed(KEY_R)) ui.selected_piece_rotation = (ui.selected_piece_rotation + 1U) & 3U;
+        }
+    } else if (ui.tab == EditorTab::Buildings && !project.buildings.empty()) {
+        ui.selected_building = std::min(ui.selected_building, project.buildings.size() - 1U);
+        const auto occupied = occupied_cell_indices(project.buildings[ui.selected_building].data);
+        if (IsKeyPressed(KEY_LEFT)) nudge_building_cell(project, ui, -1);
+        if (IsKeyPressed(KEY_RIGHT)) nudge_building_cell(project, ui, 1);
+        if (IsKeyPressed(KEY_EQUAL)) nudge_building_cell(project, ui, 16);
+        if (IsKeyPressed(KEY_UP)) {
+            ui.selected_building_field = ui.selected_building_field == 0U ? 6U : ui.selected_building_field - 1U;
+        }
+        if (IsKeyPressed(KEY_DOWN)) {
+            ui.selected_building_field = (ui.selected_building_field + 1U) % 7U;
+        }
+        if (!occupied.empty() && IsKeyPressed(KEY_TAB)) {
+            if (shift) {
+                ui.selected_building_cell = ui.selected_building_cell == 0U ? occupied.size() - 1U : ui.selected_building_cell - 1U;
+            } else {
+                ui.selected_building_cell = (ui.selected_building_cell + 1U) % occupied.size();
+            }
+        }
+    } else if (ui.tab == EditorTab::Blocks && !project.blocks.empty()) {
+        if (IsKeyPressed(KEY_LEFT)) nudge_block(project, ui, -1);
+        if (IsKeyPressed(KEY_RIGHT)) nudge_block(project, ui, 1);
+        if (IsKeyPressed(KEY_UP)) nudge_block(project, ui, 4);
+        if (IsKeyPressed(KEY_DOWN)) nudge_block(project, ui, -4);
+        if (IsKeyPressed(KEY_TAB)) {
+            // 14 fields: 0..8 header/flags, 9..13 patch control-point components.
+            ui.selected_block_field = shift
+                ? (ui.selected_block_field == 0U ? 13U : ui.selected_block_field - 1U)
+                : (ui.selected_block_field + 1U) % 14U;
+        }
+    } else if (ui.tab == EditorTab::Buildblocks && !project.buildblocks.empty()) {
+        if (IsKeyPressed(KEY_LEFT)) nudge_buildblock_geometry(project, ui, -1);
+        if (IsKeyPressed(KEY_RIGHT)) nudge_buildblock_geometry(project, ui, 1);
+        if (IsKeyPressed(KEY_UP)) nudge_buildblock_geometry(project, ui, 4);
+        if (IsKeyPressed(KEY_DOWN)) nudge_buildblock_geometry(project, ui, -4);
+        ui.selected_buildblock = std::min(ui.selected_buildblock, project.buildblocks.size() - 1U);
+        const auto& buildblock = project.buildblocks[ui.selected_buildblock].data;
+        if (!buildblock.layers.empty() && IsKeyPressed(KEY_TAB)) {
+            const auto count = buildblock.layers.size();
+            ui.selected_buildblock_layer = shift
+                ? (ui.selected_buildblock_layer == 0U ? count - 1U : ui.selected_buildblock_layer - 1U)
+                : (ui.selected_buildblock_layer + 1U) % count;
+        }
+    }
+}
+
 
 } // namespace map_editor::app_internal
 
@@ -1207,6 +1599,10 @@ int run_editor_app() {
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
     InitWindow(1440, 900, "map_editor_cpp");
     SetTargetFPS(60);
+    // Esc must not quit the app: it is used to cancel a gizmo drag, and closing
+    // is gated by the unsaved-changes prompt below. KEY_NULL also removes Esc
+    // from WindowShouldClose().
+    SetExitKey(KEY_NULL);
 
     rlImGuiSetup(true);
     auto& io = ImGui::GetIO();
@@ -1229,11 +1625,24 @@ int run_editor_app() {
     bool show_graphics_debug = false;
     GfxDebugStats gfx_debug_stats;
 
-    while (!WindowShouldClose()) {
+    // Close gating: a close request (window X, Alt+F4, Exit menu) sets this; with
+    // unsaved changes it opens a save prompt and blocks exit until resolved.
+    bool running = true;
+    bool close_requested = false;
+    bool open_unsaved_prompt = false;
+
+    while (running) {
         gfx_debug_stats.reset_frame();
         gfx_debug_stats.push_frame_time(GetFrameTime() * 1000.0F);
         gfx_debug_stats.add_phase_ms(GfxDebugTimingPhase::TotalFrame, GetFrameTime() * 1000.0);
         g_gfx_debug_stats = &gfx_debug_stats;
+
+        // The OS close button / Alt+F4 raise WindowShouldClose(); route it through
+        // the same gate as the Exit menu instead of quitting immediately.
+        if (WindowShouldClose()) {
+            close_requested = true;
+        }
+
         if (IsKeyPressed(KEY_F3)) {
             show_graphics_debug = !show_graphics_debug;
         }
@@ -1271,6 +1680,13 @@ int run_editor_app() {
             update_free_fly_camera(camera, ui.camera_fly_speed);
         }
 
+        // Editor hotkeys: only when ImGui is not capturing the keyboard (no active
+        // text field) and the freecam is not flying, so they never collide with
+        // typing or WASD movement.
+        if (project && !io.WantCaptureKeyboard && !IsCursorHidden()) {
+            handle_editor_hotkeys(*project, ui, camera, status);
+        }
+
         if (show_3d_viewport && last_viewport_size.x > 0 && last_viewport_size.y > 0) {
             BeginTextureMode(viewport_texture);
             ClearBackground(Color{24, 27, 30, 255});
@@ -1296,18 +1712,8 @@ int run_editor_app() {
                             // Resolve each placement's .sbb so the scene builder
                             // can stamp building ground footprints into the
                             // terrain corner-height grid (same lookup as the
-                            // city building draw path).
-                            std::vector<const SbbBuilding*> placement_buildings;
-                            placement_buildings.reserve(project->city->data.buildings.size());
-                            for (const auto& placement : project->city->data.buildings) {
-                                const auto asset = std::ranges::find_if(
-                                    project->buildings,
-                                    [&placement](const LoadedAsset<SbbBuilding>& candidate) {
-                                        return candidate.name == placement.name || candidate.data.name == placement.name;
-                                    });
-                                placement_buildings.push_back(
-                                    asset == project->buildings.end() ? nullptr : &asset->data);
-                            }
+                            // city building draw path and the viewport picker).
+                            const auto placement_buildings = resolve_placement_buildings(*project);
                             project->city_scene_cache = build_map_scene(project->city->data, placement_buildings);
                             project->city_scene_cache_fingerprint = scene_fingerprint;
                             project->city_scene_cache_valid = true;
@@ -1348,6 +1754,19 @@ int run_editor_app() {
                         if (city_cursor.has_value()) {
                             draw_city_cursor(*city_cursor, 4.0F, ui.city_mode);
                         }
+
+                        // Drag gizmo on the selected building. Hover-highlights the
+                        // handle under the cursor unless a drag is already active.
+                        if (ui.city_mode == CityEditMode::Buildings && !project->city->data.buildings.empty()) {
+                            const auto sel = std::min(ui.selected_city_building, project->city->data.buildings.size() - 1U);
+                            const auto& placement = project->city->data.buildings[sel];
+                            const auto hovered = ui.gizmo_active != GizmoAxis::None
+                                ? ui.gizmo_active
+                                : (is_viewport_hovered && !IsCursorHidden()
+                                       ? pick_building_gizmo(camera, virtual_mouse_pos, placement)
+                                       : GizmoAxis::None);
+                            draw_building_gizmo(placement, hovered);
+                        }
                     } else if (ui.tab == EditorTab::Buildings && !project->buildings.empty()) {
                         ui.selected_building = std::min(ui.selected_building, project->buildings.size() - 1U);
                         const auto occupied = occupied_cell_indices(project->buildings[ui.selected_building].data);
@@ -1387,20 +1806,58 @@ int run_editor_app() {
 
         if (show_3d_viewport && project && is_viewport_hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !IsCursorHidden()) {
             if (ui.tab == EditorTab::City && project->city) {
+                const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+                const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
                 const auto city_cursor = city_grid_point_under_mouse(camera, virtual_mouse_pos);
-                if (city_cursor.has_value()) {
-                    if (ui.city_mode == CityEditMode::Buildings) {
-                        if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) {
-                            place_city_building_copy(*project, ui, *city_cursor);
-                        } else {
-                            set_city_building_position(*project, ui, *city_cursor);
+                const auto pick_ray = GetMouseRay(virtual_mouse_pos, camera);
+                const Vec3 ray_origin{pick_ray.position.x, pick_ray.position.y, pick_ray.position.z};
+                const Vec3 ray_dir{pick_ray.direction.x, pick_ray.direction.y, pick_ray.direction.z};
+                if (ui.city_mode == CityEditMode::Buildings) {
+                    // A plain click first tests the gizmo handles of the selected
+                    // building; hitting one starts a drag instead of reselecting.
+                    GizmoAxis gizmo_hit = GizmoAxis::None;
+                    if (!shift && !ctrl && !project->city->data.buildings.empty()) {
+                        const auto sel = std::min(ui.selected_city_building, project->city->data.buildings.size() - 1U);
+                        gizmo_hit = pick_building_gizmo(camera, virtual_mouse_pos, project->city->data.buildings[sel]);
+                    }
+                    if (gizmo_hit != GizmoAxis::None) {
+                        const auto& placement = project->city->data.buildings[std::min(ui.selected_city_building, project->city->data.buildings.size() - 1U)];
+                        ui.gizmo_active = gizmo_hit;
+                        ui.gizmo_drag_origin_x = placement.x;
+                        ui.gizmo_drag_origin_y = placement.y;
+                        ui.gizmo_drag_origin_z = placement.z;
+                        ui.gizmo_drag_origin_rot = placement.rotation;
+                    } else if (shift && ctrl) {
+                        if (city_cursor.has_value()) place_city_building_copy(*project, ui, *city_cursor);
+                    } else if (shift) {
+                        if (city_cursor.has_value()) set_city_building_position(*project, ui, *city_cursor);
+                    } else {
+                        const auto placements = resolve_placement_buildings(*project);
+                        const auto picked = pick_city_building(
+                            project->city->data, placements, ray_origin, ray_dir, project->city_scene_cache.unit_size);
+                        if (picked.has_value()) {
+                            ui.selected_city_building = *picked;
                         }
-                    } else if (ui.city_mode == CityEditMode::Roads) {
-                        append_city_road_point(*project, ui, *city_cursor);
-                    } else if (ui.city_mode == CityEditMode::Pieces) {
-                        if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) {
+                    }
+                } else if (ui.city_mode == CityEditMode::Roads) {
+                    // Plain click selects the road under the cursor; Shift appends a
+                    // road point/intersection at the cursor.
+                    if (shift) {
+                        if (city_cursor.has_value()) append_city_road_point(*project, ui, *city_cursor);
+                    } else {
+                        const auto picked = pick_city_road(
+                            project->city->data, project->city_scene_cache, ray_origin, ray_dir);
+                        if (picked.has_value()) {
+                            ui.selected_city_street = *picked;
+                        }
+                    }
+                } else if (ui.city_mode == CityEditMode::Pieces) {
+                    // Plain click selects/moves the grid cursor; Shift stamps a
+                    // voxel; Ctrl clears one.
+                    if (city_cursor.has_value()) {
+                        if (ctrl) {
                             clear_city_piece_voxel(*project, *city_cursor, ui);
-                        } else {
+                        } else if (shift) {
                             set_city_piece_voxel(*project, ui, *city_cursor);
                         }
                     }
@@ -1416,6 +1873,17 @@ int run_editor_app() {
                 }
             } else if (ui.tab == EditorTab::Buildings && !project->buildings.empty()) {
                 select_building_cell_from_viewport(*project, ui, camera, viewport_mouse_pos, last_viewport_size, status);
+            }
+        }
+
+        // Gizmo drag: while the mouse is held after grabbing a handle, map the
+        // cursor to the building's new grid position; release ends the drag.
+        if (ui.gizmo_active != GizmoAxis::None) {
+            if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && project && project->city) {
+                apply_building_gizmo_drag(*project, ui, camera, virtual_mouse_pos);
+            }
+            if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+                ui.gizmo_active = GizmoAxis::None;
             }
         }
 
@@ -1437,7 +1905,7 @@ int run_editor_app() {
                 }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Exit", "Alt+F4")) {
-                    break;
+                    close_requested = true;
                 }
                 ImGui::EndMenu();
             }
@@ -1528,6 +1996,14 @@ int run_editor_app() {
                     ImGui::RadioButton("Buildings", &mode_idx, 1); ImGui::SameLine();
                     ImGui::RadioButton("Pieces", &mode_idx, 2);
                     ui.city_mode = static_cast<CityEditMode>(mode_idx);
+
+                    if (ui.city_mode == CityEditMode::Buildings) {
+                        ImGui::TextDisabled("Click: select / drag gizmo  |  Shift+Click: move  |  Ctrl+Shift+Click: copy");
+                    } else if (ui.city_mode == CityEditMode::Roads) {
+                        ImGui::TextDisabled("Click: select road  |  Shift+Click: add road point");
+                    } else {
+                        ImGui::TextDisabled("Shift+Click: place  |  Ctrl+Click: clear  |  %s: rotate", key_label(KEY_R).c_str());
+                    }
 
                     ImGui::Separator();
                     int view_idx = ui.city_view_mode == CityViewMode::GamePreview ? 0 : 1;
@@ -1646,6 +2122,7 @@ int run_editor_app() {
 
         ImGui::Begin("Inspector");
         if (project) {
+            draw_controls_help(ui);
             if (ui.tab == EditorTab::City && project->city) {
                 if (ui.city_mode == CityEditMode::Roads && !project->city->data.streets.empty()) {
                     ui.selected_city_street = std::min(ui.selected_city_street, project->city->data.streets.size() - 1U);
@@ -1693,10 +2170,10 @@ int run_editor_app() {
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Increment district index");
                     ImGui::SameLine();
                     if (ImGui::Button("Duplicate")) duplicate_city_street(*project, ui);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Duplicate current street");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Duplicate current street (Ctrl+D)");
                     ImGui::SameLine();
                     if (ImGui::Button("Delete")) delete_city_street(*project, ui);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete current street");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete current street (Del)");
 
                     ImGui::Spacing();
                     if (ImGui::Button(ui.city_dirty ? "Save City *" : "Save City", ImVec2(-FLT_MIN, 35))) {
@@ -1734,13 +2211,13 @@ int run_editor_app() {
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Nudge Y up");
                     ImGui::SameLine();
                     if (ImGui::Button("Rotate")) nudge_city_building(*project, ui, 0, 0, 0, 1);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Rotate building 90 degrees");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Rotate building 90 degrees (%s, Shift+%s back)", key_label(KEY_R).c_str(), key_label(KEY_R).c_str());
 
                     if (ImGui::Button("Duplicate")) duplicate_city_building(*project, ui);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Duplicate current building");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Duplicate current building (Ctrl+%s)", key_label(KEY_D).c_str());
                     ImGui::SameLine();
                     if (ImGui::Button("Delete")) delete_city_building(*project, ui);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete building placement");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete building placement (Del)");
                     ImGui::SameLine();
                     if (ImGui::Button(ui.city_dirty ? "Save City *" : "Save City")) {
                         save_city(*project, ui, status);
@@ -1939,6 +2416,42 @@ int run_editor_app() {
                     }
                 }
             }
+        }
+
+        // Resolve a pending close request. Clean -> exit now. Dirty -> raise the
+        // save prompt (once) and keep running until the user resolves it.
+        if (close_requested) {
+            close_requested = false;
+            if (project && has_unsaved_changes(ui)) {
+                open_unsaved_prompt = true;
+            } else {
+                running = false;
+            }
+        }
+        if (open_unsaved_prompt) {
+            ImGui::OpenPopup("Unsaved Changes");
+            open_unsaved_prompt = false;
+        }
+        if (ImGui::BeginPopupModal("Unsaved Changes", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextUnformatted("You have unsaved changes. Save before exiting?");
+            ImGui::Spacing();
+            if (ImGui::Button("Save & Exit", ImVec2(120, 0))) {
+                if (project) {
+                    save_all_dirty(*project, ui, status);
+                }
+                running = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Discard & Exit", ImVec2(120, 0))) {
+                running = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
         }
 
         rlImGuiEnd();

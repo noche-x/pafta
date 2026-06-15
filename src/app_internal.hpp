@@ -351,6 +351,16 @@ enum class CityViewMode {
     Editor,
 };
 
+// Drag-gizmo handle on the selected city building. MoveX/MoveZ slide along the
+// ground axes, MoveY lifts vertically, Rotate spins 90deg steps.
+enum class GizmoAxis {
+    None,
+    MoveX,
+    MoveY,
+    MoveZ,
+    Rotate,
+};
+
 struct EditorUi {
     EditorTab tab{EditorTab::City};
     std::size_t selected_building{};
@@ -387,6 +397,15 @@ struct EditorUi {
     bool building_dirty{};
     bool block_dirty{};
     bool buildblock_dirty{};
+    // Active drag-gizmo handle for the selected city building (none when not
+    // dragging). Set on mouse-press over a handle, cleared on release.
+    GizmoAxis gizmo_active{GizmoAxis::None};
+    // Building grid position captured when a gizmo drag started, so the drag maps
+    // absolute mouse motion to grid cells instead of accumulating per-frame error.
+    std::int32_t gizmo_drag_origin_x{};
+    std::int32_t gizmo_drag_origin_z{};
+    std::int32_t gizmo_drag_origin_y{};
+    std::int32_t gizmo_drag_origin_rot{};
 };
 
 struct CityGridPoint {
@@ -396,6 +415,7 @@ struct CityGridPoint {
 };
 
 std::string lower_name(std::string_view value);
+std::vector<const SbbBuilding*> resolve_placement_buildings(const EditorProject& project);
 std::optional<EditorProject> load_project_folder(const std::filesystem::path& folder, std::string& error);
 std::vector<NamedBlockMesh> block_meshes(const EditorProject& project);
 std::vector<NamedBuildblockTemplate> buildblock_templates(const EditorProject& project);
