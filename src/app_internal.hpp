@@ -307,7 +307,7 @@ struct EditorProject {
     GpuBuildingRenderModel building_floor_preview_gpu_model;
     std::optional<std::size_t> portal_preview_index;
     std::optional<std::size_t> building_floor_preview_building;
-    std::uint32_t building_floor_preview_floor{};
+    std::optional<std::uint32_t> building_floor_preview_floor{};
     bool building_floor_preview_dirty{true};
     bool render_buffers_dirty{true};
     MapScene city_scene_cache;
@@ -399,6 +399,9 @@ struct EditorUi {
     std::size_t selected_building_cell{};
     std::size_t selected_building_field{};
     std::size_t selected_buildblock_field{};
+    // Buildings tab view: false => whole building, true => only building_view_floor.
+    bool building_view_floor_only{false};
+    int building_view_floor{0};
     float camera_fly_speed{48.0F};
     bool city_dirty{};
     bool building_dirty{};
@@ -432,7 +435,7 @@ void set_status(EditorProject& project);
 void service_render_rebuild(EditorProject& project);
 void invalidate_portal_render_models(EditorProject& project);
 GpuBuildingRenderModel upload_building_render_model(const BuildingRenderBuffer& buffer, const SbbBuilding& building, const EditorProject& project);
-GpuBuildingRenderModel& building_tool_floor_preview_model(EditorProject& project, std::size_t building_index, std::uint32_t floor);
+GpuBuildingRenderModel& building_tool_floor_preview_model(EditorProject& project, std::size_t building_index, std::optional<std::uint32_t> floor);
 Texture2D load_city_window_gradient_texture();
 void draw_mesh_faces(const SblBlockMesh& mesh, float scale, Color fill);
 void draw_sbb_scene_for_app(const SbbBuilding& building, GpuBuildingRenderModel& model, const SbbCell* selected);
@@ -442,7 +445,8 @@ void draw_city_building_model(
     const SbcBuilding& placement,
     bool selected,
     bool use_lod,
-    const Texture2D* city_window_texture = nullptr);
+    const Texture2D* city_window_texture = nullptr,
+    bool hovered = false);
 void draw_city_piece_voxels(EditorProject& project, bool textured, std::optional<std::size_t> selected_portal = std::nullopt);
 GpuBuildingRenderModel upload_city_tile_model(const BuildingRenderBuffer& buffer, const EditorProject& project);
 GpuBuildingRenderModel upload_city_terrain_model(const BuildingRenderBuffer& buffer, const EditorProject& project);

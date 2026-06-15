@@ -552,7 +552,8 @@ void start_city_scene_rebuild(EditorProject& project, std::uint64_t fingerprint)
 void draw_city_building_models_full_detail(
     EditorProject& project,
     const SbcBuilding* selected_building,
-    const Texture2D* city_window_texture) {
+    const Texture2D* city_window_texture,
+    const SbcBuilding* hovered_building = nullptr) {
     if (!project.city) {
         return;
     }
@@ -577,7 +578,8 @@ void draw_city_building_models_full_detail(
             placement,
             selected_building == &placement,
             false,
-            city_window_texture);
+            city_window_texture,
+            hovered_building == &placement);
     }
 }
 
@@ -1909,9 +1911,23 @@ int run_editor_app() {
                         } else {
                             draw_city_editor_overlay(*project, city_scene);
                         }
+                        // Hover preview: outline the building a click would select.
+                        const SbcBuilding* hovered_building = nullptr;
+                        if (ui.city_mode == CityEditMode::Buildings && is_viewport_hovered &&
+                            !IsCursorHidden() && ui.gizmo_active == GizmoAxis::None) {
+                            const auto pick_ray = GetMouseRay(virtual_mouse_pos, camera);
+                            const Vec3 ro{pick_ray.position.x, pick_ray.position.y, pick_ray.position.z};
+                            const Vec3 rd{pick_ray.direction.x, pick_ray.direction.y, pick_ray.direction.z};
+                            const auto placements = resolve_placement_buildings(*project);
+                            const auto picked = pick_city_building(
+                                project->city->data, placements, ro, rd, project->city_scene_cache.unit_size);
+                            if (picked.has_value() && *picked < project->city->data.buildings.size()) {
+                                hovered_building = &project->city->data.buildings[*picked];
+                            }
+                        }
                         {
                             GfxDebugScopedTimer timer{gfx_debug_stats, GfxDebugTimingPhase::BuildingDraw};
-                            draw_city_building_models_full_detail(*project, selected_building, &city_window_texture);
+                            draw_city_building_models_full_detail(*project, selected_building, &city_window_texture, hovered_building);
                         }
                         {
                             GfxDebugScopedTimer timer{gfx_debug_stats, GfxDebugTimingPhase::BuildingDraw};
@@ -1947,7 +1963,10 @@ int run_editor_app() {
                             ? nullptr
                             : &project->buildings[ui.selected_building].data.cells[occupied[std::min(ui.selected_building_cell, occupied.size() - 1U)]];
                         if (ui.selected_building < project->buildings.size()) {
-                            const auto preview_floor = selected != nullptr ? selected->y : 0U;
+                            // Whole building (nullopt) or a single chosen floor.
+                            const std::optional<std::uint32_t> preview_floor = ui.building_view_floor_only
+                                ? std::optional<std::uint32_t>(static_cast<std::uint32_t>(std::max(0, ui.building_view_floor)))
+                                : std::nullopt;
                             auto& preview_model = building_tool_floor_preview_model(*project, ui.selected_building, preview_floor);
                             GfxDebugScopedTimer timer{gfx_debug_stats, GfxDebugTimingPhase::BuildingDraw};
                             draw_sbb_scene_for_app(

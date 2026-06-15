@@ -427,6 +427,31 @@ void draw_building_asset_panel(EditorProject& project, EditorUi& ui) {
     ui.selected_building = std::min(ui.selected_building, project.buildings.size() - 1U);
     auto& building = project.buildings[ui.selected_building].data;
     const auto occupied = occupied_cell_indices(building);
+
+    // View: whole building, or one floor chosen with a slider + step buttons.
+    ImGui::SeparatorText("View");
+    int view_mode = ui.building_view_floor_only ? 1 : 0;
+    ImGui::RadioButton("Whole building", &view_mode, 0); ImGui::SameLine();
+    ImGui::RadioButton("Floor by floor", &view_mode, 1);
+    const bool was_floor_only = ui.building_view_floor_only;
+    ui.building_view_floor_only = view_mode == 1;
+    if (ui.building_view_floor_only) {
+        const int max_floor = std::max(0, static_cast<int>(building.size_y) - 1);
+        ui.building_view_floor = std::clamp(ui.building_view_floor, 0, max_floor);
+        bool changed = ui.building_view_floor_only != was_floor_only;
+        if (ImGui::Button("-") && ui.building_view_floor > 0) { --ui.building_view_floor; changed = true; }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-40.0F);
+        if (ImGui::SliderInt("##floor", &ui.building_view_floor, 0, max_floor, "Floor %d")) { changed = true; }
+        ImGui::SameLine();
+        if (ImGui::Button("+") && ui.building_view_floor < max_floor) { ++ui.building_view_floor; changed = true; }
+        if (changed) {
+            project.building_floor_preview_dirty = true;
+        }
+    } else if (was_floor_only) {
+        project.building_floor_preview_dirty = true;  // switched back to whole
+    }
+
     ImGui::SeparatorText("Occupied Cells");
     if (ImGui::BeginChild("##building_cells_panel", ImVec2(0, 0), true)) {
         if (ImGui::BeginTable("##building_cells_table", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_ScrollY)) {
@@ -448,6 +473,10 @@ void draw_building_asset_panel(EditorProject& project, EditorUi& ui) {
                 const bool selected = ui.selected_building_cell == row;
                 if (ImGui::Selectable(std::to_string(cell.index).c_str(), selected, ImGuiSelectableFlags_SpanAllColumns)) {
                     ui.selected_building_cell = row;
+                    // In floor mode, jump the view to the picked cell's floor.
+                    if (ui.building_view_floor_only) {
+                        ui.building_view_floor = static_cast<int>(cell.y);
+                    }
                     project.building_floor_preview_dirty = true;
                 }
                 ImGui::TableNextColumn();

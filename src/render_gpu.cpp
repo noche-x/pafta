@@ -977,7 +977,8 @@ void draw_city_building_model(
     const SbcBuilding& placement,
     bool selected,
     bool use_lod,
-    const Texture2D* city_window_texture) {
+    const Texture2D* city_window_texture,
+    bool hovered) {
     constexpr auto unit_size = 4.0F;
     const auto render_origin = native_city_building_render_origin(placement, unit_size);
     const auto origin = Vector3{render_origin.x, render_origin.y, render_origin.z};
@@ -1054,6 +1055,9 @@ void draw_city_building_model(
         if (selected) {
             // Shader silhouette outline around the actual building mesh.
             draw_building_outline(model, origin, placement.rotation, Color{255, 214, 96, 255});
+        } else if (hovered) {
+            // Dimmer cyan outline previews what a click would select.
+            draw_building_outline(model, origin, placement.rotation, Color{120, 200, 255, 255});
         }
     }
 
@@ -1153,7 +1157,7 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
 GpuBuildingRenderModel& building_tool_floor_preview_model(
     EditorProject& project,
     std::size_t building_index,
-    std::uint32_t floor
+    std::optional<std::uint32_t> floor
 ) {
     if (project.building_floor_preview_dirty ||
         project.building_floor_preview_building != building_index ||

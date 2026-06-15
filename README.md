@@ -82,6 +82,10 @@ City tab:
 
 Buildings / Blocks / Buildblocks tabs: **Left/Right** nudge the selected field, **Up/Down** take the coarser step (and cycle the active field on the Buildings tab), **Tab/Shift+Tab** cycle the selected cell/field/layer record, and **Ctrl+S** saves the `*.edited.*` copy.
 
+The Buildings tab has a **View** switch: **Whole building** renders every floor, or **Floor by floor** shows a single floor picked with a slider plus **-/+** step buttons (selecting a cell jumps the view to that cell's floor).
+
+In City Buildings mode, the building under the cursor gets a dim outline preview so you can see what a click will select before clicking.
+
 The argument-based file viewer and edit commands are retained as dev/test utilities so CTest can validate binary parsing and patching behavior; they are not the main editor workflow.
 
 Focused SBB cell edits can be made without opening the viewer:
