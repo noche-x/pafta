@@ -833,45 +833,69 @@ Matrix building_transform_matrix(Vector3 origin, std::int32_t rotation) {
     };
 }
 
-// Mesh-hugging glow: re-draws the building geometry as a few translucent shells,
-// each scaled up a little more about the building origin, with additive blending
-// and depth writes off. The stacked shells fade outward into a soft halo that
-// follows the actual silhouette instead of a bounding box. A cheap stand-in for a
-// framebuffer bloom pass (which would need a full-screen shader + a fragile GL
-// path), while reading as a real glow around the mesh.
-void draw_building_glow_shell(GpuBuildingRenderModel& model, Vector3 origin, std::int32_t rotation, Color tint) {
+// Flat-color outline shader (GLSL 330, raylib's desktop GL profile). It ignores
+// texture/lighting and emits one uniform color, so the inverted-hull pass draws a
+// clean silhouette rim. Lazily loaded and cached for the app's lifetime.
+struct OutlineShader {
+    Shader shader{};
+    int color_loc{-1};
+    bool loaded{false};
+};
+
+OutlineShader& outline_shader() {
+    static OutlineShader cache;
+    if (!cache.loaded) {
+        const char* vs =
+            "#version 330\n"
+            "in vec3 vertexPosition;\n"
+            "uniform mat4 mvp;\n"
+            "void main() { gl_Position = mvp * vec4(vertexPosition, 1.0); }\n";
+        const char* fs =
+            "#version 330\n"
+            "out vec4 finalColor;\n"
+            "uniform vec4 outlineColor;\n"
+            "void main() { finalColor = outlineColor; }\n";
+        cache.shader = LoadShaderFromMemory(vs, fs);
+        cache.color_loc = GetShaderLocation(cache.shader, "outlineColor");
+        cache.loaded = true;
+    }
+    return cache;
+}
+
+// Silhouette outline via the inverted-hull technique: re-draw the building mesh
+// scaled up slightly, with FRONT faces culled so only the enlarged back faces
+// show as a rim peeking out around the real mesh. A flat-color shader paints the
+// rim one solid outline color. No bloom, no framebuffer pass.
+void draw_building_outline(GpuBuildingRenderModel& model, Vector3 origin, std::int32_t rotation, Color tint) {
+    auto& outline = outline_shader();
+    if (outline.shader.id == 0) {
+        return;  // shader failed to compile; skip outline rather than crash
+    }
     const auto pulse = 0.5F + 0.5F * static_cast<float>(std::sin(GetTime() * 4.0));
-    const auto base = building_transform_matrix(origin, rotation);
-    rlDisableBackfaceCulling();
-    rlDisableDepthMask();
-    BeginBlendMode(BLEND_ADDITIVE);
-    // Three expanding shells; outer ones are larger and fainter.
-    const std::array<float, 3> grows{0.04F, 0.10F + 0.04F * pulse, 0.18F + 0.06F * pulse};
-    const std::array<unsigned char, 3> alphas{
-        static_cast<unsigned char>(70 + 40 * pulse),
-        static_cast<unsigned char>(40 + 24 * pulse),
-        static_cast<unsigned char>(20 + 14 * pulse)};
-    for (std::size_t s = 0; s < grows.size(); ++s) {
-        const auto scale = 1.0F + grows[s];
-        const auto transform = MatrixMultiply(MatrixScale(scale, scale, scale), base);
-        const auto color = Color{tint.r, tint.g, tint.b, alphas[s]};
-        for (auto& chunk : model.chunks) {
-            if (chunk.material.maps == nullptr || chunk.mesh.vertexCount <= 0) {
-                continue;
-            }
-            chunk.material.maps[MATERIAL_MAP_DIFFUSE].texture = chunk.source_texture;
-            chunk.material.maps[MATERIAL_MAP_DIFFUSE].color = color;
-            DrawMesh(chunk.mesh, chunk.material, transform);
-            if (g_gfx_debug_stats != nullptr) {
-                g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::WireOverlay,
-                    static_cast<std::uint64_t>(std::max(chunk.mesh.triangleCount, 0)),
-                    static_cast<std::uint64_t>(std::max(chunk.mesh.vertexCount, 0)), 1U);
-            }
+    const auto grow = 0.05F + 0.02F * pulse;
+    const auto scale = 1.0F + grow;
+    const auto transform = MatrixMultiply(MatrixScale(scale, scale, scale), building_transform_matrix(origin, rotation));
+    const float color[4]{tint.r / 255.0F, tint.g / 255.0F, tint.b / 255.0F, 1.0F};
+    SetShaderValue(outline.shader, outline.color_loc, color, SHADER_UNIFORM_VEC4);
+
+    // DrawMesh binds material.shader (it ignores BeginShaderMode), so swap the
+    // chunk's shader to the outline shader for this pass and restore it after.
+    rlSetCullFace(RL_CULL_FACE_FRONT);
+    for (auto& chunk : model.chunks) {
+        if (chunk.mesh.vertexCount <= 0 || chunk.material.maps == nullptr) {
+            continue;
+        }
+        const auto saved = chunk.material.shader;
+        chunk.material.shader = outline.shader;
+        DrawMesh(chunk.mesh, chunk.material, transform);
+        chunk.material.shader = saved;
+        if (g_gfx_debug_stats != nullptr) {
+            g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::WireOverlay,
+                static_cast<std::uint64_t>(std::max(chunk.mesh.triangleCount, 0)),
+                static_cast<std::uint64_t>(std::max(chunk.mesh.vertexCount, 0)), 1U);
         }
     }
-    EndBlendMode();
-    rlEnableDepthMask();
-    rlEnableBackfaceCulling();
+    rlSetCullFace(RL_CULL_FACE_BACK);
 }
 
 void draw_gpu_building_model(
@@ -1028,8 +1052,8 @@ void draw_city_building_model(
     } else {
         draw_gpu_building_model(model, origin, placement.rotation, selected, selected, city_window_texture, GfxDebugDrawCategory::CityCells);
         if (selected) {
-            // Soft mesh-hugging glow around the actual building silhouette.
-            draw_building_glow_shell(model, origin, placement.rotation, Color{255, 214, 96, 255});
+            // Shader silhouette outline around the actual building mesh.
+            draw_building_outline(model, origin, placement.rotation, Color{255, 214, 96, 255});
         }
     }
 

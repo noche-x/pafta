@@ -64,7 +64,7 @@ Drop a map folder into the window or click `Open Folder`. The expected folder la
 
 Camera (freecam): hold **right mouse**, then **WASD** to move, **Space/Shift** for up/down, **Ctrl** for 2x speed, and the **mouse wheel** to change fly speed. The keyboard edit shortcuts below are inactive while flying or while typing in a field.
 
-Selection is click-to-select: a plain left-click in the viewport selects whatever is under the cursor, and placement actions sit on modifiers so they no longer fight selection. The selected building, road, or piece gets a pulsing glow outline. The Inspector buttons remain as a secondary path and show their hotkey in tooltips; a collapsible **Controls** section at the top of the Inspector lists the bindings for the current tab/mode.
+Selection is click-to-select: a plain left-click in the viewport selects whatever is under the cursor, and placement actions sit on modifiers so they no longer fight selection. A selected building gets a shader silhouette outline (inverted-hull, no bloom); selected roads and pieces get a pulsing highlight. The Inspector buttons remain as a secondary path and show their hotkey in tooltips; a collapsible **Controls** section at the top of the Inspector lists the bindings for the current tab/mode.
 
 Key labels in the help text and tooltips are localized to your keyboard layout (an AZERTY user sees ZQSD, not WASD). The keys still fire on the same physical positions on every layout — only the printed labels change.
 
@@ -77,7 +77,7 @@ Global: **Ctrl+S** saves the active tab's `*.edited.*` copy, **F** focuses the c
 City tab:
 
 - **Buildings** mode: click selects a placement; **Shift+click** moves the selected one to the cursor; **Ctrl+Shift+click** stamps a copy. Arrows move X/Z, **PgUp/PgDn** move Y, **R** rotates (**Shift+R** reverses), **Ctrl+D** duplicates, **Del** deletes.
-- **Roads** mode: click selects a road; **Shift+click** adds a road point/intersection. Arrows adjust the from/to nodes, **`[` `]`** the left width, **`;` `'`** the right width, **`-` `=`** the district, **Ctrl+D** duplicates, **Del** deletes.
+- **Roads** mode: **click lays a road chain** — the first click starts at the nearest existing node (or makes one), each further click adds a straight, axis-aligned segment (the end snaps to whichever of X/Z you moved more), and the new end node becomes the next start. New nodes take the terrain height, so roads run up and down with the land. Click the active start node again or press **Esc** to end the chain. **Shift+click** selects a road to edit; arrows adjust the from/to nodes, **`[` `]`** the left width, **`;` `'`** the right width, **`-` `=`** the district, **Ctrl+D** duplicates, **Del** deletes.
 - **Pieces** mode: **Shift+click** places a voxel, **Ctrl+click** clears it, **R** rotates the voxel before placing.
 
 Buildings / Blocks / Buildblocks tabs: **Left/Right** nudge the selected field, **Up/Down** take the coarser step (and cycle the active field on the Buildings tab), **Tab/Shift+Tab** cycle the selected cell/field/layer record, and **Ctrl+S** saves the `*.edited.*` copy.
