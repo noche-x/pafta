@@ -833,6 +833,47 @@ Matrix building_transform_matrix(Vector3 origin, std::int32_t rotation) {
     };
 }
 
+// Mesh-hugging glow: re-draws the building geometry as a few translucent shells,
+// each scaled up a little more about the building origin, with additive blending
+// and depth writes off. The stacked shells fade outward into a soft halo that
+// follows the actual silhouette instead of a bounding box. A cheap stand-in for a
+// framebuffer bloom pass (which would need a full-screen shader + a fragile GL
+// path), while reading as a real glow around the mesh.
+void draw_building_glow_shell(GpuBuildingRenderModel& model, Vector3 origin, std::int32_t rotation, Color tint) {
+    const auto pulse = 0.5F + 0.5F * static_cast<float>(std::sin(GetTime() * 4.0));
+    const auto base = building_transform_matrix(origin, rotation);
+    rlDisableBackfaceCulling();
+    rlDisableDepthMask();
+    BeginBlendMode(BLEND_ADDITIVE);
+    // Three expanding shells; outer ones are larger and fainter.
+    const std::array<float, 3> grows{0.04F, 0.10F + 0.04F * pulse, 0.18F + 0.06F * pulse};
+    const std::array<unsigned char, 3> alphas{
+        static_cast<unsigned char>(70 + 40 * pulse),
+        static_cast<unsigned char>(40 + 24 * pulse),
+        static_cast<unsigned char>(20 + 14 * pulse)};
+    for (std::size_t s = 0; s < grows.size(); ++s) {
+        const auto scale = 1.0F + grows[s];
+        const auto transform = MatrixMultiply(MatrixScale(scale, scale, scale), base);
+        const auto color = Color{tint.r, tint.g, tint.b, alphas[s]};
+        for (auto& chunk : model.chunks) {
+            if (chunk.material.maps == nullptr || chunk.mesh.vertexCount <= 0) {
+                continue;
+            }
+            chunk.material.maps[MATERIAL_MAP_DIFFUSE].texture = chunk.source_texture;
+            chunk.material.maps[MATERIAL_MAP_DIFFUSE].color = color;
+            DrawMesh(chunk.mesh, chunk.material, transform);
+            if (g_gfx_debug_stats != nullptr) {
+                g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::WireOverlay,
+                    static_cast<std::uint64_t>(std::max(chunk.mesh.triangleCount, 0)),
+                    static_cast<std::uint64_t>(std::max(chunk.mesh.vertexCount, 0)), 1U);
+            }
+        }
+    }
+    EndBlendMode();
+    rlEnableDepthMask();
+    rlEnableBackfaceCulling();
+}
+
 void draw_gpu_building_model(
     GpuBuildingRenderModel& model,
     Vector3 origin,
@@ -986,10 +1027,14 @@ void draw_city_building_model(
         }
     } else {
         draw_gpu_building_model(model, origin, placement.rotation, selected, selected, city_window_texture, GfxDebugDrawCategory::CityCells);
+        if (selected) {
+            // Soft mesh-hugging glow around the actual building silhouette.
+            draw_building_glow_shell(model, origin, placement.rotation, Color{255, 214, 96, 255});
+        }
     }
 
-    if (selected) {
-        // Glow box sized to the building footprint, centered on its bounds.
+    if (selected && use_lod) {
+        // The far LOD has no mesh to shell; fall back to a glow box on the bounds.
         const auto sx = static_cast<float>(std::max(1U, template_file.size_x)) * unit_size;
         const auto sy = static_cast<float>(std::max(1U, template_file.size_y)) * unit_size;
         const auto sz = static_cast<float>(std::max(1U, template_file.size_z)) * unit_size;
@@ -1254,19 +1299,38 @@ void draw_city_scene(
     for (const auto& road : scene.roads) {
         const auto selected = selected_street != nullptr && road.source == selected_street;
         if (selected) {
-            auto from = to_raylib(road.from);
-            auto to = to_raylib(road.to);
-            from.y += scene.unit_size * 1.1F;
-            to.y += scene.unit_size * 1.1F;
+            const auto lift = scene.unit_size * 1.1F;
             const auto pulse = 0.5F + 0.5F * static_cast<float>(std::sin(GetTime() * 4.0));
             const auto glow = Color{255, 215, 90, static_cast<unsigned char>(170 + 70 * pulse)};
-            DrawSphere(from, scene.unit_size * (0.32F + 0.08F * pulse), glow);
-            DrawSphere(to, scene.unit_size * (0.32F + 0.08F * pulse), glow);
-            // Bright pulsing centerline so the whole selected segment reads, not
-            // just its endpoints.
-            DrawLine3D(from, to, Color{255, 235, 140, 255});
+            const auto line = Color{255, 235, 140, 255};
+
+            // Height along a road follows the terrain grade, not a straight chord
+            // between the two endpoints. Sample terrain at steps along the segment
+            // so the selection polyline hugs the sloped road instead of cutting
+            // through hills.
+            const auto height_at = [&](float x, float z) {
+                return (scene.terrain.has_value() ? terrain_height_at(*scene.terrain, x, z) : road.from.y) + lift;
+            };
+            const auto seg_len = std::sqrt(
+                (road.to.x - road.from.x) * (road.to.x - road.from.x) +
+                (road.to.z - road.from.z) * (road.to.z - road.from.z));
+            const auto steps = std::clamp(static_cast<int>(seg_len / scene.unit_size), 1, 256);
+            auto prev = Vector3{road.from.x, height_at(road.from.x, road.from.z), road.from.z};
+            for (int i = 1; i <= steps; ++i) {
+                const auto t = static_cast<float>(i) / static_cast<float>(steps);
+                const auto x = road.from.x + (road.to.x - road.from.x) * t;
+                const auto z = road.from.z + (road.to.z - road.from.z) * t;
+                const auto cur = Vector3{x, height_at(x, z), z};
+                DrawLine3D(prev, cur, line);
+                prev = cur;
+            }
+            DrawSphere({road.from.x, height_at(road.from.x, road.from.z), road.from.z},
+                scene.unit_size * (0.32F + 0.08F * pulse), glow);
+            DrawSphere({road.to.x, height_at(road.to.x, road.to.z), road.to.z},
+                scene.unit_size * (0.32F + 0.08F * pulse), glow);
             if (g_gfx_debug_stats != nullptr) {
-                g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::WireOverlay, 0U, 4U, 3U);
+                g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::WireOverlay, 0U,
+                    static_cast<std::uint64_t>(steps) * 2U + 4U, static_cast<std::uint64_t>(steps) + 2U);
             }
         }
     }

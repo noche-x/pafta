@@ -2,6 +2,7 @@
 #include "app_internal.hpp"
 
 #include <raylib.h>
+#include <rlgl.h>
 #include <imgui.h>
 #include <rlImGui.h>
 
@@ -1603,6 +1604,10 @@ int run_editor_app() {
     // is gated by the unsaved-changes prompt below. KEY_NULL also removes Esc
     // from WindowShouldClose().
     SetExitKey(KEY_NULL);
+    // Push the far clip plane way out (default is 1000). The city spans thousands
+    // of world units at 4 units/cell, so the default plane clips distant terrain
+    // and buildings. rlgl reads these on every BeginMode3D, so one call sticks.
+    rlSetClipPlanes(0.05, 100000.0);
 
     rlImGuiSetup(true);
     auto& io = ImGui::GetIO();
