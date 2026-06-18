@@ -1077,6 +1077,120 @@ void picks_nearest_occupied_building_cell_with_native_anchor() {
     assert(close_to(pick->hit_world.z, 2.0F));
 }
 
+void building_cell_picker_respects_visible_floor_filter() {
+    map_editor::SbbBuilding building{};
+    building.anchor_x = 0;
+    building.anchor_y = 0;
+    building.anchor_z = 0;
+    building.extent_x = 1;
+    building.extent_y = 2;
+    building.extent_z = 1;
+    building.cells.push_back({
+        10,
+        0,
+        0,
+        0,
+        {0x40000000U, 0xffffU, 0U, 0U, 0U, 0U},
+        0,
+        true,
+        {},
+    });
+    building.cells.push_back({
+        11,
+        0,
+        1,
+        0,
+        {0x40000000U, 0xffffU, 0U, 0U, 0U, 0U},
+        0,
+        true,
+        {},
+    });
+
+    const auto pick = map_editor::pick_building_cell(
+        building,
+        {2.0F, 12.0F, 2.0F},
+        {0.0F, -1.0F, 0.0F},
+        4.0F,
+        0U);
+
+    assert(pick.has_value());
+    assert(pick->cell_index == 0U);
+}
+
+void city_building_picker_ignores_empty_cells_inside_bounds() {
+    map_editor::SbbBuilding building{};
+    building.anchor_x = 0;
+    building.anchor_y = 0;
+    building.anchor_z = 0;
+    building.extent_x = 3;
+    building.extent_y = 1;
+    building.extent_z = 1;
+    building.cells.push_back({
+        20,
+        0,
+        0,
+        0,
+        {0x40000000U, 0xffffU, 0U, 0U, 0U, 0U},
+        0,
+        true,
+        {},
+    });
+    building.cells.push_back({
+        21,
+        1,
+        0,
+        0,
+        {0x40000000U, 0xffffU, 0U, 0U, 0U, 0U},
+        0,
+        false,
+        {},
+    });
+    building.cells.push_back({
+        22,
+        2,
+        0,
+        0,
+        {0x40000000U, 0xffffU, 0U, 0U, 0U, 0U},
+        0,
+        true,
+        {},
+    });
+
+    map_editor::SbcMap map{};
+    map.buildings.push_back({0, "sparse", 0, 0, 0, 0});
+    const std::vector<const map_editor::SbbBuilding*> placement_buildings{&building};
+
+    const auto pick = map_editor::pick_city_building(
+        map,
+        placement_buildings,
+        {6.0F, 8.0F, 2.0F},
+        {0.0F, -1.0F, 0.0F},
+        4.0F);
+
+    assert(!pick.has_value());
+}
+
+void city_piece_picker_selects_occupied_portal_voxel() {
+    map_editor::SbcMap map{};
+    map_editor::SbcPortal portal{};
+    portal.index = 0;
+    portal.fields = {0, 2, 1, 3};
+    portal.blocks.assign(0x200, 0U);
+    portal.blocks[4U + 2U * 0x40U + 5U * 8U] = 0x01020007U;
+    map.portals.push_back(portal);
+
+    const auto pick = map_editor::pick_city_piece(
+        map,
+        {82.0F, 64.0F, 118.0F},
+        {0.0F, -1.0F, 0.0F},
+        4.0F);
+
+    assert(pick.has_value());
+    assert(pick->portal_index == 0U);
+    assert(pick->block_index == 4U + 2U * 0x40U + 5U * 8U);
+    assert(pick->word == 0x01020007U);
+}
+
 void edits_selected_sbb_cell_state() {
     auto building = map_editor::parse_sbb_file(
         fixture_root() / "server/data/test2/building/test.sbb");
@@ -1253,6 +1367,40 @@ void builds_grid_aligned_city_street_tile_strip() {
     assert(std::ranges::any_of(scene.city_tile_buffer.material_names, [](const std::string& name) {
         return name == "city_curb_concrete";
     }));
+}
+
+void builds_city_street_tile_strips_for_all_cardinal_endpoint_orders() {
+    const auto has_segment = [](std::int32_t from_x, std::int32_t from_z, std::int32_t to_x, std::int32_t to_z,
+                                 std::int32_t probe_x, std::int32_t probe_z) {
+        map_editor::SbcMap map{};
+        map.intersections.push_back({0U, from_x, 0, from_z});
+        map.intersections.push_back({1U, to_x, 0, to_z});
+        map.streets.push_back({0U, 0, 1, 0, 1, 1, "Road"});
+
+        const auto scene = map_editor::build_map_scene(map);
+        return find_city_tile(scene, probe_x, probe_z, map_editor::CityTileKind::Road) != nullptr;
+    };
+
+    assert(has_segment(0, 0, 4, 0, 2, 0));
+    assert(has_segment(4, 0, 0, 0, 2, 0));
+    assert(has_segment(0, 0, 0, 4, 0, 2));
+    assert(has_segment(0, 4, 0, 0, 0, 2));
+}
+
+void canonicalizes_city_street_endpoint_order_for_native_axes() {
+    map_editor::SbcMap map{};
+    map.intersections.push_back({0U, 8, 0, 0});
+    map.intersections.push_back({1U, 0, 0, 0});
+    map.intersections.push_back({2U, 4, 0, 8});
+    map.intersections.push_back({3U, 4, 0, 0});
+
+    const auto west = map_editor::canonical_city_street_endpoint_order(map, {0U, 0, 1, 0, 1, 1, "West"});
+    const auto north = map_editor::canonical_city_street_endpoint_order(map, {1U, 2, 3, 0, 1, 1, "North"});
+
+    assert(west.from_intersection == 1);
+    assert(west.to_intersection == 0);
+    assert(north.from_intersection == 3);
+    assert(north.to_intersection == 2);
 }
 
 void fills_intersection_footprint_and_closes_missing_sides_with_curbs() {
@@ -1454,6 +1602,38 @@ void city_road_tile_heights_follow_native_slope_region() {
         max_top = std::max(max_top, vertex.position.y);
     }
     assert(max_top - min_top > 32.0F * 0.9F);
+}
+
+void city_intersection_markers_use_native_road_surface_height() {
+    map_editor::SbcMap map{};
+    map.intersections.push_back({0U, 600, 7, 600});
+    map.intersections.push_back({1U, 620, 9, 600});
+    map.streets.push_back({0U, 0, 1, 0, 1, 1, "Raised"});
+
+    const auto scene = map_editor::build_map_scene(map);
+
+    assert(scene.intersections.size() == 2U);
+    assert(scene.roads.size() == 1U);
+    assert(close_to(scene.intersections.front().position.y, 28.25F));
+    assert(close_to(scene.roads.front().from.y, 28.25F));
+    assert(close_to(scene.roads.front().to.y, 36.25F));
+}
+
+void picks_city_intersection_marker_from_ray() {
+    map_editor::SbcMap map{};
+    map.intersections.push_back({0U, 4, 3, 8});
+    const auto scene = map_editor::build_map_scene(map);
+    const auto marker_size = scene.unit_size * 0.42F;
+    const auto marker_y = scene.intersections.front().position.y + marker_size + 0.04F;
+
+    const auto picked = map_editor::pick_city_intersection(
+        map,
+        scene,
+        {scene.intersections.front().position.x, marker_y + 10.0F, scene.intersections.front().position.z},
+        {0.0F, -1.0F, 0.0F});
+
+    assert(picked.has_value());
+    assert(*picked == 0U);
 }
 
 void traffic_light_poles_stand_at_native_corners_of_3way_plus_intersections() {
@@ -2845,6 +3025,9 @@ int main() {
     native_building_tool_preview_uses_frame_faces_for_buildblock_opening();
     native_building_tool_preview_leaves_buildblock_opening_empty();
     picks_nearest_occupied_building_cell_with_native_anchor();
+    building_cell_picker_respects_visible_floor_filter();
+    city_building_picker_ignores_empty_cells_inside_bounds();
+    city_piece_picker_selects_occupied_portal_voxel();
     edits_selected_sbb_cell_state();
     edits_selected_sbc_building_state();
     edits_selected_sbl_word_state();
@@ -2853,6 +3036,8 @@ int main() {
     rejects_unsupported_sbc_version();
     builds_map_scene();
     builds_grid_aligned_city_street_tile_strip();
+    builds_city_street_tile_strips_for_all_cardinal_endpoint_orders();
+    canonicalizes_city_street_endpoint_order_for_native_axes();
     fills_intersection_footprint_and_closes_missing_sides_with_curbs();
     terrain_noise_hash_matches_native_all_ones_mask();
     terrain_noise_sample_uses_native_two_to_negative_thirty_normalizer();
@@ -2862,6 +3047,8 @@ int main() {
     city_terrain_inside_patch_conforms_to_piece_cells();
     city_terrain_inside_patch_conforms_to_building_footprints();
     city_road_tile_heights_follow_native_slope_region();
+    city_intersection_markers_use_native_road_surface_height();
+    picks_city_intersection_marker_from_ray();
     traffic_light_poles_stand_at_native_corners_of_3way_plus_intersections();
     parses_buildblock_sbl_fixture();
     builds_buildblock_preview_scene();

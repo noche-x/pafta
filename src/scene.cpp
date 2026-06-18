@@ -932,8 +932,40 @@ void add_native_tool_inset_detail(
             0x3fU,
             material_slots);
     };
+    // Windows are openings: they read as see-through cutouts like the door gap,
+    // not solid inset boxes. Draw each window as a thin frame around its rect
+    // perimeter, leaving the middle open so you can see through it. A frame is four
+    // narrow strips; frame_w is the strip thickness in cell-fraction units.
+    constexpr float frame_w = 1.0F / 16.0F;
+    auto add_frame_strip = [&](float fx, float fy, float fwidth, float fheight) {
+        if (fwidth <= 0.0F || fheight <= 0.0F) {
+            return;
+        }
+        add_native_tool_box(
+            buffer,
+            vertex_indices,
+            cell,
+            side,
+            native_tool_inset_x(layer, side, fx, fwidth),
+            fy,
+            0.0F,
+            fwidth,
+            fheight,
+            native_preview_inset_depth,
+            0x3fU,
+            material_slots);
+    };
     for (const auto& window : layer.windows) {
-        add_rect_box(window);
+        const float wx = window.x;
+        const float wy = window.y;
+        const float ww = window.width;
+        const float wh = window.height;
+        const float fw = std::min(frame_w, ww * 0.5F);
+        const float fh = std::min(frame_w, wh * 0.5F);
+        add_frame_strip(wx, wy, ww, fh);                       // bottom
+        add_frame_strip(wx, wy + wh - fh, ww, fh);             // top
+        add_frame_strip(wx, wy + fh, fw, wh - 2.0F * fh);      // left
+        add_frame_strip(wx + ww - fw, wy + fh, fw, wh - 2.0F * fh); // right
     }
     // VERIFY(editor.exe FUN_140051c60): decompilation proves the first rect
     // array at +0x1138; beams share the same SblPortalRect shape in this port
@@ -1336,6 +1368,10 @@ struct CityTileValue {
     // the tilted top so a sloping street reads as a continuous grade.
     float slope_x{};
     float slope_z{};
+    // SbcMap::streets index that laid this tile (-1 for intersection tiles, which
+    // belong to no single street). Lets clicks on the real asphalt resolve to a
+    // road.
+    std::int32_t street_index{-1};
 };
 
 using CityTileMap = std::unordered_map<CityTileKey, CityTileValue, CityTileKeyHash>;
@@ -1352,14 +1388,21 @@ void set_city_tile(
     CityTileKind kind,
     float top_y,
     float slope_x = 0.0F,
-    float slope_z = 0.0F) {
+    float slope_z = 0.0F,
+    std::int32_t street_index = -1) {
     const CityTileKey key{x, y, z};
-    const auto [match, inserted] = tiles.emplace(key, CityTileValue{kind, top_y, slope_x, slope_z});
-    if (!inserted && city_tile_kind_overrides(kind, match->second.kind)) {
-        match->second.kind = kind;
-        match->second.top_y = top_y;
-        match->second.slope_x = slope_x;
-        match->second.slope_z = slope_z;
+    const auto [match, inserted] = tiles.emplace(key, CityTileValue{kind, top_y, slope_x, slope_z, street_index});
+    if (!inserted) {
+        if (city_tile_kind_overrides(kind, match->second.kind)) {
+            match->second.kind = kind;
+            match->second.top_y = top_y;
+            match->second.slope_x = slope_x;
+            match->second.slope_z = slope_z;
+            match->second.street_index = street_index;
+        } else if (match->second.street_index < 0 && street_index >= 0) {
+            // Adopt a street owner if this tile didn't have one yet.
+            match->second.street_index = street_index;
+        }
     }
 }
 
@@ -1393,6 +1436,7 @@ struct NativeCityStreet {
     std::int32_t orientation{};  // 0 = runs along x, 1 = runs along z (native unk1[0])
     std::int32_t left_width{};   // native unk1[1] (startOffset)
     std::int32_t right_width{};  // native unk1[2] (endOffset)
+    std::int32_t source_index{-1}; // index into SbcMap::streets this came from
 };
 
 struct NativeCityGraph {
@@ -1415,32 +1459,28 @@ NativeCityGraph build_native_city_graph(const SbcMap& map) {
         graph.intersections.push_back(native);
     }
 
-    for (const auto& street : map.streets) {
-        if (street.from_intersection < 0 || street.to_intersection < 0) {
+    for (std::size_t street_src = 0; street_src < map.streets.size(); ++street_src) {
+        const auto ordered_street = canonical_city_street_endpoint_order(map, map.streets[street_src]);
+        if (ordered_street.from_intersection < 0 || ordered_street.to_intersection < 0) {
             continue;
         }
-        auto a = static_cast<std::size_t>(street.from_intersection);
-        auto b = static_cast<std::size_t>(street.to_intersection);
+        auto a = static_cast<std::size_t>(ordered_street.from_intersection);
+        auto b = static_cast<std::size_t>(ordered_street.to_intersection);
         if (a >= graph.intersections.size() || b >= graph.intersections.size() || a == b) {
             continue;
         }
 
         const auto dx = graph.intersections[b].gx - graph.intersections[a].gx;
         const auto dz = graph.intersections[b].gz - graph.intersections[a].gz;
-        // Native orientation pick: 0 when the x delta dominates (the binary
-        // assumes records run toward +axis; normalize backwards segments so the
-        // same math holds for arbitrary editor maps).
-        const auto orientation = dz < dx ? 0 : 1;
-        if ((orientation == 0 && dx < 0) || (orientation == 1 && dz < 0)) {
-            std::swap(a, b);
-        }
+        const auto orientation = std::abs(dz) < std::abs(dx) ? 0 : 1;
 
         NativeCityStreet native;
         native.a = static_cast<std::int32_t>(a);
         native.b = static_cast<std::int32_t>(b);
         native.orientation = orientation;
-        native.left_width = std::max(0, street.left_width);
-        native.right_width = std::max(0, street.right_width);
+        native.source_index = static_cast<std::int32_t>(street_src);
+        native.left_width = std::max(0, ordered_street.left_width);
+        native.right_width = std::max(0, ordered_street.right_width);
         const auto street_index = static_cast<std::int32_t>(graph.streets.size());
         auto& from = graph.intersections[a];
         auto& to = graph.intersections[b];
@@ -1623,7 +1663,7 @@ void place_native_street_tiles(
         const auto z = along_x ? cross_coord : along_coord;
         const auto slope_x = along_x ? grade : 0.0F;
         const auto slope_z = along_x ? 0.0F : grade;
-        set_city_tile(tiles, x, level, z, kind, top_y, slope_x, slope_z);
+        set_city_tile(tiles, x, level, z, kind, top_y, slope_x, slope_z, street.source_index);
     };
 
     auto height = from.level;
@@ -1721,6 +1761,28 @@ void place_native_intersection_tiles(
 }
 
 } // namespace
+
+SbcStreet canonical_city_street_endpoint_order(const SbcMap& map, SbcStreet street) {
+    if (street.from_intersection < 0 || street.to_intersection < 0) {
+        return street;
+    }
+
+    const auto a = static_cast<std::size_t>(street.from_intersection);
+    const auto b = static_cast<std::size_t>(street.to_intersection);
+    if (a >= map.intersections.size() || b >= map.intersections.size() || a == b) {
+        return street;
+    }
+
+    const auto& from = map.intersections[a];
+    const auto& to = map.intersections[b];
+    const auto dx = to.x - from.x;
+    const auto dz = to.z - from.z;
+    const auto along_x = std::abs(dz) < std::abs(dx);
+    if ((along_x && dx < 0) || (!along_x && dz < 0)) {
+        std::swap(street.from_intersection, street.to_intersection);
+    }
+    return street;
+}
 
 float terrain_noise_sample(float x, float z, float frequency_x, float frequency_z) {
     const auto sx = x * frequency_x;
@@ -2097,7 +2159,7 @@ std::vector<CityTileCell> build_city_tile_cells(
         const auto base_y = value.kind == CityTileKind::Curb
             ? value.top_y - 0.25F
             : value.top_y - 4.0F;
-        tiles.push_back({key.x, key.y, key.z, base_y, value.slope_x, value.slope_z, value.kind});
+        tiles.push_back({key.x, key.y, key.z, base_y, value.slope_x, value.slope_z, value.kind, value.street_index});
     }
     std::ranges::sort(tiles, [](const CityTileCell& left, const CityTileCell& right) {
         if (left.y != right.y) {
@@ -2373,14 +2435,6 @@ std::optional<CityTerrain> build_city_terrain(
     // a single grass material) instead of drawn triangle-by-triangle.
     sort_triangles_into_native_material_runs(terrain.mesh);
     return terrain;
-}
-
-Vec3 normalized_xz(Vec3 value) {
-    const auto length = std::sqrt(value.x * value.x + value.z * value.z);
-    if (length <= 0.0001F) {
-        return {1.0F, 0.0F, 0.0F};
-    }
-    return {value.x / length, 0.0F, value.z / length};
 }
 
 // Traffic light corner objects. Placement: MapConnector_PlaceIntersectionPerimeterTiles
@@ -2812,7 +2866,8 @@ std::optional<CellPick> pick_building_cell(
     const SbbBuilding& building,
     const Vec3& ray_origin,
     const Vec3& ray_dir,
-    float unit_size) {
+    float unit_size,
+    std::optional<std::uint32_t> floor) {
     if (unit_size <= 0.0F) {
         return std::nullopt;
     }
@@ -2821,7 +2876,7 @@ std::optional<CellPick> pick_building_cell(
     std::optional<CellPick> nearest;
     for (std::size_t cell_index = 0; cell_index < building.cells.size(); ++cell_index) {
         const auto& cell = building.cells[cell_index];
-        if (!cell.occupied) {
+        if (!cell.occupied || (floor.has_value() && cell.y != *floor)) {
             continue;
         }
 
@@ -2857,6 +2912,55 @@ std::optional<Vec3> ray_ground_hit(const Vec3& ray_origin, const Vec3& ray_dir) 
     return add_scaled(ray_origin, ray_dir, t);
 }
 
+std::optional<Vec3> ray_terrain_hit(const CityTerrain& terrain, const Vec3& ray_origin, const Vec3& ray_dir) {
+    if (terrain.heights.empty() || terrain.sample_count_x <= 0 || terrain.sample_count_z <= 0 ||
+        terrain.sample_spacing <= 0.0F) {
+        return ray_ground_hit(ray_origin, ray_dir);
+    }
+
+    // March the ray in fixed steps and detect the span where it crosses from above
+    // the heightfield to below it, then bisect that span. signed_gap(t) > 0 means
+    // the ray point is above the terrain surface at that x/z. The terrain is a
+    // height grid, so a downward-looking ray crosses it at most once over the
+    // relevant span; a coarse march plus a short bisection lands within a few
+    // millimetres without needing per-triangle intersection.
+    const auto signed_gap = [&](float t) {
+        const auto p = add_scaled(ray_origin, ray_dir, t);
+        return p.y - terrain_height_at(terrain, p.x, p.z);
+    };
+
+    const auto span = (terrain.max_x - terrain.min_x) + (terrain.max_z - terrain.min_z);
+    const auto max_t = span > 0.0F ? span * 2.0F + 4096.0F : 8192.0F;
+    const auto step = std::max(terrain.sample_spacing * 0.5F, 1.0F);
+
+    float prev_t = 0.0F;
+    float prev_gap = signed_gap(prev_t);
+    // Ray starting under the surface: nothing meaningful to snap to.
+    if (prev_gap < 0.0F) {
+        return ray_ground_hit(ray_origin, ray_dir);
+    }
+    for (float t = step; t <= max_t; t += step) {
+        const auto gap = signed_gap(t);
+        if (gap <= 0.0F) {
+            float lo = prev_t;
+            float hi = t;
+            for (int i = 0; i < 24; ++i) {
+                const auto mid = (lo + hi) * 0.5F;
+                if (signed_gap(mid) > 0.0F) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            return add_scaled(ray_origin, ray_dir, (lo + hi) * 0.5F);
+        }
+        prev_t = t;
+        prev_gap = gap;
+    }
+    (void)prev_gap;
+    return ray_ground_hit(ray_origin, ray_dir);
+}
+
 std::optional<std::size_t> pick_city_building(
     const SbcMap& map,
     const std::vector<const SbbBuilding*>& placement_buildings,
@@ -2873,13 +2977,18 @@ std::optional<std::size_t> pick_city_building(
     for (std::size_t index = 0; index < map.buildings.size(); ++index) {
         const auto& placement = map.buildings[index];
         const auto* building = index < placement_buildings.size() ? placement_buildings[index] : nullptr;
+        auto test_cell_box = [&](Vec3 center) {
+            const auto box_min = Vec3{center.x - half, center.y - half, center.z - half};
+            const auto box_max = Vec3{center.x + half, center.y + half, center.z + half};
+            const auto t = ray_aabb_intersection_t(ray_origin, ray_dir, box_min, box_max);
+            if (!t.has_value() || *t >= nearest_t) {
+                return;
+            }
+            nearest = index;
+            nearest_t = *t;
+        };
 
-        // World AABB over the placement's occupied cells (so the pick box hugs the
-        // actual footprint), or a single placement cell box when the .sbb is
-        // unresolved. Cell-to-world uses the same transform as the draw/stamp path.
-        Vec3 box_min{std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
-        Vec3 box_max{std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest()};
-        bool has_box = false;
+        bool tested_loaded_cell = false;
         if (building != nullptr) {
             for (const auto& cell : building->cells) {
                 if (!cell.occupied) {
@@ -2890,26 +2999,58 @@ std::optional<std::size_t> pick_city_building(
                     (static_cast<float>(cell.y) - static_cast<float>(building->anchor_y) + 0.5F) * unit_size,
                     (static_cast<float>(cell.z) - static_cast<float>(building->anchor_z) + 0.5F) * unit_size,
                 };
-                const auto center = native_city_building_transform_point(placement, local, unit_size);
-                box_min = Vec3{std::min(box_min.x, center.x - half), std::min(box_min.y, center.y - half), std::min(box_min.z, center.z - half)};
-                box_max = Vec3{std::max(box_max.x, center.x + half), std::max(box_max.y, center.y + half), std::max(box_max.z, center.z + half)};
-                has_box = true;
+                test_cell_box(native_city_building_transform_point(placement, local, unit_size));
+                tested_loaded_cell = true;
             }
         }
-        if (!has_box) {
+        if (!tested_loaded_cell) {
             const auto origin = native_city_building_render_origin(placement, unit_size);
-            box_min = Vec3{origin.x - half, origin.y, origin.z - half};
-            box_max = Vec3{origin.x + half, origin.y + unit_size, origin.z + half};
+            test_cell_box({origin.x, origin.y + half, origin.z});
         }
-
-        const auto t = ray_aabb_intersection_t(ray_origin, ray_dir, box_min, box_max);
-        if (!t.has_value() || *t >= nearest_t) {
-            continue;
-        }
-        nearest = index;
-        nearest_t = *t;
     }
 
+    return nearest;
+}
+
+std::optional<CityPiecePick> pick_city_piece(
+    const SbcMap& map,
+    const Vec3& ray_origin,
+    const Vec3& ray_dir,
+    float unit_size) {
+    if (unit_size <= 0.0F) {
+        return std::nullopt;
+    }
+
+    const auto half = unit_size * 0.5F;
+    std::optional<CityPiecePick> nearest;
+    float nearest_t = std::numeric_limits<float>::max();
+    for (std::size_t portal_index = 0; portal_index < map.portals.size(); ++portal_index) {
+        const auto& portal = map.portals[portal_index];
+        for (std::size_t block_index = 0; block_index < portal.blocks.size() && block_index < 0x200U; ++block_index) {
+            const auto word = portal.blocks[block_index];
+            if (word == 0U) {
+                continue;
+            }
+
+            const auto local_x = static_cast<std::int32_t>(block_index & 7U);
+            const auto local_z = static_cast<std::int32_t>((block_index / 8U) & 7U);
+            const auto local_y = static_cast<std::int32_t>((block_index / 0x40U) & 7U);
+            const Vec3 center{
+                (static_cast<float>(portal.fields[1] * 8 + local_x) + 0.5F) * unit_size,
+                (static_cast<float>(portal.fields[2] * 8 + local_y) + 0.5F) * unit_size,
+                (static_cast<float>(portal.fields[3] * 8 + local_z) + 0.5F) * unit_size,
+            };
+            const auto box_min = Vec3{center.x - half, center.y - half, center.z - half};
+            const auto box_max = Vec3{center.x + half, center.y + half, center.z + half};
+            const auto t = ray_aabb_intersection_t(ray_origin, ray_dir, box_min, box_max);
+            if (!t.has_value() || *t >= nearest_t) {
+                continue;
+            }
+
+            nearest = CityPiecePick{portal_index, block_index, word};
+            nearest_t = *t;
+        }
+    }
     return nearest;
 }
 
@@ -2918,12 +3059,17 @@ std::optional<std::size_t> pick_city_road(
     const MapScene& scene,
     const Vec3& ray_origin,
     const Vec3& ray_dir) {
-    const auto hit = ray_ground_hit(ray_origin, ray_dir);
+    // Roads sit on the terrain surface, often well above y=0. Hit-testing against
+    // the y=0 plane lands the ground point at the wrong X/Z (the click misses the
+    // visible road), so raycast the actual terrain surface like the cursor does.
+    const auto hit = scene.terrain.has_value()
+        ? ray_terrain_hit(*scene.terrain, ray_origin, ray_dir)
+        : ray_ground_hit(ray_origin, ray_dir);
     if (!hit.has_value()) {
         return std::nullopt;
     }
 
-    // Distance from the ground hit to each road segment; the nearest segment
+    // Distance from the surface hit to each road segment; the nearest segment
     // within its drawn half-width wins. scene.roads[i].source back-references the
     // SBC street, resolved to an index into map.streets.
     std::optional<std::size_t> nearest;
@@ -2963,6 +3109,124 @@ std::optional<std::size_t> pick_city_road(
     }
 
     return nearest;
+}
+
+std::optional<std::size_t> pick_city_intersection(
+    const SbcMap& map,
+    const MapScene& scene,
+    const Vec3& ray_origin,
+    const Vec3& ray_dir) {
+    const auto marker_size = scene.unit_size * 0.42F;
+    const auto marker_lift = marker_size * 0.5F + 0.04F;
+    // Pad the pick target a little beyond the drawn marker so the small node cube
+    // is easy to grab, but not so much that it swallows the road running through
+    // it (a full-cell box made roads unselectable near their endpoints). The
+    // unified picker (pick_city_road_or_node) breaks node/road ties by camera
+    // distance, so this only needs to be comfortably clickable, not greedy.
+    const auto half = marker_size * 0.85F;
+
+    std::optional<std::size_t> nearest;
+    auto nearest_t = std::numeric_limits<float>::max();
+    for (const auto& intersection : scene.intersections) {
+        std::optional<std::size_t> index;
+        for (std::size_t i = 0; i < map.intersections.size(); ++i) {
+            if (&map.intersections[i] == intersection.source) {
+                index = i;
+                break;
+            }
+        }
+        if (!index.has_value()) {
+            continue;
+        }
+
+        const Vec3 center{
+            intersection.position.x,
+            intersection.position.y + marker_lift,
+            intersection.position.z,
+        };
+        const auto t = ray_aabb_intersection_t(
+            ray_origin,
+            ray_dir,
+            {center.x - half, center.y - half, center.z - half},
+            {center.x + half, center.y + half, center.z + half});
+        if (!t.has_value() || *t >= nearest_t) {
+            continue;
+        }
+
+        nearest = *index;
+        nearest_t = *t;
+    }
+
+    return nearest;
+}
+
+std::optional<CityRoadPick> pick_city_road_or_node(
+    const SbcMap& map,
+    const MapScene& scene,
+    const Vec3& ray_origin,
+    const Vec3& ray_dir) {
+    // Node candidate: distance along the ray to the nearest node marker box.
+    const auto marker_size = scene.unit_size * 0.42F;
+    const auto marker_lift = marker_size * 0.5F + 0.04F;
+    const auto node_half = marker_size * 0.85F;
+    std::optional<std::size_t> node_index;
+    float node_t = std::numeric_limits<float>::max();
+    for (const auto& intersection : scene.intersections) {
+        std::optional<std::size_t> index;
+        for (std::size_t i = 0; i < map.intersections.size(); ++i) {
+            if (&map.intersections[i] == intersection.source) {
+                index = i;
+                break;
+            }
+        }
+        if (!index.has_value()) {
+            continue;
+        }
+        const Vec3 center{intersection.position.x, intersection.position.y + marker_lift, intersection.position.z};
+        const auto t = ray_aabb_intersection_t(
+            ray_origin, ray_dir,
+            {center.x - node_half, center.y - node_half, center.z - node_half},
+            {center.x + node_half, center.y + node_half, center.z + node_half});
+        if (t.has_value() && *t < node_t) {
+            node_t = *t;
+            node_index = *index;
+        }
+    }
+
+    // Road candidate: where the ray meets the terrain surface, which road's drawn
+    // footprint (segment within its half-width) that point lands in. The road t is
+    // the distance from the ray origin to that surface hit, so it is directly
+    // comparable to the node t above.
+    // Pick against the actual rendered road tiles (the asphalt you see), not the
+    // abstract centerline. Each road tile is a unit cube; the nearest one the ray
+    // enters resolves to its owning street via tile.street_index. Intersection
+    // tiles (street_index < 0) are ignored so they fall through to node picking.
+    std::optional<std::size_t> road_index;
+    float road_t = std::numeric_limits<float>::max();
+    const auto unit = scene.unit_size;
+    for (const auto& tile : scene.city_tiles) {
+        if (tile.kind != CityTileKind::Road || tile.street_index < 0 ||
+            static_cast<std::size_t>(tile.street_index) >= map.streets.size()) {
+            continue;
+        }
+        const Vec3 box_min{static_cast<float>(tile.x) * unit, tile.base_y, static_cast<float>(tile.z) * unit};
+        const Vec3 box_max{box_min.x + unit, tile.base_y + unit, box_min.z + unit};
+        const auto t = ray_aabb_intersection_t(ray_origin, ray_dir, box_min, box_max);
+        if (t.has_value() && *t < road_t) {
+            road_t = *t;
+            road_index = static_cast<std::size_t>(tile.street_index);
+        }
+    }
+
+    // Whichever the ray reaches first wins. A small bias keeps a direct node click
+    // winning when the node box and the road overlap (the node sits on the road).
+    if (node_index.has_value() && (!road_index.has_value() || node_t <= road_t + scene.unit_size * 0.25F)) {
+        return CityRoadPick{CityRoadPick::Kind::Node, *node_index};
+    }
+    if (road_index.has_value()) {
+        return CityRoadPick{CityRoadPick::Kind::Road, *road_index};
+    }
+    return std::nullopt;
 }
 
 // -----------------------------------------------------------------------------
@@ -3102,6 +3366,45 @@ std::uint64_t city_scene_fingerprint(const SbcMap& map) {
     return hash;
 }
 
+std::uint64_t city_terrain_fingerprint(const SbcMap& map) {
+    // Subset of city_scene_fingerprint covering only the inputs that change the
+    // terrain heightfield mesh: intersection positions (corner heights), building
+    // footprints, and piece/portal cells (footprint stamping). Streets/road widths
+    // are excluded, so road and street edits skip the expensive terrain re-upload.
+    std::uint64_t hash = 1469598103934665603ULL;
+    const auto mix = [&hash](std::int64_t value) {
+        auto bits = static_cast<std::uint64_t>(value);
+        for (int byte = 0; byte < 8; ++byte) {
+            hash ^= bits & 0xFFU;
+            hash *= 1099511628211ULL;
+            bits >>= 8;
+        }
+    };
+    mix(static_cast<std::int64_t>(map.intersections.size()));
+    for (const auto& it : map.intersections) {
+        mix(it.x);
+        mix(it.y);
+        mix(it.z);
+    }
+    mix(static_cast<std::int64_t>(map.buildings.size()));
+    for (const auto& building : map.buildings) {
+        mix(building.x);
+        mix(building.y);
+        mix(building.z);
+        mix(building.rotation);
+    }
+    mix(static_cast<std::int64_t>(map.portals.size()));
+    for (const auto& portal : map.portals) {
+        mix(portal.fields[1]);
+        mix(portal.fields[2]);
+        mix(portal.fields[3]);
+        for (const auto word : portal.blocks) {
+            mix(static_cast<std::int64_t>(word));
+        }
+    }
+    return hash;
+}
+
 MapScene build_map_scene(const SbcMap& map) {
     return build_map_scene(map, {});
 }
@@ -3138,16 +3441,12 @@ MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*
             &street,
             {
                 static_cast<float>(from.x) * scene.unit_size,
-                scene.terrain.has_value()
-                    ? terrain_height_at(*scene.terrain, static_cast<float>(from.x) * scene.unit_size, static_cast<float>(from.z) * scene.unit_size)
-                    : static_cast<float>(from.y) * scene.unit_size,
+                native_road_surface_y(from.y - 1),
                 static_cast<float>(from.z) * scene.unit_size,
             },
             {
                 static_cast<float>(to.x) * scene.unit_size,
-                scene.terrain.has_value()
-                    ? terrain_height_at(*scene.terrain, static_cast<float>(to.x) * scene.unit_size, static_cast<float>(to.z) * scene.unit_size)
-                    : static_cast<float>(to.y) * scene.unit_size,
+                native_road_surface_y(to.y - 1),
                 static_cast<float>(to.z) * scene.unit_size,
             },
             static_cast<float>(std::max(2, street.left_width + street.right_width + 2)) * scene.unit_size,
@@ -3167,9 +3466,7 @@ MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*
             &intersection,
             {
                 static_cast<float>(intersection.x) * scene.unit_size,
-                scene.terrain.has_value()
-                    ? terrain_height_at(*scene.terrain, static_cast<float>(intersection.x) * scene.unit_size, static_cast<float>(intersection.z) * scene.unit_size)
-                    : static_cast<float>(intersection.y) * scene.unit_size,
+                native_road_surface_y(intersection.y - 1),
                 static_cast<float>(intersection.z) * scene.unit_size,
             },
             width,

@@ -155,6 +155,8 @@ enum class GfxDebugTimingPhase : std::size_t {
     TerrainDraw,
     CityRoadDraw,
     BuildingDraw,
+    PieceDraw,
+    OutlineDraw,
     PoleDraw,
     ImGuiUi,
     TotalFrame,
@@ -325,10 +327,20 @@ struct EditorProject {
     GpuBuildingRenderModel city_tile_gpu_model;
     GpuBuildingRenderModel terrain_gpu_model;
     bool city_scene_gpu_valid{false};
+    // Terrain mesh is uploaded separately from the road/curb tiles: it only needs
+    // re-upload when terrain-affecting inputs change (terrain_gpu_fingerprint),
+    // so road/street edits skip the heavy terrain GPU upload.
+    std::uint64_t terrain_gpu_fingerprint{};
+    bool terrain_gpu_valid{false};
     bool portal_render_dirty{true};
     bool portal_preview_render_dirty{true};
     bool portal_render_textured{};
     bool portal_preview_render_textured{};
+    // Async portal (piece) mesh rebuild: the CPU buffer build runs on a worker so
+    // placing a piece never hitches the frame; the old mesh keeps showing until
+    // the new buffer is ready and uploaded on the main thread.
+    bool portal_rebuild_in_progress{};
+    std::optional<std::future<BuildingRenderBuffer>> portal_rebuild_future;
     bool render_build_in_progress{};
     std::uint64_t render_build_generation{};
     std::optional<std::future<RenderBuildResult>> render_build_future;
@@ -337,6 +349,24 @@ struct EditorProject {
     std::size_t pending_gpu_upload_index{};
     std::vector<std::string> render_logs;
     std::string status;
+    // Lazily-rendered 3D thumbnails for the template galleries, keyed by building
+    // asset index. RenderTexture2D handles are owned here and freed on shutdown.
+    std::vector<RenderTexture2D> building_thumbnails;
+    std::vector<bool> building_thumbnail_ready;
+    std::vector<RenderTexture2D> city_block_thumbnails;
+    std::vector<bool> city_block_thumbnail_ready;
+    // Undo/redo of the city map. Each entry is a full SbcMap snapshot plus the
+    // label of the action that produced the state AFTER it. undo_stack.back() is
+    // the current state; popping it (onto redo_stack) reverts. The action_log is a
+    // human-readable backlog of everything done this session.
+    std::vector<std::pair<std::string, SbcMap>> undo_stack;
+    std::vector<std::pair<std::string, SbcMap>> redo_stack;
+    std::vector<std::string> action_log;
+    // Set on load: drives the loading screen that pregenerates thumbnails (and
+    // shows progress) so the galleries are warm before you open them.
+    bool pregenerating{true};
+    std::size_t pregen_building_cursor{};
+    std::size_t pregen_block_cursor{};
 };
 
 enum class EditorTab {
@@ -347,15 +377,52 @@ enum class EditorTab {
     Blocks,
 };
 
-enum class CityEditMode {
-    Roads,
-    Buildings,
-    Pieces,
+// Unified city-view tools (no Roads/Buildings/Pieces sub-mode). Select picks
+// anything under the cursor (nearest wins) and gives the picked building/piece a
+// gizmo; Building places a chosen building template; Road draws road chains; Piece
+// places/draws pieces; Erase deletes whatever is clicked.
+enum class CityTool {
+    Select,
+    Building,
+    Road,
+    Piece,
+    Erase,
 };
 
-enum class CityViewMode {
-    GamePreview,
-    Editor,
+// What the Select tool currently has selected, so the gizmo/inspector know what to
+// act on and the outline knows what to trace.
+enum class CitySelectionKind {
+    None,
+    Building,
+    Road,
+    Node,
+    Piece,
+};
+
+// Active tool in the Buildings (template) editor. Select picks a cell, PlaceBlock
+// occupies the cell under the cursor with the chosen block, PaintTexture writes
+// the chosen material onto the picked face.
+enum class BuildingTool {
+    Select,
+    PlaceBlock,
+    PaintTexture,
+};
+
+// Staged configuration for the Place Block tool, mirroring editor.exe's block
+// panel: choose whether the placed cell has an exterior shell, an interior shell,
+// or both (neither = nothing to place), pick the buildblock template (cell_type)
+// that shapes its walls, and pick the material for each of the six faces on each
+// side. Place writes exactly this into the target cell.
+struct BlockToolConfig {
+    bool exterior{true};
+    bool interior{false};
+    // Buildblock template index into building.block_names (cell_type). 0 = the
+    // plain solid box.
+    std::size_t buildblock_index{};
+    // Material index (into building.materials) per face. Faces 0..5 are
+    // Down, South, West, North, East, Up - the renderer's slot order.
+    std::array<std::size_t, 6> exterior_face_material{};
+    std::array<std::size_t, 6> interior_face_material{};
 };
 
 // Drag-gizmo handle on the selected city building. MoveX/MoveZ slide along the
@@ -366,6 +433,16 @@ enum class GizmoAxis {
     MoveY,
     MoveZ,
     Rotate,
+};
+
+struct CityGridPoint {
+    std::int32_t x{};
+    std::int32_t y{};
+    std::int32_t z{};
+
+    friend bool operator==(const CityGridPoint& a, const CityGridPoint& b) {
+        return a.x == b.x && a.y == b.y && a.z == b.z;
+    }
 };
 
 struct EditorUi {
@@ -380,11 +457,47 @@ struct EditorUi {
     std::size_t selected_buildblock_door{};
     std::size_t selected_buildblock_window{};
     std::size_t selected_buildblock_beam{};
-    CityEditMode city_mode{CityEditMode::Roads};
-    CityViewMode city_view_mode{CityViewMode::GamePreview};
+    // Active tools per editor, set by the viewport-left toolbar.
+    CityTool city_tool{CityTool::Select};
+    CitySelectionKind city_selection{CitySelectionKind::None};
+    // Multi-selection of placeable things (buildings + piece portals). The active
+    // single selection (selected_city_building / selected_portal) is always the
+    // last-clicked member; these sets carry the whole group for move/delete. Empty
+    // means "just the single active selection".
+    std::vector<std::size_t> selected_city_buildings;
+    std::vector<std::size_t> selected_portals;
+    // Box (rubber-band) selection: while dragging with the Select tool, everything
+    // whose screen point falls in the rectangle gets selected. box_select_active is
+    // set on press, the start/current points are viewport-space pixels.
+    bool box_select_active{false};
+    Vector2 box_select_start{};
+    // Building/piece template to place with the Building/Piece tools.
+    std::size_t place_building_template{};
+    BuildingTool building_tool{BuildingTool::Select};
+    // Place Block tool configuration (editor.exe-style block panel).
+    BlockToolConfig block_config{};
+    // Paint Texture tool: the material it writes and which side (exterior/interior
+    // texture slots) it paints.
+    std::size_t paint_material_index{};
+    bool paint_interior{false};
+    // Click-and-hold stamping: the last grid cell a held-drag stamped, so dragging
+    // across cells places fast without re-stamping the same cell every frame. Reset
+    // on mouse release. {INT32_MIN} means "nothing stamped yet this drag".
+    std::optional<CityGridPoint> drag_stamp_cell;
     std::size_t selected_city_street{};
+    std::size_t selected_city_intersection{};
     std::size_t selected_city_building{};
     std::optional<std::size_t> pending_road_intersection;
+    // Roads-mode hover, recomputed each frame for the select preview: the node or
+    // road a Shift+Click would grab. Node wins over road when both are under the
+    // cursor, matching the click priority.
+    std::optional<std::size_t> hover_city_intersection;
+    std::optional<std::size_t> hover_city_street;
+    // Selected piece is a single voxel (world grid cell), not the whole 8x8x8
+    // portal: pieces are edited and highlighted one block at a time even though
+    // they are stored grouped in portals internally.
+    std::optional<CityGridPoint> selected_piece_voxel;
+    std::optional<CityGridPoint> hover_piece_voxel;
     std::size_t selected_city_block{};
     std::size_t selected_city_block_layer{};
     std::size_t selected_city_block_slot{};
@@ -397,12 +510,24 @@ struct EditorUi {
     bool render_roads{true};
     bool render_terrain{true};
     std::size_t selected_building_cell{};
+    // Building-view hover: the cell index under the cursor this frame (for the
+    // silhouette outline), recomputed each frame; nullopt when none.
+    std::optional<std::size_t> building_hover_cell;
     std::size_t selected_building_field{};
     std::size_t selected_buildblock_field{};
     // Buildings tab view: false => whole building, true => only building_view_floor.
     bool building_view_floor_only{false};
     int building_view_floor{0};
     float camera_fly_speed{48.0F};
+    // Animated camera focus (F key): when active, the camera eases from the start
+    // pose to the target pose over focus_duration. Cancelled by manual fly input.
+    bool focus_animating{false};
+    float focus_t{};
+    float focus_duration{0.6F};
+    Vector3 focus_start_position{};
+    Vector3 focus_start_target{};
+    Vector3 focus_end_position{};
+    Vector3 focus_end_target{};
     bool city_dirty{};
     bool building_dirty{};
     bool block_dirty{};
@@ -418,13 +543,10 @@ struct EditorUi {
     std::int32_t gizmo_drag_origin_rot{};
 };
 
-struct CityGridPoint {
-    std::int32_t x{};
-    std::int32_t y{};
-    std::int32_t z{};
-};
-
 std::string lower_name(std::string_view value);
+// Display label for a key, localized to the user's keyboard layout (printable
+// keys via glfwGetKeyName, fixed names for the rest). Defined in app.cpp.
+std::string key_label(int key);
 std::vector<const SbbBuilding*> resolve_placement_buildings(const EditorProject& project);
 std::optional<EditorProject> load_project_folder(const std::filesystem::path& folder, std::string& error);
 std::vector<NamedBlockMesh> block_meshes(const EditorProject& project);
@@ -437,6 +559,13 @@ void invalidate_portal_render_models(EditorProject& project);
 GpuBuildingRenderModel upload_building_render_model(const BuildingRenderBuffer& buffer, const SbbBuilding& building, const EditorProject& project);
 GpuBuildingRenderModel& building_tool_floor_preview_model(EditorProject& project, std::size_t building_index, std::optional<std::uint32_t> floor);
 Texture2D load_city_window_gradient_texture();
+// Loaded texture for a material name (matches project.textures by name), or
+// nullptr when the project has no texture by that name. Used to show real texture
+// thumbnails in the material pickers instead of name strings.
+const Texture2D* texture_for_material(const EditorProject& project, std::string_view material_name);
+// Picks a material by clickable thumbnail grid (real texture when available, a
+// color tile otherwise). Edits selected in place; returns true on change.
+bool material_swatch_picker(const EditorProject& project, const char* id, const std::vector<std::string>& materials, std::size_t& selected);
 void draw_mesh_faces(const SblBlockMesh& mesh, float scale, Color fill);
 void draw_sbb_scene_for_app(const SbbBuilding& building, GpuBuildingRenderModel& model, const SbbCell* selected);
 void draw_city_building_model(
@@ -447,7 +576,17 @@ void draw_city_building_model(
     bool use_lod,
     const Texture2D* city_window_texture = nullptr,
     bool hovered = false);
-void draw_city_piece_voxels(EditorProject& project, bool textured, std::optional<std::size_t> selected_portal = std::nullopt);
+void draw_city_building_mask(GpuBuildingRenderModel& model, const SbcBuilding& placement);
+void draw_outline_from_mask(RenderTexture2D& mask, Vector2 viewport_size, Color tint);
+void draw_city_road_mask(const EditorProject& project, const MapScene& scene, std::size_t street_index);
+void draw_building_cell_mask(const SbbBuilding& building, const SbbCell& cell);
+void draw_city_piece_voxels(
+    EditorProject& project,
+    bool textured,
+    std::optional<std::size_t> selected_portal = std::nullopt,
+    bool draw_wires = false,
+    bool isolate_selected = false);
+void draw_city_piece_glow(CityGridPoint cell, Color color);
 GpuBuildingRenderModel upload_city_tile_model(const BuildingRenderBuffer& buffer, const EditorProject& project);
 GpuBuildingRenderModel upload_city_terrain_model(const BuildingRenderBuffer& buffer, const EditorProject& project);
 void unload_city_render_model(GpuBuildingRenderModel& model);
@@ -459,19 +598,40 @@ void draw_city_scene(
     bool render_terrain);
 void draw_city_editor_overlay(const EditorProject& project, const MapScene& scene);
 void draw_city_traffic_light_poles(const MapScene& scene);
-void draw_city_cursor(CityGridPoint point, float unit_size, CityEditMode mode);
+void draw_city_cursor(CityGridPoint point, float unit_size, CityTool tool);
+// Terrain-following grid drawn around the cursor while laying roads/pieces, so
+// the click cell and its neighbours are legible against the ground.
+void draw_city_edit_grid(CityGridPoint center, const MapScene& scene);
+// Roads-mode selection/hover overlay: distinct styling for the selected node, the
+// selected road, and the node/road under the cursor (hover_city_* in ui).
+void draw_city_road_selection(const EditorProject& project, const EditorUi& ui, const MapScene& scene);
 void draw_city_block_preview(const SbcCityBlock& city_block, const std::vector<NamedBlockMesh>& meshes, std::size_t selected_layer, std::size_t selected_slot);
 void draw_buildblock_preview_3d(const BuildblockPreviewScene& scene);
 
 Camera3D default_camera();
 float adjust_camera_fly_speed(float current_speed, float wheel_delta);
-Vector2 get_virtual_mouse_position(Vector2 viewport_pos, Vector2 viewport_size);
+Ray get_viewport_mouse_ray(const Camera3D& camera, Vector2 viewport_mouse_pos, Vector2 viewport_size);
 Vector2 get_viewport_mouse_position(Vector2 viewport_pos, Vector2 viewport_size);
 void focus_camera_on_city(Camera3D& camera, const EditorProject& project);
 void update_free_fly_camera(Camera3D& camera, float fly_speed);
-std::optional<CityGridPoint> city_grid_point_under_mouse(const Camera3D& camera, Vector2 virtual_mouse_pos);
-std::optional<std::pair<std::size_t, std::size_t>> city_block_slot_under_mouse(const Camera3D& camera, Vector2 virtual_mouse_pos);
-bool select_building_cell_from_viewport(EditorProject& project, EditorUi& ui, const Camera3D& camera, Vector2 viewport_mouse_pos, Vector2 viewport_size, std::string& status);
+std::optional<CityGridPoint> city_grid_point_under_mouse(const Camera3D& camera, Vector2 viewport_mouse_pos, Vector2 viewport_size);
+std::optional<CityGridPoint> city_grid_point_under_mouse_terrain(
+    const Camera3D& camera,
+    Vector2 viewport_mouse_pos,
+    Vector2 viewport_size,
+    const MapScene& scene);
+std::optional<std::pair<std::size_t, std::size_t>> city_block_slot_under_mouse(
+    const Camera3D& camera,
+    Vector2 viewport_mouse_pos,
+    Vector2 viewport_size);
+bool select_building_cell_from_viewport(
+    EditorProject& project,
+    EditorUi& ui,
+    const Camera3D& camera,
+    Vector2 viewport_mouse_pos,
+    Vector2 viewport_size,
+    std::optional<std::uint32_t> floor,
+    std::string& status);
 
 std::optional<std::filesystem::path> dropped_folder();
 std::vector<std::string> building_names(const EditorProject& project);
@@ -513,8 +673,26 @@ void mark_block_changed(EditorProject& project, EditorUi& ui, SblBlockMesh& bloc
 void draw_portal_details(const SbcPortal& portal);
 void draw_building_asset_panel(EditorProject& project, EditorUi& ui);
 void draw_buildblock_gallery(EditorProject& project, EditorUi& ui);
+// Renders building asset `index` to a small thumbnail RenderTexture (cached in
+// project.building_thumbnails) and returns it, or nullptr if it can't be made.
+const RenderTexture2D* building_thumbnail(EditorProject& project, std::size_t index);
+void invalidate_building_thumbnail(EditorProject& project, std::size_t index);
+void rebuild_single_building_render(EditorProject& project, std::size_t index);
+const RenderTexture2D* city_block_thumbnail(EditorProject& project, std::size_t index);
+// Template galleries: clickable 3D thumbnails of building / piece templates that
+// set the active placement template for the Building / Piece tools.
+void draw_city_building_template_gallery(EditorProject& project, EditorUi& ui);
+void draw_city_piece_template_gallery(EditorProject& project, EditorUi& ui);
 void draw_buildblock_preview_panel(EditorProject& project, EditorUi& ui);
 void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& status);
+// Viewport-left tool overlay (mode combobox + tool buttons). Anchored at the
+// screen-space top-left of the render image (origin_x, origin_y). Returns true
+// when the overlay is hovered, so the caller can suppress 3D picking for the click.
+bool draw_viewport_toolbar(EditorProject& project, EditorUi& ui, float origin_x, float origin_y);
+// Context-sensitive controls hint, drawn as key-cap shapes anchored to the
+// bottom-right of the render image (origin + size). Shows only the bindings for
+// the active tab/tool so it stays small and never needs scrolling.
+void draw_controls_overlay(const EditorUi& ui, float origin_x, float origin_y, float width, float height);
 void draw_block_inspector(EditorProject& project, EditorUi& ui, std::string& status);
 void draw_buildblock_inspector(EditorProject& project, EditorUi& ui, std::string& status);
 void apply_editor_imgui_style();

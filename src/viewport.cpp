@@ -129,19 +129,20 @@ void update_free_fly_camera(Camera3D& camera, float fly_speed) {
     camera.target = add(camera.position, forward);
 }
 
-Vector2 get_virtual_mouse_position(Vector2 viewport_pos, Vector2 viewport_size) {
-    Vector2 mouse_pos = GetMousePosition();
-    float norm_x = (mouse_pos.x - viewport_pos.x) / viewport_size.x;
-    float norm_y = (mouse_pos.y - viewport_pos.y) / viewport_size.y;
-    return Vector2{ norm_x * GetScreenWidth(), norm_y * GetScreenHeight() };
-}
-
 Vector2 get_viewport_mouse_position(Vector2 viewport_pos, Vector2 viewport_size) {
     const auto mouse_pos = GetMousePosition();
     return Vector2{
         std::clamp(mouse_pos.x - viewport_pos.x, 0.0F, viewport_size.x),
         std::clamp(mouse_pos.y - viewport_pos.y, 0.0F, viewport_size.y),
     };
+}
+
+Ray get_viewport_mouse_ray(const Camera3D& camera, Vector2 viewport_mouse_pos, Vector2 viewport_size) {
+    return GetScreenToWorldRayEx(
+        viewport_mouse_pos,
+        camera,
+        static_cast<int>(std::max(1.0F, viewport_size.x)),
+        static_cast<int>(std::max(1.0F, viewport_size.y)));
 }
 
 void focus_camera_on_city(Camera3D& camera, const EditorProject& project) {
@@ -160,8 +161,8 @@ void focus_camera_on_city(Camera3D& camera, const EditorProject& project) {
     camera.projection = CAMERA_PERSPECTIVE;
 }
 
-std::optional<CityGridPoint> city_grid_point_under_mouse(const Camera3D& camera, Vector2 virtual_mouse_pos) {
-    const auto ray = GetMouseRay(virtual_mouse_pos, camera);
+std::optional<CityGridPoint> city_grid_point_under_mouse(const Camera3D& camera, Vector2 viewport_mouse_pos, Vector2 viewport_size) {
+    const auto ray = get_viewport_mouse_ray(camera, viewport_mouse_pos, viewport_size);
     if (std::fabs(ray.direction.y) < 0.0001F) {
         return std::nullopt;
     }
@@ -184,8 +185,43 @@ std::optional<CityGridPoint> city_grid_point_under_mouse(const Camera3D& camera,
     };
 }
 
-std::optional<std::pair<std::size_t, std::size_t>> city_block_slot_under_mouse(const Camera3D& camera, Vector2 virtual_mouse_pos) {
-    const auto ray = GetMouseRay(virtual_mouse_pos, camera);
+// Like city_grid_point_under_mouse but raycasts the actual terrain surface
+// instead of the y=0 plane, so the returned grid cell follows the land up and
+// down. X/Z snap to the grid; Y is the grid level of the terrain height at that
+// cell. Falls back to the flat-plane picker when the scene has no terrain.
+std::optional<CityGridPoint> city_grid_point_under_mouse_terrain(
+    const Camera3D& camera,
+    Vector2 viewport_mouse_pos,
+    Vector2 viewport_size,
+    const MapScene& scene) {
+    const auto unit = scene.unit_size > 0.0F ? scene.unit_size : 4.0F;
+    if (!scene.terrain.has_value()) {
+        return city_grid_point_under_mouse(camera, viewport_mouse_pos, viewport_size);
+    }
+
+    const auto ray = get_viewport_mouse_ray(camera, viewport_mouse_pos, viewport_size);
+    const Vec3 ro{ray.position.x, ray.position.y, ray.position.z};
+    const Vec3 rd{ray.direction.x, ray.direction.y, ray.direction.z};
+    const auto hit = ray_terrain_hit(*scene.terrain, ro, rd);
+    if (!hit.has_value()) {
+        return std::nullopt;
+    }
+
+    const auto gx = static_cast<std::int32_t>(std::lround(hit->x / unit));
+    const auto gz = static_cast<std::int32_t>(std::lround(hit->z / unit));
+    const auto ground = terrain_height_at(*scene.terrain, static_cast<float>(gx) * unit, static_cast<float>(gz) * unit);
+    return CityGridPoint{
+        gx,
+        static_cast<std::int32_t>(std::lround(ground / unit)),
+        gz,
+    };
+}
+
+std::optional<std::pair<std::size_t, std::size_t>> city_block_slot_under_mouse(
+    const Camera3D& camera,
+    Vector2 viewport_mouse_pos,
+    Vector2 viewport_size) {
+    const auto ray = get_viewport_mouse_ray(camera, viewport_mouse_pos, viewport_size);
     if (std::fabs(ray.direction.y) < 0.0001F) {
         return std::nullopt;
     }
@@ -226,9 +262,10 @@ std::optional<std::size_t> pick_building_cell_index_if_available(
     const Building& building,
     const Vec3& ray_origin,
     const Vec3& ray_dir,
-    float unit_size) {
-    if constexpr (requires { pick_building_cell(building, ray_origin, ray_dir, unit_size); }) {
-        const auto pick = pick_building_cell(building, ray_origin, ray_dir, unit_size);
+    float unit_size,
+    std::optional<std::uint32_t> floor) {
+    if constexpr (requires { pick_building_cell(building, ray_origin, ray_dir, unit_size, floor); }) {
+        const auto pick = pick_building_cell(building, ray_origin, ray_dir, unit_size, floor);
         if (pick.has_value()) {
             return pick->cell_index;
         }
@@ -237,6 +274,7 @@ std::optional<std::size_t> pick_building_cell_index_if_available(
         (void)ray_origin;
         (void)ray_dir;
         (void)unit_size;
+        (void)floor;
         // TODO(Agent A): This compiles before scene.hpp exposes pick_building_cell.
         // Once Agent A declares it, the ADL guarded call above starts driving selection.
     }
@@ -249,6 +287,7 @@ bool select_building_cell_from_viewport(
     const Camera3D& camera,
     Vector2 viewport_mouse_pos,
     Vector2 viewport_size,
+    std::optional<std::uint32_t> floor,
     std::string& status) {
     if (project.buildings.empty() || viewport_size.x <= 0.0F || viewport_size.y <= 0.0F) {
         return false;
@@ -265,9 +304,11 @@ bool select_building_cell_from_viewport(
     const auto ray_dir = Vec3{ray.direction.x, ray.direction.y, ray.direction.z};
     constexpr auto unit_size = 4.0F;
 
-    const auto picked = pick_building_cell_index_if_available(building, ray_origin, ray_dir, unit_size);
+    const auto picked = pick_building_cell_index_if_available(building, ray_origin, ray_dir, unit_size, floor);
     if (!picked.has_value()) {
-        status = "building cell picker unavailable until scene.hpp exposes pick_building_cell";
+        status = floor.has_value()
+            ? "no selectable cell on visible floor"
+            : "building cell picker unavailable until scene.hpp exposes pick_building_cell";
         return false;
     }
 

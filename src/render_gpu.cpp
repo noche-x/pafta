@@ -833,17 +833,15 @@ Matrix building_transform_matrix(Vector3 origin, std::int32_t rotation) {
     };
 }
 
-// Flat-color outline shader (GLSL 330, raylib's desktop GL profile). It ignores
-// texture/lighting and emits one uniform color, so the inverted-hull pass draws a
-// clean silhouette rim. Lazily loaded and cached for the app's lifetime.
-struct OutlineShader {
+// Flat mask shader used by the screen-space outline pass. It renders the selected
+// mesh into an offscreen alpha mask without changing the real scene color/depth.
+struct MaskShader {
     Shader shader{};
-    int color_loc{-1};
     bool loaded{false};
 };
 
-OutlineShader& outline_shader() {
-    static OutlineShader cache;
+MaskShader& mask_shader() {
+    static MaskShader cache;
     if (!cache.loaded) {
         const char* vs =
             "#version 330\n"
@@ -853,40 +851,69 @@ OutlineShader& outline_shader() {
         const char* fs =
             "#version 330\n"
             "out vec4 finalColor;\n"
-            "uniform vec4 outlineColor;\n"
-            "void main() { finalColor = outlineColor; }\n";
+            "void main() { finalColor = vec4(1.0); }\n";
         cache.shader = LoadShaderFromMemory(vs, fs);
+        cache.loaded = true;
+    }
+    return cache;
+}
+
+struct MaskOutlineShader {
+    Shader shader{};
+    int texel_size_loc{-1};
+    int color_loc{-1};
+    bool loaded{false};
+};
+
+MaskOutlineShader& mask_outline_shader() {
+    static MaskOutlineShader cache;
+    if (!cache.loaded) {
+        const char* fs =
+            "#version 330\n"
+            "in vec2 fragTexCoord;\n"
+            "in vec4 fragColor;\n"
+            "out vec4 finalColor;\n"
+            "uniform sampler2D texture0;\n"
+            "uniform vec2 texelSize;\n"
+            "uniform vec4 outlineColor;\n"
+            "void main() {\n"
+            "    float center = texture(texture0, fragTexCoord).a;\n"
+            "    float neighbor = 0.0;\n"
+            "    for (int y = -2; y <= 2; ++y) {\n"
+            "        for (int x = -2; x <= 2; ++x) {\n"
+            "            if (x == 0 && y == 0) { continue; }\n"
+            "            vec2 offset = vec2(float(x), float(y)) * texelSize;\n"
+            "            neighbor = max(neighbor, texture(texture0, fragTexCoord + offset).a);\n"
+            "        }\n"
+            "    }\n"
+            "    float outside = step(0.01, neighbor) * (1.0 - step(0.01, center));\n"
+            "    finalColor = vec4(outlineColor.rgb, outlineColor.a * outside) * fragColor;\n"
+            "}\n";
+        cache.shader = LoadShaderFromMemory(nullptr, fs);
+        cache.texel_size_loc = GetShaderLocation(cache.shader, "texelSize");
         cache.color_loc = GetShaderLocation(cache.shader, "outlineColor");
         cache.loaded = true;
     }
     return cache;
 }
 
-// Silhouette outline via the inverted-hull technique: re-draw the building mesh
-// scaled up slightly, with FRONT faces culled so only the enlarged back faces
-// show as a rim peeking out around the real mesh. A flat-color shader paints the
-// rim one solid outline color. No bloom, no framebuffer pass.
-void draw_building_outline(GpuBuildingRenderModel& model, Vector3 origin, std::int32_t rotation, Color tint) {
-    auto& outline = outline_shader();
-    if (outline.shader.id == 0) {
-        return;  // shader failed to compile; skip outline rather than crash
+void draw_city_building_mask(GpuBuildingRenderModel& model, const SbcBuilding& placement) {
+    auto& mask = mask_shader();
+    if (mask.shader.id == 0) {
+        return;
     }
-    const auto pulse = 0.5F + 0.5F * static_cast<float>(std::sin(GetTime() * 4.0));
-    const auto grow = 0.05F + 0.02F * pulse;
-    const auto scale = 1.0F + grow;
-    const auto transform = MatrixMultiply(MatrixScale(scale, scale, scale), building_transform_matrix(origin, rotation));
-    const float color[4]{tint.r / 255.0F, tint.g / 255.0F, tint.b / 255.0F, 1.0F};
-    SetShaderValue(outline.shader, outline.color_loc, color, SHADER_UNIFORM_VEC4);
+    constexpr auto unit_size = 4.0F;
+    const auto render_origin = native_city_building_render_origin(placement, unit_size);
+    const auto origin = Vector3{render_origin.x, render_origin.y, render_origin.z};
+    const auto transform = building_transform_matrix(origin, placement.rotation);
 
-    // DrawMesh binds material.shader (it ignores BeginShaderMode), so swap the
-    // chunk's shader to the outline shader for this pass and restore it after.
-    rlSetCullFace(RL_CULL_FACE_FRONT);
+    rlDisableBackfaceCulling();
     for (auto& chunk : model.chunks) {
         if (chunk.mesh.vertexCount <= 0 || chunk.material.maps == nullptr) {
             continue;
         }
         const auto saved = chunk.material.shader;
-        chunk.material.shader = outline.shader;
+        chunk.material.shader = mask.shader;
         DrawMesh(chunk.mesh, chunk.material, transform);
         chunk.material.shader = saved;
         if (g_gfx_debug_stats != nullptr) {
@@ -895,7 +922,98 @@ void draw_building_outline(GpuBuildingRenderModel& model, Vector3 origin, std::i
                 static_cast<std::uint64_t>(std::max(chunk.mesh.vertexCount, 0)), 1U);
         }
     }
-    rlSetCullFace(RL_CULL_FACE_BACK);
+    rlEnableBackfaceCulling();
+}
+
+// Fills the footprint of one road into the active mask target as solid geometry,
+// so draw_outline_from_mask traces a silhouette outline around it (the same look
+// city buildings get). Drawn at the road's terrain heights.
+void draw_city_road_mask(const EditorProject& project, const MapScene& scene, std::size_t street_index) {
+    if (!project.city || street_index >= project.city->data.streets.size()) {
+        return;
+    }
+    // Fill the street's actual road tiles (the asphalt you clicked) into the mask,
+    // so the silhouette outline traces the real geometry, not an abstract ribbon.
+    const auto unit = scene.unit_size > 0.0F ? scene.unit_size : 4.0F;
+    rlDisableBackfaceCulling();
+    bool drew = false;
+    for (const auto& tile : scene.city_tiles) {
+        if (tile.kind != CityTileKind::Road || tile.street_index < 0 ||
+            static_cast<std::size_t>(tile.street_index) != street_index) {
+            continue;
+        }
+        const auto top = tile.base_y + unit;
+        const float x0 = static_cast<float>(tile.x) * unit;
+        const float x1 = x0 + unit;
+        const float z0 = static_cast<float>(tile.z) * unit;
+        const float z1 = z0 + unit;
+        const float cx = x0 + unit * 0.5F;
+        const float cz = z0 + unit * 0.5F;
+        const float lift = unit * 0.04F;
+        // Match the real tilted asphalt top: each corner gets the tile's slope so
+        // the mask sits flush with the rendered road (a flat quad floated above the
+        // up-slope edge and below the down-slope edge, so the outline only traced
+        // part of it).
+        const auto corner = [&](float px, float pz) {
+            const float dy = tile.slope_x * ((px - cx) / unit) + tile.slope_z * ((pz - cz) / unit);
+            return Vector3{px, top + dy + lift, pz};
+        };
+        const Vector3 p0 = corner(x0, z0);
+        const Vector3 p1 = corner(x1, z0);
+        const Vector3 p2 = corner(x1, z1);
+        const Vector3 p3 = corner(x0, z1);
+        DrawTriangle3D(p0, p1, p2, WHITE);
+        DrawTriangle3D(p0, p2, p3, WHITE);
+        DrawTriangle3D(p2, p1, p0, WHITE); // back face too, so it shows from any angle
+        DrawTriangle3D(p3, p2, p0, WHITE);
+        drew = true;
+    }
+    rlEnableBackfaceCulling();
+    (void)drew;
+}
+
+// Fills one building cell (a cube at its anchored centre) into the active mask
+// target, so the cell gets the same silhouette-outline hover/selection look.
+void draw_building_cell_mask(const SbbBuilding& building, const SbbCell& cell) {
+    constexpr auto unit_size = 4.0F;
+    const Vector3 center{
+        (static_cast<float>(cell.x) - static_cast<float>(building.anchor_x) + 0.5F) * unit_size,
+        (static_cast<float>(cell.y) - static_cast<float>(building.anchor_y) + 0.5F) * unit_size,
+        (static_cast<float>(cell.z) - static_cast<float>(building.anchor_z) + 0.5F) * unit_size,
+    };
+    DrawCubeV(center, {unit_size, unit_size, unit_size}, WHITE);
+}
+
+void draw_outline_from_mask(RenderTexture2D& mask, Vector2 viewport_size, Color tint) {
+    auto& outline = mask_outline_shader();
+    if (outline.shader.id == 0 || mask.texture.id == 0U || viewport_size.x <= 0.0F || viewport_size.y <= 0.0F) {
+        return;
+    }
+
+    const float texel_size[2]{
+        1.0F / static_cast<float>(std::max(1, mask.texture.width)),
+        1.0F / static_cast<float>(std::max(1, mask.texture.height)),
+    };
+    const float color[4]{
+        static_cast<float>(tint.r) / 255.0F,
+        static_cast<float>(tint.g) / 255.0F,
+        static_cast<float>(tint.b) / 255.0F,
+        static_cast<float>(tint.a) / 255.0F,
+    };
+    SetShaderValue(outline.shader, outline.texel_size_loc, texel_size, SHADER_UNIFORM_VEC2);
+    SetShaderValue(outline.shader, outline.color_loc, color, SHADER_UNIFORM_VEC4);
+
+    BeginBlendMode(BLEND_ALPHA);
+    BeginShaderMode(outline.shader);
+    DrawTexturePro(
+        mask.texture,
+        Rectangle{0.0F, 0.0F, static_cast<float>(mask.texture.width), -static_cast<float>(mask.texture.height)},
+        Rectangle{0.0F, 0.0F, viewport_size.x, viewport_size.y},
+        Vector2{0.0F, 0.0F},
+        0.0F,
+        WHITE);
+    EndShaderMode();
+    EndBlendMode();
 }
 
 void draw_gpu_building_model(
@@ -952,7 +1070,16 @@ void draw_gpu_building_model(
 void draw_sbb_scene_for_app(const SbbBuilding& building, GpuBuildingRenderModel& model, const SbbCell* selected) {
     constexpr auto unit_size = 4.0F;
     DrawGrid(96, unit_size);
-    draw_gpu_building_model(model, Vector3{0.0F, 0.0F, 0.0F}, 0, false, true, nullptr, GfxDebugDrawCategory::CityCells);
+    // The tool preview mesh is built in un-anchored cell space (cell.x*unit), but
+    // the picker and selection box live in anchored space ((cell.x-anchor)*unit).
+    // Translate the model by -anchor*unit so geometry, selection, and clicks all
+    // share one origin (fixes the constant anchor offset between them).
+    const Vector3 anchor_offset{
+        -static_cast<float>(building.anchor_x) * unit_size,
+        -static_cast<float>(building.anchor_y) * unit_size,
+        -static_cast<float>(building.anchor_z) * unit_size,
+    };
+    draw_gpu_building_model(model, anchor_offset, 0, false, true, nullptr, GfxDebugDrawCategory::CityCells);
 
     if (selected != nullptr) {
         const auto center = Vector3{
@@ -962,6 +1089,148 @@ void draw_sbb_scene_for_app(const SbbBuilding& building, GpuBuildingRenderModel&
         };
         draw_selection_glow_box(center, {unit_size, unit_size, unit_size}, Color{255, 225, 90, 255});
     }
+}
+
+void invalidate_building_thumbnail(EditorProject& project, std::size_t index) {
+    if (index < project.building_thumbnail_ready.size()) {
+        project.building_thumbnail_ready[index] = false;
+    }
+}
+
+// Rebuilds and re-uploads just one building's city mesh, instead of dirtying the
+// whole project (which reloads every building). Used when a single building
+// template is edited in the Buildings tab.
+void rebuild_single_building_render(EditorProject& project, std::size_t index) {
+    if (index >= project.buildings.size()) {
+        return;
+    }
+    if (project.building_render_buffers.size() != project.buildings.size()) {
+        project.building_render_buffers.resize(project.buildings.size());
+    }
+    if (project.building_gpu_models.size() != project.buildings.size()) {
+        project.building_gpu_models.resize(project.buildings.size());
+    }
+    const auto blocks = block_meshes(project);
+    const auto templates = buildblock_templates(project);
+    project.building_render_buffers[index] =
+        build_native_building_render_buffer(project.buildings[index].data, blocks, templates);
+    project.building_gpu_models[index] =
+        upload_building_render_model(project.building_render_buffers[index], project.buildings[index].data, project);
+}
+
+const RenderTexture2D* building_thumbnail(EditorProject& project, std::size_t index) {
+    if (index >= project.buildings.size()) {
+        return nullptr;
+    }
+    if (project.building_thumbnails.size() != project.buildings.size()) {
+        project.building_thumbnails.resize(project.buildings.size());
+        project.building_thumbnail_ready.assign(project.buildings.size(), false);
+    }
+    if (project.building_thumbnail_ready[index]) {
+        return &project.building_thumbnails[index];
+    }
+
+    constexpr int kSize = 192; // render larger than displayed for crisp downscale.
+    constexpr float unit_size = 4.0F;
+    auto& building = project.buildings[index].data;
+
+    // Build the building mesh fresh (the shared tool-preview cache is keyed to a
+    // single building, so we don't reuse it here) and upload a throwaway model.
+    const auto blocks = block_meshes(project);
+    const auto templates = buildblock_templates(project);
+    const auto buffer = build_native_building_tool_preview_render_buffer(building, blocks, templates, std::nullopt);
+    auto model = upload_building_render_model(buffer, building, project);
+
+    auto& target = project.building_thumbnails[index];
+    if (target.id == 0U) {
+        target = LoadRenderTexture(kSize, kSize);
+    }
+
+    // Frame the whole building from a 3/4 view.
+    const float sx = static_cast<float>(std::max(1U, building.size_x)) * unit_size;
+    const float sy = static_cast<float>(std::max(1U, building.size_y)) * unit_size;
+    const float sz = static_cast<float>(std::max(1U, building.size_z)) * unit_size;
+    const float r = 0.5F * std::sqrt(sx * sx + sy * sy + sz * sz);
+    const Vector3 center{0.0F, sy * 0.5F, 0.0F};
+    const float dist = std::max(unit_size * 2.0F, r * 2.4F);
+    Camera3D cam{};
+    cam.position = {center.x + dist * 0.7F, center.y + dist * 0.6F, center.z + dist * 0.7F};
+    cam.target = center;
+    cam.up = {0.0F, 1.0F, 0.0F};
+    cam.fovy = 45.0F;
+    cam.projection = CAMERA_PERSPECTIVE;
+
+    const Vector3 anchor_offset{
+        -static_cast<float>(building.anchor_x) * unit_size,
+        -static_cast<float>(building.anchor_y) * unit_size,
+        -static_cast<float>(building.anchor_z) * unit_size,
+    };
+    BeginTextureMode(target);
+    ClearBackground(Color{32, 36, 41, 255});
+    BeginMode3D(cam);
+    rlEnableDepthTest();
+    draw_gpu_building_model(model, anchor_offset, 0, false, false, nullptr, GfxDebugDrawCategory::CityCells);
+    // A subtle ground plane gives the building a sense of scale/orientation.
+    DrawGrid(static_cast<int>(std::max(building.size_x, building.size_z)) + 2, unit_size);
+    EndMode3D();
+    EndTextureMode();
+    GenTextureMipmaps(&target.texture);
+    SetTextureFilter(target.texture, TEXTURE_FILTER_BILINEAR);
+
+    unload_city_render_model(model);
+    project.building_thumbnail_ready[index] = true;
+    return &target;
+}
+
+const RenderTexture2D* city_block_thumbnail(EditorProject& project, std::size_t index) {
+    if (!project.city || index >= project.city->data.city_blocks.size()) {
+        return nullptr;
+    }
+    if (project.city_block_thumbnails.size() != project.city->data.city_blocks.size()) {
+        project.city_block_thumbnails.resize(project.city->data.city_blocks.size());
+        project.city_block_thumbnail_ready.assign(project.city->data.city_blocks.size(), false);
+    }
+    if (project.city_block_thumbnail_ready[index]) {
+        return &project.city_block_thumbnails[index];
+    }
+
+    constexpr int kSize = 192;
+    const auto meshes = block_meshes(project);
+    const auto scene = build_city_block_preview_scene(project.city->data.city_blocks[index], meshes);
+
+    auto& target = project.city_block_thumbnails[index];
+    if (target.id == 0U) {
+        target = LoadRenderTexture(kSize, kSize);
+    }
+
+    const float unit = scene.unit_size;
+    const float r = unit * 6.0F;
+    const Vector3 center{unit, unit, unit};
+    const float dist = r * 2.2F;
+    Camera3D cam{};
+    cam.position = {center.x + dist * 0.7F, center.y + dist * 0.6F, center.z + dist * 0.7F};
+    cam.target = center;
+    cam.up = {0.0F, 1.0F, 0.0F};
+    cam.fovy = 45.0F;
+    cam.projection = CAMERA_PERSPECTIVE;
+
+    BeginTextureMode(target);
+    ClearBackground(Color{32, 36, 41, 255});
+    BeginMode3D(cam);
+    rlEnableDepthTest();
+    if (scene.solid_cell.has_value()) {
+        draw_render_buffer_faces(scene.solid_cell->buffer, {120, 160, 210, 255});
+    }
+    for (const auto& piece : scene.pieces) {
+        draw_mesh_faces(piece.mesh, piece.origin, scene.unit_size, {120, 160, 210, 255});
+    }
+    EndMode3D();
+    EndTextureMode();
+    GenTextureMipmaps(&target.texture);
+    SetTextureFilter(target.texture, TEXTURE_FILTER_BILINEAR);
+
+    project.city_block_thumbnail_ready[index] = true;
+    return &target;
 }
 
 const LoadedAsset<SbbBuilding>* find_building_asset(const EditorProject& project, std::string_view name) {
@@ -980,6 +1249,7 @@ void draw_city_building_model(
     const Texture2D* city_window_texture,
     bool hovered) {
     constexpr auto unit_size = 4.0F;
+    (void)hovered;
     const auto render_origin = native_city_building_render_origin(placement, unit_size);
     const auto origin = Vector3{render_origin.x, render_origin.y, render_origin.z};
     const auto fill = selected ? Color{235, 194, 82, 210} : Color{126, 151, 174, 170};
@@ -1051,14 +1321,7 @@ void draw_city_building_model(
             g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::WireOverlay, 0U, 24U, 12U);
         }
     } else {
-        draw_gpu_building_model(model, origin, placement.rotation, selected, selected, city_window_texture, GfxDebugDrawCategory::CityCells);
-        if (selected) {
-            // Shader silhouette outline around the actual building mesh.
-            draw_building_outline(model, origin, placement.rotation, Color{255, 214, 96, 255});
-        } else if (hovered) {
-            // Dimmer cyan outline previews what a click would select.
-            draw_building_outline(model, origin, placement.rotation, Color{120, 200, 255, 255});
-        }
+        draw_gpu_building_model(model, origin, placement.rotation, false, false, city_window_texture, GfxDebugDrawCategory::CityCells);
     }
 
     if (selected && use_lod) {
@@ -1145,11 +1408,26 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
         return project.portal_preview_gpu_model;
     }
 
-    if (project.portal_render_dirty || project.portal_render_textured != textured) {
-        project.portal_render_buffer = build_native_portal_render_buffer(project.city->data, blocks);
-        project.portal_gpu_model = upload_portal_render_model(project.portal_render_buffer, project, textured);
-        project.portal_render_textured = textured;
+    // Kick a worker to rebuild the (potentially large) all-portals buffer when the
+    // pieces changed; the previous mesh keeps rendering until the new one lands, so
+    // placing a piece never blocks the frame.
+    if ((project.portal_render_dirty || project.portal_render_textured != textured) &&
+        !project.portal_rebuild_in_progress) {
+        const auto map = project.city->data;
+        const auto blocks_copy = blocks;
+        project.portal_rebuild_in_progress = true;
         project.portal_render_dirty = false;
+        project.portal_render_textured = textured;
+        project.portal_rebuild_future = std::async(std::launch::async, [map, blocks_copy]() {
+            return build_native_portal_render_buffer(map, blocks_copy);
+        });
+    }
+    if (project.portal_rebuild_future.has_value() &&
+        project.portal_rebuild_future->wait_for(std::chrono::milliseconds{0}) == std::future_status::ready) {
+        project.portal_render_buffer = project.portal_rebuild_future->get();
+        project.portal_rebuild_future.reset();
+        project.portal_rebuild_in_progress = false;
+        project.portal_gpu_model = upload_portal_render_model(project.portal_render_buffer, project, textured);
     }
     return project.portal_gpu_model;
 }
@@ -1180,29 +1458,34 @@ GpuBuildingRenderModel& building_tool_floor_preview_model(
     return project.building_floor_preview_gpu_model;
 }
 
-void draw_city_piece_voxels(EditorProject& project, bool textured, std::optional<std::size_t> selected_portal) {
+void draw_city_piece_voxels(
+    EditorProject& project,
+    bool textured,
+    std::optional<std::size_t> selected_portal,
+    bool draw_wires,
+    bool isolate_selected) {
     if (!project.city) {
         return;
     }
-    auto& model = portal_render_model(project, textured, selected_portal);
+    auto& model = portal_render_model(project, textured, isolate_selected ? selected_portal : std::nullopt);
     // Native world cells sit 0.25 above their level; without the lift the piece
     // ground cells are coplanar with their stamped terrain plots and z-fight.
-    draw_gpu_building_model(model, {0.0F, 0.25F, 0.0F}, 0, false, true, nullptr, GfxDebugDrawCategory::Pieces);
+    draw_gpu_building_model(model, {0.0F, 0.25F, 0.0F}, 0, false, draw_wires, nullptr, GfxDebugDrawCategory::Pieces);
 
-    // Glow box over the selected portal's 8x8x8 voxel volume so the active piece
-    // selection reads the same way buildings and roads do.
-    if (selected_portal.has_value() && *selected_portal < project.city->data.portals.size()) {
-        const auto& portal = project.city->data.portals[*selected_portal];
-        constexpr auto unit_size = 4.0F;
-        constexpr auto span = 8.0F;
-        const auto center = Vector3{
-            (static_cast<float>(portal.fields[1]) * span + span * 0.5F) * unit_size,
-            (static_cast<float>(portal.fields[2]) * span + span * 0.5F) * unit_size,
-            (static_cast<float>(portal.fields[3]) * span + span * 0.5F) * unit_size,
-        };
-        const auto box = Vector3{span * unit_size, span * unit_size, span * unit_size};
-        draw_selection_glow_box(center, box, Color{120, 210, 255, 255});
-    }
+    // Per-voxel selection/hover glow is drawn by the caller (draw_city_piece_glow)
+    // now that pieces are selected one block at a time, not by the whole portal.
+}
+
+// Glow box over a single piece voxel (one world grid cell), so pieces highlight
+// individually instead of as the whole 8x8x8 portal they are stored in.
+void draw_city_piece_glow(CityGridPoint cell, Color color) {
+    constexpr auto unit_size = 4.0F;
+    const Vector3 center{
+        (static_cast<float>(cell.x) + 0.5F) * unit_size,
+        (static_cast<float>(cell.y) + 0.5F) * unit_size,
+        (static_cast<float>(cell.z) + 0.5F) * unit_size,
+    };
+    draw_selection_glow_box(center, {unit_size, unit_size, unit_size}, color);
 }
 
 Color city_tile_material_color(const BuildingRenderBuffer& buffer, std::uint32_t material) {
@@ -1332,29 +1615,25 @@ void draw_city_scene(
             const auto glow = Color{255, 215, 90, static_cast<unsigned char>(170 + 70 * pulse)};
             const auto line = Color{255, 235, 140, 255};
 
-            // Height along a road follows the terrain grade, not a straight chord
-            // between the two endpoints. Sample terrain at steps along the segment
-            // so the selection polyline hugs the sloped road instead of cutting
-            // through hills.
-            const auto height_at = [&](float x, float z) {
-                return (scene.terrain.has_value() ? terrain_height_at(*scene.terrain, x, z) : road.from.y) + lift;
+            const auto height_at = [&](float t) {
+                return road.from.y + (road.to.y - road.from.y) * t + lift;
             };
             const auto seg_len = std::sqrt(
                 (road.to.x - road.from.x) * (road.to.x - road.from.x) +
                 (road.to.z - road.from.z) * (road.to.z - road.from.z));
             const auto steps = std::clamp(static_cast<int>(seg_len / scene.unit_size), 1, 256);
-            auto prev = Vector3{road.from.x, height_at(road.from.x, road.from.z), road.from.z};
+            auto prev = Vector3{road.from.x, height_at(0.0F), road.from.z};
             for (int i = 1; i <= steps; ++i) {
                 const auto t = static_cast<float>(i) / static_cast<float>(steps);
                 const auto x = road.from.x + (road.to.x - road.from.x) * t;
                 const auto z = road.from.z + (road.to.z - road.from.z) * t;
-                const auto cur = Vector3{x, height_at(x, z), z};
+                const auto cur = Vector3{x, height_at(t), z};
                 DrawLine3D(prev, cur, line);
                 prev = cur;
             }
-            DrawSphere({road.from.x, height_at(road.from.x, road.from.z), road.from.z},
+            DrawSphere({road.from.x, height_at(0.0F), road.from.z},
                 scene.unit_size * (0.32F + 0.08F * pulse), glow);
-            DrawSphere({road.to.x, height_at(road.to.x, road.to.z), road.to.z},
+            DrawSphere({road.to.x, height_at(1.0F), road.to.z},
                 scene.unit_size * (0.32F + 0.08F * pulse), glow);
             if (g_gfx_debug_stats != nullptr) {
                 g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::WireOverlay, 0U,
@@ -1372,8 +1651,6 @@ void draw_city_editor_overlay(const EditorProject&, const MapScene& scene) {
     const auto marker_wire = Color{218, 236, 255, 235};
     const auto segment_color = Color{255, 225, 112, 235};
 
-    DrawGrid(96, scene.unit_size);
-
     for (const auto& intersection : scene.intersections) {
         auto position = to_raylib(intersection.position);
         position.y += marker_lift;
@@ -1382,18 +1659,39 @@ void draw_city_editor_overlay(const EditorProject&, const MapScene& scene) {
         DrawCubeWiresV(position, size, marker_wire);
     }
 
+    std::uint64_t segment_count = 0;
     for (const auto& road : scene.roads) {
-        DrawLine3D(to_raylib(road.from), to_raylib(road.to), segment_color);
+        const auto seg_len = std::sqrt(
+            (road.to.x - road.from.x) * (road.to.x - road.from.x) +
+            (road.to.z - road.from.z) * (road.to.z - road.from.z));
+        const auto steps = std::clamp(static_cast<int>(seg_len / scene.unit_size), 1, 256);
+        auto height_at = [&](float t) {
+            return road.from.y + (road.to.y - road.from.y) * t + marker_lift;
+        };
+
+        auto prev = Vector3{
+            road.from.x,
+            height_at(0.0F),
+            road.from.z,
+        };
+        for (int i = 1; i <= steps; ++i) {
+            const auto t = static_cast<float>(i) / static_cast<float>(steps);
+            const auto x = road.from.x + (road.to.x - road.from.x) * t;
+            const auto z = road.from.z + (road.to.z - road.from.z) * t;
+            const auto cur = Vector3{x, height_at(t), z};
+            DrawLine3D(prev, cur, segment_color);
+            prev = cur;
+            ++segment_count;
+        }
     }
 
     if (g_gfx_debug_stats != nullptr) {
         const auto marker_count = static_cast<std::uint64_t>(scene.intersections.size());
-        const auto segment_count = static_cast<std::uint64_t>(scene.roads.size());
         g_gfx_debug_stats->add_draw(
             GfxDebugDrawCategory::WireOverlay,
             marker_count * 12U,
             marker_count * 60U + segment_count * 2U,
-            marker_count * 2U + segment_count + 1U);
+            marker_count * 2U + segment_count);
     }
 }
 
@@ -1463,6 +1761,7 @@ void draw_city_traffic_light_poles(const MapScene& scene) {
         pole_model = build_traffic_light_pole_model(scene.unit_size);
         cached_unit = scene.unit_size;
     }
+
     for (const auto& pole : scene.traffic_light_poles) {
         const auto base = to_raylib(pole.base);
         // The model's arm points along -Z; raylib's +Y rotation is right-handed
@@ -1486,20 +1785,157 @@ void draw_city_traffic_light_poles(const MapScene& scene) {
     }
 }
 
-void draw_city_cursor(CityGridPoint point, float unit_size, CityEditMode mode) {
+void draw_city_cursor(CityGridPoint point, float unit_size, CityTool tool) {
     const auto position = Vector3{
         static_cast<float>(point.x) * unit_size,
         static_cast<float>(point.y) * unit_size + unit_size * 0.5F,
         static_cast<float>(point.z) * unit_size,
     };
     auto color = Color{235, 190, 78, 230};
-    if (mode == CityEditMode::Roads) {
+    if (tool == CityTool::Road) {
         color = Color{82, 196, 130, 230};
-    } else if (mode == CityEditMode::Pieces) {
+    } else if (tool == CityTool::Piece) {
         color = Color{91, 166, 206, 230};
     }
     DrawCubeWiresV(position, {unit_size, unit_size, unit_size}, color);
     DrawSphere(position, unit_size * 0.22F, color);
+}
+
+void draw_city_edit_grid(CityGridPoint center, const MapScene& scene) {
+    const auto unit = scene.unit_size > 0.0F ? scene.unit_size : 4.0F;
+    constexpr std::int32_t half_cells = 20;
+    // Flat plane fixed at the hovered cell's height, not terrain-following: a
+    // single working plane is easier to read and to place against. Depth test is
+    // disabled below so it overlays the scene ("goes through everything") instead
+    // of being clipped by terrain/buildings.
+    const float plane_y = static_cast<float>(center.y) * unit + unit * 0.02F;
+    const float min_x = static_cast<float>(center.x - half_cells) * unit;
+    const float max_x = static_cast<float>(center.x + half_cells) * unit;
+    const float min_z = static_cast<float>(center.z - half_cells) * unit;
+    const float max_z = static_cast<float>(center.z + half_cells) * unit;
+
+    // Modelled on raylib's DrawGrid: one rlBegin(RL_LINES) batch with raw
+    // rlVertex3f/rlColor4ub instead of N DrawLine3D calls. Lines on every 10th
+    // absolute grid coordinate are "major": brighter and a 3-line bundle so they
+    // read as thicker without per-line width.
+    const auto is_major = [](std::int32_t coord) { return coord % 10 == 0; };
+    const auto set_color = [](bool axis, bool major) {
+        if (axis) {
+            rlColor4ub(210, 225, 245, 220);
+        } else if (major) {
+            rlColor4ub(170, 195, 220, 180);
+        } else {
+            rlColor4ub(120, 140, 160, 90);
+        }
+    };
+
+    // Overlay: draw on top of everything, depth-write off so it never occludes.
+    rlDrawRenderBatchActive();
+    rlDisableDepthTest();
+    rlDisableDepthMask();
+    rlBegin(RL_LINES);
+    for (std::int32_t gx = center.x - half_cells; gx <= center.x + half_cells; ++gx) {
+        const bool axis = gx == center.x;
+        const bool major = axis || is_major(gx);
+        set_color(axis, major);
+        const float wx = static_cast<float>(gx) * unit;
+        const int bundle = major ? 1 : 0;
+        for (int b = -bundle; b <= bundle; ++b) {
+            const float off = static_cast<float>(b) * unit * 0.05F;
+            rlVertex3f(wx + off, plane_y, min_z);
+            rlVertex3f(wx + off, plane_y, max_z);
+        }
+    }
+    for (std::int32_t gz = center.z - half_cells; gz <= center.z + half_cells; ++gz) {
+        const bool axis = gz == center.z;
+        const bool major = axis || is_major(gz);
+        set_color(axis, major);
+        const float wz = static_cast<float>(gz) * unit;
+        const int bundle = major ? 1 : 0;
+        for (int b = -bundle; b <= bundle; ++b) {
+            const float off = static_cast<float>(b) * unit * 0.05F;
+            rlVertex3f(min_x, plane_y, wz + off);
+            rlVertex3f(max_x, plane_y, wz + off);
+        }
+    }
+    rlEnd();
+    rlDrawRenderBatchActive();
+    rlEnableDepthMask();
+    rlEnableDepthTest();
+}
+
+void draw_city_road_selection(const EditorProject& project, const EditorUi& ui, const MapScene& scene) {
+    if (!project.city) {
+        return;
+    }
+    const auto& map = project.city->data;
+    const auto unit = scene.unit_size > 0.0F ? scene.unit_size : 4.0F;
+    const auto lift = unit * 0.6F;
+    const auto node_world = [&](std::size_t node_index) {
+        const auto& n = map.intersections[node_index];
+        const auto y = scene.terrain.has_value()
+            ? terrain_height_at(*scene.terrain, static_cast<float>(n.x) * unit, static_cast<float>(n.z) * unit)
+            : static_cast<float>(n.y) * unit;
+        return Vector3{static_cast<float>(n.x) * unit, y + lift, static_cast<float>(n.z) * unit};
+    };
+    // Same pulsing glow box buildings use, so node and road selection read the
+    // same way. A node is one box; a road is a chain of boxes stepped along the
+    // segment (covering its full length and drawn width) so the whole road glows.
+    const auto glow_node = [&](std::size_t node_index, Color color) {
+        if (node_index >= map.intersections.size()) {
+            return;
+        }
+        const auto pos = node_world(node_index);
+        draw_selection_glow_box(pos, {unit, unit, unit}, color);
+    };
+    const auto glow_road = [&](std::size_t street_index, Color color) {
+        if (street_index >= map.streets.size()) {
+            return;
+        }
+        const auto& s = map.streets[street_index];
+        if (s.from_intersection < 0 || s.to_intersection < 0 ||
+            static_cast<std::size_t>(s.from_intersection) >= map.intersections.size() ||
+            static_cast<std::size_t>(s.to_intersection) >= map.intersections.size()) {
+            return;
+        }
+        const auto a = node_world(static_cast<std::size_t>(s.from_intersection));
+        const auto b = node_world(static_cast<std::size_t>(s.to_intersection));
+        // A translucent glowing strip over the road footprint plus a pulsing
+        // border - one clean highlighted ribbon along the road, the road analogue
+        // of the building's glow box (not a noisy stack of cubes).
+        const auto half_w = std::max(static_cast<float>(std::max(s.left_width, s.right_width)), 1.0F) * unit * 0.5F;
+        const auto len = std::sqrt((b.x - a.x) * (b.x - a.x) + (b.z - a.z) * (b.z - a.z));
+        if (len < 0.001F) {
+            return;
+        }
+        // Unit perpendicular in the ground plane.
+        const auto px = -(b.z - a.z) / len * half_w;
+        const auto pz = (b.x - a.x) / len * half_w;
+        const Vector3 a0{a.x + px, a.y, a.z + pz};
+        const Vector3 a1{a.x - px, a.y, a.z - pz};
+        const Vector3 b0{b.x + px, b.y, b.z + pz};
+        const Vector3 b1{b.x - px, b.y, b.z - pz};
+        const auto pulse = 0.5F + 0.5F * static_cast<float>(std::sin(GetTime() * 4.0));
+        const Color fill{color.r, color.g, color.b, static_cast<unsigned char>(70 + 60 * pulse)};
+        rlDisableBackfaceCulling();
+        DrawTriangle3D(a0, a1, b1, fill);
+        DrawTriangle3D(a0, b1, b0, fill);
+        rlEnableBackfaceCulling();
+        const Color edge{color.r, color.g, color.b, 255};
+        DrawLine3D(a0, b0, edge);
+        DrawLine3D(a1, b1, edge);
+    };
+
+    // Roads get the silhouette outline (composited after the 3D pass, like
+    // buildings), so here we only glow the nodes - the outline shader cannot
+    // trace the thin node markers as cleanly as a glow box does.
+    (void)glow_road;
+    if (!map.intersections.empty()) {
+        glow_node(std::min(ui.selected_city_intersection, map.intersections.size() - 1U), Color{120, 210, 255, 255});
+    }
+    if (ui.hover_city_intersection.has_value()) {
+        glow_node(*ui.hover_city_intersection, Color{200, 240, 255, 255});
+    }
 }
 
 

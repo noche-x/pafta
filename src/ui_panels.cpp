@@ -1,6 +1,8 @@
 #include "app_internal.hpp"
 
 #include <imgui.h>
+#include <rlImGui.h>
+#include <extras/IconsFontAwesome6.h>
 
 #include <algorithm>
 #include <array>
@@ -21,6 +23,36 @@ std::string hex_u32(std::uint32_t value) {
     std::ostringstream stream;
     stream << "0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << value;
     return stream.str();
+}
+
+// Compact catalog combo: shows entries[selected], lets you pick another. Empty
+// names render as their index so unnamed blocks/materials stay selectable. Used by
+// both the viewport toolbar and the block tool panel.
+bool catalog_combo(const char* label, const std::vector<std::string>& entries, std::size_t& selected) {
+    if (entries.empty()) {
+        ImGui::TextDisabled("%s: (none)", label);
+        return false;
+    }
+    selected = std::min(selected, entries.size() - 1U);
+    const auto entry_text = [&](std::size_t i) {
+        return entries[i].empty() ? ("#" + std::to_string(i)) : entries[i];
+    };
+    bool changed = false;
+    ImGui::SetNextItemWidth(118.0F);
+    if (ImGui::BeginCombo(label, entry_text(selected).c_str())) {
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            const bool is_selected = i == selected;
+            if (ImGui::Selectable(entry_text(i).c_str(), is_selected)) {
+                selected = i;
+                changed = true;
+            }
+            if (is_selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    return changed;
 }
 
 const char* building_cell_field_label(std::size_t field_index) {
@@ -617,9 +649,260 @@ void draw_buildblock_preview_panel(EditorProject& project, EditorUi& ui) {
         ImVec2{canvas_min.x + canvas_size.x, canvas_min.y + canvas_size.y});
 }
 
+// A stable pseudo-color for a material with no loaded texture, so the swatch is
+// still distinguishable instead of a flat grey.
+ImU32 material_fallback_color(std::size_t index) {
+    const auto hue = static_cast<float>((index * 47U) % 360U) / 360.0F;
+    const auto h6 = hue * 6.0F;
+    const auto c = 0.55F;
+    const auto x = c * (1.0F - std::fabs(std::fmod(h6, 2.0F) - 1.0F));
+    float r = 0.3F;
+    float g = 0.3F;
+    float b = 0.3F;
+    if (h6 < 1.0F) { r += c; g += x; }
+    else if (h6 < 2.0F) { r += x; g += c; }
+    else if (h6 < 3.0F) { g += c; b += x; }
+    else if (h6 < 4.0F) { g += x; b += c; }
+    else if (h6 < 5.0F) { r += x; b += c; }
+    else { r += c; b += x; }
+    return IM_COL32(static_cast<int>(r * 255), static_cast<int>(g * 255), static_cast<int>(b * 255), 255);
+}
+
+bool material_swatch_picker(const EditorProject& project, const char* id, const std::vector<std::string>& materials, std::size_t& selected) {
+    if (materials.empty()) {
+        ImGui::TextDisabled("(no materials)");
+        return false;
+    }
+    selected = std::min(selected, materials.size() - 1U);
+    bool changed = false;
+    constexpr float swatch = 40.0F;
+    const float avail = ImGui::GetContentRegionAvail().x;
+    const int per_row = std::max(1, static_cast<int>(avail / (swatch + 6.0F)));
+
+    ImGui::PushID(id);
+    for (std::size_t i = 0; i < materials.size(); ++i) {
+        if (i % static_cast<std::size_t>(per_row) != 0) {
+            ImGui::SameLine();
+        }
+        ImGui::PushID(static_cast<int>(i));
+        const bool is_selected = i == selected;
+        // Highlight the selected swatch with a bright frame.
+        if (is_selected) {
+            ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(255, 210, 90, 255));
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(3.0F, 3.0F));
+        }
+        const std::string name = materials[i].empty() ? ("material " + std::to_string(i)) : materials[i];
+        const auto* tex = texture_for_material(project, materials[i]);
+        bool clicked = false;
+        if (tex != nullptr && tex->id != 0U) {
+            clicked = rlImGuiImageButtonSize(("##sw" + std::to_string(i)).c_str(), tex, Vector2{swatch, swatch});
+        } else {
+            // No texture: a colored button stands in, labelled with the short name.
+            ImGui::PushStyleColor(ImGuiCol_Button, material_fallback_color(i));
+            const std::string label = name.substr(0, 3) + "##sw" + std::to_string(i);
+            clicked = ImGui::Button(label.c_str(), ImVec2(swatch, swatch));
+            ImGui::PopStyleColor();
+        }
+        if (is_selected) {
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor();
+        }
+        if (clicked) {
+            selected = i;
+            changed = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", name.c_str());
+        }
+        ImGui::PopID();
+    }
+    ImGui::PopID();
+    return changed;
+}
+
+// editor.exe-style Place Block panel: choose exterior/interior shells, the
+// buildblock template, and a material for each of the six faces on each enabled
+// side. Edits ui.block_config in place; placement reads it.
+void draw_block_tool_panel(EditorProject& project, EditorUi& ui) {
+    ui.selected_building = std::min(ui.selected_building, project.buildings.size() - 1U);
+    auto& building = project.buildings[ui.selected_building].data;
+    auto& cfg = ui.block_config;
+
+    // Face order matches the renderer's slot order (0..5).
+    static constexpr std::array<const char*, 6> face_names{"Bottom", "South", "West", "North", "East", "Top"};
+
+    ImGui::SeparatorText("Block to place");
+    ImGui::Checkbox("Exterior", &cfg.exterior);
+    ImGui::SameLine();
+    ImGui::Checkbox("Interior", &cfg.interior);
+    if (!cfg.exterior && !cfg.interior) {
+        ImGui::TextColored(ImVec4(0.95F, 0.65F, 0.3F, 1.0F), "Enable a shell to place.");
+    }
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Buildblock");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    catalog_combo("##block_buildblock", building.block_names, cfg.buildblock_index);
+
+    // Each face shows its current material as a thumbnail button; clicking opens a
+    // popup swatch grid to choose a new one. A "set all" copies the first face.
+    const auto face_material_grid = [&](const char* label, std::array<std::size_t, 6>& materials) {
+        if (!ImGui::TreeNodeEx(label, ImGuiTreeNodeFlags_DefaultOpen)) {
+            return;
+        }
+        if (building.materials.empty()) {
+            ImGui::TextDisabled("No materials in this building.");
+            ImGui::TreePop();
+            return;
+        }
+        for (std::size_t face = 0; face < 6; ++face) {
+            ImGui::PushID(static_cast<int>(face));
+            materials[face] = std::min(materials[face], building.materials.size() - 1U);
+            const auto* tex = texture_for_material(project, building.materials[materials[face]]);
+            bool open = false;
+            if (tex != nullptr && tex->id != 0U) {
+                open = rlImGuiImageButtonSize("##facesw", tex, Vector2{34.0F, 34.0F});
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Button, material_fallback_color(materials[face]));
+                open = ImGui::Button("##facesw", ImVec2(34.0F, 34.0F));
+                ImGui::PopStyleColor();
+            }
+            ImGui::SameLine();
+            ImGui::TextUnformatted(face_names[face]);
+            if (open) {
+                ImGui::OpenPopup("face_swatches");
+            }
+            if (ImGui::BeginPopup("face_swatches")) {
+                if (material_swatch_picker(project, "pop", building.materials, materials[face])) {
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
+        }
+        if (ImGui::SmallButton("Copy Bottom to all faces")) {
+            materials.fill(materials[0]);
+        }
+        ImGui::TreePop();
+    };
+
+    ImGui::Spacing();
+    if (cfg.exterior) {
+        face_material_grid("Exterior textures", cfg.exterior_face_material);
+    }
+    if (cfg.interior) {
+        face_material_grid("Interior textures", cfg.interior_face_material);
+    }
+    ImGui::Spacing();
+    ImGui::TextDisabled("Click a block face in the viewport to place against it.");
+}
+
+void draw_city_building_template_gallery(EditorProject& project, EditorUi& ui) {
+    if (project.buildings.empty()) {
+        ImGui::TextDisabled("No building templates loaded.");
+        return;
+    }
+    ui.place_building_template = std::min(ui.place_building_template, project.buildings.size() - 1U);
+    ImGui::Text("Place which building:");
+    constexpr float cell = 96.0F;
+    const float avail = ImGui::GetContentRegionAvail().x;
+    const int per_row = std::max(1, static_cast<int>(avail / (cell + 8.0F)));
+    if (ImGui::BeginChild("##bldg_gallery", ImVec2(-FLT_MIN, -FLT_MIN), false)) {
+        for (std::size_t i = 0; i < project.buildings.size(); ++i) {
+            if (i % static_cast<std::size_t>(per_row) != 0) {
+                ImGui::SameLine();
+            }
+            ImGui::PushID(static_cast<int>(i));
+            const bool selected = ui.place_building_template == i;
+            if (selected) {
+                ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(255, 210, 90, 255));
+            }
+            const auto* thumb = building_thumbnail(project, i);
+            bool clicked = false;
+            if (thumb != nullptr && thumb->texture.id != 0U) {
+                // RenderTextures are Y-flipped in GL, so flip the UVs (uv0.y=1,
+                // uv1.y=0) to show the thumbnail upright.
+                clicked = ImGui::ImageButton(
+                    ("##bt" + std::to_string(i)).c_str(),
+                    ImTextureID(thumb->texture.id),
+                    ImVec2(cell, cell),
+                    ImVec2(0.0F, 1.0F), ImVec2(1.0F, 0.0F));
+            } else {
+                clicked = ImGui::Button(("?##bt" + std::to_string(i)).c_str(), ImVec2(cell, cell));
+            }
+            if (selected) {
+                ImGui::PopStyleColor();
+            }
+            if (clicked) {
+                ui.place_building_template = i;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s", project.buildings[i].name.c_str());
+            }
+            ImGui::PopID();
+        }
+    }
+    ImGui::EndChild();
+}
+
+void draw_city_piece_template_gallery(EditorProject& project, EditorUi& ui) {
+    if (!project.city || project.city->data.city_blocks.empty()) {
+        ImGui::TextDisabled("No piece blocks.");
+        return;
+    }
+    ui.selected_city_block = std::min(ui.selected_city_block, project.city->data.city_blocks.size() - 1U);
+    ImGui::Text("Place which piece:");
+    auto names = city_block_names(project.city->data);
+    constexpr float cell = 80.0F;
+    const float avail = ImGui::GetContentRegionAvail().x;
+    const int per_row = std::max(1, static_cast<int>(avail / (cell + 8.0F)));
+    const float gallery_h = project.city->data.portals.empty() ? -FLT_MIN : 200.0F;
+    if (ImGui::BeginChild("##piece_gallery", ImVec2(-FLT_MIN, gallery_h), false)) {
+        for (std::size_t i = 0; i < project.city->data.city_blocks.size(); ++i) {
+            if (i % static_cast<std::size_t>(per_row) != 0) {
+                ImGui::SameLine();
+            }
+            ImGui::PushID(static_cast<int>(i));
+            const bool selected = ui.selected_city_block == i;
+            if (selected) {
+                ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(255, 210, 90, 255));
+            }
+            const auto* thumb = city_block_thumbnail(project, i);
+            bool clicked = false;
+            if (thumb != nullptr && thumb->texture.id != 0U) {
+                clicked = ImGui::ImageButton(
+                    ("##pt" + std::to_string(i)).c_str(),
+                    ImTextureID(thumb->texture.id),
+                    ImVec2(cell, cell),
+                    ImVec2(0.0F, 1.0F), ImVec2(1.0F, 0.0F));
+            } else {
+                clicked = ImGui::Button(("?##pt" + std::to_string(i)).c_str(), ImVec2(cell, cell));
+            }
+            if (selected) {
+                ImGui::PopStyleColor();
+            }
+            if (clicked) {
+                ui.selected_city_block = i;
+            }
+            if (ImGui::IsItemHovered() && i < names.size()) {
+                ImGui::SetTooltip("%s", names[i].c_str());
+            }
+            ImGui::PopID();
+        }
+    }
+    ImGui::EndChild();
+}
+
 void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& status) {
     if (project.buildings.empty()) {
         ImGui::TextUnformatted("No building templates loaded.");
+        return;
+    }
+
+    // When the Place Block tool is active, the inspector becomes the block panel
+    // (the editor.exe layout) instead of the per-cell field editor.
+    if (ui.building_tool == BuildingTool::PlaceBlock) {
+        draw_block_tool_panel(project, ui);
         return;
     }
 
@@ -1129,6 +1412,217 @@ void draw_buildblock_inspector(EditorProject& project, EditorUi& ui, std::string
         save_buildblock(project, ui, status);
     }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Save buildblock layers to buildblock/*.edited.sbl");
+}
+
+namespace {
+
+// Font Awesome 6 Solid icon prefixes for tool buttons (the atlas merges FA in
+// load_editor_fonts). Trailing space separates the glyph from the label.
+#define ICON_SELECT ICON_FA_ARROW_POINTER " "
+#define ICON_DRAW   ICON_FA_ROAD " "
+#define ICON_MOVE   ICON_FA_UP_DOWN_LEFT_RIGHT " "
+#define ICON_COPY   ICON_FA_COPY " "
+#define ICON_PLACE  ICON_FA_CUBE " "
+#define ICON_ERASE  ICON_FA_ERASER " "
+#define ICON_PAINT  ICON_FA_FILL_DRIP " "
+
+// One tool button: highlighted when active, sets the target on click. Returns
+// true if it was clicked. Uniform width so the column reads as a tidy stack.
+template <typename T>
+bool tool_button(const char* label, const char* tip, T& target, T value) {
+    const bool active = target == value;
+    if (active) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
+    }
+    const bool clicked = ImGui::Button(label, ImVec2(118.0F, 26.0F));
+    if (active) {
+        ImGui::PopStyleColor();
+    }
+    if (clicked) {
+        target = value;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", tip);
+    }
+    return clicked;
+}
+
+// Compact catalog combo: shows entries[selected], lets you pick another. Empty
+// names render as their 1-based index so unnamed blocks/materials stay selectable.
+} // namespace
+
+bool draw_viewport_toolbar(EditorProject& project, EditorUi& ui, float origin_x, float origin_y) {
+    // City and Buildings are the editors with viewport tools; other tabs have none.
+    const bool city = ui.tab == EditorTab::City && project.city;
+    const bool building = ui.tab == EditorTab::Buildings && !project.buildings.empty();
+    if (!city && !building) {
+        return false;
+    }
+
+    ImGui::SetNextWindowPos(ImVec2(origin_x + 12.0F, origin_y + 12.0F), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.88F);
+    constexpr auto flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
+        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+
+    // Roomier padding + rounding so the overlay reads as a floating tool panel
+    // rather than buttons jammed into the corner.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0F, 10.0F));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0F, 6.0F));
+
+    bool hovered = false;
+    if (ImGui::Begin("##viewport_toolbar", nullptr, flags)) {
+        hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+
+        if (city) {
+            // Unified city tools (no Roads/Buildings/Pieces sub-mode).
+            const auto prev_tool = ui.city_tool;
+            tool_button(ICON_SELECT "Select", "Pick anything (building/road/node/piece); gizmo to move", ui.city_tool, CityTool::Select);
+            tool_button(ICON_MOVE "Building", "Place the chosen building template on the ground", ui.city_tool, CityTool::Building);
+            tool_button(ICON_DRAW "Road", "Draw road chains (snaps to nodes, splits roads)", ui.city_tool, CityTool::Road);
+            tool_button(ICON_PLACE "Piece", "Place/draw the chosen piece (hold-drag)", ui.city_tool, CityTool::Piece);
+            tool_button(ICON_ERASE "Erase", "Delete whatever you click (hold-drag erases pieces)", ui.city_tool, CityTool::Erase);
+            if (ui.city_tool != prev_tool && ui.city_tool != CityTool::Road) {
+                ui.pending_road_intersection.reset(); // leaving the road tool ends any chain
+            }
+        } else { // Buildings editor
+            tool_button(ICON_SELECT "Select", "Pick a cell (raycast)", ui.building_tool, BuildingTool::Select);
+            tool_button(ICON_PLACE "Place", "Add a block against the clicked face (click-drag for fast fill)", ui.building_tool, BuildingTool::PlaceBlock);
+            tool_button(ICON_PAINT "Paint", "Paint the clicked face's texture", ui.building_tool, BuildingTool::PaintTexture);
+            ImGui::Separator();
+            auto& bld = project.buildings[std::min(ui.selected_building, project.buildings.size() - 1U)].data;
+            if (ui.building_tool == BuildingTool::PlaceBlock) {
+                ImGui::TextDisabled("Configure the block in\nthe Inspector, then click\na face to place it.");
+            } else if (ui.building_tool == BuildingTool::PaintTexture) {
+                int side = ui.paint_interior ? 1 : 0;
+                const char* sides[] = {"Exterior", "Interior"};
+                ImGui::SetNextItemWidth(118.0F);
+                if (ImGui::Combo("##tb_side", &side, sides, 2)) {
+                    ui.paint_interior = side == 1;
+                }
+                ImGui::TextDisabled("Texture:");
+                material_swatch_picker(project, "tb_paint", bld.materials, ui.paint_material_index);
+            }
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(4);
+    return hovered;
+}
+
+namespace {
+
+struct ControlHint {
+    std::string key;
+    std::string action;
+};
+
+// Bindings for the active tab AND the active tool only - a small, context-aware
+// set so the overlay never crowds the corner. Key labels come from key_label so
+// they match the user's keyboard layout (e.g. the W position shows "Z" on AZERTY).
+std::vector<ControlHint> controls_for(const EditorUi& ui) {
+    const auto k = [](int key) { return key_label(key); };
+    const std::string ctrl = k(KEY_LEFT_CONTROL);
+    std::vector<ControlHint> hints;
+
+    if (ui.tab == EditorTab::City) {
+        switch (ui.city_tool) {
+            case CityTool::Select:
+                hints.push_back({"LMB", "select / gizmo"});
+                hints.push_back({k(KEY_R), "rotate"});
+                hints.push_back({k(KEY_DELETE), "delete"});
+                break;
+            case CityTool::Building:
+                hints.push_back({"LMB", "place building"});
+                hints.push_back({k(KEY_R), "rotate"});
+                break;
+            case CityTool::Road:
+                hints.push_back({"LMB", "lay road"});
+                hints.push_back({k(KEY_ESCAPE), "end chain"});
+                break;
+            case CityTool::Piece:
+                hints.push_back({"LMB", "place (hold drag)"});
+                hints.push_back({k(KEY_R), "rotate"});
+                break;
+            case CityTool::Erase:
+                hints.push_back({"LMB", "delete (hold drag)"});
+                break;
+        }
+    } else if (ui.tab == EditorTab::Buildings) {
+        if (ui.building_tool == BuildingTool::PlaceBlock) {
+            hints.push_back({"LMB", "grow block (hold drag)"});
+            hints.push_back({k(KEY_TAB), "next cell"});
+        } else if (ui.building_tool == BuildingTool::PaintTexture) {
+            hints.push_back({"LMB", "paint face"});
+        } else {
+            hints.push_back({"LMB", "select cell"});
+            hints.push_back({k(KEY_TAB), "next cell"});
+            hints.push_back({k(KEY_LEFT) + "/" + k(KEY_RIGHT), "edit field"});
+        }
+    } else if (ui.tab == EditorTab::Blocks) {
+        hints.push_back({k(KEY_LEFT) + "/" + k(KEY_RIGHT), "value -/+1"});
+        hints.push_back({k(KEY_TAB), "cycle field"});
+    } else if (ui.tab == EditorTab::Buildblocks) {
+        hints.push_back({k(KEY_LEFT) + "/" + k(KEY_RIGHT), "-/+ 1/16"});
+        hints.push_back({k(KEY_TAB), "cycle layer"});
+    }
+    return hints;
+}
+
+} // namespace
+
+void draw_controls_overlay(const EditorUi& ui, float origin_x, float origin_y, float width, float height) {
+    const auto hints = controls_for(ui);
+    if (hints.empty()) {
+        return;
+    }
+
+    auto* draw = ImGui::GetForegroundDrawList();
+    const float pad = 9.0F;
+    const float row_h = ImGui::GetTextLineHeight() + 8.0F;
+    const float cap_h = ImGui::GetTextLineHeight() + 4.0F;
+    const float gap = 8.0F; // between key cap and action text.
+
+    // Measure: widest row = caps width + gap + action width.
+    float panel_w = 0.0F;
+    for (const auto& hint : hints) {
+        const float cap_w = ImGui::CalcTextSize(hint.key.c_str()).x + 12.0F;
+        const float act_w = ImGui::CalcTextSize(hint.action.c_str()).x;
+        panel_w = std::max(panel_w, cap_w + gap + act_w);
+    }
+    panel_w += pad * 2.0F;
+    const float panel_h = pad * 2.0F + row_h * static_cast<float>(hints.size());
+
+    const float x1 = origin_x + width - 12.0F;
+    const float y1 = origin_y + height - 12.0F;
+    const float x0 = x1 - panel_w;
+    const float y0 = y1 - panel_h;
+
+    draw->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(20, 23, 27, 205), 7.0F);
+    draw->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(80, 90, 102, 220), 7.0F);
+
+    float y = y0 + pad;
+    for (const auto& hint : hints) {
+        const float cap_w = ImGui::CalcTextSize(hint.key.c_str()).x + 12.0F;
+        const float cap_x = x0 + pad;
+        const ImVec2 cap_min(cap_x, y + (row_h - cap_h) * 0.5F);
+        const ImVec2 cap_max(cap_x + cap_w, cap_min.y + cap_h);
+        // Key-cap shape: rounded filled rect with a lighter top edge.
+        draw->AddRectFilled(cap_min, cap_max, IM_COL32(58, 64, 72, 255), 4.0F);
+        draw->AddRect(cap_min, cap_max, IM_COL32(120, 130, 142, 255), 4.0F);
+        const ImVec2 key_text_size = ImGui::CalcTextSize(hint.key.c_str());
+        draw->AddText(
+            ImVec2(cap_x + (cap_w - key_text_size.x) * 0.5F, cap_min.y + (cap_h - key_text_size.y) * 0.5F),
+            IM_COL32(235, 240, 245, 255),
+            hint.key.c_str());
+        draw->AddText(
+            ImVec2(cap_x + cap_w + gap, y + (row_h - ImGui::GetTextLineHeight()) * 0.5F),
+            IM_COL32(205, 212, 220, 255),
+            hint.action.c_str());
+        y += row_h;
+    }
 }
 
 void apply_editor_imgui_style() {

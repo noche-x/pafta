@@ -178,6 +178,8 @@ struct CityTileCell {
     float slope_x{};
     float slope_z{};
     CityTileKind kind{CityTileKind::Road};
+    // SbcMap::streets index that owns this road tile, or -1 for intersection tiles.
+    std::int32_t street_index{-1};
 };
 
 struct CityTerrain {
@@ -303,16 +305,31 @@ std::optional<CellPick> pick_building_cell(
     const SbbBuilding& building,
     const Vec3& ray_origin,
     const Vec3& ray_dir,
-    float unit_size);
+    float unit_size,
+    std::optional<std::uint32_t> floor = std::nullopt);
 // Intersection of a world-space ray with the y=0 ground plane, or nullopt when
 // the ray is parallel to it or only hits behind the origin.
 std::optional<Vec3> ray_ground_hit(const Vec3& ray_origin, const Vec3& ray_dir);
+// World-space hit of a ray against the terrain heightfield surface (marches then
+// bisects). Falls back to ray_ground_hit when the terrain has no samples or the
+// ray starts below the surface, so callers always get a usable ground point.
+std::optional<Vec3> ray_terrain_hit(const CityTerrain& terrain, const Vec3& ray_origin, const Vec3& ray_dir);
 // Returns the index into map.buildings whose placed footprint the ray hits
 // nearest, or nullopt. placement_buildings[i] resolves each placement's loaded
 // .sbb (nullptr when unresolved -> a single placement cell box is used).
 std::optional<std::size_t> pick_city_building(
     const SbcMap& map,
     const std::vector<const SbbBuilding*>& placement_buildings,
+    const Vec3& ray_origin,
+    const Vec3& ray_dir,
+    float unit_size);
+struct CityPiecePick {
+    std::size_t portal_index{};
+    std::size_t block_index{};
+    std::uint32_t word{};
+};
+std::optional<CityPiecePick> pick_city_piece(
+    const SbcMap& map,
     const Vec3& ray_origin,
     const Vec3& ray_dir,
     float unit_size);
@@ -323,6 +340,26 @@ std::optional<std::size_t> pick_city_road(
     const MapScene& scene,
     const Vec3& ray_origin,
     const Vec3& ray_dir);
+std::optional<std::size_t> pick_city_intersection(
+    const SbcMap& map,
+    const MapScene& scene,
+    const Vec3& ray_origin,
+    const Vec3& ray_dir);
+// Unified road/node pick: tests both the node markers and the road surfaces and
+// returns whichever the ray reaches first (nearest to the camera), so a click on
+// the visible road selects the road and a click on a node selects the node -
+// matching how building picking just grabs whatever is under the cursor.
+struct CityRoadPick {
+    enum class Kind { Node, Road };
+    Kind kind{};
+    std::size_t index{};
+};
+std::optional<CityRoadPick> pick_city_road_or_node(
+    const SbcMap& map,
+    const MapScene& scene,
+    const Vec3& ray_origin,
+    const Vec3& ray_dir);
+SbcStreet canonical_city_street_endpoint_order(const SbcMap& map, SbcStreet street);
 CityBuildingBasis native_city_building_rotation_basis(std::int32_t rotation);
 Vec3 native_city_rotate_local(Vec3 local, std::int32_t rotation);
 Vec3 native_city_building_render_origin(const SbcBuilding& placement, float unit_size = 4.0F);
@@ -333,6 +370,10 @@ MapScene build_map_scene(const SbcMap& map);
 // terrain corner-height grid like the native instantiation does.
 MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*>& placement_buildings);
 std::uint64_t city_scene_fingerprint(const SbcMap& map);
+// Subset fingerprint over only terrain-affecting inputs (intersections, building
+// footprints, piece cells). Lets the GPU layer re-upload the heavy terrain mesh
+// only when the terrain actually changed, not on every road/street edit.
+std::uint64_t city_terrain_fingerprint(const SbcMap& map);
 std::uint32_t terrain_noise_hash(std::int32_t x, std::int32_t y, std::uint32_t mask);
 float terrain_noise_sample(float x, float z, float frequency_x, float frequency_z);
 float native_like_city_terrain_height(float world_x, float world_z);
