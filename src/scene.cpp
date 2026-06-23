@@ -244,9 +244,8 @@ const SblTemplate* resolve_building_buildblock_template(
 // Reproduce that ordering so a district word's index lands on the same template
 // the game would resolve. An out-of-range or empty-`block` template renders nothing,
 // exactly as the native instancing loop does for unfilled catalog slots.
-const SblTemplate* resolve_district_buildblock_by_index(
-    const std::vector<NamedBuildblockTemplate>& templates,
-    std::uint32_t catalog_index) {
+std::vector<const NamedBuildblockTemplate*> district_buildblock_catalog_order(
+    const std::vector<NamedBuildblockTemplate>& templates) {
     std::vector<const NamedBuildblockTemplate*> ordered;
     ordered.reserve(templates.size());
     for (const auto& entry : templates) {
@@ -258,6 +257,13 @@ const SblTemplate* resolve_district_buildblock_by_index(
     if (ordered.size() > 64U) {
         ordered.resize(64U);
     }
+    return ordered;
+}
+
+const SblTemplate* resolve_district_buildblock_by_index(
+    const std::vector<NamedBuildblockTemplate>& templates,
+    std::uint32_t catalog_index) {
+    const auto ordered = district_buildblock_catalog_order(templates);
     if (catalog_index >= ordered.size()) {
         return nullptr;
     }
@@ -2951,6 +2957,16 @@ BuildingRenderBuffer build_native_portal_render_buffer(
 
     sort_triangles_into_native_material_runs(buffer);
     return buffer;
+}
+
+std::string district_buildblock_name_for_index(
+    const std::vector<NamedBuildblockTemplate>& buildblock_templates,
+    std::uint32_t catalog_index) {
+    const auto ordered = district_buildblock_catalog_order(buildblock_templates);
+    if (catalog_index >= ordered.size()) {
+        return {};
+    }
+    return ordered[catalog_index]->name;
 }
 
 std::optional<CellPick> pick_building_cell(

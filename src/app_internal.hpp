@@ -501,6 +501,10 @@ struct EditorUi {
     // they are stored grouped in portals internally.
     std::optional<CityGridPoint> selected_piece_voxel;
     std::optional<CityGridPoint> hover_piece_voxel;
+    // Raw district word of the selected piece. v11 maps decode it through the named
+    // city_blocks table; v10 (round) has no city_blocks, so the inspector reads this
+    // directly to show the legacy cell's class/index.
+    std::uint32_t selected_piece_word{};
     std::size_t selected_city_block{};
     std::size_t selected_city_block_layer{};
     std::size_t selected_city_block_slot{};

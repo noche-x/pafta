@@ -2170,6 +2170,7 @@ void select_city_piece(EditorProject& project, EditorUi& ui, const CityPiecePick
     }
 
     ui.selected_portal = pick.portal_index;
+    ui.selected_piece_word = pick.word;
     if (!project.city->data.city_blocks.empty()) {
         ui.selected_city_block = std::min<std::size_t>(pick.word & 0xfffU, project.city->data.city_blocks.size() - 1U);
         const auto& city_block = project.city->data.city_blocks[ui.selected_city_block];
@@ -4244,6 +4245,39 @@ int run_editor_app() {
                         save_city(*project, ui, status);
                     }
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Save city changes to city2.edited.sbc");
+                } else if (ui.city_selection == CitySelectionKind::Piece && project->city->data.city_blocks.empty() &&
+                           ui.selected_piece_voxel.has_value()) {
+                    // v10 maps (round) have no named city_blocks: the picked cell is a
+                    // raw legacy district word. Decode and show its class/index inline
+                    // since there's no city_block table to drive the normal inspector.
+                    const auto word = ui.selected_piece_word;
+                    const auto cell_class = word & 0xe0000000U;
+                    ImGui::Text("Legacy District Cell (v10)");
+                    ImGui::Separator();
+                    ImGui::Text("Cell: [%d, %d, %d]", ui.selected_piece_voxel->x,
+                        ui.selected_piece_voxel->y, ui.selected_piece_voxel->z);
+                    ImGui::Text("Word: 0x%08X", word);
+                    if (cell_class == 0x40000000U) {
+                        ImGui::Text("Type: Solid cell (road/asphalt slab)");
+                    } else if (cell_class == 0x80000000U) {
+                        const auto catalog_index = static_cast<std::uint32_t>(word & 0xffffU);
+                        const auto name = district_buildblock_name_for_index(
+                            buildblock_templates(*project), catalog_index);
+                        ImGui::Text("Type: Buildblock piece");
+                        ImGui::Text("Catalog Index: %u", catalog_index);
+                        ImGui::Text("Buildblock: %s", name.empty() ? "(empty / unloaded slot)" : name.c_str());
+                        ImGui::Text("Rotation: %u", (word >> 24U) & 3U);
+                    } else {
+                        ImGui::Text("Type: 0x%08X", cell_class);
+                    }
+                    if (!project->city->data.portals.empty()) {
+                        ui.selected_portal = std::min(ui.selected_portal, project->city->data.portals.size() - 1U);
+                        const auto& portal = project->city->data.portals[ui.selected_portal];
+                        ImGui::Spacing();
+                        if (ImGui::CollapsingHeader("Portal Details", ImGuiTreeNodeFlags_DefaultOpen)) {
+                            draw_portal_details(portal);
+                        }
+                    }
                 } else if (ui.city_selection == CitySelectionKind::Piece && !project->city->data.city_blocks.empty()) {
                     ui.selected_city_block = std::min(ui.selected_city_block, project->city->data.city_blocks.size() - 1U);
                     auto& city_block = project->city->data.city_blocks[ui.selected_city_block];
@@ -4330,6 +4364,16 @@ int run_editor_app() {
                     }
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Save voxel changes to city2.edited.sbc");
                 }
+            } else if (ui.tab == EditorTab::Pieces && project->city && project->city->data.city_blocks.empty()) {
+                // v10 maps (round) store district cells as raw legacy words, not the
+                // named city_blocks table this tab edits. Editing isn't supported;
+                // point the user at the City tab where legacy cells can be inspected.
+                ImGui::TextWrapped("This map (SBC v%u) has no named city blocks.",
+                    project->city->data.version);
+                ImGui::Spacing();
+                ImGui::TextWrapped(
+                    "Its district cells are legacy words rendered directly from the buildblock "
+                    "catalog and solid road slabs. Select a cell on the City tab to inspect it.");
             } else if (ui.tab == EditorTab::Blocks) {
                 draw_block_inspector(*project, ui, status);
             } else if (ui.tab == EditorTab::Buildblocks) {

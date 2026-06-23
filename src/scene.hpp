@@ -309,6 +309,12 @@ BuildingRenderBuffer build_native_portal_render_buffer(
     // load-order name list (matching the texture set the game loads). Empty =
     // flat/untextured v10 pieces.
     const std::vector<std::string>& texture_names = {});
+// Name of the buildblock a v10 district piece word resolves to, indexed by
+// `word & 0xffff` into the game-ordered catalog (sorted, capped 64). Empty if the
+// index is out of range (the cell renders nothing). For inspector display.
+std::string district_buildblock_name_for_index(
+    const std::vector<NamedBuildblockTemplate>& buildblock_templates,
+    std::uint32_t catalog_index);
 // Returns the building cell hit by a world-space ray, nearest first, or nullopt.
 std::optional<CellPick> pick_building_cell(
     const SbbBuilding& building,
