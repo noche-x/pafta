@@ -1801,6 +1801,31 @@ void place_native_intersection_tiles(
     }
 }
 
+// Districts pave their piece cells with the same drivable asphalt surface the
+// streets use: the burger/parking-plaza fill on the round map is district paving,
+// not street tiles. The dominant `_null` piece (and the out-of-range index-20
+// piece) carry no mesh in the binary, so their visible surface is the road plane
+// at the cell's level. We lay an asphalt Road tile at every piece-class
+// (0x80000000) district cell at native_road_surface_y(level) so these plazas read
+// as paved like in-game. Solid (0x40000000) cells already render their own
+// asphalt cube via the portal buffer, so they are not paved here (avoids a
+// double surface). Pieces that DO carry mesh geometry render their block on top.
+void place_district_paving_tiles(CityTileMap& tiles, const SbcMap& map) {
+    for (const auto& portal : map.portals) {
+        const auto& voxels = portal.voxel_blocks();
+        const auto block_count = std::min<std::size_t>(voxels.size(), 0x200);
+        for (std::size_t voxel_index = 0; voxel_index < block_count; ++voxel_index) {
+            if ((voxels[voxel_index] & 0xe0000000U) != 0x80000000U) {
+                continue;
+            }
+            const auto x = portal.fields[1] * 8 + static_cast<std::int32_t>(voxel_index & 7U);
+            const auto z = portal.fields[3] * 8 + static_cast<std::int32_t>((voxel_index >> 3U) & 7U);
+            const auto level = portal.fields[2] * 8 + static_cast<std::int32_t>((voxel_index >> 6U) & 7U);
+            set_city_tile(tiles, x, level, z, CityTileKind::Road, native_road_surface_y(level));
+        }
+    }
+}
+
 } // namespace
 
 SbcStreet canonical_city_street_endpoint_order(const SbcMap& map, SbcStreet street) {
@@ -2182,6 +2207,7 @@ void apply_native_city_terrain_patch(
 }
 
 std::vector<CityTileCell> build_city_tile_cells(
+    const SbcMap& map,
     const NativeCityGraph& graph,
     CityCornerStampMap& stamps) {
     CityTileMap tile_map;
@@ -2191,6 +2217,9 @@ std::vector<CityTileCell> build_city_tile_cells(
     for (const auto& intersection : graph.intersections) {
         place_native_intersection_tiles(tile_map, graph, intersection);
     }
+    // District paving overlays the street tiles: non-empty district cells become
+    // drivable asphalt (e.g. the round map's elevated parking/burger plazas).
+    place_district_paving_tiles(tile_map, map);
 
     std::vector<CityTileCell> tiles;
     tiles.reserve(tile_map.size());
@@ -2353,16 +2382,15 @@ std::optional<CityTerrain> build_city_terrain(
     // (sitting at the same patched level as the road tops) z-fights the road on
     // the lowest, flattest blocks. Build a covered-cell set so terrain quads
     // fully under tiles are skipped.
+    // tile_cells includes district piece paving (place_district_paving_tiles), so
+    // terrain is carved under those plazas. District solid cells aren't paved (they
+    // render their own cube), so carve terrain under them here too — otherwise the
+    // terrain mesh buries the flat asphalt slabs.
     std::unordered_set<std::uint64_t> covered_cells;
     covered_cells.reserve(tile_cells.size());
     for (const auto& tile : tile_cells) {
         covered_cells.insert(CityCornerStampMap::key(tile.x, tile.z));
     }
-    // District solid cells (0x40000000) are flat asphalt slabs the game lays at
-    // ground level to fill areas (e.g. parking-lot aprons). Like road tiles, the
-    // terrain surface must be removed under them or the terrain mesh buries them.
-    // v10 maps (round) store these in legacy_blocks; v11+ in blocks. The piece-class
-    // cells render their own meshes above ground, so only solid cells carve terrain.
     for (const auto& portal : map.portals) {
         const auto& voxels = portal.voxel_blocks();
         const auto block_count = std::min<std::size_t>(voxels.size(), 0x200);
@@ -3542,7 +3570,7 @@ MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*
     // expansion, then the terrain rebuild with its patches.
     auto graph = build_native_city_graph(map);
     CityCornerStampMap corner_stamps;
-    scene.city_tiles = build_city_tile_cells(graph, corner_stamps);
+    scene.city_tiles = build_city_tile_cells(map, graph, corner_stamps);
     stamp_city_portal_cells(corner_stamps, map);
     stamp_city_building_footprints(corner_stamps, map, placement_buildings);
     scene.traffic_light_poles = build_city_traffic_light_poles(graph, scene.unit_size);
