@@ -2358,6 +2358,23 @@ std::optional<CityTerrain> build_city_terrain(
     for (const auto& tile : tile_cells) {
         covered_cells.insert(CityCornerStampMap::key(tile.x, tile.z));
     }
+    // District solid cells (0x40000000) are flat asphalt slabs the game lays at
+    // ground level to fill areas (e.g. parking-lot aprons). Like road tiles, the
+    // terrain surface must be removed under them or the terrain mesh buries them.
+    // v10 maps (round) store these in legacy_blocks; v11+ in blocks. The piece-class
+    // cells render their own meshes above ground, so only solid cells carve terrain.
+    for (const auto& portal : map.portals) {
+        const auto& voxels = portal.voxel_blocks();
+        const auto block_count = std::min<std::size_t>(voxels.size(), 0x200);
+        for (std::size_t voxel_index = 0; voxel_index < block_count; ++voxel_index) {
+            if ((voxels[voxel_index] & 0xe0000000U) != 0x40000000U) {
+                continue;
+            }
+            const auto gx = portal.fields[1] * 8 + static_cast<std::int32_t>(voxel_index & 7U);
+            const auto gz = portal.fields[3] * 8 + static_cast<std::int32_t>((voxel_index >> 3U) & 7U);
+            covered_cells.insert(CityCornerStampMap::key(gx, gz));
+        }
+    }
     auto cell_covered = [&](std::int32_t gx, std::int32_t gz) {
         return covered_cells.contains(CityCornerStampMap::key(gx, gz));
     };
