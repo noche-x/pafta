@@ -922,8 +922,14 @@ std::vector<SblLayer> read_sbl_layers(const BinaryReader& reader) {
 CsxEntryKind classify_csx_entry(std::uint32_t type) {
     switch (type) {
         case 0x585a0001:
+            // Block/buildblock .sbl (parse_sbl). CSX packs these with container
+            // version sentinel 1; load_project_csx_geometry normalizes 1 -> 2.
             return CsxEntryKind::Sbl;
         case 0x585a0002:
+            // Building .sbb. CSX packs it with container version sentinel 1;
+            // load_project_csx_geometry normalizes 1 -> 14 before parse_sbb.
+            // (parse_sbl is lenient enough to misread these bytes as layers, but
+            // parse_sbb confirms they are real buildings, e.g. station2 12x12x4.)
             return CsxEntryKind::Sbb;
         case 0x585a0004:
             return CsxEntryKind::Texture;
@@ -959,7 +965,8 @@ SbbBuilding parse_sbb(const std::vector<std::uint8_t>& bytes) {
     SbbBuilding building;
     building.version = reader.u32(0);
     if (!sbb_version_supported(building.version)) {
-        throw std::runtime_error("Unsupported SBB version");
+        throw std::runtime_error(
+            "Unsupported SBB version " + std::to_string(building.version) + " (supported 12-14)");
     }
     building.name = reader.ascii(4, 0x40);
     building.size_x = reader.u32(0x44);

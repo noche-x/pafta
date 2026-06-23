@@ -135,6 +135,15 @@ struct SbcPortal {
     std::vector<std::uint32_t> legacy_blocks;
     std::vector<std::uint16_t> textures;
     std::vector<std::uint32_t> itemsets;
+
+    // The active 0x200-voxel district grid. v11+ SBC stores it in `blocks`; v10
+    // (e.g. the round map) stores the same grid, same word format
+    // (0x80000000 = piece, 0x40000000 = solid), in `legacy_blocks`. Scene/terrain
+    // building must read whichever is populated, or v10 maps lose their district
+    // pieces and the piece-driven terrain stamping.
+    const std::vector<std::uint32_t>& voxel_blocks() const {
+        return blocks.empty() ? legacy_blocks : blocks;
+    }
 };
 
 struct SbcPortalConnection {

@@ -237,6 +237,33 @@ const SblTemplate* resolve_building_buildblock_template(
     return templates.empty() ? nullptr : &templates.front().template_file;
 }
 
+// The native global buildblock catalog (g_buildblockTemplateCatalog) is what v10
+// district piece words index by `word & 0xffff`. The game builds it in
+// BuildblockCatalog_LoadAll @0x26e70: scan loose buildblock/*.sbl only (NOT CSX),
+// strip the extension, sort names bytewise, cap at 64, then index in that order.
+// Reproduce that ordering so a district word's index lands on the same template
+// the game would resolve. An out-of-range or empty-`block` template renders nothing,
+// exactly as the native instancing loop does for unfilled catalog slots.
+const SblTemplate* resolve_district_buildblock_by_index(
+    const std::vector<NamedBuildblockTemplate>& templates,
+    std::uint32_t catalog_index) {
+    std::vector<const NamedBuildblockTemplate*> ordered;
+    ordered.reserve(templates.size());
+    for (const auto& entry : templates) {
+        ordered.push_back(&entry);
+    }
+    std::ranges::sort(ordered, [](const NamedBuildblockTemplate* lhs, const NamedBuildblockTemplate* rhs) {
+        return lhs->name < rhs->name;
+    });
+    if (ordered.size() > 64U) {
+        ordered.resize(64U);
+    }
+    if (catalog_index >= ordered.size()) {
+        return nullptr;
+    }
+    return &ordered[catalog_index]->template_file;
+}
+
 const SbbCell* find_cell_at(const std::vector<SbbCell>& cells, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
     const auto match = std::ranges::find_if(cells, [x, y, z](const SbbCell& cell) {
         return cell.x == x && cell.y == y && cell.z == z;
@@ -431,6 +458,13 @@ std::uint32_t rotate_native_material_slot(std::uint32_t material, std::int32_t r
     return material;
 }
 
+std::uint32_t rotate_native_block_mesh_material_slot(std::uint32_t material, std::int32_t rotation) {
+    auto rotate_range = [rotation](std::uint32_t value, std::uint32_t first) {
+        return ((value - first + static_cast<std::uint32_t>(rotation & 3)) & 3U) + first;
+    };
+    return material >= 1U && material <= 4U ? rotate_range(material, 1U) : material;
+}
+
 std::uint32_t rotate_native_orientation_once(std::uint32_t orientation) {
     switch (orientation & 0xf0000U) {
         case 0x60000U:
@@ -495,7 +529,7 @@ NativeRotatedBlockFace rotate_block_face_native_impl(const SblBlockMesh& mesh, c
             orientation == 0x10000U ||
             orientation == 0x50000U ||
             orientation == 0x20000U) {
-            rotated.material = rotate_native_material_slot(rotated.material, 1);
+            rotated.material = rotate_native_block_mesh_material_slot(rotated.material, 1);
             orientation = rotate_native_orientation_once(orientation);
         }
     }
@@ -1558,9 +1592,10 @@ struct CityCornerStampMap {
 // voxel index decodes as y*64 + z*8 + x.
 void stamp_city_portal_cells(CityCornerStampMap& stamps, const SbcMap& map) {
     for (const auto& portal : map.portals) {
-        const auto block_count = std::min<std::size_t>(portal.blocks.size(), 0x200);
+        const auto& voxels = portal.voxel_blocks();
+        const auto block_count = std::min<std::size_t>(voxels.size(), 0x200);
         for (std::size_t voxel_index = 0; voxel_index < block_count; ++voxel_index) {
-            if (portal.blocks[voxel_index] == 0U) {
+            if (voxels[voxel_index] == 0U) {
                 continue;
             }
             const auto local_x = static_cast<std::int32_t>(voxel_index & 7U);
@@ -2794,7 +2829,9 @@ BuildingRenderBuffer build_native_building_tool_preview_render_buffer(
 BuildingRenderBuffer build_native_portal_render_buffer(
     const SbcMap& map,
     const std::vector<NamedBlockMesh>& block_meshes,
-    std::optional<std::size_t> selected_portal) {
+    std::optional<std::size_t> selected_portal,
+    const std::vector<NamedBuildblockTemplate>& buildblock_templates,
+    const std::vector<std::string>& texture_names) {
     BuildingRenderBuffer buffer;
     VertexIndexMap vertex_indices;
 
@@ -2807,16 +2844,14 @@ BuildingRenderBuffer build_native_portal_render_buffer(
             continue;
         }
         const auto& portal = map.portals[portal_index];
-        const auto block_count = std::min<std::size_t>(portal.blocks.size(), 0x200);
+        const auto& voxels = portal.voxel_blocks();
+        const auto block_count = std::min<std::size_t>(voxels.size(), 0x200);
         for (std::size_t voxel_index = 0; voxel_index < block_count; ++voxel_index) {
-            const auto word = portal.blocks[voxel_index];
+            const auto word = voxels[voxel_index];
             if (word == 0U) {
                 continue;
             }
             const auto city_block_index = static_cast<std::size_t>(word & 0xfffU);
-            if (city_block_index >= map.city_blocks.size()) {
-                continue;
-            }
 
             auto layer_index = static_cast<std::size_t>((word >> 16U) & 0x3fU);
             layer_index = layer_index == 0U ? 0U : layer_index - 1U;
@@ -2830,6 +2865,62 @@ BuildingRenderBuffer build_native_portal_render_buffer(
                 static_cast<float>(portal.fields[3] * 8 + local_z) * buffer.unit_size,
             };
 
+            // v10 maps (e.g. round) have no city_blocks. The native loader applies
+            // these legacy district cells in World_LoadMapAndInitializeTerrain's
+            // legacy loop, feeding the raw word into World_SetTileBlockAndResolveNeighborLinks:
+            //   - class 0x40000000 = a solid world cell (the flat asphalt road-end
+            //     slabs); per-face material comes from the cell's 8-short texture grid
+            //     (portal.textures, 8 per voxel), short 0 = first loaded texture.
+            //   - class 0x80000000 = a buildblock-template instance indexed by
+            //     (word & 0xffff) into the global buildblock catalog (loose
+            //     buildblock/*.sbl, sorted, capped 64). Index 0 = _null and any
+            //     out-of-range index render nothing, exactly as the native instancing
+            //     loop does for empty catalog slots.
+            if (map.city_blocks.empty()) {
+                const auto cell_class = word & 0xe0000000U;
+                const auto grid_material = [&](std::size_t slot) {
+                    const auto grid_base = voxel_index * 8U + std::min<std::size_t>(slot, 7U);
+                    const auto tex_idx = grid_base < portal.textures.size()
+                        ? static_cast<std::size_t>(portal.textures[grid_base])
+                        : 0U;
+                    const auto name = tex_idx < texture_names.size() ? texture_names[tex_idx] : std::string{};
+                    return material_id_for_name(buffer, name);
+                };
+
+                if (cell_class == 0x40000000U) {
+                    add_native_city_block_solid_cell(
+                        buffer,
+                        vertex_indices,
+                        origin,
+                        [&](BuildingFaceSide side) {
+                            return grid_material(material_slot_for_cell_side(side));
+                        });
+                    continue;
+                }
+
+                if (cell_class == 0x80000000U) {
+                    const auto catalog_index = static_cast<std::uint32_t>(word & 0xffffU);
+                    const auto* template_file =
+                        resolve_district_buildblock_by_index(buildblock_templates, catalog_index);
+                    if (template_file == nullptr || !template_file->block.has_value()) {
+                        continue;
+                    }
+                    add_rotated_block_mesh_to_buffer(
+                        buffer,
+                        vertex_indices,
+                        *template_file->block,
+                        origin,
+                        rotation,
+                        [&](BuildingRenderBuffer&, const SblBlockFace&, const NativeRotatedBlockFace& rotated_face) {
+                            return grid_material(rotated_face.material);
+                        });
+                }
+                continue;
+            }
+
+            if (city_block_index >= map.city_blocks.size()) {
+                continue;
+            }
             const auto& city_block = map.city_blocks[city_block_index];
             const auto resolution = resolve_city_block_render(city_block, block_meshes);
             if (resolution.render_class == CityBlockRenderClass::Mesh && resolution.mesh != nullptr) {
@@ -3026,8 +3117,9 @@ std::optional<CityPiecePick> pick_city_piece(
     float nearest_t = std::numeric_limits<float>::max();
     for (std::size_t portal_index = 0; portal_index < map.portals.size(); ++portal_index) {
         const auto& portal = map.portals[portal_index];
-        for (std::size_t block_index = 0; block_index < portal.blocks.size() && block_index < 0x200U; ++block_index) {
-            const auto word = portal.blocks[block_index];
+        const auto& voxels = portal.voxel_blocks();
+        for (std::size_t block_index = 0; block_index < voxels.size() && block_index < 0x200U; ++block_index) {
+            const auto word = voxels[block_index];
             if (word == 0U) {
                 continue;
             }
@@ -3359,7 +3451,7 @@ std::uint64_t city_scene_fingerprint(const SbcMap& map) {
         mix(portal.fields[1]);
         mix(portal.fields[2]);
         mix(portal.fields[3]);
-        for (const auto word : portal.blocks) {
+        for (const auto word : portal.voxel_blocks()) {
             mix(static_cast<std::int64_t>(word));
         }
     }
@@ -3398,7 +3490,7 @@ std::uint64_t city_terrain_fingerprint(const SbcMap& map) {
         mix(portal.fields[1]);
         mix(portal.fields[2]);
         mix(portal.fields[3]);
-        for (const auto word : portal.blocks) {
+        for (const auto word : portal.voxel_blocks()) {
             mix(static_cast<std::int64_t>(word));
         }
     }

@@ -2155,6 +2155,32 @@ void native_block_rotation_uses_positive_rotated_bounds() {
     assert(rotated_thrice.material == 4U);
 }
 
+void native_block_mesh_rotation_only_cycles_side_material_slots() {
+    map_editor::SblBlockMesh mesh{};
+    mesh.width = 1;
+    mesh.height = 1;
+    mesh.depth = 1;
+    map_editor::SblBlockFace face{
+        9U,
+        {
+            {0.0F, 0.0F, 0.0F},
+            {1.0F, 0.0F, 0.0F},
+            {1.0F, 1.0F, 0.0F},
+            {0.0F, 1.0F, 0.0F},
+        },
+        {},
+        false,
+        0x60000U,
+    };
+
+    const auto rotated_overlay = map_editor::rotate_block_face_native(mesh, face, 1);
+    assert(rotated_overlay.material == 9U);
+
+    face.material = 1U;
+    const auto rotated_side = map_editor::rotate_block_face_native(mesh, face, 1);
+    assert(rotated_side.material == 2U);
+}
+
 void tessellates_authored_sbl_patches() {
     const auto template_file = map_editor::parse_sbl_file(
         fixture_root() / "server/data/test2/block/garagerampcircular.sbl");
@@ -2257,6 +2283,8 @@ void parses_csx_fixture() {
     assert(archive.entries.size() == archive.entry_count);
     assert(archive.entries[0].name == "apartment01");
     assert(archive.entries[0].type == 0x585a0002);
+    // 0x585a0002 is a building .sbb (verified: parse_sbb succeeds on its bytes once
+    // the container sentinel version is normalized 1 -> 14).
     assert(archive.entries[0].kind == map_editor::CsxEntryKind::Sbb);
 
     bool has_sbl = false;
@@ -3069,6 +3097,7 @@ int main() {
     native_building_render_buffer_uses_generated_builtin_block_for_unresolved_piece_refs();
     native_block_mesh_catalog_seeds_builtin_blocks_before_file_blocks();
     native_block_rotation_uses_positive_rotated_bounds();
+    native_block_mesh_rotation_only_cycles_side_material_slots();
     tessellates_authored_sbl_patches();
     emits_sbl_v2_light_record_faces();
     patches_sbl_authored_patch_control_point();

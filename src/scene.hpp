@@ -299,7 +299,16 @@ BuildingRenderBuffer build_native_building_tool_preview_render_buffer(
 BuildingRenderBuffer build_native_portal_render_buffer(
     const SbcMap& map,
     const std::vector<NamedBlockMesh>& block_meshes,
-    std::optional<std::size_t> selected_portal = std::nullopt);
+    std::optional<std::size_t> selected_portal = std::nullopt,
+    // v10 maps (no city_blocks) resolve district piece words by index into the
+    // buildblock template catalog (sorted by name to match BuildblockCatalog_LoadAll).
+    // Pass the buildblock templates so those pieces can render; empty = skip them.
+    const std::vector<NamedBuildblockTemplate>& buildblock_templates = {},
+    // v10 per-cell face materials come from the legacy texture grid
+    // (portal.textures, 8 shorts per cell), each a texture index into this
+    // load-order name list (matching the texture set the game loads). Empty =
+    // flat/untextured v10 pieces.
+    const std::vector<std::string>& texture_names = {});
 // Returns the building cell hit by a world-space ray, nearest first, or nullopt.
 std::optional<CellPick> pick_building_cell(
     const SbbBuilding& building,

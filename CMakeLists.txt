@@ -70,6 +70,28 @@ if(NOT portable_file_dialogs_POPULATED)
   FetchContent_Populate(portable_file_dialogs)
 endif()
 
+# tinygltf ships tiny_gltf.h + json.hpp + stb_image{,_write}.h in its repo root;
+# header-only, used by src/mesh_export.cpp to write glTF.
+FetchContent_Declare(
+  tinygltf
+  URL https://github.com/syoyo/tinygltf/archive/refs/tags/v2.9.3.tar.gz
+)
+FetchContent_GetProperties(tinygltf)
+if(NOT tinygltf_POPULATED)
+  if(POLICY CMP0169)
+    cmake_policy(SET CMP0169 OLD)
+  endif()
+  FetchContent_Populate(tinygltf)
+endif()
+
+# nativefiledialog-extended: real native save/open dialogs (Cocoa NSSavePanel on
+# macOS) instead of pfd's unreliable osascript shell-out. Provides the `nfd` target.
+FetchContent_Declare(
+  nfd
+  URL https://github.com/btzy/nativefiledialog-extended/archive/refs/tags/v1.3.0.tar.gz
+)
+FetchContent_MakeAvailable(nfd)
+
 add_library(map_editor_core
   src/editor_state.cpp
   src/formats.cpp
@@ -84,14 +106,16 @@ target_compile_options(map_editor_core PRIVATE
 add_executable(map_editor_cpp
   src/app.cpp
   src/main.cpp
+  src/mesh_export.cpp
   src/render_gpu.cpp
   src/ui_panels.cpp
   src/viewport.cpp
 )
 target_include_directories(map_editor_cpp PRIVATE
   "${portable_file_dialogs_SOURCE_DIR}"
+  "${tinygltf_SOURCE_DIR}"
 )
-target_link_libraries(map_editor_cpp PRIVATE map_editor_core imgui_rlimgui raylib)
+target_link_libraries(map_editor_cpp PRIVATE map_editor_core imgui_rlimgui raylib nfd)
 target_compile_options(map_editor_cpp PRIVATE
   $<$<CXX_COMPILER_ID:MSVC>:/W4>
   $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>

@@ -349,6 +349,9 @@ struct EditorProject {
     std::size_t pending_gpu_upload_index{};
     std::vector<std::string> render_logs;
     std::string status;
+    // Per-file parse failures hit during load (e.g. an unsupported .sbb version).
+    // Collected instead of thrown so one bad asset never aborts the whole map.
+    std::vector<std::string> load_warnings;
     // Lazily-rendered 3D thumbnails for the template galleries, keyed by building
     // asset index. RenderTexture2D handles are owned here and freed on shutdown.
     std::vector<RenderTexture2D> building_thumbnails;
@@ -551,6 +554,7 @@ std::vector<const SbbBuilding*> resolve_placement_buildings(const EditorProject&
 std::optional<EditorProject> load_project_folder(const std::filesystem::path& folder, std::string& error);
 std::vector<NamedBlockMesh> block_meshes(const EditorProject& project);
 std::vector<NamedBuildblockTemplate> buildblock_templates(const EditorProject& project);
+std::vector<std::string> project_texture_names(const EditorProject& project);
 void write_file_bytes(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes);
 void set_status(EditorProject& project);
 
@@ -563,6 +567,9 @@ Texture2D load_city_window_gradient_texture();
 // nullptr when the project has no texture by that name. Used to show real texture
 // thumbnails in the material pickers instead of name strings.
 const Texture2D* texture_for_material(const EditorProject& project, std::string_view material_name);
+// Looks up a loaded project texture by material name (case-insensitive); nullptr if
+// absent. Shared with the mesh exporter.
+const Texture2D* find_project_texture(const EditorProject& project, std::string_view name);
 // Picks a material by clickable thumbnail grid (real texture when available, a
 // color tile otherwise). Edits selected in place; returns true on change.
 bool material_swatch_picker(const EditorProject& project, const char* id, const std::vector<std::string>& materials, std::size_t& selected);

@@ -1,14 +1,17 @@
 #include "app.hpp"
 #include "app_internal.hpp"
+#include "mesh_export.hpp"
 
 #include <raylib.h>
 #include <rlgl.h>
+#include <raymath.h>
 #include <imgui.h>
 #include <rlImGui.h>
 #include <extras/FA6FreeSolidFontData.h>
 #include <extras/IconsFontAwesome6.h>
 
 #include <portable-file-dialogs.h>
+#include <nfd.hpp>
 
 #include <algorithm>
 #include <array>
@@ -378,6 +381,22 @@ void add_texture_if_valid(EditorProject& project, std::string name, Texture2D te
     project.textures.emplace_back(std::move(name), texture);
 }
 
+void upsert_texture_if_valid(EditorProject& project, std::string name, Texture2D texture, std::unordered_map<std::string, std::size_t>& loaded_names) {
+    if (texture.id == 0U) {
+        return;
+    }
+
+    const auto key = lower_name(name);
+    configure_texture(texture);
+    if (const auto existing = loaded_names.find(key); existing != loaded_names.end()) {
+        project.textures[existing->second] = LoadedTexture{std::move(name), texture};
+        return;
+    }
+
+    loaded_names.emplace(key, project.textures.size());
+    project.textures.emplace_back(std::move(name), texture);
+}
+
 std::optional<Texture2D> load_embedded_png_texture(const std::vector<std::uint8_t>& payload) {
     if (payload.size() < 0x4cU || read_le_u32(payload, 0U) != 1U) {
         return std::nullopt;
@@ -397,11 +416,32 @@ std::optional<Texture2D> load_embedded_png_texture(const std::vector<std::uint8_
         return std::nullopt;
     }
 
+    // editor.exe LoadTexture_PNG_ToBuffer @14003ab40 writes each source row into
+    // dest row (height-1 - row), i.e. it flips PNGs vertically at load for OpenGL's
+    // bottom-left texture origin. Block UVs are authored against that flipped image,
+    // so raylib (which uploads PNG rows top-down) must flip too or every texture is
+    // upside-down. Only obvious on textures with vertical orientation (text/figures).
+    ImageFlipVertical(&image);
+
     Texture2D texture = LoadTextureFromImage(image);
     UnloadImage(image);
     if (texture.id == 0U) {
         return std::nullopt;
     }
+    return texture;
+}
+
+// Loose .png loaded the same way the editor does: decode, flip vertically to match
+// editor.exe's bottom-up write, then upload. Returns an id==0 texture on failure so
+// add_texture_if_valid skips it, matching the previous LoadTexture behavior.
+Texture2D load_flipped_png_texture(const std::filesystem::path& path) {
+    Image image = LoadImage(path.string().c_str());
+    if (!IsImageValid(image)) {
+        return Texture2D{};
+    }
+    ImageFlipVertical(&image);
+    Texture2D texture = LoadTextureFromImage(image);
+    UnloadImage(image);
     return texture;
 }
 
@@ -422,10 +462,10 @@ void load_project_textures(EditorProject& project) {
     std::unordered_map<std::string, std::size_t> loaded_names;
 
     for (const auto& path : files_with_extension(project.root / "texture", ".png")) {
-        add_texture_if_valid(project, stem_name(path), LoadTexture(path.string().c_str()), loaded_names);
+        add_texture_if_valid(project, stem_name(path), load_flipped_png_texture(path), loaded_names);
     }
     for (const auto& path : files_with_extension(project.root, ".png")) {
-        add_texture_if_valid(project, stem_name(path), LoadTexture(path.string().c_str()), loaded_names);
+        add_texture_if_valid(project, stem_name(path), load_flipped_png_texture(path), loaded_names);
     }
     for (const auto& path : files_with_extension(project.root, ".csx")) {
         const auto archive = parse_csx_file(path);
@@ -433,11 +473,8 @@ void load_project_textures(EditorProject& project) {
             if (entry.kind != CsxEntryKind::Texture) {
                 continue;
             }
-            if (loaded_names.contains(lower_name(entry.name))) {
-                continue;
-            }
             if (auto texture = load_embedded_png_texture(entry.payload)) {
-                add_texture_if_valid(project, entry.name, *texture, loaded_names);
+                upsert_texture_if_valid(project, entry.name, *texture, loaded_names);
             }
         }
     }
@@ -456,6 +493,49 @@ std::vector<std::filesystem::path> files_with_extension(const std::filesystem::p
     }
     std::ranges::sort(files);
     return files;
+}
+
+// A .csx-packed .sbb begins with the container version sentinel 1 (verified
+// against subrosa.exe SbbContainer_ReadWrite @00196d60, which hard-checks the
+// leading dword == 1), whereas a loose building/*.sbb begins with its real
+// version 12-14 (Sbb_LoadFromFile @00026830 gates `version - 12 < 3`). The packed
+// body is otherwise laid out exactly like a loose version-14 file: anchors at
+// +0x4c/+0x50/+0x54 and the trailing aux/LOD records are always present. So a
+// packed SBB is parsed by rewriting its leading sentinel to 14 and handing it to
+// the unchanged loose-file parser. Returns the payload unchanged when the leading
+// word is not the container sentinel (already a real loose-version file).
+std::vector<std::uint8_t> normalize_packed_sbb_bytes(const std::vector<std::uint8_t>& payload) {
+    constexpr std::uint32_t container_sentinel = 1U;
+    constexpr std::uint32_t loose_version_14 = 0x0eU;
+    if (payload.size() < 4U || read_le_u32(payload, 0U) != container_sentinel) {
+        return payload;
+    }
+    std::vector<std::uint8_t> normalized = payload;
+    normalized[0] = static_cast<std::uint8_t>(loose_version_14 & 0xFFU);
+    normalized[1] = static_cast<std::uint8_t>((loose_version_14 >> 8U) & 0xFFU);
+    normalized[2] = static_cast<std::uint8_t>((loose_version_14 >> 16U) & 0xFFU);
+    normalized[3] = static_cast<std::uint8_t>((loose_version_14 >> 24U) & 0xFFU);
+    return normalized;
+}
+
+// CSX-packed .sbl blocks/buildblocks carry the same container sentinel version 1,
+// but their body is the loose version-2 layout (with the trailing light/exterior
+// face section). parse_sbl only reads that section when version > 1, so a sentinel-1
+// block loses its exterior faces (renders as a single authored patch or nothing).
+// Rewrite the leading sentinel 1 -> 2 so the loose parser reads the full mesh.
+// Leaves real loose-version files (2) untouched.
+std::vector<std::uint8_t> normalize_packed_sbl_bytes(const std::vector<std::uint8_t>& payload) {
+    constexpr std::uint32_t container_sentinel = 1U;
+    constexpr std::uint32_t loose_version_2 = 2U;
+    if (payload.size() < 4U || read_le_u32(payload, 0U) != container_sentinel) {
+        return payload;
+    }
+    std::vector<std::uint8_t> normalized = payload;
+    normalized[0] = static_cast<std::uint8_t>(loose_version_2 & 0xFFU);
+    normalized[1] = 0U;
+    normalized[2] = 0U;
+    normalized[3] = 0U;
+    return normalized;
 }
 
 // Loads SBB buildings and SBL blocks/buildblocks packed inside .csx archives in
@@ -488,25 +568,40 @@ void load_project_csx_geometry(EditorProject& project) {
     };
 
     for (const auto& path : files_with_extension(project.root, ".csx")) {
-        const auto archive = parse_csx_file(path);
+        CsxArchive archive;
+        try {
+            archive = parse_csx_file(path);
+        } catch (const std::exception& error) {
+            project.load_warnings.push_back(path.filename().string() + ": " + error.what());
+            continue;
+        }
+
         for (const auto& entry : archive.entries) {
             const auto name = std::filesystem::path{entry.name}.stem().string();
             if (name.empty()) {
                 continue;
             }
 
-            if (entry.kind == CsxEntryKind::Sbb) {
-                upsert(project.buildings, project.building_bytes, name, path,
-                       parse_sbb(entry.payload), entry.payload);
-            } else if (entry.kind == CsxEntryKind::Sbl) {
-                auto parsed = parse_sbl(entry.payload);
-                if (parsed.block.has_value()) {
-                    upsert(project.blocks, project.block_bytes, name, path,
-                           *parsed.block, entry.payload);
-                } else if (!parsed.layers.empty()) {
-                    upsert(project.buildblocks, project.buildblock_bytes, name, path,
-                           std::move(parsed), entry.payload);
+            try {
+                if (entry.kind == CsxEntryKind::Sbb) {
+                    auto bytes = normalize_packed_sbb_bytes(entry.payload);
+                    auto building = parse_sbb(bytes);
+                    upsert(project.buildings, project.building_bytes, name, path,
+                           std::move(building), std::move(bytes));
+                } else if (entry.kind == CsxEntryKind::Sbl) {
+                    auto bytes = normalize_packed_sbl_bytes(entry.payload);
+                    auto parsed = parse_sbl(bytes);
+                    if (parsed.block.has_value()) {
+                        upsert(project.blocks, project.block_bytes, name, path,
+                               *parsed.block, std::move(bytes));
+                    } else if (!parsed.layers.empty()) {
+                        upsert(project.buildblocks, project.buildblock_bytes, name, path,
+                               std::move(parsed), std::move(bytes));
+                    }
                 }
+            } catch (const std::exception& error) {
+                project.load_warnings.push_back(
+                    path.filename().string() + " [" + name + "]: " + error.what());
             }
         }
     }
@@ -524,31 +619,49 @@ std::optional<EditorProject> load_project_folder(const std::filesystem::path& fo
 
     const auto city_path = root / "city2.sbc";
     if (std::filesystem::exists(city_path)) {
-        project.city_bytes = read_file_bytes(city_path);
-        project.city = LoadedAsset<SbcMap>{city_path, "city2", parse_sbc(*project.city_bytes)};
+        try {
+            project.city_bytes = read_file_bytes(city_path);
+            project.city = LoadedAsset<SbcMap>{city_path, "city2", parse_sbc(*project.city_bytes)};
+        } catch (const std::exception& error) {
+            project.city_bytes.reset();
+            project.city.reset();
+            project.load_warnings.push_back(city_path.filename().string() + ": " + error.what());
+        }
     }
 
     for (const auto& path : files_with_extension(root / "building", ".sbb")) {
-        auto bytes = read_file_bytes(path);
-        project.buildings.push_back({path, stem_name(path), parse_sbb(bytes)});
-        project.building_bytes.push_back(std::move(bytes));
+        try {
+            auto bytes = read_file_bytes(path);
+            project.buildings.push_back({path, stem_name(path), parse_sbb(bytes)});
+            project.building_bytes.push_back(std::move(bytes));
+        } catch (const std::exception& error) {
+            project.load_warnings.push_back(path.filename().string() + ": " + error.what());
+        }
     }
 
     for (const auto& path : files_with_extension(root / "block", ".sbl")) {
-        auto bytes = read_file_bytes(path);
-        auto parsed = parse_sbl(bytes);
-        if (parsed.block.has_value()) {
-            project.blocks.push_back({path, stem_name(path), *parsed.block});
-            project.block_bytes.push_back(std::move(bytes));
+        try {
+            auto bytes = read_file_bytes(path);
+            auto parsed = parse_sbl(bytes);
+            if (parsed.block.has_value()) {
+                project.blocks.push_back({path, stem_name(path), *parsed.block});
+                project.block_bytes.push_back(std::move(bytes));
+            }
+        } catch (const std::exception& error) {
+            project.load_warnings.push_back(path.filename().string() + ": " + error.what());
         }
     }
 
     for (const auto& path : files_with_extension(root / "buildblock", ".sbl")) {
-        auto bytes = read_file_bytes(path);
-        auto parsed = parse_sbl(bytes);
-        if (!parsed.layers.empty()) {
-            project.buildblocks.push_back({path, stem_name(path), std::move(parsed)});
-            project.buildblock_bytes.push_back(std::move(bytes));
+        try {
+            auto bytes = read_file_bytes(path);
+            auto parsed = parse_sbl(bytes);
+            if (!parsed.layers.empty()) {
+                project.buildblocks.push_back({path, stem_name(path), std::move(parsed)});
+                project.buildblock_bytes.push_back(std::move(bytes));
+            }
+        } catch (const std::exception& error) {
+            project.load_warnings.push_back(path.filename().string() + ": " + error.what());
         }
     }
 
@@ -565,6 +678,12 @@ std::optional<EditorProject> load_project_folder(const std::filesystem::path& fo
         + " (" + std::to_string(project.buildings.size()) + " buildings, "
         + std::to_string(project.blocks.size()) + " blocks, "
         + std::to_string(project.textures.size()) + " textures)";
+    if (!project.load_warnings.empty()) {
+        project.status += " | " + std::to_string(project.load_warnings.size()) + " skipped";
+        for (const auto& warning : project.load_warnings) {
+            project.render_logs.push_back("skipped " + warning);
+        }
+    }
     return project;
 }
 
@@ -584,6 +703,17 @@ std::vector<NamedBuildblockTemplate> buildblock_templates(const EditorProject& p
         templates.push_back({buildblock.name, buildblock.data});
     }
     return templates;
+}
+
+// Loaded texture names in load order. v10 district pieces index this list via the
+// legacy texture grid to resolve per-face materials.
+std::vector<std::string> project_texture_names(const EditorProject& project) {
+    std::vector<std::string> names;
+    names.reserve(project.textures.size());
+    for (const auto& texture : project.textures) {
+        names.push_back(texture.name);
+    }
+    return names;
 }
 
 void write_file_bytes(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes) {
@@ -650,6 +780,105 @@ std::vector<const SbbBuilding*> resolve_placement_buildings(const EditorProject&
         placement_buildings.push_back(asset == project.buildings.end() ? nullptr : &asset->data);
     }
     return placement_buildings;
+}
+
+// Suggested default .gltf output path for the active view, or empty with a reason
+// in `reason` when the current tab has nothing to export. No OS dialog (pfd's
+// osascript save dialog is unreliable on macOS); the path is chosen in-app.
+std::filesystem::path default_export_path(const EditorProject& project, const EditorUi& ui, std::string& reason) {
+    auto make_path = [&project](const std::string& name) {
+        const auto safe = name.empty() ? std::string("export") : name;
+        return project.root / (safe + ".gltf");
+    };
+
+    if (ui.tab == EditorTab::Buildings) {
+        if (project.buildings.empty()) {
+            reason = "no building loaded";
+            return {};
+        }
+        const auto index = std::min(ui.selected_building, project.buildings.size() - 1U);
+        return make_path(project.buildings[index].name.empty() ? "building" : project.buildings[index].name);
+    }
+    if (ui.tab == EditorTab::Blocks) {
+        if (project.blocks.empty()) {
+            reason = "no block loaded";
+            return {};
+        }
+        const auto index = std::min(ui.selected_block, project.blocks.size() - 1U);
+        return make_path(project.blocks[index].name.empty() ? "block" : project.blocks[index].name);
+    }
+    if (ui.tab == EditorTab::City) {
+        if (!project.city) {
+            reason = "no city loaded";
+            return {};
+        }
+        return make_path("city");
+    }
+    reason = "this view (switch to Buildings, Blocks, or City)";
+    return {};
+}
+
+// Exports the active view to glTF at an explicit path (no dialog). Builds the right
+// geometry and writes <path>.gltf + .bin + .png. Sets `status` to the result.
+void run_mesh_export(EditorProject& project, const EditorUi& ui, const std::filesystem::path& path,
+                     const ExportOptions& options, std::string& status) {
+    if (path.empty()) {
+        status = "Export: empty path.";
+        return;
+    }
+
+    if (ui.tab == EditorTab::Buildings) {
+        if (project.buildings.empty()) {
+            status = "Export: no building loaded.";
+            return;
+        }
+        const auto index = std::min(ui.selected_building, project.buildings.size() - 1U);
+        const auto& asset = project.buildings[index];
+        const auto blocks = block_meshes(project);
+        const auto templates = buildblock_templates(project);
+        const auto buffer = build_native_building_render_buffer(asset.data, blocks, templates);
+        status = export_building_to_gltf(path, buffer, asset.name, project, &asset.data.materials, options).message;
+        return;
+    }
+
+    if (ui.tab == EditorTab::Blocks) {
+        if (project.blocks.empty()) {
+            status = "Export: no block loaded.";
+            return;
+        }
+        const auto index = std::min(ui.selected_block, project.blocks.size() - 1U);
+        const auto& asset = project.blocks[index];
+        status = export_block_to_gltf(path, asset.data, asset.name, project).message;
+        return;
+    }
+
+    if (ui.tab == EditorTab::City) {
+        if (!project.city) {
+            status = "Export: no city loaded.";
+            return;
+        }
+        const auto placement_buildings = resolve_placement_buildings(project);
+        const auto blocks = block_meshes(project);
+        const auto templates = buildblock_templates(project);
+        const auto scene = build_map_scene(project.city->data, placement_buildings);
+        std::vector<BuildingRenderBuffer> placement_buffers;
+        placement_buffers.reserve(scene.buildings.size());
+        for (std::size_t i = 0; i < scene.buildings.size(); ++i) {
+            const SbbBuilding* sbb = i < placement_buildings.size() ? placement_buildings[i] : nullptr;
+            placement_buffers.push_back(
+                sbb == nullptr ? BuildingRenderBuffer{}
+                               : build_native_building_render_buffer(*sbb, blocks, templates));
+        }
+        // Piece/portal geometry (districts placed with the Piece tool), the same
+        // textured buffer the city view draws via the portal render model.
+        const auto piece_buffer = build_native_portal_render_buffer(
+            project.city->data, blocks, std::nullopt, templates, project_texture_names(project));
+        status = export_city_to_gltf(path, scene, placement_buffers, placement_buildings,
+                                     piece_buffer, project, options).message;
+        return;
+    }
+
+    status = "Export: this view has no mesh to export.";
 }
 
 // Launches a background rebuild of the city scene (roads + terrain field +
@@ -736,8 +965,42 @@ void draw_city_building_models_full_detail(
         return normalize(value, Vector3{0.0F, 0.0F, -1.0F});
     };
 
+    // Extract the 6 world-space frustum planes from the camera's view-projection
+    // matrix (Gribb-Hartmann), once per frame. A sphere is culled only when it is
+    // fully outside one plane, which is exact at every angle — no cone approximation
+    // like the previous hand-rolled test that blinked buildings out at grazing views.
+    struct Plane {
+        float a, b, c, d;
+    };
+    std::array<Plane, 6> frustum_planes{};
+    bool frustum_valid = false;
+    if (viewport_size.x > 0.0F && viewport_size.y > 0.0F) {
+        const auto aspect = viewport_size.x / viewport_size.y;
+        const auto view = GetCameraMatrix(camera);
+        const auto proj = MatrixPerspective(
+            camera.fovy * 0.017453292519943295,
+            static_cast<double>(aspect),
+            rlGetCullDistanceNear(),
+            rlGetCullDistanceFar());
+        const auto m = MatrixMultiply(view, proj);
+        // Rows of the view-proj give the planes; m is column-major in raylib's
+        // Matrix (m0,m4,m8,m12 = first column).
+        auto make = [](float a, float b, float c, float d) {
+            const auto len = std::sqrt(a * a + b * b + c * c);
+            const auto inv = len > 1e-8F ? 1.0F / len : 0.0F;
+            return Plane{a * inv, b * inv, c * inv, d * inv};
+        };
+        frustum_planes[0] = make(m.m3 + m.m0, m.m7 + m.m4, m.m11 + m.m8, m.m15 + m.m12);   // left
+        frustum_planes[1] = make(m.m3 - m.m0, m.m7 - m.m4, m.m11 - m.m8, m.m15 - m.m12);   // right
+        frustum_planes[2] = make(m.m3 + m.m1, m.m7 + m.m5, m.m11 + m.m9, m.m15 + m.m13);   // bottom
+        frustum_planes[3] = make(m.m3 - m.m1, m.m7 - m.m5, m.m11 - m.m9, m.m15 - m.m13);   // top
+        frustum_planes[4] = make(m.m3 + m.m2, m.m7 + m.m6, m.m11 + m.m10, m.m15 + m.m14);  // near
+        frustum_planes[5] = make(m.m3 - m.m2, m.m7 - m.m6, m.m11 - m.m10, m.m15 - m.m14);  // far
+        frustum_valid = true;
+    }
+
     auto visible_in_viewport = [&](const SbbBuilding& building, const SbcBuilding& placement) {
-        if (viewport_size.x <= 0.0F || viewport_size.y <= 0.0F) {
+        if (!frustum_valid) {
             return true;
         }
 
@@ -759,9 +1022,6 @@ void draw_city_building_models_full_detail(
             {min_x, max_y, max_z},
         }};
 
-        const auto forward = camera_forward();
-        const auto right = normalize(cross(forward, camera.up), Vector3{1.0F, 0.0F, 0.0F});
-        const auto up = normalize(cross(right, forward), Vector3{0.0F, 1.0F, 0.0F});
         Vector3 center{};
         std::array<Vector3, 8> world_corners{};
         std::size_t corner_index = 0;
@@ -784,24 +1044,14 @@ void draw_city_building_models_full_detail(
             radius = std::max(radius, std::sqrt(dx * dx + dy * dy + dz * dz));
         }
 
-        const Vector3 offset{
-            center.x - camera.position.x,
-            center.y - camera.position.y,
-            center.z - camera.position.z,
-        };
-        const auto depth = dot(offset, forward);
-        if (depth + radius <= 0.0F) {
-            return false;
+        // Cull only if the bounding sphere is fully on the outside of any plane.
+        for (const auto& p : frustum_planes) {
+            const auto distance = p.a * center.x + p.b * center.y + p.c * center.z + p.d;
+            if (distance < -radius) {
+                return false;
+            }
         }
-
-        constexpr auto degrees_to_radians = 0.017453292519943295F;
-        const auto tan_y = std::tan(camera.fovy * 0.5F * degrees_to_radians);
-        const auto tan_x = tan_y * (viewport_size.x / viewport_size.y);
-        const auto positive_depth = std::max(depth, 0.0F);
-        const auto horizontal = std::abs(dot(offset, right));
-        const auto vertical = std::abs(dot(offset, up));
-        return horizontal <= positive_depth * tan_x + radius &&
-            vertical <= positive_depth * tan_y + radius;
+        return true;
     };
 
     std::vector<DrawEntry> entries;
@@ -993,6 +1243,9 @@ void set_status(EditorProject& project) {
         std::to_string(project.buildings.size()) + " buildings | " +
         std::to_string(project.blocks.size()) + " blocks | " +
         std::to_string(project.buildblocks.size()) + " buildblocks";
+    if (!project.load_warnings.empty()) {
+        project.status += " | " + std::to_string(project.load_warnings.size()) + " skipped";
+    }
 }
 
 std::filesystem::path edited_city_path(const EditorProject& project) {
@@ -2996,6 +3249,34 @@ void draw_loading_overlay(EditorProject& project) {
     ImGui::End();
 }
 
+// Paints one standalone frame with a centered "Parsing <folder>..." message.
+// load_project_folder parses every asset synchronously on the main thread (and
+// uploads textures via the GPU), so it cannot move to a worker; presenting this
+// frame just before the blocking call gives the user a painted load screen
+// instead of a frozen/blank window during the parse.
+void present_parsing_frame(const std::filesystem::path& folder) {
+    BeginDrawing();
+    ClearBackground(DARKGRAY);
+    rlImGuiBegin();
+
+    const auto vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5F, vp->WorkPos.y + vp->WorkSize.y * 0.5F),
+                            ImGuiCond_Always, ImVec2(0.5F, 0.5F));
+    ImGui::SetNextWindowBgAlpha(0.92F);
+    if (ImGui::Begin("Parsing", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing)) {
+        ImGui::Text("Parsing %s...", folder.filename().string().c_str());
+        ImGui::Dummy(ImVec2(360.0F, 4.0F));
+        ImGui::TextDisabled("reading buildings, blocks, and archives");
+    }
+    ImGui::End();
+
+    rlImGuiEnd();
+    EndDrawing();
+}
+
 
 } // namespace map_editor::app_internal
 
@@ -3047,6 +3328,18 @@ int run_editor_app() {
     bool close_requested = false;
     bool open_unsaved_prompt = false;
 
+    // Deferred project load. A drag-drop / Open Folder sets pending_load_folder;
+    // the loop then presents one "Parsing..." frame before running the blocking
+    // synchronous parse, so the load screen actually paints instead of freezing
+    // on a blank window.
+    std::optional<std::filesystem::path> pending_load_folder;
+
+    // Mesh-export options dialog. Opened by File > Export Mesh; the popup shows a
+    // context-aware title + what-to-export checkboxes, then runs the native save
+    // dialog. Options persist across exports during the session.
+    bool open_export_popup = false;
+    ExportOptions export_options{};
+
     while (running) {
         gfx_debug_stats.reset_frame();
         gfx_debug_stats.push_frame_time(GetFrameTime() * 1000.0F);
@@ -3064,16 +3357,7 @@ int run_editor_app() {
         }
 
         if (auto folder = dropped_folder()) {
-            if (project) free_project_thumbnails(*project);
-            project = load_project_folder(*folder, status);
-            if (project) {
-                set_status(*project);
-                if (ui.tab == EditorTab::City) {
-                    focus_camera_on_city(camera, *project);
-                } else {
-                    camera = default_camera();
-                }
-            }
+            pending_load_folder = std::move(*folder);
         }
 
         static Vector2 viewport_mouse_pos = {0, 0};
@@ -3609,11 +3893,17 @@ int run_editor_app() {
 
         bool open_folder_requested = false;
         bool reset_layout_requested = false;
+        bool export_mesh_requested = false;
+        bool run_export_after_popup = false;
 
         if (ImGui::BeginMainMenuBar()) {
             if (ImGui::BeginMenu("File")) {
                 if (ImGui::MenuItem("Open Folder...", "Ctrl+O")) {
                     open_folder_requested = true;
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Export Mesh...", nullptr, false, project != std::nullopt)) {
+                    export_mesh_requested = true;
                 }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Exit", "Alt+F4")) {
@@ -4164,16 +4454,76 @@ int run_editor_app() {
         if (open_folder_requested) {
             auto result = pfd::select_folder("Open SRC map folder").result();
             if (!result.empty()) {
-                if (project) free_project_thumbnails(*project);
-                project = load_project_folder(result, status);
-                if (project) {
-                    set_status(*project);
-                    if (ui.tab == EditorTab::City) {
-                        focus_camera_on_city(camera, *project);
-                    } else {
-                        camera = default_camera();
-                    }
-                }
+                pending_load_folder = std::filesystem::path{result};
+            }
+        }
+
+        if (export_mesh_requested && project) {
+            std::string reason;
+            const auto default_path = default_export_path(*project, ui, reason);
+            if (default_path.empty()) {
+                status = "Export: " + reason + ".";
+            } else {
+                open_export_popup = true;
+            }
+        }
+        if (open_export_popup) {
+            ImGui::OpenPopup("Export Mesh");
+            open_export_popup = false;
+        }
+        if (project && ImGui::BeginPopupModal("Export Mesh", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            // Context-aware title + options for the active view.
+            const char* scope =
+                ui.tab == EditorTab::City ? "City" :
+                ui.tab == EditorTab::Buildings ? "Building" :
+                ui.tab == EditorTab::Blocks ? "Block" : "Mesh";
+            ImGui::Text("Export %s Mesh as glTF", scope);
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            if (ui.tab == EditorTab::City) {
+                ImGui::TextUnformatted("Include:");
+                ImGui::Checkbox("Buildings", &export_options.include_buildings);
+                ImGui::Checkbox("Pieces", &export_options.include_pieces);
+                ImGui::Checkbox("Terrain", &export_options.include_terrain);
+                ImGui::Checkbox("Roads / curbs", &export_options.include_roads);
+                ImGui::Checkbox("Window panes", &export_options.include_window_panes);
+            } else if (ui.tab == EditorTab::Buildings) {
+                ImGui::Checkbox("Window panes", &export_options.include_window_panes);
+            } else {
+                ImGui::TextDisabled("No options for this view.");
+            }
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            // Defer the native save dialog until after the popup finishes rendering;
+            // NFD blocks the main thread and must not run mid-ImGui-frame.
+            if (ImGui::Button("Export", ImVec2(120, 0))) {
+                run_export_after_popup = true;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
+        if (run_export_after_popup && project) {
+            std::string reason;
+            const auto default_path = default_export_path(*project, ui, reason);
+            // Native save dialog (NFD-e: Cocoa NSSavePanel on macOS, not osascript).
+            NFD::Guard nfd_guard;
+            NFD::UniquePath out_path;
+            const nfdnfilteritem_t filters[1] = {{"glTF", "gltf"}};
+            const auto default_dir = default_path.parent_path().string();
+            const auto default_name = default_path.filename().string();
+            const auto result = NFD::SaveDialog(
+                out_path, filters, 1, default_dir.c_str(), default_name.c_str());
+            if (result == NFD_OKAY) {
+                run_mesh_export(*project, ui, std::filesystem::path{out_path.get()}, export_options, status);
+            } else if (result == NFD_ERROR) {
+                status = std::string("Export: dialog error: ") + NFD::GetError();
             }
         }
 
@@ -4216,6 +4566,27 @@ int run_editor_app() {
         rlImGuiEnd();
         EndDrawing();
         g_gfx_debug_stats = nullptr;
+
+        // Run a deferred load now that the normal frame has been presented. Paint
+        // a dedicated "Parsing..." frame first so the screen shows progress, then
+        // run the blocking synchronous parse and apply the result.
+        if (pending_load_folder) {
+            const auto folder = *pending_load_folder;
+            pending_load_folder.reset();
+            present_parsing_frame(folder);
+            if (project) {
+                free_project_thumbnails(*project);
+            }
+            project = load_project_folder(folder, status);
+            if (project) {
+                set_status(*project);
+                if (ui.tab == EditorTab::City) {
+                    focus_camera_on_city(camera, *project);
+                } else {
+                    camera = default_camera();
+                }
+            }
+        }
     }
 
     if (project) {

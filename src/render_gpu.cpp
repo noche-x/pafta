@@ -56,27 +56,9 @@ Color lerp_color(Color from, Color to, float t) {
 }
 
 Texture2D load_city_window_gradient_texture() {
-    constexpr auto width = 32;
-    constexpr auto height = 96;
-    constexpr auto mullion_step_x = 8;
-    constexpr auto mullion_step_y = 16;
-    const auto bottom = Color{21, 39, 63, 255};
-    const auto top = Color{92, 205, 226, 255};
-    Image image = GenImageColor(width, height, bottom);
-    for (auto y = 0; y < height; ++y) {
-        const auto t = 1.0F - static_cast<float>(y) / static_cast<float>(height - 1);
-        for (auto x = 0; x < width; ++x) {
-            auto color = lerp_color(bottom, top, t);
-            if ((x % mullion_step_x) == 0 || (y % mullion_step_y) == 0) {
-                color = lerp_color(color, Color{8, 18, 30, 255}, 0.45F);
-            }
-            if (((x + y) % 19) == 0) {
-                color = lerp_color(color, Color{180, 238, 246, 255}, 0.18F);
-            }
-            ImageDrawPixel(&image, x, y, color);
-        }
-    }
-
+    // Flat mid-gray window surface (no gradient/mullions) to match the exported
+    // window planes.
+    Image image = GenImageColor(4, 4, Color{128, 128, 128, 255});
     auto texture = LoadTextureFromImage(image);
     if (texture.id != 0U) {
         SetTextureFilter(texture, TEXTURE_FILTER_BILINEAR);
@@ -431,6 +413,7 @@ const Texture2D* texture_for_buffer_material(const EditorProject& project, const
 
 float baked_directional_light(Vector3 normal);
 Color shade_color(Color base, float light);
+Shader scene_lit_shader();
 
 GpuBuildingMeshChunk upload_mesh_chunk(
     const BuildingRenderBuffer& buffer,
@@ -461,7 +444,9 @@ GpuBuildingMeshChunk upload_mesh_chunk(
         fallback.mesh.vertices = static_cast<float*>(MemAlloc(static_cast<unsigned int>(fallback.mesh.vertexCount * 3 * sizeof(float))));
         fallback.mesh.texcoords = static_cast<float*>(MemAlloc(static_cast<unsigned int>(fallback.mesh.vertexCount * 2 * sizeof(float))));
         fallback.mesh.colors = static_cast<unsigned char*>(MemAlloc(static_cast<unsigned int>(fallback.mesh.vertexCount * 4 * sizeof(unsigned char))));
-        if (fallback.mesh.vertices == nullptr || fallback.mesh.texcoords == nullptr || fallback.mesh.colors == nullptr) {
+        fallback.mesh.normals = static_cast<float*>(MemAlloc(static_cast<unsigned int>(fallback.mesh.vertexCount * 3 * sizeof(float))));
+        if (fallback.mesh.vertices == nullptr || fallback.mesh.texcoords == nullptr || fallback.mesh.colors == nullptr ||
+            fallback.mesh.normals == nullptr) {
             if (fallback.mesh.vertices != nullptr) {
                 MemFree(fallback.mesh.vertices);
             }
@@ -471,9 +456,13 @@ GpuBuildingMeshChunk upload_mesh_chunk(
             if (fallback.mesh.colors != nullptr) {
                 MemFree(fallback.mesh.colors);
             }
+            if (fallback.mesh.normals != nullptr) {
+                MemFree(fallback.mesh.normals);
+            }
             fallback.mesh.vertices = nullptr;
             fallback.mesh.texcoords = nullptr;
             fallback.mesh.colors = nullptr;
+            fallback.mesh.normals = nullptr;
             fallback.mesh.vertexCount = 0;
             fallback.mesh.triangleCount = 0;
             return fallback;
@@ -482,6 +471,7 @@ GpuBuildingMeshChunk upload_mesh_chunk(
         auto* out = fallback.mesh.vertices;
         auto* out_uv = fallback.mesh.texcoords;
         auto* out_color = fallback.mesh.colors;
+        auto* out_normal = fallback.mesh.normals;
         for (auto triangle_index = first_triangle; triangle_index < clamped_end; ++triangle_index) {
             const auto& triangle = buffer.triangles[triangle_index];
             std::array<RenderBufferVertex, 3> tri_vertices{};
@@ -508,6 +498,9 @@ GpuBuildingMeshChunk upload_mesh_chunk(
                 e1.x * e2.y - e1.y * e2.x,
             };
             const auto vertex_light = shade_color(WHITE, baked_directional_light(face_normal));
+            const auto fn_len = std::sqrt(face_normal.x * face_normal.x + face_normal.y * face_normal.y + face_normal.z * face_normal.z);
+            const auto fn_inv = fn_len > 1e-6F ? 1.0F / fn_len : 0.0F;
+            const Vector3 unit_normal{face_normal.x * fn_inv, face_normal.y * fn_inv, face_normal.z * fn_inv};
             for (const auto vertex_index : triangle.indices) {
                 const auto vertex = vertex_index < buffer.vertices.size()
                     ? buffer.vertices[vertex_index]
@@ -522,11 +515,15 @@ GpuBuildingMeshChunk upload_mesh_chunk(
                 *out_color++ = vertex_light.g;
                 *out_color++ = vertex_light.b;
                 *out_color++ = vertex_light.a;
+                *out_normal++ = unit_normal.x;
+                *out_normal++ = unit_normal.y;
+                *out_normal++ = unit_normal.z;
             }
         }
 
         UploadMesh(&fallback.mesh, false);
         fallback.material = LoadMaterialDefault();
+        fallback.material.shader = scene_lit_shader();
         fallback.material.maps[MATERIAL_MAP_DIFFUSE].color = native_material_color(material_id, false, window_material);
         if (texture != nullptr && texture->id != 0U) {
             fallback.material.maps[MATERIAL_MAP_DIFFUSE].texture = *texture;
@@ -540,11 +537,13 @@ GpuBuildingMeshChunk upload_mesh_chunk(
     std::vector<float> texcoords;
     std::vector<unsigned char> colors;
     std::vector<unsigned short> indices;
+    std::vector<float> normals;
     std::unordered_map<std::uint32_t, unsigned short> local_indices;
     std::vector<Vector3> vertex_normals(buffer.vertices.size());
     vertices.reserve(static_cast<std::size_t>(clamped_count) * 9U);
     texcoords.reserve(static_cast<std::size_t>(clamped_count) * 6U);
     colors.reserve(static_cast<std::size_t>(clamped_count) * 12U);
+    normals.reserve(static_cast<std::size_t>(clamped_count) * 9U);
     indices.reserve(static_cast<std::size_t>(clamped_count) * 3U);
     local_indices.reserve(static_cast<std::size_t>(clamped_count) * 3U);
 
@@ -599,6 +598,14 @@ GpuBuildingMeshChunk upload_mesh_chunk(
         colors.push_back(vertex_light.g);
         colors.push_back(vertex_light.b);
         colors.push_back(vertex_light.a);
+        // Per-pixel lighting normal (smoothed). The lit shader recomputes the same
+        // model from this; the baked color above stays as a per-vertex fallback.
+        const auto raw_n = source_index < vertex_normals.size() ? vertex_normals[source_index] : Vector3{0.0F, 1.0F, 0.0F};
+        const auto nlen = std::sqrt(raw_n.x * raw_n.x + raw_n.y * raw_n.y + raw_n.z * raw_n.z);
+        const auto inv = nlen > 1e-6F ? 1.0F / nlen : 0.0F;
+        normals.push_back(raw_n.x * inv);
+        normals.push_back(raw_n.y * inv);
+        normals.push_back(raw_n.z * inv);
         local_indices.emplace(source_index, local_index);
         return local_index;
     };
@@ -619,8 +626,10 @@ GpuBuildingMeshChunk upload_mesh_chunk(
     chunk.mesh.vertices = static_cast<float*>(MemAlloc(static_cast<unsigned int>(vertices.size() * sizeof(float))));
     chunk.mesh.texcoords = static_cast<float*>(MemAlloc(static_cast<unsigned int>(texcoords.size() * sizeof(float))));
     chunk.mesh.colors = static_cast<unsigned char*>(MemAlloc(static_cast<unsigned int>(colors.size() * sizeof(unsigned char))));
+    chunk.mesh.normals = static_cast<float*>(MemAlloc(static_cast<unsigned int>(normals.size() * sizeof(float))));
     chunk.mesh.indices = static_cast<unsigned short*>(MemAlloc(static_cast<unsigned int>(indices.size() * sizeof(unsigned short))));
-    if (chunk.mesh.vertices == nullptr || chunk.mesh.texcoords == nullptr || chunk.mesh.colors == nullptr || chunk.mesh.indices == nullptr) {
+    if (chunk.mesh.vertices == nullptr || chunk.mesh.texcoords == nullptr || chunk.mesh.colors == nullptr ||
+        chunk.mesh.normals == nullptr || chunk.mesh.indices == nullptr) {
         if (chunk.mesh.vertices != nullptr) {
             MemFree(chunk.mesh.vertices);
         }
@@ -630,12 +639,16 @@ GpuBuildingMeshChunk upload_mesh_chunk(
         if (chunk.mesh.colors != nullptr) {
             MemFree(chunk.mesh.colors);
         }
+        if (chunk.mesh.normals != nullptr) {
+            MemFree(chunk.mesh.normals);
+        }
         if (chunk.mesh.indices != nullptr) {
             MemFree(chunk.mesh.indices);
         }
         chunk.mesh.vertices = nullptr;
         chunk.mesh.texcoords = nullptr;
         chunk.mesh.colors = nullptr;
+        chunk.mesh.normals = nullptr;
         chunk.mesh.indices = nullptr;
         chunk.mesh.vertexCount = 0;
         chunk.mesh.triangleCount = 0;
@@ -645,10 +658,12 @@ GpuBuildingMeshChunk upload_mesh_chunk(
     std::ranges::copy(vertices, chunk.mesh.vertices);
     std::ranges::copy(texcoords, chunk.mesh.texcoords);
     std::ranges::copy(colors, chunk.mesh.colors);
+    std::ranges::copy(normals, chunk.mesh.normals);
     std::ranges::copy(indices, chunk.mesh.indices);
 
     UploadMesh(&chunk.mesh, false);
     chunk.material = LoadMaterialDefault();
+    chunk.material.shader = scene_lit_shader();
     chunk.material.maps[MATERIAL_MAP_DIFFUSE].color = native_material_color(material_id, false, window_material);
     if (texture != nullptr && texture->id != 0U) {
         chunk.material.maps[MATERIAL_MAP_DIFFUSE].texture = *texture;
@@ -666,31 +681,54 @@ GpuBuildingMeshChunk upload_mesh_chunk(
 // City slopes are shallow (1/16..1/7 grades, 3-8 degrees), so a physically
 // scaled term barely changes brightness; the horizontal normal components are
 // exaggerated before lighting so grades and terrain undulation actually read.
+// Hemisphere + key sun + fill light, returned as a single luminance multiplier so
+// it stays a drop-in for the baked-vertex-color path. Compared to the old single
+// sun + flat ambient floor, surfaces facing away from the sun now read by their
+// orientation (sky-vs-ground hemisphere) and a dim opposite fill keeps shadow
+// sides from going flat. Tuned so a flat up-facing ground reads ~1.0.
 float baked_directional_light(Vector3 normal) {
-    constexpr Vector3 sun{0.52F, 0.64F, 0.57F};  // ~40 degree elevation, off-axis
-    constexpr float ambient = 0.42F;
-    constexpr float slope_boost = 3.0F;
+    constexpr Vector3 sun{0.40F, 0.78F, 0.48F};   // key light, high and off-axis
+    constexpr Vector3 fill{-0.45F, 0.30F, -0.40F};  // dim fill, roughly opposite
+    constexpr float key_strength = 0.55F;
+    constexpr float fill_strength = 0.18F;
+    constexpr float sky_amount = 0.50F;   // hemisphere brightness facing up
+    constexpr float ground_amount = 0.30F;  // hemisphere brightness facing down
+    constexpr float slope_boost = 2.0F;
+
     const auto len = std::sqrt(normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
     if (len <= 0.0001F) {
         return 1.0F;
     }
     Vector3 n{normal.x / len, normal.y / len, normal.z / len};
-    // Backface culling is off and the terrain/tile top faces wind so their
-    // geometric normal points DOWN (e1xe2 = -Y). Lighting must treat these as
-    // up-facing, so flip any downward normal — otherwise every ground face
-    // clamps to the ambient floor and slopes read flat.
+    // Backface culling is off and ground top faces wind so their geometric normal
+    // points DOWN; treat those as up-facing so slopes read instead of clamping.
     if (n.y < 0.0F) {
         n = {-n.x, -n.y, -n.z};
     }
-    // Exaggerate tilt only for mostly-up faces (ground); walls keep their angle.
+    // Exaggerate tilt only for mostly-up faces (ground) so grade reads; walls keep
+    // their true angle.
+    Vector3 lit_n = n;
     if (n.y > 0.7F) {
-        n.x *= slope_boost;
-        n.z *= slope_boost;
-        const auto boosted = std::sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
-        n = {n.x / boosted, n.y / boosted, n.z / boosted};
+        lit_n.x *= slope_boost;
+        lit_n.z *= slope_boost;
+        const auto boosted = std::sqrt(lit_n.x * lit_n.x + lit_n.y * lit_n.y + lit_n.z * lit_n.z);
+        lit_n = {lit_n.x / boosted, lit_n.y / boosted, lit_n.z / boosted};
     }
-    const auto ndotl = n.x * sun.x + n.y * sun.y + n.z * sun.z;
-    return ambient + (1.0F - ambient) * std::max(0.0F, ndotl);
+
+    const auto sun_len = std::sqrt(sun.x * sun.x + sun.y * sun.y + sun.z * sun.z);
+    const auto fill_len = std::sqrt(fill.x * fill.x + fill.y * fill.y + fill.z * fill.z);
+    const auto ndotl = (lit_n.x * sun.x + lit_n.y * sun.y + lit_n.z * sun.z) / sun_len;
+    const auto ndotf = (lit_n.x * fill.x + lit_n.y * fill.y + lit_n.z * fill.z) / fill_len;
+
+    // Hemisphere ambient: lerp ground->sky by the up component (remapped 0..1).
+    const auto up = n.y * 0.5F + 0.5F;
+    const auto hemisphere = ground_amount + (sky_amount - ground_amount) * up;
+    // Wrapped diffuse (half-Lambert) on the key so the terminator is soft, not a
+    // hard cut to black on the shadow side.
+    const auto key = key_strength * std::max(0.0F, ndotl * 0.5F + 0.5F);
+    const auto fill_light = fill_strength * std::max(0.0F, ndotf);
+
+    return std::min(1.35F, hemisphere + key + fill_light);
 }
 
 Color shade_color(Color base, float light) {
@@ -856,6 +894,76 @@ MaskShader& mask_shader() {
         cache.loaded = true;
     }
     return cache;
+}
+
+// Per-pixel scene lighting: the same hemisphere + key sun + fill model as the
+// baked baked_directional_light, but evaluated per fragment from the interpolated
+// world normal so large faces shade smoothly instead of per-vertex. The vertex
+// color still arrives (used as ambient occlusion / tint); the fragment multiplies
+// texture * colDiffuse * vertexColor * light.
+struct LitShader {
+    Shader shader{};
+    bool loaded{false};
+};
+
+LitShader& lit_shader() {
+    static LitShader cache;
+    if (!cache.loaded) {
+        const char* vs =
+            "#version 330\n"
+            "in vec3 vertexPosition;\n"
+            "in vec2 vertexTexCoord;\n"
+            "in vec3 vertexNormal;\n"
+            "in vec4 vertexColor;\n"
+            "uniform mat4 mvp;\n"
+            "uniform mat4 matModel;\n"
+            "uniform mat4 matNormal;\n"
+            "out vec2 fragTexCoord;\n"
+            "out vec4 fragColor;\n"
+            "out vec3 fragNormal;\n"
+            "void main() {\n"
+            "    fragTexCoord = vertexTexCoord;\n"
+            "    fragColor = vertexColor;\n"
+            "    fragNormal = normalize((matNormal * vec4(vertexNormal, 0.0)).xyz);\n"
+            "    gl_Position = mvp * vec4(vertexPosition, 1.0);\n"
+            "}\n";
+        const char* fs =
+            "#version 330\n"
+            "in vec2 fragTexCoord;\n"
+            "in vec4 fragColor;\n"
+            "in vec3 fragNormal;\n"
+            "uniform sampler2D texture0;\n"
+            "uniform vec4 colDiffuse;\n"
+            "out vec4 finalColor;\n"
+            // Mirror baked_directional_light: hemisphere + half-Lambert key + fill.
+            "const vec3 SUN = normalize(vec3(0.40, 0.78, 0.48));\n"
+            "const vec3 FILL = normalize(vec3(-0.45, 0.30, -0.40));\n"
+            "void main() {\n"
+            "    vec3 n = normalize(fragNormal);\n"
+            "    if (n.y < 0.0) n = -n;\n"   // ground faces wind downward; treat as up
+            "    float up = n.y * 0.5 + 0.5;\n"
+            "    float hemisphere = mix(0.30, 0.50, up);\n"
+            "    float key = 0.55 * max(0.0, dot(n, SUN) * 0.5 + 0.5);\n"
+            "    float fill = 0.18 * max(0.0, dot(n, FILL));\n"
+            "    float light = min(1.35, hemisphere + key + fill);\n"
+            "    vec4 tex = texture(texture0, fragTexCoord);\n"
+            // The mesh vertex colors already bake the same light term; the shader
+            // recomputes it per-pixel from the normal, so DON'T multiply fragColor
+            // again or lighting would be applied twice (light^2).
+            "    finalColor = tex * colDiffuse * vec4(vec3(light), 1.0);\n"
+            "}\n";
+        cache.shader = LoadShaderFromMemory(vs, fs);
+        // matModel/matNormal are standard raylib locations; bind them so the shader
+        // gets the model + normal matrices for world-space normals.
+        cache.shader.locs[SHADER_LOC_MATRIX_MODEL] = GetShaderLocation(cache.shader, "matModel");
+        cache.shader.locs[SHADER_LOC_MATRIX_NORMAL] = GetShaderLocation(cache.shader, "matNormal");
+        cache.loaded = true;
+    }
+    return cache;
+}
+
+Shader scene_lit_shader() {
+    return lit_shader().shader;
 }
 
 struct MaskOutlineShader {
@@ -1395,11 +1503,13 @@ GpuBuildingRenderModel upload_portal_render_model(const BuildingRenderBuffer& bu
 
 GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool textured, std::optional<std::size_t> selected_portal) {
     const auto blocks = block_meshes(project);
+    const auto bb_templates = buildblock_templates(project);
+    const auto tex_names = project_texture_names(project);
     if (selected_portal.has_value()) {
         if (project.portal_preview_render_dirty ||
             project.portal_preview_render_textured != textured ||
             project.portal_preview_index != selected_portal) {
-            project.portal_preview_render_buffer = build_native_portal_render_buffer(project.city->data, blocks, selected_portal);
+            project.portal_preview_render_buffer = build_native_portal_render_buffer(project.city->data, blocks, selected_portal, bb_templates, tex_names);
             project.portal_preview_gpu_model = upload_portal_render_model(project.portal_preview_render_buffer, project, textured);
             project.portal_preview_index = selected_portal;
             project.portal_preview_render_textured = textured;
@@ -1415,11 +1525,13 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
         !project.portal_rebuild_in_progress) {
         const auto map = project.city->data;
         const auto blocks_copy = blocks;
+        const auto bb_copy = bb_templates;
+        const auto tex_copy = tex_names;
         project.portal_rebuild_in_progress = true;
         project.portal_render_dirty = false;
         project.portal_render_textured = textured;
-        project.portal_rebuild_future = std::async(std::launch::async, [map, blocks_copy]() {
-            return build_native_portal_render_buffer(map, blocks_copy);
+        project.portal_rebuild_future = std::async(std::launch::async, [map, blocks_copy, bb_copy, tex_copy]() {
+            return build_native_portal_render_buffer(map, blocks_copy, std::nullopt, bb_copy, tex_copy);
         });
     }
     if (project.portal_rebuild_future.has_value() &&
@@ -1731,8 +1843,10 @@ Model build_traffic_light_pole_model(float unit_size) {
     model.meshMaterial = reinterpret_cast<int*>(MemAlloc(static_cast<unsigned int>(boxes.size() * sizeof(int))));
     model.materials = static_cast<Material*>(MemAlloc(2 * sizeof(Material)));
     model.materials[0] = LoadMaterialDefault();
+    model.materials[0].shader = scene_lit_shader();
     model.materials[0].maps[MATERIAL_MAP_DIFFUSE].color = Color{40, 43, 45, 255};
     model.materials[1] = LoadMaterialDefault();
+    model.materials[1].shader = scene_lit_shader();
     model.materials[1].maps[MATERIAL_MAP_DIFFUSE].color = Color{205, 48, 38, 255};
 
     for (std::size_t index = 0; index < boxes.size(); ++index) {
