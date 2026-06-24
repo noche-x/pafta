@@ -1,4 +1,5 @@
 #include "app_internal.hpp"
+#include "profiler.hpp"
 
 #include <rlgl.h>
 #include <raymath.h>
@@ -126,6 +127,7 @@ void drain_render_build_progress(EditorProject& project) {
 }
 
 void start_async_render_buffer_rebuild(EditorProject& project) {
+    MAPED_PROFILE_FUNCTION();
     const auto buildings = project.buildings;
     const auto blocks = block_meshes(project);
     const auto templates = buildblock_templates(project);
@@ -146,6 +148,8 @@ void start_async_render_buffer_rebuild(EditorProject& project) {
     append_render_log(project, "render build queued: " + std::to_string(buildings.size()) + " buildings");
 
     project.render_build_future = std::async(std::launch::async, [buildings, blocks, templates, generation, progress]() {
+        MAPED_PROFILE_THREAD("Building render rebuild");
+        MAPED_PROFILE_BLOCK("build async building render buffers");
         using Clock = std::chrono::steady_clock;
         RenderBuildResult result;
         result.generation = generation;
@@ -202,6 +206,7 @@ void accept_render_build_result(EditorProject& project, RenderBuildResult result
 }
 
 void upload_next_pending_building(EditorProject& project) {
+    MAPED_PROFILE_FUNCTION();
     if (project.pending_gpu_upload_indices.empty()) {
         return;
     }
@@ -239,6 +244,7 @@ void invalidate_portal_render_models(EditorProject& project) {
 }
 
 void service_render_rebuild(EditorProject& project) {
+    MAPED_PROFILE_FUNCTION();
     if (project.render_buffers_dirty && !project.render_build_in_progress) {
         start_async_render_buffer_rebuild(project);
     }
@@ -1502,15 +1508,27 @@ GpuBuildingRenderModel upload_portal_render_model(const BuildingRenderBuffer& bu
 }
 
 GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool textured, std::optional<std::size_t> selected_portal) {
+    MAPED_PROFILE_FUNCTION();
+    MAPED_PROFILE_BLOCK("portal_render_model collect block meshes");
     const auto blocks = block_meshes(project);
+    MAPED_PROFILE_END_BLOCK;
+    MAPED_PROFILE_BLOCK("portal_render_model collect buildblock templates");
     const auto bb_templates = buildblock_templates(project);
-    const auto tex_names = project_texture_names(project);
+    MAPED_PROFILE_END_BLOCK;
+    // v10 district pieces index the game's absolute texture table (built-ins +
+    // CSX in archive order), not the editor's load order — see
+    // project_grid_texture_names.
+    MAPED_PROFILE_BLOCK("portal_render_model collect grid texture names");
+    const auto tex_names = project_grid_texture_names(project);
+    MAPED_PROFILE_END_BLOCK;
     if (selected_portal.has_value()) {
         if (project.portal_preview_render_dirty ||
             project.portal_preview_render_textured != textured ||
             project.portal_preview_index != selected_portal) {
+            MAPED_PROFILE_BLOCK("portal_render_model rebuild selected portal preview");
             project.portal_preview_render_buffer = build_native_portal_render_buffer(project.city->data, blocks, selected_portal, bb_templates, tex_names);
             project.portal_preview_gpu_model = upload_portal_render_model(project.portal_preview_render_buffer, project, textured);
+            MAPED_PROFILE_END_BLOCK;
             project.portal_preview_index = selected_portal;
             project.portal_preview_render_textured = textured;
             project.portal_preview_render_dirty = false;
@@ -1523,6 +1541,7 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
     // placing a piece never blocks the frame.
     if ((project.portal_render_dirty || project.portal_render_textured != textured) &&
         !project.portal_rebuild_in_progress) {
+        MAPED_PROFILE_BLOCK("portal_render_model queue async rebuild");
         const auto map = project.city->data;
         const auto blocks_copy = blocks;
         const auto bb_copy = bb_templates;
@@ -1531,15 +1550,20 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
         project.portal_render_dirty = false;
         project.portal_render_textured = textured;
         project.portal_rebuild_future = std::async(std::launch::async, [map, blocks_copy, bb_copy, tex_copy]() {
+            MAPED_PROFILE_THREAD("Portal render rebuild");
+            MAPED_PROFILE_BLOCK("build async portal render buffer");
             return build_native_portal_render_buffer(map, blocks_copy, std::nullopt, bb_copy, tex_copy);
         });
+        MAPED_PROFILE_END_BLOCK;
     }
     if (project.portal_rebuild_future.has_value() &&
         project.portal_rebuild_future->wait_for(std::chrono::milliseconds{0}) == std::future_status::ready) {
+        MAPED_PROFILE_BLOCK("portal_render_model adopt async rebuild");
         project.portal_render_buffer = project.portal_rebuild_future->get();
         project.portal_rebuild_future.reset();
         project.portal_rebuild_in_progress = false;
         project.portal_gpu_model = upload_portal_render_model(project.portal_render_buffer, project, textured);
+        MAPED_PROFILE_END_BLOCK;
     }
     return project.portal_gpu_model;
 }

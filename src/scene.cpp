@@ -1,5 +1,8 @@
 #include "scene.hpp"
 
+#include "buildblock_catalog.hpp"
+#include "profiler.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -260,14 +263,21 @@ std::vector<const NamedBuildblockTemplate*> district_buildblock_catalog_order(
     return ordered;
 }
 
-const SblTemplate* resolve_district_buildblock_by_index(
-    const std::vector<NamedBuildblockTemplate>& templates,
-    std::uint32_t catalog_index) {
-    const auto ordered = district_buildblock_catalog_order(templates);
-    if (catalog_index >= ordered.size()) {
+// The real v10 render catalog is g_buildblockTemplateCatalog, built procedurally
+// by Buildblock_InitTemplateMeshCatalog @0x10110 (curbs, railings, beams baked in
+// 4 Y rotations), NOT the loose buildblock/*.sbl files. Build it once and reuse.
+// A district piece word indexes this by (word & 0xffff). An empty entry (vertex/
+// face count 0) renders nothing, exactly as the native instancing loop does.
+const SblBlockMesh* resolve_district_procedural_mesh(std::uint32_t catalog_index) {
+    static const std::vector<BuildblockCatalogEntry> catalog = build_native_builtin_catalog();
+    if (catalog_index >= catalog.size()) {
         return nullptr;
     }
-    return &ordered[catalog_index]->template_file;
+    const auto& mesh = catalog[catalog_index].mesh;
+    if (mesh.faces.empty()) {
+        return nullptr;
+    }
+    return &mesh;
 }
 
 const SbbCell* find_cell_at(const std::vector<SbbCell>& cells, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
@@ -1801,30 +1811,6 @@ void place_native_intersection_tiles(
     }
 }
 
-// Districts pave their piece cells with the same drivable asphalt surface the
-// streets use: the burger/parking-plaza fill on the round map is district paving,
-// not street tiles. The dominant `_null` piece (and the out-of-range index-20
-// piece) carry no mesh in the binary, so their visible surface is the road plane
-// at the cell's level. We lay an asphalt Road tile at every piece-class
-// (0x80000000) district cell at native_road_surface_y(level) so these plazas read
-// as paved like in-game. Solid (0x40000000) cells already render their own
-// asphalt cube via the portal buffer, so they are not paved here (avoids a
-// double surface). Pieces that DO carry mesh geometry render their block on top.
-void place_district_paving_tiles(CityTileMap& tiles, const SbcMap& map) {
-    for (const auto& portal : map.portals) {
-        const auto& voxels = portal.voxel_blocks();
-        const auto block_count = std::min<std::size_t>(voxels.size(), 0x200);
-        for (std::size_t voxel_index = 0; voxel_index < block_count; ++voxel_index) {
-            if ((voxels[voxel_index] & 0xe0000000U) != 0x80000000U) {
-                continue;
-            }
-            const auto x = portal.fields[1] * 8 + static_cast<std::int32_t>(voxel_index & 7U);
-            const auto z = portal.fields[3] * 8 + static_cast<std::int32_t>((voxel_index >> 3U) & 7U);
-            const auto level = portal.fields[2] * 8 + static_cast<std::int32_t>((voxel_index >> 6U) & 7U);
-            set_city_tile(tiles, x, level, z, CityTileKind::Road, native_road_surface_y(level));
-        }
-    }
-}
 
 } // namespace
 
@@ -2207,7 +2193,6 @@ void apply_native_city_terrain_patch(
 }
 
 std::vector<CityTileCell> build_city_tile_cells(
-    const SbcMap& map,
     const NativeCityGraph& graph,
     CityCornerStampMap& stamps) {
     CityTileMap tile_map;
@@ -2217,9 +2202,10 @@ std::vector<CityTileCell> build_city_tile_cells(
     for (const auto& intersection : graph.intersections) {
         place_native_intersection_tiles(tile_map, graph, intersection);
     }
-    // District paving overlays the street tiles: non-empty district cells become
-    // drivable asphalt (e.g. the round map's elevated parking/burger plazas).
-    place_district_paving_tiles(tile_map, map);
+    // District piece cells are no longer paved here: the v10 portal render path
+    // emits each district piece's own catalog mesh (g_buildblockTemplateCatalog[
+    // word & 0xffff]), so idx-0 plaza cells render their curb top-plate exactly as
+    // the binary does — there is no separate asphalt overlay in the native editor.
 
     std::vector<CityTileCell> tiles;
     tiles.reserve(tile_map.size());
@@ -2382,14 +2368,38 @@ std::optional<CityTerrain> build_city_terrain(
     // (sitting at the same patched level as the road tops) z-fights the road on
     // the lowest, flattest blocks. Build a covered-cell set so terrain quads
     // fully under tiles are skipped.
-    // tile_cells includes district piece paving (place_district_paving_tiles), so
-    // terrain is carved under those plazas. District solid cells aren't paved (they
-    // render their own cube), so carve terrain under them here too — otherwise the
-    // terrain mesh buries the flat asphalt slabs.
+    // District piece cells are no longer paved (they render their own catalog
+    // mesh), so the carve below covers only street/curb tiles. District solid
+    // cells render their own cube, so carve terrain under them here too —
+    // otherwise the terrain mesh buries the flat asphalt slabs.
     std::unordered_set<std::uint64_t> covered_cells;
     covered_cells.reserve(tile_cells.size());
     for (const auto& tile : tile_cells) {
         covered_cells.insert(CityCornerStampMap::key(tile.x, tile.z));
+    }
+    // Only SINGLETON solid cells render (build_native_portal_render_buffer culls
+    // stacked foundation walls), so only carve terrain under singletons. Carving
+    // under the culled stacks would punch holes in the ground with nothing behind
+    // them. Match the render's cull: a solid with another solid directly above or
+    // below is part of a stack and is neither drawn nor carved.
+    std::unordered_set<std::uint64_t> solid_cell_coords;
+    const auto solid_key3 = [](std::int32_t x, std::int32_t y, std::int32_t z) {
+        return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 42) |
+               (static_cast<std::uint64_t>(static_cast<std::uint32_t>(y) & 0x1fffffU) << 21) |
+               static_cast<std::uint64_t>(static_cast<std::uint32_t>(z) & 0x1fffffU);
+    };
+    for (const auto& portal : map.portals) {
+        const auto& voxels = portal.voxel_blocks();
+        const auto block_count = std::min<std::size_t>(voxels.size(), 0x200);
+        for (std::size_t voxel_index = 0; voxel_index < block_count; ++voxel_index) {
+            if ((voxels[voxel_index] & 0xe0000000U) != 0x40000000U) {
+                continue;
+            }
+            const auto sx = portal.fields[1] * 8 + static_cast<std::int32_t>(voxel_index & 7U);
+            const auto sz = portal.fields[3] * 8 + static_cast<std::int32_t>((voxel_index >> 3U) & 7U);
+            const auto sy = portal.fields[2] * 8 + static_cast<std::int32_t>((voxel_index >> 6U) & 7U);
+            solid_cell_coords.insert(solid_key3(sx, sy, sz));
+        }
     }
     for (const auto& portal : map.portals) {
         const auto& voxels = portal.voxel_blocks();
@@ -2400,6 +2410,11 @@ std::optional<CityTerrain> build_city_terrain(
             }
             const auto gx = portal.fields[1] * 8 + static_cast<std::int32_t>(voxel_index & 7U);
             const auto gz = portal.fields[3] * 8 + static_cast<std::int32_t>((voxel_index >> 3U) & 7U);
+            const auto gy = portal.fields[2] * 8 + static_cast<std::int32_t>((voxel_index >> 6U) & 7U);
+            if (solid_cell_coords.contains(solid_key3(gx, gy + 1, gz)) ||
+                solid_cell_coords.contains(solid_key3(gx, gy - 1, gz))) {
+                continue;
+            }
             covered_cells.insert(CityCornerStampMap::key(gx, gz));
         }
     }
@@ -2692,6 +2707,7 @@ BuildingRenderBuffer build_native_building_render_buffer(
     const SbbBuilding& building,
     const std::vector<NamedBlockMesh>& block_meshes,
     const std::vector<NamedBuildblockTemplate>& buildblock_templates) {
+    MAPED_PROFILE_FUNCTION();
     BuildingRenderBuffer buffer;
     const auto unit_size = buffer.unit_size;
     VertexIndexMap vertex_indices;
@@ -2881,14 +2897,53 @@ BuildingRenderBuffer build_native_portal_render_buffer(
     const SbcMap& map,
     const std::vector<NamedBlockMesh>& block_meshes,
     std::optional<std::size_t> selected_portal,
-    const std::vector<NamedBuildblockTemplate>& buildblock_templates,
+    [[maybe_unused]] const std::vector<NamedBuildblockTemplate>& buildblock_templates,
     const std::vector<std::string>& texture_names) {
+    MAPED_PROFILE_FUNCTION();
     BuildingRenderBuffer buffer;
     VertexIndexMap vertex_indices;
 
     auto layer_slot_material = [&](const SbcCityBlock& city_block, std::size_t layer_index, std::uint32_t slot) {
         return material_id_for_name(buffer, city_block_layer_slot_name(city_block, layer_index, slot));
     };
+
+    // v10 district SOLID (0x40000000) cells are buried world fill. The game never
+    // draws the vertical STACKS of them (foundation walls, up to 5 cells deep at
+    // Y=6..10) — they sit below the ground and the terrain hides them. The editor
+    // drew every cell as an opaque cube, so those buried stacks showed up as black
+    // walls in 3D (and were absent from the 2D preview — the tell). A SINGLE solid
+    // cell standing alone in its column is a real flat asphalt slab (the plaza /
+    // road-end pieces) and still renders. So: cull a solid that has another solid
+    // directly above or below it (i.e. it belongs to a stack); keep singletons.
+    // Precompute solid coordinates so the render loop can test vertical neighbors.
+    std::unordered_set<std::uint64_t> solid_cell_coords;
+    // Any occupied (non-empty) district cell, used to detect a solid buried under a
+    // piece (e.g. the Y=11 solid support directly below a Y=12 railing piece). The
+    // game culls the buried solid's faces against the piece/sidewalk above it; the
+    // editor must skip it too or it z-fights the sidewalk tile.
+    std::unordered_set<std::uint64_t> occupied_cell_coords;
+    const auto solid_key = [](std::int32_t x, std::int32_t y, std::int32_t z) {
+        return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 42) |
+               (static_cast<std::uint64_t>(static_cast<std::uint32_t>(y) & 0x1fffffU) << 21) |
+               static_cast<std::uint64_t>(static_cast<std::uint32_t>(z) & 0x1fffffU);
+    };
+    for (const auto& portal : map.portals) {
+        const auto& portal_voxels = portal.voxel_blocks();
+        const auto portal_count = std::min<std::size_t>(portal_voxels.size(), 0x200);
+        for (std::size_t vi = 0; vi < portal_count; ++vi) {
+            const auto cell_word = portal_voxels[vi];
+            if (cell_word == 0U) {
+                continue;
+            }
+            const auto sx = portal.fields[1] * 8 + static_cast<std::int32_t>(vi & 7U);
+            const auto sz = portal.fields[3] * 8 + static_cast<std::int32_t>((vi >> 3U) & 7U);
+            const auto sy = portal.fields[2] * 8 + static_cast<std::int32_t>((vi >> 6U) & 7U);
+            occupied_cell_coords.insert(solid_key(sx, sy, sz));
+            if ((cell_word & 0xe0000000U) == 0x40000000U) {
+                solid_cell_coords.insert(solid_key(sx, sy, sz));
+            }
+        }
+    }
 
     for (std::size_t portal_index = 0; portal_index < map.portals.size(); ++portal_index) {
         if (selected_portal.has_value() && portal_index != *selected_portal) {
@@ -2931,14 +2986,37 @@ BuildingRenderBuffer build_native_portal_render_buffer(
                 const auto cell_class = word & 0xe0000000U;
                 const auto grid_material = [&](std::size_t slot) {
                     const auto grid_base = voxel_index * 8U + std::min<std::size_t>(slot, 7U);
-                    const auto tex_idx = grid_base < portal.textures.size()
+                    auto tex_idx = grid_base < portal.textures.size()
                         ? static_cast<std::size_t>(portal.textures[grid_base])
                         : 0U;
+                    // An unset grid slot stores 0xffff; BuildCellRenderGeometryAndAdjacency
+                    // @0xc4c0 replaces such entries with the default texture rather than
+                    // leaving them unbound. Procedural pieces (railings/curbs) carry no
+                    // per-face texture, so every slot is unset -> fall back to texture 0
+                    // instead of an empty name (which renders black).
+                    if (tex_idx >= texture_names.size()) {
+                        tex_idx = 0U;
+                    }
                     const auto name = tex_idx < texture_names.size() ? texture_names[tex_idx] : std::string{};
                     return material_id_for_name(buffer, name);
                 };
 
                 if (cell_class == 0x40000000U) {
+                    // Cull buried solids; keep singleton slabs (flat plaza/road-end
+                    // pieces). A solid is buried when:
+                    //  - another solid sits directly above OR below it (a vertical
+                    //    foundation-wall stack the game never draws), or
+                    //  - ANY district cell sits directly above it (e.g. the Y=11
+                    //    solid support under a Y=12 railing piece) — the game hides it
+                    //    behind the piece + sidewalk, so drawing it z-fights the tile.
+                    const auto cell_x = portal.fields[1] * 8 + local_x;
+                    const auto cell_y = portal.fields[2] * 8 + local_y;
+                    const auto cell_z = portal.fields[3] * 8 + local_z;
+                    if (solid_cell_coords.contains(solid_key(cell_x, cell_y + 1, cell_z)) ||
+                        solid_cell_coords.contains(solid_key(cell_x, cell_y - 1, cell_z)) ||
+                        occupied_cell_coords.contains(solid_key(cell_x, cell_y + 1, cell_z))) {
+                        continue;
+                    }
                     add_native_city_block_solid_cell(
                         buffer,
                         vertex_indices,
@@ -2951,17 +3029,23 @@ BuildingRenderBuffer build_native_portal_render_buffer(
 
                 if (cell_class == 0x80000000U) {
                     const auto catalog_index = static_cast<std::uint32_t>(word & 0xffffU);
-                    const auto* template_file =
-                        resolve_district_buildblock_by_index(buildblock_templates, catalog_index);
-                    if (template_file == nullptr || !template_file->block.has_value()) {
+                    const auto* mesh = resolve_district_procedural_mesh(catalog_index);
+                    if (mesh == nullptr) {
                         continue;
                     }
+                    // BuildCellRenderGeometryAndAdjacency @0xc4c0 copies the catalog
+                    // mesh's vertices with translation only — it does NOT rotate the
+                    // piece geometry by the cell's (word>>24)&3 rotation (that field
+                    // only rotates the per-quad UV/material slot at render time, plus
+                    // the four pre-rotated catalog ids the map may reference directly).
+                    // So render the catalog mesh as authored (rotation 0); the
+                    // material slot still comes from the cell's 8-short texture grid.
                     add_rotated_block_mesh_to_buffer(
                         buffer,
                         vertex_indices,
-                        *template_file->block,
+                        *mesh,
                         origin,
-                        rotation,
+                        0,
                         [&](BuildingRenderBuffer&, const SblBlockFace&, const NativeRotatedBlockFace& rotated_face) {
                             return grid_material(rotated_face.material);
                         });
@@ -3563,6 +3647,7 @@ MapScene build_map_scene(const SbcMap& map) {
 }
 
 MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*>& placement_buildings) {
+    MAPED_PROFILE_FUNCTION();
     MapScene scene;
     // Native build order (World_LoadMapAndInitializeTerrain @56980): street
     // graph, then street/intersection tiles, district/piece cells, and building
@@ -3570,7 +3655,7 @@ MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*
     // expansion, then the terrain rebuild with its patches.
     auto graph = build_native_city_graph(map);
     CityCornerStampMap corner_stamps;
-    scene.city_tiles = build_city_tile_cells(map, graph, corner_stamps);
+    scene.city_tiles = build_city_tile_cells(graph, corner_stamps);
     stamp_city_portal_cells(corner_stamps, map);
     stamp_city_building_footprints(corner_stamps, map, placement_buildings);
     scene.traffic_light_poles = build_city_traffic_light_poles(graph, scene.unit_size);

@@ -10,6 +10,11 @@ CMakeUserPresets.json
 # Runtime-generated UI layout
 imgui.ini
 
+# Profiler output (easy_profiler dumps / flamegraph collapsed stacks)
+captures/
+*.collapsed
+*.prof
+
 # Editor/OS cruft
 .DS_Store
 *.swp

@@ -49,6 +49,23 @@ ctest --preset dev
 ```
 
 If raylib is not installed, CMake fetches raylib `5.5` from its release archive.
+Profiling is opt-in:
+
+```bash
+cmake --preset dev -DMAP_EDITOR_CPP_ENABLE_PROFILER=ON
+cmake --build --preset dev --parallel
+```
+
+When enabled, CMake fetches pinned `yse/easy_profiler` source, the editor starts
+the easy_profiler listener on the default port `28077`, and scoped blocks cover
+project loading, scene/render-buffer rebuilds, GPU upload pacing, export, and
+the main frame loop. Connect with easy_profiler's GUI to start/stop captures.
+For a GUI-free capture, set `MAPED_PROFILE_OUT` and quit the editor normally:
+
+```bash
+MAPED_PROFILE_OUT=captures/maped.prof ./build/dev/map_editor_cpp
+./build/easy_profiler_gui_v2_1_0/bin/profiler_converter captures/maped.prof captures/maped.json
+```
 
 On Windows with Visual Studio, use the `dev-msvc` preset instead. The CTest suite expects this folder to live in the SRC workspace layout, with `server/data/test2` available one directory above `map_editor_cpp`. The root workflow `.github/workflows/map_editor_cpp.yml` runs the `ci`/`ci-msvc` preset gate on macOS, Ubuntu, and Windows.
 

@@ -559,6 +559,7 @@ std::optional<EditorProject> load_project_folder(const std::filesystem::path& fo
 std::vector<NamedBlockMesh> block_meshes(const EditorProject& project);
 std::vector<NamedBuildblockTemplate> buildblock_templates(const EditorProject& project);
 std::vector<std::string> project_texture_names(const EditorProject& project);
+std::vector<std::string> project_grid_texture_names(const EditorProject& project);
 void write_file_bytes(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes);
 void set_status(EditorProject& project);
 

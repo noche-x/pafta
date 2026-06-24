@@ -1,6 +1,7 @@
 #include "app.hpp"
 #include "app_internal.hpp"
 #include "mesh_export.hpp"
+#include "profiler.hpp"
 
 #include <raylib.h>
 #include <rlgl.h>
@@ -459,6 +460,7 @@ const Texture2D* texture_for_material(const EditorProject& project, std::string_
 }
 
 void load_project_textures(EditorProject& project) {
+    MAPED_PROFILE_FUNCTION();
     std::unordered_map<std::string, std::size_t> loaded_names;
 
     for (const auto& path : files_with_extension(project.root / "texture", ".png")) {
@@ -548,6 +550,7 @@ std::vector<std::uint8_t> normalize_packed_sbl_bytes(const std::vector<std::uint
 // its parallel *_bytes vector index-aligned (placement resolution and the SBB
 // patch/rebuild writers index them together).
 void load_project_csx_geometry(EditorProject& project) {
+    MAPED_PROFILE_FUNCTION();
     // Upserts data + raw bytes keyed by lowercased stem, preserving index
     // alignment between the asset vector and its parallel bytes vector.
     const auto upsert = [](auto& assets, auto& bytes_list, const std::string& name,
@@ -608,6 +611,7 @@ void load_project_csx_geometry(EditorProject& project) {
 }
 
 std::optional<EditorProject> load_project_folder(const std::filesystem::path& folder, std::string& error) {
+    MAPED_PROFILE_FUNCTION();
     const auto root = std::filesystem::weakly_canonical(folder);
     if (!std::filesystem::is_directory(root)) {
         error = "not a folder: " + root.string();
@@ -619,6 +623,7 @@ std::optional<EditorProject> load_project_folder(const std::filesystem::path& fo
 
     const auto city_path = root / "city2.sbc";
     if (std::filesystem::exists(city_path)) {
+        MAPED_PROFILE_BLOCK("load city2.sbc");
         try {
             project.city_bytes = read_file_bytes(city_path);
             project.city = LoadedAsset<SbcMap>{city_path, "city2", parse_sbc(*project.city_bytes)};
@@ -627,8 +632,10 @@ std::optional<EditorProject> load_project_folder(const std::filesystem::path& fo
             project.city.reset();
             project.load_warnings.push_back(city_path.filename().string() + ": " + error.what());
         }
+        MAPED_PROFILE_END_BLOCK;
     }
 
+    MAPED_PROFILE_BLOCK("load loose building sbb");
     for (const auto& path : files_with_extension(root / "building", ".sbb")) {
         try {
             auto bytes = read_file_bytes(path);
@@ -638,7 +645,9 @@ std::optional<EditorProject> load_project_folder(const std::filesystem::path& fo
             project.load_warnings.push_back(path.filename().string() + ": " + error.what());
         }
     }
+    MAPED_PROFILE_END_BLOCK;
 
+    MAPED_PROFILE_BLOCK("load loose block sbl");
     for (const auto& path : files_with_extension(root / "block", ".sbl")) {
         try {
             auto bytes = read_file_bytes(path);
@@ -651,7 +660,9 @@ std::optional<EditorProject> load_project_folder(const std::filesystem::path& fo
             project.load_warnings.push_back(path.filename().string() + ": " + error.what());
         }
     }
+    MAPED_PROFILE_END_BLOCK;
 
+    MAPED_PROFILE_BLOCK("load loose buildblock sbl");
     for (const auto& path : files_with_extension(root / "buildblock", ".sbl")) {
         try {
             auto bytes = read_file_bytes(path);
@@ -664,9 +675,14 @@ std::optional<EditorProject> load_project_folder(const std::filesystem::path& fo
             project.load_warnings.push_back(path.filename().string() + ": " + error.what());
         }
     }
+    MAPED_PROFILE_END_BLOCK;
 
+    MAPED_PROFILE_BLOCK("load project textures");
     load_project_textures(project);
+    MAPED_PROFILE_END_BLOCK;
+    MAPED_PROFILE_BLOCK("load project csx geometry");
     load_project_csx_geometry(project);
+    MAPED_PROFILE_END_BLOCK;
 
     if (!project.city && project.buildings.empty() && project.blocks.empty() && project.buildblocks.empty()) {
         error = "folder does not look like a map folder: " + root.string();
@@ -688,6 +704,7 @@ std::optional<EditorProject> load_project_folder(const std::filesystem::path& fo
 }
 
 std::vector<NamedBlockMesh> block_meshes(const EditorProject& project) {
+    MAPED_PROFILE_FUNCTION();
     std::vector<NamedBlockMesh> meshes;
     meshes.reserve(project.blocks.size());
     for (const auto& block : project.blocks) {
@@ -697,6 +714,7 @@ std::vector<NamedBlockMesh> block_meshes(const EditorProject& project) {
 }
 
 std::vector<NamedBuildblockTemplate> buildblock_templates(const EditorProject& project) {
+    MAPED_PROFILE_FUNCTION();
     std::vector<NamedBuildblockTemplate> templates;
     templates.reserve(project.buildblocks.size());
     for (const auto& buildblock : project.buildblocks) {
@@ -712,6 +730,36 @@ std::vector<std::string> project_texture_names(const EditorProject& project) {
     names.reserve(project.textures.size());
     for (const auto& texture : project.textures) {
         names.push_back(texture.name);
+    }
+    return names;
+}
+
+// The v10 district legacy texture grid stores ABSOLUTE indices into the game's
+// runtime texture table, whose order is fixed by World_InitResourcePoolsAndCatalogs
+// @0x13e408 + World_LoadMapAndInitializeTerrain @0x56b10:
+//   index 0      = "concrete"  (built-in, texture/concrete.png)
+//   index 1,2    = reserved built-in slots
+//   index 3      = the generated default texture (DAT_64cff7e4 = 3)
+//   index 4..N   = the map's CSX 0x585a0004 textures IN ARCHIVE ORDER
+//     (DAT_64cff560 starts at 4 and increments per CSX texture entry).
+// asphalt2.png / asphalt2_material.png / map.png load into fixed model slots, NOT
+// this indexed table, so they must NOT shift the indices. This builds the matching
+// name list so a district cell's grid index resolves to the same texture the game
+// uses. Built-in indices 0-3 are the game's "concrete" + default grey, which live
+// in the game's base data/texture dir (not the map folder), so the editor can't
+// load them by name; map them to "asphalt2" — the grey road texture the editor
+// does have — so plaza/sidewalk cells read grey like in-game. CSX names follow in
+// archive order.
+std::vector<std::string> project_grid_texture_names(const EditorProject& project) {
+    MAPED_PROFILE_FUNCTION();
+    std::vector<std::string> names = {"asphalt2", "asphalt2", "asphalt2", "asphalt2"};
+    for (const auto& path : files_with_extension(project.root, ".csx")) {
+        const auto archive = parse_csx_file(path);
+        for (const auto& entry : archive.entries) {
+            if (entry.kind == CsxEntryKind::Texture) {
+                names.push_back(entry.name);
+            }
+        }
     }
     return names;
 }
@@ -822,6 +870,7 @@ std::filesystem::path default_export_path(const EditorProject& project, const Ed
 // geometry and writes <path>.gltf + .bin + .png. Sets `status` to the result.
 void run_mesh_export(EditorProject& project, const EditorUi& ui, const std::filesystem::path& path,
                      const ExportOptions& options, std::string& status) {
+    MAPED_PROFILE_FUNCTION();
     if (path.empty()) {
         status = "Export: empty path.";
         return;
@@ -872,7 +921,7 @@ void run_mesh_export(EditorProject& project, const EditorUi& ui, const std::file
         // Piece/portal geometry (districts placed with the Piece tool), the same
         // textured buffer the city view draws via the portal render model.
         const auto piece_buffer = build_native_portal_render_buffer(
-            project.city->data, blocks, std::nullopt, templates, project_texture_names(project));
+            project.city->data, blocks, std::nullopt, templates, project_grid_texture_names(project));
         status = export_city_to_gltf(path, scene, placement_buffers, placement_buildings,
                                      piece_buffer, project, options).message;
         return;
@@ -886,6 +935,7 @@ void run_mesh_export(EditorProject& project, const EditorUi& ui, const std::file
 // map and the resolved .sbb data so nothing it touches can be mutated or freed by
 // the main thread mid-build. GPU upload stays on the main thread (see the caller).
 void start_city_scene_rebuild(EditorProject& project, std::uint64_t fingerprint) {
+    MAPED_PROFILE_FUNCTION();
     if (!project.city) {
         return;
     }
@@ -914,6 +964,8 @@ void start_city_scene_rebuild(EditorProject& project, std::uint64_t fingerprint)
     project.city_scene_build_future = std::async(
         std::launch::async,
         [map = std::move(map_copy), owned, resolved = std::move(resolved), generation]() {
+            MAPED_PROFILE_THREAD("City scene rebuild");
+            MAPED_PROFILE_BLOCK("build async map scene");
             std::vector<const SbbBuilding*> placement_buildings;
             placement_buildings.reserve(owned->size());
             for (std::size_t i = 0; i < owned->size(); ++i) {
@@ -3197,6 +3249,7 @@ void free_project_thumbnails(EditorProject& project) {
 // open instantly, then clears the pregenerating flag. Thumbnails need the GL
 // context, so this runs on the main thread, paced to avoid a long stall.
 void service_pregeneration(EditorProject& project) {
+    MAPED_PROFILE_FUNCTION();
     if (!project.pregenerating) {
         return;
     }
@@ -3256,6 +3309,7 @@ void draw_loading_overlay(EditorProject& project) {
 // frame just before the blocking call gives the user a painted load screen
 // instead of a frozen/blank window during the parse.
 void present_parsing_frame(const std::filesystem::path& folder) {
+    MAPED_PROFILE_FUNCTION();
     BeginDrawing();
     ClearBackground(DARKGRAY);
     rlImGuiBegin();
@@ -3284,6 +3338,7 @@ void present_parsing_frame(const std::filesystem::path& folder) {
 namespace map_editor {
 
 int run_editor_app() {
+    MAPED_PROFILE_FUNCTION();
     using namespace app_internal;
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
     InitWindow(1440, 900, "map_editor_cpp");
@@ -3334,6 +3389,12 @@ int run_editor_app() {
     // synchronous parse, so the load screen actually paints instead of freezing
     // on a blank window.
     std::optional<std::filesystem::path> pending_load_folder;
+    // Optional auto-load: if MAPED_AUTOLOAD names a map folder, queue it at
+    // startup. Convenient for profiling/screenshot runs that need a known map
+    // open without the manual Open Folder step; no effect when the var is unset.
+    if (const char* env = std::getenv("MAPED_AUTOLOAD")) {
+        pending_load_folder = std::filesystem::path{env};
+    }
 
     // Mesh-export options dialog. Opened by File > Export Mesh; the popup shows a
     // context-aware title + what-to-export checkboxes, then runs the native save
@@ -3342,6 +3403,7 @@ int run_editor_app() {
     ExportOptions export_options{};
 
     while (running) {
+        MAPED_PROFILE_BLOCK("editor frame");
         gfx_debug_stats.reset_frame();
         gfx_debug_stats.push_frame_time(GetFrameTime() * 1000.0F);
         gfx_debug_stats.add_phase_ms(GfxDebugTimingPhase::TotalFrame, GetFrameTime() * 1000.0);
@@ -3418,6 +3480,7 @@ int run_editor_app() {
                             // there is always something to show on load. Only edits
                             // (below) go to the background worker.
                             const auto placement_buildings = resolve_placement_buildings(*project);
+                            MAPED_PROFILE_BLOCK("build initial map scene");
                             project->city_scene_cache = build_map_scene(project->city->data, placement_buildings);
                             project->city_scene_cache_fingerprint = scene_fingerprint;
                             project->city_scene_cache_valid = true;
@@ -3450,6 +3513,7 @@ int run_editor_app() {
                             // re-upload it when terrain-affecting inputs actually
                             // changed (intersections/buildings/pieces) - a road or
                             // street-width edit reuses the existing terrain GPU mesh.
+                            MAPED_PROFILE_BLOCK("upload city scene gpu models");
                             unload_city_render_model(project->city_tile_gpu_model);
                             project->city_tile_gpu_model =
                                 upload_city_tile_model(project->city_scene_cache.city_tile_buffer, *project);
@@ -4554,6 +4618,7 @@ int run_editor_app() {
         }
 
         if (run_export_after_popup && project) {
+            MAPED_PROFILE_BLOCK("export mesh dialog result");
             std::string reason;
             const auto default_path = default_export_path(*project, ui, reason);
             // Native save dialog (NFD-e: Cocoa NSSavePanel on macOS, not osascript).
@@ -4615,6 +4680,7 @@ int run_editor_app() {
         // a dedicated "Parsing..." frame first so the screen shows progress, then
         // run the blocking synchronous parse and apply the result.
         if (pending_load_folder) {
+            MAPED_PROFILE_BLOCK("load pending project");
             const auto folder = *pending_load_folder;
             pending_load_folder.reset();
             present_parsing_frame(folder);

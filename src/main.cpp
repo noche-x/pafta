@@ -1,5 +1,6 @@
 #include "app.hpp"
 #include "formats.hpp"
+#include "profiler.hpp"
 #include "scene.hpp"
 
 #include <algorithm>
@@ -291,6 +292,7 @@ std::vector<map_editor::NamedBuildblockTemplate> load_sibling_buildblock_templat
 }
 
 int print_file_summary(const std::filesystem::path& path) {
+    MAPED_PROFILE_FUNCTION();
     const auto is_sbc = has_extension(path, ".sbc");
     const auto is_sbb = has_extension(path, ".sbb");
     const auto is_sbl = has_extension(path, ".sbl");
@@ -340,6 +342,8 @@ int print_file_summary(const std::filesystem::path& path) {
 } // namespace
 
 int main(int argc, char** argv) {
+    map_editor::profiling::Session profiling_session;
+    MAPED_PROFILE_FUNCTION();
     try {
         if (argc == 1) {
             return map_editor::run_editor_app();

@@ -300,9 +300,11 @@ BuildingRenderBuffer build_native_portal_render_buffer(
     const SbcMap& map,
     const std::vector<NamedBlockMesh>& block_meshes,
     std::optional<std::size_t> selected_portal = std::nullopt,
-    // v10 maps (no city_blocks) resolve district piece words by index into the
-    // buildblock template catalog (sorted by name to match BuildblockCatalog_LoadAll).
-    // Pass the buildblock templates so those pieces can render; empty = skip them.
+    // v10 maps (no city_blocks) resolve district piece words by (word & 0xffff)
+    // into the PROCEDURAL buildblock template catalog built in code
+    // (build_native_builtin_catalog), not the loose buildblock/*.sbl files. This
+    // param is retained only for the inspector's name lookup; the render no longer
+    // consumes it.
     const std::vector<NamedBuildblockTemplate>& buildblock_templates = {},
     // v10 per-cell face materials come from the legacy texture grid
     // (portal.textures, 8 shorts per cell), each a texture index into this
