@@ -299,6 +299,19 @@ struct EditorProject {
     std::vector<LoadedAsset<SblBlockMesh>> blocks;
     std::vector<LoadedAsset<SblTemplate>> buildblocks;
     std::vector<LoadedTexture> textures;
+    // Derived render inputs, computed once from the loaded assets and reused every
+    // frame instead of rebuilt per draw. project_grid_texture_names in particular
+    // used to re-parse every CSX archive from disk on each call (it runs from the
+    // per-frame portal render path). These are filled by ensure_render_input_cache
+    // and invalidated (render_input_cache_valid=false) whenever blocks/buildblocks/
+    // textures or the CSX texture set change. The CSX names are independent of the
+    // in-memory assets, so they are cached separately and only invalidated on load.
+    std::vector<NamedBlockMesh> cached_block_meshes;
+    std::vector<NamedBuildblockTemplate> cached_buildblock_templates;
+    std::vector<std::string> cached_texture_names;
+    std::vector<std::string> cached_grid_texture_names;
+    bool render_input_cache_valid{false};
+    bool grid_texture_names_valid{false};
     std::vector<BuildingRenderBuffer> building_render_buffers;
     std::vector<GpuBuildingRenderModel> building_gpu_models;
     BuildingRenderBuffer portal_render_buffer;
@@ -556,10 +569,20 @@ std::string lower_name(std::string_view value);
 std::string key_label(int key);
 std::vector<const SbbBuilding*> resolve_placement_buildings(const EditorProject& project);
 std::optional<EditorProject> load_project_folder(const std::filesystem::path& folder, std::string& error);
-std::vector<NamedBlockMesh> block_meshes(const EditorProject& project);
-std::vector<NamedBuildblockTemplate> buildblock_templates(const EditorProject& project);
-std::vector<std::string> project_texture_names(const EditorProject& project);
-std::vector<std::string> project_grid_texture_names(const EditorProject& project);
+// Derived render inputs. The block-mesh catalog, buildblock templates, texture
+// names, and grid (CSX) texture names are computed once and cached on the project
+// (see EditorProject::cached_* / ensure_render_input_cache); these accessors return
+// references into that cache. Call invalidate_render_input_cache after mutating
+// blocks/buildblocks/textures so the next access rebuilds the in-memory caches (the
+// CSX grid names only change on load). build_grid_texture_names is the disk-parsing
+// builder behind the grid-name cache, exposed for the load path.
+std::vector<std::string> build_grid_texture_names(const EditorProject& project);
+void ensure_render_input_cache(EditorProject& project);
+void invalidate_render_input_cache(EditorProject& project);
+const std::vector<NamedBlockMesh>& block_meshes(EditorProject& project);
+const std::vector<NamedBuildblockTemplate>& buildblock_templates(EditorProject& project);
+const std::vector<std::string>& project_texture_names(EditorProject& project);
+const std::vector<std::string>& project_grid_texture_names(EditorProject& project);
 void write_file_bytes(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes);
 void set_status(EditorProject& project);
 

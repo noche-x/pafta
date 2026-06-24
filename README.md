@@ -69,6 +69,23 @@ MAPED_PROFILE_OUT=captures/maped.prof ./build/dev/map_editor_cpp
 
 On Windows with Visual Studio, use the `dev-msvc` preset instead. The CTest suite expects this folder to live in the SRC workspace layout, with `server/data/test2` available one directory above `map_editor_cpp`. The root workflow `.github/workflows/map_editor_cpp.yml` runs the `ci`/`ci-msvc` preset gate on macOS, Ubuntu, and Windows.
 
+### Performance notes
+
+- **File reads are bulk.** `read_file_bytes` sizes the file and pulls it in one
+  `read()`; large CSX archives (the round map ships a ~73 MB `test.csx`) decode an
+  order of magnitude faster than the old byte-at-a-time stream-iterator read.
+- **Derived render inputs are cached on the project, not rebuilt per frame.** The
+  block-mesh catalog, buildblock templates, and texture-name lists live in
+  `EditorProject::cached_*` and are built once by `ensure_render_input_cache`. The
+  grid (CSX) texture names used to re-parse every `.csx` from disk inside the
+  per-frame portal render path; they are now cached and only rebuilt on load.
+  Anything that edits block/buildblock data must call
+  `invalidate_render_input_cache` (the `mark_*_changed` hooks already do).
+- **Project loading fans out across threads.** Loose SBB/SBL parsing, CSX archive
+  parsing, and PNG decode run through a bounded `parallel_for`; the order-dependent
+  merges (CSX-wins upsert, index-aligned asset/byte vectors) and all GL texture
+  uploads stay serial on the main thread.
+
 ## Run
 
 ```bash

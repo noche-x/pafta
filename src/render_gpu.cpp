@@ -1509,18 +1509,14 @@ GpuBuildingRenderModel upload_portal_render_model(const BuildingRenderBuffer& bu
 
 GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool textured, std::optional<std::size_t> selected_portal) {
     MAPED_PROFILE_FUNCTION();
-    MAPED_PROFILE_BLOCK("portal_render_model collect block meshes");
-    const auto blocks = block_meshes(project);
-    MAPED_PROFILE_END_BLOCK;
-    MAPED_PROFILE_BLOCK("portal_render_model collect buildblock templates");
-    const auto bb_templates = buildblock_templates(project);
-    MAPED_PROFILE_END_BLOCK;
-    // v10 district pieces index the game's absolute texture table (built-ins +
-    // CSX in archive order), not the editor's load order — see
-    // project_grid_texture_names.
-    MAPED_PROFILE_BLOCK("portal_render_model collect grid texture names");
-    const auto tex_names = project_grid_texture_names(project);
-    MAPED_PROFILE_END_BLOCK;
+    // References into the project's cached render inputs (built once at load, not
+    // per frame). Only the async-rebuild branch below copies them, and only when a
+    // rebuild is actually queued — the steady-state path touches no allocations.
+    // v10 district pieces index the game's absolute texture table (built-ins + CSX
+    // in archive order), not the editor's load order — see project_grid_texture_names.
+    const auto& blocks = block_meshes(project);
+    const auto& bb_templates = buildblock_templates(project);
+    const auto& tex_names = project_grid_texture_names(project);
     if (selected_portal.has_value()) {
         if (project.portal_preview_render_dirty ||
             project.portal_preview_render_textured != textured ||
@@ -1576,8 +1572,8 @@ GpuBuildingRenderModel& building_tool_floor_preview_model(
     if (project.building_floor_preview_dirty ||
         project.building_floor_preview_building != building_index ||
         project.building_floor_preview_floor != floor) {
-        const auto blocks = block_meshes(project);
-        const auto templates = buildblock_templates(project);
+        const auto& blocks = block_meshes(project);
+        const auto& templates = buildblock_templates(project);
         project.building_floor_preview_render_buffer = build_native_building_tool_preview_render_buffer(
             project.buildings[building_index].data,
             blocks,

@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -32,6 +33,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -398,49 +400,83 @@ void upsert_texture_if_valid(EditorProject& project, std::string name, Texture2D
     project.textures.emplace_back(std::move(name), texture);
 }
 
-std::optional<Texture2D> load_embedded_png_texture(const std::vector<std::uint8_t>& payload) {
-    if (payload.size() < 0x4cU || read_le_u32(payload, 0U) != 1U) {
-        return std::nullopt;
+// Runs body(i) for i in [0, count) across a bounded set of worker threads (capped
+// at hardware_concurrency, min 1), blocking until all complete. body must be
+// thread-safe for distinct i. Used to fan out the CPU-bound load-time work (PNG
+// decode, CSX parse) without spawning one thread per item.
+template <typename Body>
+void parallel_for(std::size_t count, Body&& body) {
+    if (count == 0) {
+        return;
     }
+    const unsigned hw = std::max(1U, std::thread::hardware_concurrency());
+    const std::size_t workers = std::min<std::size_t>(count, hw);
+    if (workers <= 1) {
+        for (std::size_t i = 0; i < count; ++i) {
+            body(i);
+        }
+        return;
+    }
+    std::atomic<std::size_t> next{0};
+    std::vector<std::future<void>> futures;
+    futures.reserve(workers);
+    for (std::size_t w = 0; w < workers; ++w) {
+        futures.push_back(std::async(std::launch::async, [&next, count, &body] {
+            for (std::size_t i = next.fetch_add(1); i < count; i = next.fetch_add(1)) {
+                body(i);
+            }
+        }));
+    }
+    for (auto& future : futures) {
+        future.get();
+    }
+}
 
+// editor.exe LoadTexture_PNG_ToBuffer @14003ab40 writes each source row into dest
+// row (height-1 - row), i.e. it flips PNGs vertically at load for OpenGL's
+// bottom-left texture origin. Block UVs are authored against that flipped image, so
+// raylib (which uploads PNG rows top-down) must flip too or every texture is
+// upside-down. Only obvious on textures with vertical orientation (text/figures).
+//
+// CPU-only decode stage (no GL): produces a flipped raylib Image. Safe to run on a
+// worker thread; raylib's LoadImage*/ImageFlipVertical touch only local pixel data
+// (stbi has no shared state in the default config). The GL upload stays on the main
+// thread in upload_decoded_image.
+Image decode_flipped_png_from_file(const std::filesystem::path& path) {
+    Image image = LoadImage(path.string().c_str());
+    if (!IsImageValid(image)) {
+        return Image{};
+    }
+    ImageFlipVertical(&image);
+    return image;
+}
+
+Image decode_flipped_embedded_png(const std::vector<std::uint8_t>& payload) {
+    if (payload.size() < 0x4cU || read_le_u32(payload, 0U) != 1U) {
+        return Image{};
+    }
     const auto image_size = static_cast<std::size_t>(read_le_u32(payload, 0x44U));
     if (image_size == 0U || image_size > payload.size() - 0x4cU) {
-        return std::nullopt;
+        return Image{};
     }
     const auto* image_bytes = payload.data() + 0x4cU;
     if (image_size < 2U || image_bytes[0] != 0x89U || image_bytes[1] != 0x50U) {
-        return std::nullopt;
+        return Image{};
     }
-
     Image image = LoadImageFromMemory(".png", image_bytes, static_cast<int>(image_size));
     if (!IsImageValid(image)) {
-        return std::nullopt;
+        return Image{};
     }
-
-    // editor.exe LoadTexture_PNG_ToBuffer @14003ab40 writes each source row into
-    // dest row (height-1 - row), i.e. it flips PNGs vertically at load for OpenGL's
-    // bottom-left texture origin. Block UVs are authored against that flipped image,
-    // so raylib (which uploads PNG rows top-down) must flip too or every texture is
-    // upside-down. Only obvious on textures with vertical orientation (text/figures).
     ImageFlipVertical(&image);
-
-    Texture2D texture = LoadTextureFromImage(image);
-    UnloadImage(image);
-    if (texture.id == 0U) {
-        return std::nullopt;
-    }
-    return texture;
+    return image;
 }
 
-// Loose .png loaded the same way the editor does: decode, flip vertically to match
-// editor.exe's bottom-up write, then upload. Returns an id==0 texture on failure so
-// add_texture_if_valid skips it, matching the previous LoadTexture behavior.
-Texture2D load_flipped_png_texture(const std::filesystem::path& path) {
-    Image image = LoadImage(path.string().c_str());
+// GL upload stage (main thread only). Consumes the decoded Image and returns a
+// Texture2D (id==0 on failure, which add_texture_if_valid skips). Frees the image.
+Texture2D upload_decoded_image(Image image) {
     if (!IsImageValid(image)) {
         return Texture2D{};
     }
-    ImageFlipVertical(&image);
     Texture2D texture = LoadTextureFromImage(image);
     UnloadImage(image);
     return texture;
@@ -463,21 +499,63 @@ void load_project_textures(EditorProject& project) {
     MAPED_PROFILE_FUNCTION();
     std::unordered_map<std::string, std::size_t> loaded_names;
 
+    // One decode task: a name, whether it overrides (CSX-wins upsert) or only adds,
+    // and a closure that produces the flipped Image off the main thread. The decode
+    // (PNG/stbi) is CPU-bound and dominated load time; the GL upload below stays
+    // serial on the main thread. Order is preserved exactly: texture/*.png, then
+    // root *.png, then CSX-embedded textures in archive order — texture indices and
+    // the CSX-wins merge depend on this sequence.
+    struct DecodeTask {
+        std::string name;
+        bool upsert;
+        std::function<Image()> decode;
+    };
+    std::vector<DecodeTask> tasks;
+
     for (const auto& path : files_with_extension(project.root / "texture", ".png")) {
-        add_texture_if_valid(project, stem_name(path), load_flipped_png_texture(path), loaded_names);
+        tasks.push_back({stem_name(path), false, [path] { return decode_flipped_png_from_file(path); }});
     }
     for (const auto& path : files_with_extension(project.root, ".png")) {
-        add_texture_if_valid(project, stem_name(path), load_flipped_png_texture(path), loaded_names);
+        tasks.push_back({stem_name(path), false, [path] { return decode_flipped_png_from_file(path); }});
     }
-    for (const auto& path : files_with_extension(project.root, ".csx")) {
-        const auto archive = parse_csx_file(path);
-        for (const auto& entry : archive.entries) {
-            if (entry.kind != CsxEntryKind::Texture) {
-                continue;
+    // CSX archives are parsed in parallel; the texture entries they expose are then
+    // appended as decode tasks in archive order (matching the previous serial walk).
+    {
+        MAPED_PROFILE_BLOCK("parse csx archives (textures)");
+        const auto csx_paths = files_with_extension(project.root, ".csx");
+        std::vector<CsxArchive> archives(csx_paths.size());
+        parallel_for(csx_paths.size(), [&](std::size_t i) { archives[i] = parse_csx_file(csx_paths[i]); });
+        for (auto& archive : archives) {
+            for (const auto& entry : archive.entries) {
+                if (entry.kind != CsxEntryKind::Texture) {
+                    continue;
+                }
+                tasks.push_back({entry.name, true, [payload = entry.payload] {
+                                     return decode_flipped_embedded_png(payload);
+                                 }});
             }
-            if (auto texture = load_embedded_png_texture(entry.payload)) {
-                upsert_texture_if_valid(project, entry.name, *texture, loaded_names);
+        }
+    }
+
+    // Parallel decode stage: each task's PNG is decoded + flipped on a worker. The
+    // results are collected in task order so the serial upload below is identical to
+    // the old single-threaded order.
+    std::vector<Image> decoded(tasks.size());
+    {
+        MAPED_PROFILE_BLOCK("parallel png decode");
+        parallel_for(tasks.size(), [&](std::size_t i) { decoded[i] = tasks[i].decode(); });
+    }
+
+    // Serial GL upload + registration on the main thread, in original order.
+    MAPED_PROFILE_BLOCK("upload textures");
+    for (std::size_t i = 0; i < tasks.size(); ++i) {
+        Texture2D texture = upload_decoded_image(decoded[i]);
+        if (tasks[i].upsert) {
+            if (texture.id != 0U) {
+                upsert_texture_if_valid(project, std::move(tasks[i].name), texture, loaded_names);
             }
+        } else {
+            add_texture_if_valid(project, std::move(tasks[i].name), texture, loaded_names);
         }
     }
 }
@@ -570,41 +648,95 @@ void load_project_csx_geometry(EditorProject& project) {
         bytes_list.push_back(std::move(bytes));
     };
 
-    for (const auto& path : files_with_extension(project.root, ".csx")) {
-        CsxArchive archive;
+    // One parsed geometry entry, ready to upsert. Parsing (parse_sbb/parse_sbl) is
+    // CPU-bound and done off the main thread; the upsert below is serial because the
+    // CSX-wins merge is order-dependent (it overrides matching slots in place).
+    enum class GeometryKind { None, Sbb, Sbl };
+    struct ParsedGeometry {
+        GeometryKind kind{GeometryKind::None};
+        std::string name;
+        std::filesystem::path source;
+        std::vector<std::uint8_t> bytes;
+        std::optional<SbbBuilding> building;
+        std::optional<SblTemplate> sbl;
+        std::string warning;  // non-empty => push to load_warnings, skip the upsert
+    };
+
+    // Flatten every CSX entry across all archives into a work list (in archive +
+    // entry order), parsing the archives themselves in parallel first.
+    const auto csx_paths = files_with_extension(project.root, ".csx");
+    std::vector<CsxArchive> archives(csx_paths.size());
+    std::vector<std::string> archive_warnings(csx_paths.size());
+    parallel_for(csx_paths.size(), [&](std::size_t i) {
         try {
-            archive = parse_csx_file(path);
+            archives[i] = parse_csx_file(csx_paths[i]);
         } catch (const std::exception& error) {
-            project.load_warnings.push_back(path.filename().string() + ": " + error.what());
+            archive_warnings[i] = csx_paths[i].filename().string() + ": " + error.what();
+        }
+    });
+
+    struct EntryRef {
+        std::size_t archive_index;
+        std::size_t entry_index;
+    };
+    std::vector<EntryRef> entry_refs;
+    for (std::size_t a = 0; a < archives.size(); ++a) {
+        if (!archive_warnings[a].empty()) {
+            project.load_warnings.push_back(std::move(archive_warnings[a]));
             continue;
         }
+        for (std::size_t e = 0; e < archives[a].entries.size(); ++e) {
+            entry_refs.push_back({a, e});
+        }
+    }
 
-        for (const auto& entry : archive.entries) {
-            const auto name = std::filesystem::path{entry.name}.stem().string();
-            if (name.empty()) {
-                continue;
+    // Parse SBB/SBL geometry for every entry in parallel into an order-preserving
+    // result buffer.
+    std::vector<ParsedGeometry> parsed(entry_refs.size());
+    parallel_for(entry_refs.size(), [&](std::size_t i) {
+        const auto& ref = entry_refs[i];
+        const auto& entry = archives[ref.archive_index].entries[ref.entry_index];
+        const auto& path = csx_paths[ref.archive_index];
+        const auto name = std::filesystem::path{entry.name}.stem().string();
+        if (name.empty()) {
+            return;
+        }
+        ParsedGeometry out;
+        out.name = name;
+        out.source = path;
+        try {
+            if (entry.kind == CsxEntryKind::Sbb) {
+                out.bytes = normalize_packed_sbb_bytes(entry.payload);
+                out.building = parse_sbb(out.bytes);
+                out.kind = GeometryKind::Sbb;
+            } else if (entry.kind == CsxEntryKind::Sbl) {
+                out.bytes = normalize_packed_sbl_bytes(entry.payload);
+                out.sbl = parse_sbl(out.bytes);
+                out.kind = GeometryKind::Sbl;
             }
+        } catch (const std::exception& error) {
+            out.kind = GeometryKind::None;
+            out.warning = path.filename().string() + " [" + name + "]: " + error.what();
+        }
+        parsed[i] = std::move(out);
+    });
 
-            try {
-                if (entry.kind == CsxEntryKind::Sbb) {
-                    auto bytes = normalize_packed_sbb_bytes(entry.payload);
-                    auto building = parse_sbb(bytes);
-                    upsert(project.buildings, project.building_bytes, name, path,
-                           std::move(building), std::move(bytes));
-                } else if (entry.kind == CsxEntryKind::Sbl) {
-                    auto bytes = normalize_packed_sbl_bytes(entry.payload);
-                    auto parsed = parse_sbl(bytes);
-                    if (parsed.block.has_value()) {
-                        upsert(project.blocks, project.block_bytes, name, path,
-                               *parsed.block, std::move(bytes));
-                    } else if (!parsed.layers.empty()) {
-                        upsert(project.buildblocks, project.buildblock_bytes, name, path,
-                               std::move(parsed), std::move(bytes));
-                    }
-                }
-            } catch (const std::exception& error) {
-                project.load_warnings.push_back(
-                    path.filename().string() + " [" + name + "]: " + error.what());
+    // Serial merge in original order (CSX-wins upsert is order-dependent).
+    for (auto& item : parsed) {
+        if (!item.warning.empty()) {
+            project.load_warnings.push_back(std::move(item.warning));
+            continue;
+        }
+        if (item.kind == GeometryKind::Sbb) {
+            upsert(project.buildings, project.building_bytes, item.name, item.source,
+                   std::move(*item.building), std::move(item.bytes));
+        } else if (item.kind == GeometryKind::Sbl) {
+            if (item.sbl->block.has_value()) {
+                upsert(project.blocks, project.block_bytes, item.name, item.source,
+                       *item.sbl->block, std::move(item.bytes));
+            } else if (!item.sbl->layers.empty()) {
+                upsert(project.buildblocks, project.buildblock_bytes, item.name, item.source,
+                       std::move(*item.sbl), std::move(item.bytes));
             }
         }
     }
@@ -635,44 +767,104 @@ std::optional<EditorProject> load_project_folder(const std::filesystem::path& fo
         MAPED_PROFILE_END_BLOCK;
     }
 
+    // Loose assets are read+parsed in parallel into an order-preserving buffer, then
+    // appended in directory order (asset/byte vectors stay index-aligned, and other
+    // code indexes them positionally). read_file_bytes + parse_sbb/parse_sbl are
+    // CPU/IO-bound and were the heaviest serial load steps (loose building SBBs in
+    // particular). One result slot per file; failures carry a warning instead.
     MAPED_PROFILE_BLOCK("load loose building sbb");
-    for (const auto& path : files_with_extension(root / "building", ".sbb")) {
-        try {
-            auto bytes = read_file_bytes(path);
-            project.buildings.push_back({path, stem_name(path), parse_sbb(bytes)});
-            project.building_bytes.push_back(std::move(bytes));
-        } catch (const std::exception& error) {
-            project.load_warnings.push_back(path.filename().string() + ": " + error.what());
+    {
+        const auto paths = files_with_extension(root / "building", ".sbb");
+        struct LooseSbb {
+            std::filesystem::path path;
+            std::optional<SbbBuilding> building;
+            std::vector<std::uint8_t> bytes;
+            std::string warning;
+        };
+        std::vector<LooseSbb> results(paths.size());
+        parallel_for(paths.size(), [&](std::size_t i) {
+            results[i].path = paths[i];
+            try {
+                results[i].bytes = read_file_bytes(paths[i]);
+                results[i].building = parse_sbb(results[i].bytes);
+            } catch (const std::exception& error) {
+                results[i].building.reset();
+                results[i].warning = paths[i].filename().string() + ": " + error.what();
+            }
+        });
+        for (auto& r : results) {
+            if (!r.warning.empty()) {
+                project.load_warnings.push_back(std::move(r.warning));
+                continue;
+            }
+            project.buildings.push_back({r.path, stem_name(r.path), std::move(*r.building)});
+            project.building_bytes.push_back(std::move(r.bytes));
         }
     }
     MAPED_PROFILE_END_BLOCK;
 
     MAPED_PROFILE_BLOCK("load loose block sbl");
-    for (const auto& path : files_with_extension(root / "block", ".sbl")) {
-        try {
-            auto bytes = read_file_bytes(path);
-            auto parsed = parse_sbl(bytes);
-            if (parsed.block.has_value()) {
-                project.blocks.push_back({path, stem_name(path), *parsed.block});
-                project.block_bytes.push_back(std::move(bytes));
+    {
+        const auto paths = files_with_extension(root / "block", ".sbl");
+        struct LooseSbl {
+            std::filesystem::path path;
+            std::optional<SblTemplate> parsed;
+            std::vector<std::uint8_t> bytes;
+            std::string warning;
+        };
+        std::vector<LooseSbl> results(paths.size());
+        parallel_for(paths.size(), [&](std::size_t i) {
+            results[i].path = paths[i];
+            try {
+                results[i].bytes = read_file_bytes(paths[i]);
+                results[i].parsed = parse_sbl(results[i].bytes);
+            } catch (const std::exception& error) {
+                results[i].parsed.reset();
+                results[i].warning = paths[i].filename().string() + ": " + error.what();
             }
-        } catch (const std::exception& error) {
-            project.load_warnings.push_back(path.filename().string() + ": " + error.what());
+        });
+        for (auto& r : results) {
+            if (!r.warning.empty()) {
+                project.load_warnings.push_back(std::move(r.warning));
+                continue;
+            }
+            if (r.parsed->block.has_value()) {
+                project.blocks.push_back({r.path, stem_name(r.path), *r.parsed->block});
+                project.block_bytes.push_back(std::move(r.bytes));
+            }
         }
     }
     MAPED_PROFILE_END_BLOCK;
 
     MAPED_PROFILE_BLOCK("load loose buildblock sbl");
-    for (const auto& path : files_with_extension(root / "buildblock", ".sbl")) {
-        try {
-            auto bytes = read_file_bytes(path);
-            auto parsed = parse_sbl(bytes);
-            if (!parsed.layers.empty()) {
-                project.buildblocks.push_back({path, stem_name(path), std::move(parsed)});
-                project.buildblock_bytes.push_back(std::move(bytes));
+    {
+        const auto paths = files_with_extension(root / "buildblock", ".sbl");
+        struct LooseSbl {
+            std::filesystem::path path;
+            std::optional<SblTemplate> parsed;
+            std::vector<std::uint8_t> bytes;
+            std::string warning;
+        };
+        std::vector<LooseSbl> results(paths.size());
+        parallel_for(paths.size(), [&](std::size_t i) {
+            results[i].path = paths[i];
+            try {
+                results[i].bytes = read_file_bytes(paths[i]);
+                results[i].parsed = parse_sbl(results[i].bytes);
+            } catch (const std::exception& error) {
+                results[i].parsed.reset();
+                results[i].warning = paths[i].filename().string() + ": " + error.what();
             }
-        } catch (const std::exception& error) {
-            project.load_warnings.push_back(path.filename().string() + ": " + error.what());
+        });
+        for (auto& r : results) {
+            if (!r.warning.empty()) {
+                project.load_warnings.push_back(std::move(r.warning));
+                continue;
+            }
+            if (!r.parsed->layers.empty()) {
+                project.buildblocks.push_back({r.path, stem_name(r.path), std::move(*r.parsed)});
+                project.buildblock_bytes.push_back(std::move(r.bytes));
+            }
         }
     }
     MAPED_PROFILE_END_BLOCK;
@@ -703,8 +895,9 @@ std::optional<EditorProject> load_project_folder(const std::filesystem::path& fo
     return project;
 }
 
-std::vector<NamedBlockMesh> block_meshes(const EditorProject& project) {
-    MAPED_PROFILE_FUNCTION();
+// Builds the block-mesh catalog from the loaded SBL blocks (a native built-in set
+// prepended via build_native_block_mesh_catalog). Pure function of project.blocks.
+std::vector<NamedBlockMesh> build_block_meshes(const EditorProject& project) {
     std::vector<NamedBlockMesh> meshes;
     meshes.reserve(project.blocks.size());
     for (const auto& block : project.blocks) {
@@ -713,8 +906,7 @@ std::vector<NamedBlockMesh> block_meshes(const EditorProject& project) {
     return build_native_block_mesh_catalog(meshes);
 }
 
-std::vector<NamedBuildblockTemplate> buildblock_templates(const EditorProject& project) {
-    MAPED_PROFILE_FUNCTION();
+std::vector<NamedBuildblockTemplate> build_buildblock_templates(const EditorProject& project) {
     std::vector<NamedBuildblockTemplate> templates;
     templates.reserve(project.buildblocks.size());
     for (const auto& buildblock : project.buildblocks) {
@@ -725,13 +917,56 @@ std::vector<NamedBuildblockTemplate> buildblock_templates(const EditorProject& p
 
 // Loaded texture names in load order. v10 district pieces index this list via the
 // legacy texture grid to resolve per-face materials.
-std::vector<std::string> project_texture_names(const EditorProject& project) {
+std::vector<std::string> build_texture_names(const EditorProject& project) {
     std::vector<std::string> names;
     names.reserve(project.textures.size());
     for (const auto& texture : project.textures) {
         names.push_back(texture.name);
     }
     return names;
+}
+
+// Fills the derived render-input caches (block meshes, buildblock templates,
+// texture names) once. Cheap to call every frame: it returns immediately when the
+// cache is already valid. The grid texture names parse CSX archives from disk, so
+// they have their own validity flag and are only rebuilt when invalidated.
+void ensure_render_input_cache(EditorProject& project) {
+    if (!project.render_input_cache_valid) {
+        MAPED_PROFILE_BLOCK("rebuild render input cache");
+        project.cached_block_meshes = build_block_meshes(project);
+        project.cached_buildblock_templates = build_buildblock_templates(project);
+        project.cached_texture_names = build_texture_names(project);
+        project.render_input_cache_valid = true;
+    }
+    if (!project.grid_texture_names_valid) {
+        MAPED_PROFILE_BLOCK("rebuild grid texture names");
+        project.cached_grid_texture_names = build_grid_texture_names(project);
+        project.grid_texture_names_valid = true;
+    }
+}
+
+void invalidate_render_input_cache(EditorProject& project) {
+    project.render_input_cache_valid = false;
+}
+
+const std::vector<NamedBlockMesh>& block_meshes(EditorProject& project) {
+    ensure_render_input_cache(project);
+    return project.cached_block_meshes;
+}
+
+const std::vector<NamedBuildblockTemplate>& buildblock_templates(EditorProject& project) {
+    ensure_render_input_cache(project);
+    return project.cached_buildblock_templates;
+}
+
+const std::vector<std::string>& project_texture_names(EditorProject& project) {
+    ensure_render_input_cache(project);
+    return project.cached_texture_names;
+}
+
+const std::vector<std::string>& project_grid_texture_names(EditorProject& project) {
+    ensure_render_input_cache(project);
+    return project.cached_grid_texture_names;
 }
 
 // The v10 district legacy texture grid stores ABSOLUTE indices into the game's
@@ -750,7 +985,11 @@ std::vector<std::string> project_texture_names(const EditorProject& project) {
 // load them by name; map them to "asphalt2" — the grey road texture the editor
 // does have — so plaza/sidewalk cells read grey like in-game. CSX names follow in
 // archive order.
-std::vector<std::string> project_grid_texture_names(const EditorProject& project) {
+//
+// This parses every CSX archive from disk, so it is only run when the project's
+// CSX set changes (load). The result is cached in project.cached_grid_texture_names
+// by ensure_render_input_cache; the per-frame render path reads the cache.
+std::vector<std::string> build_grid_texture_names(const EditorProject& project) {
     MAPED_PROFILE_FUNCTION();
     std::vector<std::string> names = {"asphalt2", "asphalt2", "asphalt2", "asphalt2"};
     for (const auto& path : files_with_extension(project.root, ".csx")) {
@@ -2332,6 +2571,8 @@ void mark_buildblock_changed(EditorProject& project, EditorUi& ui) {
     ui.buildblock_dirty = true;
     project.render_buffers_dirty = true;
     project.building_floor_preview_dirty = true;
+    // Editing buildblock data invalidates the cached buildblock-template catalog.
+    invalidate_render_input_cache(project);
     invalidate_portal_render_models(project);
 }
 
@@ -2339,6 +2580,8 @@ void mark_block_changed(EditorProject& project, EditorUi& ui, SblBlockMesh& bloc
     ui.block_dirty = true;
     refresh_sbl_block_faces(block);
     project.render_buffers_dirty = true;
+    // Editing block data invalidates the cached block-mesh catalog.
+    invalidate_render_input_cache(project);
     invalidate_portal_render_models(project);
 }
 

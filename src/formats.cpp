@@ -945,15 +945,29 @@ CsxEntryKind classify_csx_entry(std::uint32_t type) {
 // -----------------------------------------------------------------------------
 
 std::vector<std::uint8_t> read_file_bytes(const std::filesystem::path& path) {
-    std::ifstream file(path, std::ios::binary);
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) {
         throw std::runtime_error("Could not open " + path.string());
     }
 
-    return {
-        std::istreambuf_iterator<char>{file},
-        std::istreambuf_iterator<char>{},
-    };
+    // Bulk read: size the buffer from the end-seek and pull the whole file in one
+    // read() call. The previous istreambuf_iterator construction copied the file a
+    // byte at a time through the stream's locale/sentry machinery, which dominated
+    // load-time profiles (CSX/SBC/SBB/SBL all funnel through here).
+    const auto end = file.tellg();
+    if (end < 0) {
+        throw std::runtime_error("Could not size " + path.string());
+    }
+    file.seekg(0, std::ios::beg);
+
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(end));
+    if (!bytes.empty()) {
+        file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (file.gcount() != static_cast<std::streamsize>(bytes.size())) {
+            bytes.resize(static_cast<std::size_t>(file.gcount()));
+        }
+    }
+    return bytes;
 }
 
 SbbBuilding parse_sbb(const std::vector<std::uint8_t>& bytes) {
