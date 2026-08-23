@@ -2,6 +2,7 @@
 
 #include "formats.hpp"
 
+#include <array>
 #include <cstddef>
 #include <optional>
 #include <string>
@@ -153,6 +154,7 @@ struct RenderIntersection {
     const SbcIntersection* source{};
     Vec3 position{};
     float width{};
+    std::array<Vec3, 4> editor_quad{};
 };
 
 struct RenderRoad {
@@ -160,6 +162,7 @@ struct RenderRoad {
     Vec3 from{};
     Vec3 to{};
     float width{};
+    std::array<Vec3, 4> editor_quad{};
 };
 
 enum class CityTileKind {

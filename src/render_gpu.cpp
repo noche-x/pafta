@@ -1797,10 +1797,22 @@ void draw_city_scene(
 void draw_city_editor_overlay(const EditorProject&, const MapScene& scene) {
     GfxDebugMaybeTimer timer{GfxDebugTimingPhase::CityRoadDraw};
     constexpr float marker_size = 2.0F;
-    constexpr float road_surface_offset = 0.25F;
+    const auto node_area_color = Color{76, 139, 214, 85};
+    const auto segment_color = Color{255, 225, 112, 100};
     const auto marker_fill = Color{76, 139, 214, 170};
     const auto marker_wire = Color{218, 236, 255, 235};
-    const auto segment_color = Color{255, 225, 112, 235};
+
+    const auto draw_quad = [](const std::array<Vec3, 4>& quad, Color color) {
+        DrawTriangle3D(to_raylib(quad[0]), to_raylib(quad[1]), to_raylib(quad[2]), color);
+        DrawTriangle3D(to_raylib(quad[0]), to_raylib(quad[2]), to_raylib(quad[3]), color);
+    };
+
+    for (const auto& intersection : scene.intersections) {
+        draw_quad(intersection.editor_quad, node_area_color);
+    }
+    for (const auto& road : scene.roads) {
+        draw_quad(road.editor_quad, segment_color);
+    }
 
     for (const auto& intersection : scene.intersections) {
         auto position = to_raylib(intersection.position);
@@ -1810,39 +1822,14 @@ void draw_city_editor_overlay(const EditorProject&, const MapScene& scene) {
         DrawCubeWiresV(position, size, marker_wire);
     }
 
-    std::uint64_t segment_count = 0;
-    for (const auto& road : scene.roads) {
-        const auto seg_len = std::sqrt(
-            (road.to.x - road.from.x) * (road.to.x - road.from.x) +
-            (road.to.z - road.from.z) * (road.to.z - road.from.z));
-        const auto steps = std::clamp(static_cast<int>(seg_len / scene.unit_size), 1, 256);
-        auto height_at = [&](float t) {
-            return road.from.y + (road.to.y - road.from.y) * t - road_surface_offset;
-        };
-
-        auto prev = Vector3{
-            road.from.x,
-            height_at(0.0F),
-            road.from.z,
-        };
-        for (int i = 1; i <= steps; ++i) {
-            const auto t = static_cast<float>(i) / static_cast<float>(steps);
-            const auto x = road.from.x + (road.to.x - road.from.x) * t;
-            const auto z = road.from.z + (road.to.z - road.from.z) * t;
-            const auto cur = Vector3{x, height_at(t), z};
-            DrawLine3D(prev, cur, segment_color);
-            prev = cur;
-            ++segment_count;
-        }
-    }
-
     if (g_gfx_debug_stats != nullptr) {
         const auto marker_count = static_cast<std::uint64_t>(scene.intersections.size());
+        const auto quad_count = marker_count + static_cast<std::uint64_t>(scene.roads.size());
         g_gfx_debug_stats->add_draw(
             GfxDebugDrawCategory::WireOverlay,
-            marker_count * 12U,
-            marker_count * 60U + segment_count * 2U,
-            marker_count * 2U + segment_count);
+            marker_count * 12U + quad_count * 2U,
+            marker_count * 60U + quad_count * 6U,
+            marker_count * 2U + quad_count * 2U);
     }
 }
 

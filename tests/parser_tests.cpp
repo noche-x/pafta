@@ -1700,7 +1700,7 @@ void city_road_tile_heights_follow_native_slope_region() {
     assert(max_top - min_top > 32.0F * 0.9F);
 }
 
-void city_intersection_markers_use_native_road_surface_height() {
+void city_road_scene_positions_use_native_game_surface_height() {
     map_editor::SbcMap map{};
     map.intersections.push_back({0U, 600, 7, 600});
     map.intersections.push_back({1U, 620, 9, 600});
@@ -1715,12 +1715,37 @@ void city_intersection_markers_use_native_road_surface_height() {
     assert(close_to(scene.roads.front().to.y, 36.25F));
 }
 
+void city_editor_guides_use_native_expanded_extents() {
+    map_editor::SbcMap map{};
+    map.intersections.push_back({0U, 10, 5, 10});
+    map.intersections.push_back({1U, 20, 5, 10});
+    map.intersections.push_back({2U, 10, 5, 20});
+    map.intersections.push_back({3U, 0, 5, 10});
+    map.intersections.push_back({4U, 10, 5, 0});
+    map.streets.push_back({0U, 0, 1, 0, 1, 2, "E"});
+    map.streets.push_back({1U, 0, 2, 0, 1, 2, "S"});
+    map.streets.push_back({2U, 3, 0, 0, 1, 2, "W"});
+    map.streets.push_back({3U, 4, 0, 0, 1, 2, "N"});
+
+    const auto scene = map_editor::build_map_scene(map);
+    const auto& node = scene.intersections[0].editor_quad;
+    assert(close_to(node[0].x, 28.0F) && close_to(node[0].y, 20.0F) && close_to(node[0].z, 52.0F));
+    assert(close_to(node[1].x, 48.0F) && close_to(node[1].z, 52.0F));
+    assert(close_to(node[2].x, 48.0F) && close_to(node[2].z, 32.0F));
+    assert(close_to(node[3].x, 28.0F) && close_to(node[3].z, 32.0F));
+
+    const auto& east = scene.roads[0].editor_quad;
+    assert(close_to(east[0].x, 48.0F) && close_to(east[0].y, 20.0F) && close_to(east[0].z, 32.0F));
+    assert(close_to(east[1].x, 48.0F) && close_to(east[1].z, 52.0F));
+    assert(close_to(east[2].x, 80.0F) && close_to(east[2].z, 52.0F));
+    assert(close_to(east[3].x, 80.0F) && close_to(east[3].z, 32.0F));
+}
+
 void picks_city_intersection_marker_from_ray() {
     map_editor::SbcMap map{};
     map.intersections.push_back({0U, 4, 3, 8});
     const auto scene = map_editor::build_map_scene(map);
-    const auto marker_size = scene.unit_size * 0.42F;
-    const auto marker_y = scene.intersections.front().position.y + marker_size + 0.04F;
+    const auto marker_y = static_cast<float>(map.intersections.front().y) * scene.unit_size;
 
     const auto picked = map_editor::pick_city_intersection(
         map,
@@ -3173,7 +3198,8 @@ int main() {
     city_terrain_inside_patch_conforms_to_piece_cells();
     city_terrain_inside_patch_conforms_to_building_footprints();
     city_road_tile_heights_follow_native_slope_region();
-    city_intersection_markers_use_native_road_surface_height();
+    city_road_scene_positions_use_native_game_surface_height();
+    city_editor_guides_use_native_expanded_extents();
     picks_city_intersection_marker_from_ray();
     traffic_light_poles_stand_at_native_corners_of_3way_plus_intersections();
     parses_buildblock_sbl_fixture();

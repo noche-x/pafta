@@ -3387,8 +3387,7 @@ std::optional<std::size_t> pick_city_intersection(
     const MapScene& scene,
     const Vec3& ray_origin,
     const Vec3& ray_dir) {
-    const auto marker_size = scene.unit_size * 0.42F;
-    const auto marker_lift = marker_size * 0.5F + 0.04F;
+    constexpr float marker_size = 2.0F;
     // Pad the pick target a little beyond the drawn marker so the small node cube
     // is easy to grab, but not so much that it swallows the road running through
     // it (a full-cell box made roads unselectable near their endpoints). The
@@ -3412,7 +3411,7 @@ std::optional<std::size_t> pick_city_intersection(
 
         const Vec3 center{
             intersection.position.x,
-            intersection.position.y + marker_lift,
+            static_cast<float>(intersection.source->y) * scene.unit_size,
             intersection.position.z,
         };
         const auto t = ray_aabb_intersection_t(
@@ -3437,8 +3436,7 @@ std::optional<CityRoadPick> pick_city_road_or_node(
     const Vec3& ray_origin,
     const Vec3& ray_dir) {
     // Node candidate: distance along the ray to the nearest node marker box.
-    const auto marker_size = scene.unit_size * 0.42F;
-    const auto marker_lift = marker_size * 0.5F + 0.04F;
+    constexpr float marker_size = 2.0F;
     const auto node_half = marker_size * 0.85F;
     std::optional<std::size_t> node_index;
     float node_t = std::numeric_limits<float>::max();
@@ -3453,7 +3451,11 @@ std::optional<CityRoadPick> pick_city_road_or_node(
         if (!index.has_value()) {
             continue;
         }
-        const Vec3 center{intersection.position.x, intersection.position.y + marker_lift, intersection.position.z};
+        const Vec3 center{
+            intersection.position.x,
+            static_cast<float>(intersection.source->y) * scene.unit_size,
+            intersection.position.z,
+        };
         const auto t = ray_aabb_intersection_t(
             ray_origin, ray_dir,
             {center.x - node_half, center.y - node_half, center.z - node_half},
@@ -3697,35 +3699,77 @@ MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*
     scene.terrain = build_city_terrain(map, graph, corner_stamps, scene.city_tiles, scene.unit_size);
     scene.city_tile_buffer = build_city_tile_render_buffer(scene.city_tiles, scene.unit_size);
 
-    for (const auto& street : map.streets) {
-        if (street.from_intersection < 0 || street.to_intersection < 0) {
+    for (const auto& street : graph.streets) {
+        if (street.a < 0 || street.b < 0 || street.source_index < 0) {
             continue;
         }
-        const auto from_index = static_cast<std::size_t>(street.from_intersection);
-        const auto to_index = static_cast<std::size_t>(street.to_intersection);
-        if (from_index >= map.intersections.size() || to_index >= map.intersections.size()) {
+        const auto from_index = static_cast<std::size_t>(street.a);
+        const auto to_index = static_cast<std::size_t>(street.b);
+        const auto source_index = static_cast<std::size_t>(street.source_index);
+        if (from_index >= graph.intersections.size() || to_index >= graph.intersections.size() ||
+            source_index >= map.streets.size()) {
             continue;
         }
 
-        const auto& from = map.intersections[from_index];
-        const auto& to = map.intersections[to_index];
+        const auto& source = map.streets[source_index];
+        const auto& source_from = map.intersections[static_cast<std::size_t>(source.from_intersection)];
+        const auto& source_to = map.intersections[static_cast<std::size_t>(source.to_intersection)];
+        const auto& from = graph.intersections[from_index];
+        const auto& to = graph.intersections[to_index];
+        Vec3 guide_from{
+            static_cast<float>(from.gx) * scene.unit_size,
+            static_cast<float>(from.level + 1) * scene.unit_size,
+            static_cast<float>(from.gz) * scene.unit_size,
+        };
+        Vec3 guide_to{
+            static_cast<float>(to.gx) * scene.unit_size,
+            static_cast<float>(to.level + 1) * scene.unit_size,
+            static_cast<float>(to.gz) * scene.unit_size,
+        };
+        if (street.orientation == 0) {
+            guide_from.x += static_cast<float>(from.ext_x_pos) * scene.unit_size;
+            guide_to.x -= static_cast<float>(to.ext_x_neg) * scene.unit_size;
+        } else {
+            guide_from.z += static_cast<float>(from.ext_z_pos) * scene.unit_size;
+            guide_to.z -= static_cast<float>(to.ext_z_neg) * scene.unit_size;
+        }
+
+        const auto dx = guide_to.x - guide_from.x;
+        const auto dz = guide_to.z - guide_from.z;
+        const auto length = std::sqrt(dx * dx + dz * dz);
+        std::array<Vec3, 4> editor_quad{};
+        if (length > 0.0F) {
+            const Vec3 perpendicular{-dz / length, 0.0F, dx / length};
+            const auto left = static_cast<float>(street.left_width + 1) * scene.unit_size;
+            const auto right = static_cast<float>(street.right_width + 1) * scene.unit_size;
+            editor_quad = {{
+                {guide_from.x - perpendicular.x * left, guide_from.y, guide_from.z - perpendicular.z * left},
+                {guide_from.x + perpendicular.x * right, guide_from.y, guide_from.z + perpendicular.z * right},
+                {guide_to.x + perpendicular.x * right, guide_to.y, guide_to.z + perpendicular.z * right},
+                {guide_to.x - perpendicular.x * left, guide_to.y, guide_to.z - perpendicular.z * left},
+            }};
+        }
+
         scene.roads.push_back({
-            &street,
+            &source,
             {
-                static_cast<float>(from.x) * scene.unit_size,
-                native_road_surface_y(from.y - 1),
-                static_cast<float>(from.z) * scene.unit_size,
+                static_cast<float>(source_from.x) * scene.unit_size,
+                native_road_surface_y(source_from.y - 1),
+                static_cast<float>(source_from.z) * scene.unit_size,
             },
             {
-                static_cast<float>(to.x) * scene.unit_size,
-                native_road_surface_y(to.y - 1),
-                static_cast<float>(to.z) * scene.unit_size,
+                static_cast<float>(source_to.x) * scene.unit_size,
+                native_road_surface_y(source_to.y - 1),
+                static_cast<float>(source_to.z) * scene.unit_size,
             },
-            static_cast<float>(std::max(2, street.left_width + street.right_width + 2)) * scene.unit_size,
+            static_cast<float>(street.left_width + street.right_width + 2) * scene.unit_size,
+            editor_quad,
         });
     }
 
-    for (const auto& intersection : map.intersections) {
+    for (std::size_t intersection_index = 0; intersection_index < map.intersections.size(); ++intersection_index) {
+        const auto& intersection = map.intersections[intersection_index];
+        const auto& native = graph.intersections[intersection_index];
         auto width = 2.0F * scene.unit_size;
         for (const auto& road : scene.roads) {
             if (road.source->from_intersection == static_cast<std::int32_t>(intersection.index) ||
@@ -3742,6 +3786,28 @@ MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*
                 static_cast<float>(intersection.z) * scene.unit_size,
             },
             width,
+            {{
+                {
+                    static_cast<float>(native.gx - native.ext_x_neg) * scene.unit_size,
+                    static_cast<float>(native.level + 1) * scene.unit_size,
+                    static_cast<float>(native.gz + native.ext_z_pos) * scene.unit_size,
+                },
+                {
+                    static_cast<float>(native.gx + native.ext_x_pos) * scene.unit_size,
+                    static_cast<float>(native.level + 1) * scene.unit_size,
+                    static_cast<float>(native.gz + native.ext_z_pos) * scene.unit_size,
+                },
+                {
+                    static_cast<float>(native.gx + native.ext_x_pos) * scene.unit_size,
+                    static_cast<float>(native.level + 1) * scene.unit_size,
+                    static_cast<float>(native.gz - native.ext_z_neg) * scene.unit_size,
+                },
+                {
+                    static_cast<float>(native.gx - native.ext_x_neg) * scene.unit_size,
+                    static_cast<float>(native.level + 1) * scene.unit_size,
+                    static_cast<float>(native.gz - native.ext_z_neg) * scene.unit_size,
+                },
+            }},
         });
     }
 
