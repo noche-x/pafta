@@ -17,7 +17,7 @@
 
 The canvas sets its work plane to `floor * 4`. All cell positions use the native four-world-unit cell size.
 
-`BuildBuildingBlockRenderBuffers @ 0x1400799d0` builds the visible cell faces. It checks neighbor occupancy before it emits faces 1 through 5, then offsets generated vertices by the live volume center. The port still needs a field-level proof before changing its building-preview origin or its non-floor top-face rules.
+`BuildBuildingBlockRenderBuffers @ 0x1400799d0` builds the visible cell faces. It checks neighbor occupancy before it emits faces 1 through 5, then offsets generated vertices by the live volume center. The port now emits face 5 for an exposed solid-cell top and suppresses it when the cell above is solid. The building-preview origin still needs a field-level mapping before it changes.
 
 ## Port status
 

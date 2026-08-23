@@ -2849,6 +2849,7 @@ BuildingRenderBuffer build_native_building_tool_preview_render_buffer(
         const auto* east = find_cell_at(cell_index, cell.x + 1U, cell.y, cell.z);
         const auto* north = find_cell_at(cell_index, cell.x, cell.y, cell.z - 1U);
         const auto* south = find_cell_at(cell_index, cell.x, cell.y, cell.z + 1U);
+        const auto* up = find_cell_at(cell_index, cell.x, cell.y + 1U, cell.z);
 
         if (cell.interior_block() == 0xffffU) {
             add_native_tool_floor_cell_mesh(
@@ -2874,6 +2875,9 @@ BuildingRenderBuffer build_native_building_tool_preview_render_buffer(
         }
         if ((cell.interior_block() == 0U || (east != nullptr ? east->interior_portal_face() : 0U) < 2U) && !is_solid(east)) {
             boundary_mask |= 1U << 4U;
+        }
+        if (!is_solid(up)) {
+            boundary_mask |= 1U << 5U;
         }
 
         for (std::uint32_t face = 1U; face < native_preview_face_corners.size(); ++face) {

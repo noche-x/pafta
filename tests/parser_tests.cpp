@@ -518,6 +518,33 @@ void native_building_tool_preview_generates_ceiling_from_floor_cell_key() {
     }));
 }
 
+void native_building_tool_preview_emits_only_exposed_solid_top_faces() {
+    auto make_cell = [](std::size_t index, std::uint32_t y) {
+        return map_editor::SbbCell{
+            index,
+            0,
+            y,
+            0,
+            {0x40000000U, 0U, 0U, 0U, 0U, 0U},
+            0,
+            true,
+            {},
+        };
+    };
+
+    map_editor::SbbBuilding exposed{};
+    exposed.cells.push_back(make_cell(0U, 0U));
+    const auto exposed_buffer = map_editor::build_native_building_tool_preview_render_buffer(exposed, {}, {}, 0U);
+    assert(exposed_buffer.triangles.size() == 10U);
+    assert(has_buffer_position(exposed_buffer, 0.0F, 4.0F, 0.0F));
+
+    map_editor::SbbBuilding covered{};
+    covered.cells.push_back(make_cell(0U, 0U));
+    covered.cells.push_back(make_cell(1U, 1U));
+    const auto covered_buffer = map_editor::build_native_building_tool_preview_render_buffer(covered, {}, {}, 0U);
+    assert(covered_buffer.triangles.size() == 8U);
+}
+
 map_editor::BuildingRenderBuffer native_preview_buffer_for_default_side(std::uint32_t side) {
     auto make_cell = [](std::uint32_t x, std::uint32_t z, std::uint32_t exterior_face, std::uint32_t interior_face, bool occupied) {
         return map_editor::SbbCell{
@@ -3108,6 +3135,7 @@ int main() {
     native_building_rendering_ignores_interior_piece_words();
     native_building_tool_preview_generates_floor_faces_from_floor_cell_key();
     native_building_tool_preview_generates_ceiling_from_floor_cell_key();
+    native_building_tool_preview_emits_only_exposed_solid_top_faces();
     native_building_tool_preview_places_side_code_faces_on_source_side();
     native_building_tool_preview_generates_inset_boxes_from_floor_cell_side_code();
     resolves_sbb_portal_edge_units();
