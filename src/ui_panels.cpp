@@ -1,6 +1,7 @@
 #include "app_internal.hpp"
 
 #include <imgui.h>
+#include <imgui_internal.h>
 #include <rlImGui.h>
 #include <extras/IconsFontAwesome6.h>
 
@@ -23,6 +24,22 @@ std::string hex_u32(std::uint32_t value) {
     std::ostringstream stream;
     stream << "0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << value;
     return stream.str();
+}
+
+bool workspace_search_matches(const EditorUi& ui, EditorTab tab, std::string_view name) {
+    const auto& query = ui.asset_search[static_cast<std::size_t>(tab)];
+    if (query[0] == '\0') {
+        return true;
+    }
+    return lower_name(name).find(lower_name(query.data())) != std::string::npos;
+}
+
+std::string compact_asset_name(std::string_view name) {
+    constexpr std::size_t max_length = 14;
+    if (name.size() <= max_length) {
+        return std::string{name};
+    }
+    return std::string{name.substr(0, max_length - 3U)} + "...";
 }
 
 // Compact catalog combo: shows entries[selected], lets you pick another. Empty
@@ -426,6 +443,13 @@ void draw_buildblock_face_preview(
 
 void draw_building_asset_panel(EditorProject& project, EditorUi& ui) {
     const auto names = building_names(project);
+    std::vector<std::size_t> visible;
+    visible.reserve(names.size());
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        if (workspace_search_matches(ui, EditorTab::Buildings, names[i])) {
+            visible.push_back(i);
+        }
+    }
     ImGui::Text("Buildings (*.sbb)");
     const auto building_list_height = std::max(130.0F, ImGui::GetContentRegionAvail().y * 0.34F);
     if (ImGui::BeginChild("##building_templates_panel", ImVec2(0, building_list_height), true)) {
@@ -433,19 +457,24 @@ void draw_building_asset_panel(EditorProject& project, EditorUi& ui) {
             ImGui::TableSetupColumn("Name");
             ImGui::TableSetupColumn("Cells", ImGuiTableColumnFlags_WidthFixed, 54.0F);
             ImGui::TableHeadersRow();
-            for (std::size_t i = 0; i < project.buildings.size(); ++i) {
-                ImGui::PushID(static_cast<int>(i));
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn();
-                const bool selected = ui.selected_building == i;
-                if (ImGui::Selectable(names[i].c_str(), selected, ImGuiSelectableFlags_SpanAllColumns)) {
-                    ui.selected_building = i;
-                    ui.selected_building_cell = 0;
-                    project.building_floor_preview_dirty = true;
+            ImGuiListClipper clipper;
+            clipper.Begin(static_cast<int>(visible.size()));
+            while (clipper.Step()) {
+                for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                    const auto i = visible[static_cast<std::size_t>(row)];
+                    ImGui::PushID(static_cast<int>(i));
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    const bool selected = ui.selected_building == i;
+                    if (ImGui::Selectable(names[i].c_str(), selected, ImGuiSelectableFlags_SpanAllColumns)) {
+                        ui.selected_building = i;
+                        ui.selected_building_cell = 0;
+                        project.building_floor_preview_dirty = true;
+                    }
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%zu", project.buildings[i].data.cells.size());
+                    ImGui::PopID();
                 }
-                ImGui::TableNextColumn();
-                ImGui::Text("%zu", project.buildings[i].data.cells.size());
-                ImGui::PopID();
             }
             ImGui::EndTable();
         }
@@ -537,6 +566,13 @@ void draw_buildblock_gallery(EditorProject& project, EditorUi& ui) {
     }
 
     ui.selected_buildblock = std::min(ui.selected_buildblock, project.buildblocks.size() - 1U);
+    std::vector<std::size_t> visible;
+    visible.reserve(project.buildblocks.size());
+    for (std::size_t i = 0; i < project.buildblocks.size(); ++i) {
+        if (workspace_search_matches(ui, EditorTab::Buildblocks, project.buildblocks[i].name)) {
+            visible.push_back(i);
+        }
+    }
     const auto total_y = std::max(1.0F, ImGui::GetContentRegionAvail().y);
     const auto list_height = std::clamp(total_y * 0.36F, 120.0F, 220.0F);
     if (ImGui::BeginChild("##buildblock_list_panel", ImVec2(0, list_height), true)) {
@@ -544,21 +580,26 @@ void draw_buildblock_gallery(EditorProject& project, EditorUi& ui) {
             ImGui::TableSetupColumn("Name");
             ImGui::TableSetupColumn("Faces", ImGuiTableColumnFlags_WidthFixed, 56.0F);
             ImGui::TableHeadersRow();
-            for (std::size_t i = 0; i < project.buildblocks.size(); ++i) {
-                ImGui::PushID(static_cast<int>(i));
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn();
-                const bool selected = ui.selected_buildblock == i;
-                if (ImGui::Selectable(project.buildblocks[i].name.c_str(), selected, ImGuiSelectableFlags_SpanAllColumns)) {
-                    if (ui.selected_buildblock != i) {
-                        reset_buildblock_template_selection(ui, i);
-                    } else {
-                        ui.selected_buildblock = i;
+            ImGuiListClipper clipper;
+            clipper.Begin(static_cast<int>(visible.size()));
+            while (clipper.Step()) {
+                for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                    const auto i = visible[static_cast<std::size_t>(row)];
+                    ImGui::PushID(static_cast<int>(i));
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    const bool selected = ui.selected_buildblock == i;
+                    if (ImGui::Selectable(project.buildblocks[i].name.c_str(), selected, ImGuiSelectableFlags_SpanAllColumns)) {
+                        if (ui.selected_buildblock != i) {
+                            reset_buildblock_template_selection(ui, i);
+                        } else {
+                            ui.selected_buildblock = i;
+                        }
                     }
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%zu", project.buildblocks[i].data.layers.size());
+                    ImGui::PopID();
                 }
-                ImGui::TableNextColumn();
-                ImGui::Text("%zu", project.buildblocks[i].data.layers.size());
-                ImGui::PopID();
             }
             ImGui::EndTable();
         }
@@ -804,15 +845,24 @@ void draw_city_building_template_gallery(EditorProject& project, EditorUi& ui) {
     }
     ui.place_building_template = std::min(ui.place_building_template, project.buildings.size() - 1U);
     ImGui::Text("Place which building:");
+    std::vector<std::size_t> visible;
+    visible.reserve(project.buildings.size());
+    for (std::size_t i = 0; i < project.buildings.size(); ++i) {
+        if (workspace_search_matches(ui, EditorTab::City, project.buildings[i].name)) {
+            visible.push_back(i);
+        }
+    }
     constexpr float cell = 96.0F;
     const float avail = ImGui::GetContentRegionAvail().x;
-    const int per_row = std::max(1, static_cast<int>(avail / (cell + 8.0F)));
+    const int per_row = std::max(1, static_cast<int>(avail / (cell + 12.0F)));
     if (ImGui::BeginChild("##bldg_gallery", ImVec2(-FLT_MIN, -FLT_MIN), false)) {
-        for (std::size_t i = 0; i < project.buildings.size(); ++i) {
-            if (i % static_cast<std::size_t>(per_row) != 0) {
+        for (std::size_t row = 0; row < visible.size(); ++row) {
+            const auto i = visible[row];
+            if (row % static_cast<std::size_t>(per_row) != 0) {
                 ImGui::SameLine();
             }
             ImGui::PushID(static_cast<int>(i));
+            ImGui::BeginGroup();
             const bool selected = ui.place_building_template == i;
             if (selected) {
                 ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(255, 210, 90, 255));
@@ -836,9 +886,11 @@ void draw_city_building_template_gallery(EditorProject& project, EditorUi& ui) {
             if (clicked) {
                 ui.place_building_template = i;
             }
+            ImGui::TextUnformatted(compact_asset_name(project.buildings[i].name).c_str());
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("%s", project.buildings[i].name.c_str());
             }
+            ImGui::EndGroup();
             ImGui::PopID();
         }
     }
@@ -853,16 +905,25 @@ void draw_city_piece_template_gallery(EditorProject& project, EditorUi& ui) {
     ui.selected_city_block = std::min(ui.selected_city_block, project.city->data.city_blocks.size() - 1U);
     ImGui::Text("Place which piece:");
     auto names = city_block_names(project.city->data);
+    std::vector<std::size_t> visible;
+    visible.reserve(names.size());
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        if (workspace_search_matches(ui, EditorTab::City, names[i])) {
+            visible.push_back(i);
+        }
+    }
     constexpr float cell = 80.0F;
     const float avail = ImGui::GetContentRegionAvail().x;
     const int per_row = std::max(1, static_cast<int>(avail / (cell + 8.0F)));
     const float gallery_h = project.city->data.portals.empty() ? -FLT_MIN : 200.0F;
     if (ImGui::BeginChild("##piece_gallery", ImVec2(-FLT_MIN, gallery_h), false)) {
-        for (std::size_t i = 0; i < project.city->data.city_blocks.size(); ++i) {
-            if (i % static_cast<std::size_t>(per_row) != 0) {
+        for (std::size_t row = 0; row < visible.size(); ++row) {
+            const auto i = visible[row];
+            if (row % static_cast<std::size_t>(per_row) != 0) {
                 ImGui::SameLine();
             }
             ImGui::PushID(static_cast<int>(i));
+            ImGui::BeginGroup();
             const bool selected = ui.selected_city_block == i;
             if (selected) {
                 ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(255, 210, 90, 255));
@@ -884,9 +945,13 @@ void draw_city_piece_template_gallery(EditorProject& project, EditorUi& ui) {
             if (clicked) {
                 ui.selected_city_block = i;
             }
+            if (i < names.size()) {
+                ImGui::TextUnformatted(compact_asset_name(names[i]).c_str());
+            }
             if (ImGui::IsItemHovered() && i < names.size()) {
                 ImGui::SetTooltip("%s", names[i].c_str());
             }
+            ImGui::EndGroup();
             ImGui::PopID();
         }
     }
@@ -1678,63 +1743,33 @@ void apply_editor_imgui_style() {
 }
 
 void load_default_imgui_layout() {
-    static constexpr char default_layout[] = R"ini(
-[Window][WindowOverViewport_11111111]
-Pos=0,19
-Size=1440,881
-Collapsed=0
+    const auto dockspace = ImHashStr("SRCMapEditorDockSpace");
+    const auto* viewport = ImGui::GetMainViewport();
+    ImGui::DockBuilderRemoveNode(dockspace);
+    ImGui::DockBuilderAddNode(dockspace, ImGuiDockNodeFlags_DockSpace);
+    ImGui::DockBuilderSetNodePos(dockspace, viewport->WorkPos);
+    ImGui::DockBuilderSetNodeSize(dockspace, viewport->WorkSize);
 
-[Window][Debug##Default]
-Pos=60,60
-Size=400,400
-Collapsed=0
+    ImGuiID center = dockspace;
+    const auto left = ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, 0.22F, nullptr, &center);
+    const auto right = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.26F, nullptr, &center);
+    const auto bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.18F, nullptr, &center);
 
-[Window][Viewport 3D]
-Pos=322,19
-Size=756,663
-Collapsed=0
-DockId=0x00000005,0
+    ImGui::DockBuilderDockWindow("Asset Browser", left);
+    ImGui::DockBuilderDockWindow("Inspector", right);
+    ImGui::DockBuilderDockWindow("Console / Status", bottom);
+    ImGui::DockBuilderDockWindow("History", bottom);
+    ImGui::DockBuilderDockWindow("Viewport 3D", center);
+    ImGui::DockBuilderDockWindow("2D Preview", center);
+    ImGui::DockBuilderDockWindow("Buildblock 2D Preview", center);
+    ImGui::DockBuilderFinish(dockspace);
+}
 
-[Window][Asset Browser]
-Pos=0,19
-Size=320,881
-Collapsed=0
-DockId=0x00000001,0
-
-[Window][Console / Status]
-Pos=322,684
-Size=756,216
-Collapsed=0
-DockId=0x00000006,0
-
-[Window][Inspector]
-Pos=1080,19
-Size=360,881
-Collapsed=0
-DockId=0x00000004,0
-
-[Window][2D Preview]
-Pos=322,19
-Size=756,663
-Collapsed=0
-DockId=0x00000005,1
-
-[Window][Buildblock 2D Preview]
-Pos=322,19
-Size=756,663
-Collapsed=0
-DockId=0x00000005,2
-
-[Docking][Data]
-DockSpace       ID=0x08BD597D Window=0x1BBC0F80 Pos=0,19 Size=1440,881 Split=X Selected=0x13DC1525
-  DockNode      ID=0x00000003 Parent=0x08BD597D SizeRef=1080,881 Split=X
-    DockNode    ID=0x00000001 Parent=0x00000003 SizeRef=320,881 Selected=0x36AF052B
-    DockNode    ID=0x00000002 Parent=0x00000003 SizeRef=756,881 Split=Y Selected=0x13DC1525
-      DockNode  ID=0x00000005 Parent=0x00000002 SizeRef=756,663 CentralNode=1 Selected=0x13DC1525
-      DockNode  ID=0x00000006 Parent=0x00000002 SizeRef=756,216 Selected=0x8C63CC03
-  DockNode      ID=0x00000004 Parent=0x08BD597D SizeRef=360,881 Selected=0x36DC96AB
-)ini";
-    ImGui::LoadIniSettingsFromMemory(default_layout, sizeof(default_layout) - 1U);
+void draw_editor_dockspace(bool reset_layout) {
+    if (reset_layout) {
+        load_default_imgui_layout();
+    }
+    ImGui::DockSpaceOverViewport(ImHashStr("SRCMapEditorDockSpace"), ImGui::GetMainViewport());
 }
 
 } // namespace map_editor::app_internal

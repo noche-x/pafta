@@ -3329,8 +3329,67 @@ void update_focus_animation(EditorUi& ui, Camera3D& camera) {
     }
 }
 
-// flying, so it never collides with text fields or WASD movement.
-void handle_editor_hotkeys(EditorProject& project, EditorUi& ui, Camera3D& camera, std::string& status) {
+void focus_current_selection(EditorProject& project, EditorUi& ui, Camera3D& camera) {
+    if (const auto target = focus_target_for_selection(project, ui)) {
+        start_focus_animation(ui, camera, target->point, target->radius);
+        return;
+    }
+    Camera3D framed = camera;
+    focus_camera_on_city(framed, project);
+    start_focus_animation(ui, camera, framed.target, 130.0F);
+}
+
+bool active_tab_dirty(const EditorUi& ui) {
+    switch (ui.tab) {
+        case EditorTab::City:
+        case EditorTab::Pieces:
+            return ui.city_dirty;
+        case EditorTab::Buildings:
+            return ui.building_dirty;
+        case EditorTab::Buildblocks:
+            return ui.buildblock_dirty;
+        case EditorTab::Blocks:
+            return ui.block_dirty;
+    }
+    return false;
+}
+
+const char* active_tool_label(const EditorUi& ui) {
+    if (ui.tab == EditorTab::City) {
+        switch (ui.city_tool) {
+            case CityTool::Select: return "Select";
+            case CityTool::Building: return "Place building";
+            case CityTool::Road: return "Draw road";
+            case CityTool::Piece: return "Place piece";
+            case CityTool::Erase: return "Erase";
+        }
+    }
+    if (ui.tab == EditorTab::Buildings) {
+        switch (ui.building_tool) {
+            case BuildingTool::Select: return "Select cell";
+            case BuildingTool::PlaceBlock: return "Place block";
+            case BuildingTool::PaintTexture: return "Paint texture";
+        }
+    }
+    return "Inspect";
+}
+
+bool asset_search_matches(const EditorUi& ui, std::string_view name) {
+    const auto& query = ui.asset_search[static_cast<std::size_t>(ui.tab)];
+    if (query[0] == '\0') {
+        return true;
+    }
+    return lower_name(name).find(lower_name(query.data())) != std::string::npos;
+}
+
+// Handles global commands first, then viewport-only editing keys. The caller
+// already excludes active text fields and freecam flight.
+void handle_editor_hotkeys(
+    EditorProject& project,
+    EditorUi& ui,
+    Camera3D& camera,
+    std::string& status,
+    bool viewport_hovered) {
     const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
     const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
 
@@ -3339,8 +3398,10 @@ void handle_editor_hotkeys(EditorProject& project, EditorUi& ui, Camera3D& camer
         save_active_tab(project, ui, status);
         return;
     }
-    // Undo / redo. Ctrl+Z undoes; Ctrl+Y or Ctrl+Shift+Z redoes.
-    if (ctrl && IsKeyPressed(KEY_Z)) {
+    // The current undo stack owns city changes only. Do not silently undo the city
+    // while the user is editing a different asset type.
+    const bool city_history_active = ui.tab == EditorTab::City || ui.tab == EditorTab::Pieces;
+    if (city_history_active && ctrl && IsKeyPressed(KEY_Z)) {
         if (shift) {
             redo_city(project, ui, status);
         } else {
@@ -3348,21 +3409,14 @@ void handle_editor_hotkeys(EditorProject& project, EditorUi& ui, Camera3D& camer
         }
         return;
     }
-    if (ctrl && IsKeyPressed(KEY_Y)) {
+    if (city_history_active && ctrl && IsKeyPressed(KEY_Y)) {
         redo_city(project, ui, status);
         return;
     }
     if (IsKeyPressed(KEY_F)) {
-        // Focus the selected thing with an eased glide; fall back to framing the
-        // whole city when nothing is selected.
-        if (const auto target = focus_target_for_selection(project, ui)) {
-            start_focus_animation(ui, camera, target->point, target->radius);
-        } else {
-            Camera3D framed = camera;
-            focus_camera_on_city(framed, project);
-            start_focus_animation(ui, camera, framed.target, 130.0F);
-        }
+        focus_current_selection(project, ui, camera);
     }
+
     // Esc cancels an in-progress gizmo drag, restoring the captured position.
     if (IsKeyPressed(KEY_ESCAPE) && ui.gizmo_active != GizmoAxis::None) {
         if (project.city && !project.city->data.buildings.empty()) {
@@ -3378,6 +3432,13 @@ void handle_editor_hotkeys(EditorProject& project, EditorUi& ui, Camera3D& camer
     // Esc ends an in-progress road-laying chain.
     if (IsKeyPressed(KEY_ESCAPE) && ui.pending_road_intersection.has_value()) {
         end_road_chain(ui);
+        return;
+    }
+
+    // Destructive and transform keys belong to the 3D canvas. Requiring the
+    // pointer over the rendered image prevents Delete, arrows, and placement keys
+    // from firing while the user works in another panel.
+    if (!viewport_hovered) {
         return;
     }
 
@@ -3603,9 +3664,7 @@ int run_editor_app() {
     // the wider Latin coverage and re-merges FA so both survive.
     load_editor_fonts(io);
     apply_editor_imgui_style();
-    if (io.IniFilename == nullptr || !std::filesystem::exists(io.IniFilename)) {
-        load_default_imgui_layout();
-    }
+    bool reset_layout_requested = io.IniFilename == nullptr || !std::filesystem::exists(io.IniFilename);
 
     Camera3D camera = default_camera();
     std::optional<EditorProject> project;
@@ -3644,6 +3703,7 @@ int run_editor_app() {
     // dialog. Options persist across exports during the session.
     bool open_export_popup = false;
     ExportOptions export_options{};
+    bool layout_checked = false;
 
     while (running) {
         MAPED_PROFILE_BLOCK("editor frame");
@@ -3693,7 +3753,7 @@ int run_editor_app() {
         // text field) and the freecam is not flying, so they never collide with
         // typing or WASD movement.
         if (project && !io.WantCaptureKeyboard && !IsCursorHidden()) {
-            handle_editor_hotkeys(*project, ui, camera, status);
+            handle_editor_hotkeys(*project, ui, camera, status, is_viewport_hovered);
         }
 
         const SbcBuilding* outline_selected_building = nullptr;
@@ -4190,7 +4250,8 @@ int run_editor_app() {
         const auto imgui_begin = std::chrono::steady_clock::now();
         rlImGuiBegin();
 
-        ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
+        draw_editor_dockspace(reset_layout_requested);
+        reset_layout_requested = false;
 
         // Warm the thumbnail caches a few per frame after load, and show a loading
         // overlay with progress until render buffers + thumbnails are all ready.
@@ -4200,7 +4261,6 @@ int run_editor_app() {
         }
 
         bool open_folder_requested = false;
-        bool reset_layout_requested = false;
         bool export_mesh_requested = false;
         bool run_export_after_popup = false;
 
@@ -4219,13 +4279,53 @@ int run_editor_app() {
                 }
                 ImGui::EndMenu();
             }
-            if (ImGui::BeginMenu("Window")) {
+            if (ImGui::BeginMenu("View")) {
                 if (ImGui::MenuItem("Reset Dock Layout")) {
                     reset_layout_requested = true;
                 }
-                ImGui::MenuItem("Show ImGui Demo Window", nullptr, &show_demo_window);
                 ImGui::MenuItem("Graphics Debug", "F3", &show_graphics_debug);
+                if (ImGui::BeginMenu("Developer")) {
+                    ImGui::MenuItem("ImGui Demo Window", nullptr, &show_demo_window);
+                    ImGui::EndMenu();
+                }
                 ImGui::EndMenu();
+            }
+            ImGui::Separator();
+            if (project) {
+                ImGui::TextDisabled("%s", project->root.filename().string().c_str());
+                ImGui::SameLine();
+                if (ImGui::SmallButton(active_tab_dirty(ui) ? "Save *" : "Save")) {
+                    save_active_tab(*project, ui, status);
+                }
+                ImGui::SameLine();
+                const bool city_history_active = ui.tab == EditorTab::City || ui.tab == EditorTab::Pieces;
+                ImGui::BeginDisabled(!city_history_active || project->undo_stack.empty());
+                if (ImGui::SmallButton("Undo")) {
+                    undo_city(*project, ui, status);
+                }
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                ImGui::BeginDisabled(!city_history_active || project->redo_stack.empty());
+                if (ImGui::SmallButton("Redo")) {
+                    redo_city(*project, ui, status);
+                }
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Focus")) {
+                    focus_current_selection(*project, ui, camera);
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Export")) {
+                    export_mesh_requested = true;
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", active_tool_label(ui));
+                if (has_unsaved_changes(ui)) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.94F, 0.79F, 0.35F, 1.0F), "Unsaved");
+                }
+            } else if (ImGui::SmallButton("Open map folder...")) {
+                open_folder_requested = true;
             }
             ImGui::EndMainMenuBar();
         }
@@ -4233,16 +4333,11 @@ int run_editor_app() {
         if (show_demo_window) {
             ImGui::ShowDemoWindow(&show_demo_window);
         }
-        if (reset_layout_requested) {
-            load_default_imgui_layout();
-        }
-
         is_viewport_hovered = false;
         if (show_3d_viewport) {
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
             ImGui::Begin("Viewport 3D");
             {
-                is_viewport_hovered = ImGui::IsWindowHovered();
                 ImVec2 size = ImGui::GetContentRegionAvail();
 
                 if ((size.x != last_viewport_size.x || size.y != last_viewport_size.y) && size.x > 0 && size.y > 0) {
@@ -4254,6 +4349,7 @@ int run_editor_app() {
                 }
 
                 rlImGuiImageRenderTexture(&viewport_texture);
+                is_viewport_hovered = ImGui::IsItemHovered();
 
                 ImVec2 min_pos = ImGui::GetWindowPos();
                 min_pos.x += ImGui::GetWindowContentRegionMin().x;
@@ -4285,6 +4381,10 @@ int run_editor_app() {
         }
 
         ImGui::Begin("Asset Browser");
+        if (!layout_checked) {
+            layout_checked = true;
+            reset_layout_requested = ImGui::GetWindowWidth() < 220.0F;
+        }
         if (!project) {
             ImGui::Text("No project loaded.");
             if (ImGui::Button("Open Folder")) {
@@ -4294,37 +4394,54 @@ int run_editor_app() {
             ImGui::Text("Project: %s", project->root.filename().string().c_str());
             ImGui::Separator();
 
-            const char* tab_names[] = { "City##asset_tab_city", "Buildings##asset_tab_buildings", "Pieces##asset_tab_pieces", "Buildblocks##asset_tab_buildblocks", "Blocks##asset_tab_blocks" };
-            for (int t = 0; t < 5; ++t) {
-                bool is_active = (static_cast<int>(ui.tab) == t);
-                if (is_active) {
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
-                }
-                if (ImGui::Button(tab_names[t], ImVec2(ImGui::GetContentRegionAvail().x / (5.0f - t) - 4, 30))) {
-                    ui.tab = static_cast<EditorTab>(t);
-                    if (ui.tab == EditorTab::City) {
-                        focus_camera_on_city(camera, *project);
-                    } else {
-                        camera = default_camera();
+            EditorTab next_tab = ui.tab;
+            if (ImGui::BeginTabBar("##workspace_tabs", ImGuiTabBarFlags_FittingPolicyResizeDown)) {
+                const auto tab = [&](const char* label, EditorTab value) {
+                    if (ImGui::BeginTabItem(label)) {
+                        next_tab = value;
+                        ImGui::EndTabItem();
                     }
+                };
+                tab("City", EditorTab::City);
+                tab("Buildings", EditorTab::Buildings);
+                tab("Pieces", EditorTab::Pieces);
+                tab("Buildblocks", EditorTab::Buildblocks);
+                tab("Blocks", EditorTab::Blocks);
+                ImGui::EndTabBar();
+            }
+            if (next_tab != ui.tab) {
+                ui.tab = next_tab;
+                if (ui.tab == EditorTab::City) {
+                    focus_camera_on_city(camera, *project);
+                } else {
+                    camera = default_camera();
                 }
-                if (is_active) {
-                    ImGui::PopStyleColor();
-                }
-                if (t < 4) ImGui::SameLine();
             }
 
-            ImGui::Separator();
+            auto& search = ui.asset_search[static_cast<std::size_t>(ui.tab)];
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputTextWithHint("##asset_search", "Search this workspace...", search.data(), search.size());
             ImGui::Spacing();
 
             if (ui.tab == EditorTab::City) {
                 if (project->city) {
                     ImGui::Text("city2.sbc");
-                    ImGui::TextDisabled("Pick a tool in the viewport toolbar.");
+                    ImGui::TextDisabled("Active tool: %s", active_tool_label(ui));
                     ImGui::Separator();
-                    ImGui::TextUnformatted("Game layers:");
-                    ImGui::Checkbox("Roads##render_roads", &ui.render_roads); ImGui::SameLine();
-                    ImGui::Checkbox("Terrain##render_terrain", &ui.render_terrain);
+                    ImGui::TextUnformatted("Preview:");
+                    int preview_mode = ui.render_roads && ui.render_terrain ? 1 : 0;
+                    if (ImGui::RadioButton("Editor", &preview_mode, 0)) {
+                        ui.render_roads = false;
+                        ui.render_terrain = false;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::RadioButton("In game", &preview_mode, 1)) {
+                        ui.render_roads = true;
+                        ui.render_terrain = true;
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Show the game terrain and finished road surfaces");
+                    }
                     ImGui::Separator();
 
                     // The Building/Piece tools pick a template to place; show the
@@ -4352,40 +4469,64 @@ int run_editor_app() {
                     } else {
                         // Select/Road/Erase: list placed buildings and roads to pick.
                         if (!project->city->data.buildings.empty()) {
-                            auto names = city_building_names(project->city->data);
-                            ImGui::Text("Placed Buildings (%zu):", names.size());
+                            const auto names = city_building_names(project->city->data);
+                            std::vector<std::size_t> visible;
+                            visible.reserve(names.size());
+                            for (std::size_t i = 0; i < names.size(); ++i) {
+                                if (asset_search_matches(ui, names[i])) {
+                                    visible.push_back(i);
+                                }
+                            }
+                            ImGui::Text("Placed Buildings (%zu):", visible.size());
                             if (ImGui::BeginListBox("##placed_bldgs", ImVec2(-FLT_MIN, 150.0F))) {
-                                for (std::size_t i = 0; i < names.size(); ++i) {
-                                    ImGui::PushID(static_cast<int>(i));
-                                    const bool in_group = std::find(ui.selected_city_buildings.begin(), ui.selected_city_buildings.end(), i) != ui.selected_city_buildings.end();
-                                    const bool active = ui.city_selection == CitySelectionKind::Building &&
-                                        (ui.selected_city_building == i || in_group);
-                                    if (ImGui::Selectable(names[i].c_str(), active)) {
-                                        ui.selected_city_building = i;
-                                        ui.city_selection = CitySelectionKind::Building;
-                                        // Ctrl/Shift-click in the list toggles group membership.
-                                        if (ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift) {
-                                            toggle_in_selection(ui.selected_city_buildings, i);
-                                        } else {
-                                            ui.selected_city_buildings = {i};
+                                ImGuiListClipper clipper;
+                                clipper.Begin(static_cast<int>(visible.size()));
+                                while (clipper.Step()) {
+                                    for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                                        const auto i = visible[static_cast<std::size_t>(row)];
+                                        ImGui::PushID(static_cast<int>(i));
+                                        const bool in_group = std::find(ui.selected_city_buildings.begin(), ui.selected_city_buildings.end(), i) != ui.selected_city_buildings.end();
+                                        const bool active = ui.city_selection == CitySelectionKind::Building &&
+                                            (ui.selected_city_building == i || in_group);
+                                        if (ImGui::Selectable(names[i].c_str(), active)) {
+                                            ui.selected_city_building = i;
+                                            ui.city_selection = CitySelectionKind::Building;
+                                            // Ctrl/Shift-click in the list toggles group membership.
+                                            if (ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift) {
+                                                toggle_in_selection(ui.selected_city_buildings, i);
+                                            } else {
+                                                ui.selected_city_buildings = {i};
+                                            }
                                         }
+                                        ImGui::PopID();
                                     }
-                                    ImGui::PopID();
                                 }
                                 ImGui::EndListBox();
                             }
                         }
                         if (!project->city->data.streets.empty()) {
-                            auto names = city_street_names(project->city->data);
-                            ImGui::Text("Roads (%zu):", names.size());
+                            const auto names = city_street_names(project->city->data);
+                            std::vector<std::size_t> visible;
+                            visible.reserve(names.size());
+                            for (std::size_t i = 0; i < names.size(); ++i) {
+                                if (asset_search_matches(ui, names[i])) {
+                                    visible.push_back(i);
+                                }
+                            }
+                            ImGui::Text("Roads (%zu):", visible.size());
                             if (ImGui::BeginListBox("##roads", ImVec2(-FLT_MIN, -FLT_MIN))) {
-                                for (std::size_t i = 0; i < names.size(); ++i) {
-                                    ImGui::PushID(static_cast<int>(i));
-                                    if (ImGui::Selectable(names[i].c_str(), ui.city_selection == CitySelectionKind::Road && ui.selected_city_street == i)) {
-                                        ui.selected_city_street = i;
-                                        ui.city_selection = CitySelectionKind::Road;
+                                ImGuiListClipper clipper;
+                                clipper.Begin(static_cast<int>(visible.size()));
+                                while (clipper.Step()) {
+                                    for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                                        const auto i = visible[static_cast<std::size_t>(row)];
+                                        ImGui::PushID(static_cast<int>(i));
+                                        if (ImGui::Selectable(names[i].c_str(), ui.city_selection == CitySelectionKind::Road && ui.selected_city_street == i)) {
+                                            ui.selected_city_street = i;
+                                            ui.city_selection = CitySelectionKind::Road;
+                                        }
+                                        ImGui::PopID();
                                     }
-                                    ImGui::PopID();
                                 }
                                 ImGui::EndListBox();
                             }
@@ -4398,31 +4539,55 @@ int run_editor_app() {
                 draw_building_asset_panel(*project, ui);
             } else if (ui.tab == EditorTab::Pieces) {
                 if (project->city && !project->city->data.city_blocks.empty()) {
-                    auto names = city_block_names(project->city->data);
-                    ImGui::Text("City Block Templates:");
+                    const auto names = city_block_names(project->city->data);
+                    std::vector<std::size_t> visible;
+                    visible.reserve(names.size());
+                    for (std::size_t i = 0; i < names.size(); ++i) {
+                        if (asset_search_matches(ui, names[i])) {
+                            visible.push_back(i);
+                        }
+                    }
+                    ImGui::Text("City Block Templates (%zu):", visible.size());
                     if (ImGui::BeginListBox("##city_pieces", ImVec2(-FLT_MIN, -FLT_MIN))) {
-                        for (std::size_t i = 0; i < names.size(); ++i) {
-                            ImGui::PushID(static_cast<int>(i));
-                            const bool selected = (ui.selected_city_block == i);
-                            if (ImGui::Selectable(names[i].c_str(), selected)) {
-                                ui.selected_city_block = i;
+                        ImGuiListClipper clipper;
+                        clipper.Begin(static_cast<int>(visible.size()));
+                        while (clipper.Step()) {
+                            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                                const auto i = visible[static_cast<std::size_t>(row)];
+                                ImGui::PushID(static_cast<int>(i));
+                                const bool selected = (ui.selected_city_block == i);
+                                if (ImGui::Selectable(names[i].c_str(), selected)) {
+                                    ui.selected_city_block = i;
+                                }
+                                ImGui::PopID();
                             }
-                            ImGui::PopID();
                         }
                         ImGui::EndListBox();
                     }
                 }
             } else if (ui.tab == EditorTab::Blocks) {
-                auto names = block_names(*project);
-                ImGui::Text("Blocks (*.sbl):");
+                const auto names = block_names(*project);
+                std::vector<std::size_t> visible;
+                visible.reserve(names.size());
+                for (std::size_t i = 0; i < names.size(); ++i) {
+                    if (asset_search_matches(ui, names[i])) {
+                        visible.push_back(i);
+                    }
+                }
+                ImGui::Text("Blocks (*.sbl) (%zu):", visible.size());
                 if (ImGui::BeginListBox("##blocks", ImVec2(-FLT_MIN, -FLT_MIN))) {
-                    for (std::size_t i = 0; i < names.size(); ++i) {
-                        ImGui::PushID(static_cast<int>(i));
-                        const bool selected = (ui.selected_block == i);
-                        if (ImGui::Selectable(names[i].c_str(), selected)) {
-                            ui.selected_block = i;
+                    ImGuiListClipper clipper;
+                    clipper.Begin(static_cast<int>(visible.size()));
+                    while (clipper.Step()) {
+                        for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                            const auto i = visible[static_cast<std::size_t>(row)];
+                            ImGui::PushID(static_cast<int>(i));
+                            const bool selected = (ui.selected_block == i);
+                            if (ImGui::Selectable(names[i].c_str(), selected)) {
+                                ui.selected_block = i;
+                            }
+                            ImGui::PopID();
                         }
-                        ImGui::PopID();
                     }
                     ImGui::EndListBox();
                 }
@@ -4435,6 +4600,11 @@ int run_editor_app() {
         ImGui::Begin("Inspector");
         if (project) {
             draw_controls_help(ui);
+            if (ui.tab == EditorTab::City && ui.city_selection == CitySelectionKind::None) {
+                ImGui::SeparatorText("Selection");
+                ImGui::TextUnformatted("Nothing selected");
+                ImGui::TextWrapped("Use Select in the viewport, then click a building, road, node, or piece.");
+            }
             if (ui.tab == EditorTab::City && project->city) {
                 if ((ui.city_selection == CitySelectionKind::Road || ui.city_selection == CitySelectionKind::Node) &&
                     (!project->city->data.intersections.empty() || !project->city->data.streets.empty())) {
@@ -4933,6 +5103,7 @@ int run_editor_app() {
             project = load_project_folder(folder, status);
             if (project) {
                 set_status(*project);
+                status = "loaded " + project->root.filename().string();
                 if (ui.tab == EditorTab::City) {
                     focus_camera_on_city(camera, *project);
                 } else {

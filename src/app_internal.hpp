@@ -463,6 +463,9 @@ struct CityGridPoint {
 
 struct EditorUi {
     EditorTab tab{EditorTab::City};
+    // One persistent search query per workspace tab. Keeping the queries separate
+    // prevents a Buildings search from making another tab appear empty.
+    std::array<std::array<char, 128>, 5> asset_search{};
     std::size_t selected_building{};
     std::size_t selected_block{};
     std::size_t selected_block_field{};
@@ -732,5 +735,6 @@ void draw_block_inspector(EditorProject& project, EditorUi& ui, std::string& sta
 void draw_buildblock_inspector(EditorProject& project, EditorUi& ui, std::string& status);
 void apply_editor_imgui_style();
 void load_default_imgui_layout();
+void draw_editor_dockspace(bool reset_layout);
 
 } // namespace map_editor::app_internal
