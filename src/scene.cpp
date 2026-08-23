@@ -2893,6 +2893,36 @@ BuildingRenderBuffer build_native_building_tool_preview_render_buffer(
     return buffer;
 }
 
+BuildingRenderBuffer build_city_building_full_render_buffer(
+    const SbbBuilding& building,
+    const std::vector<NamedBlockMesh>& block_meshes,
+    const std::vector<NamedBuildblockTemplate>& buildblock_templates) {
+    auto buffer = build_native_building_tool_preview_render_buffer(
+        building,
+        block_meshes,
+        buildblock_templates,
+        std::nullopt);
+    const Vec3 offset{
+        -static_cast<float>(building.anchor_x) * buffer.unit_size,
+        -static_cast<float>(building.anchor_y) * buffer.unit_size,
+        -static_cast<float>(building.anchor_z) * buffer.unit_size,
+    };
+    for (auto& vertex : buffer.vertices) {
+        vertex.position.x += offset.x;
+        vertex.position.y += offset.y;
+        vertex.position.z += offset.z;
+    }
+    for (auto& line : buffer.wire_lines) {
+        line.from.x += offset.x;
+        line.from.y += offset.y;
+        line.from.z += offset.z;
+        line.to.x += offset.x;
+        line.to.y += offset.y;
+        line.to.z += offset.z;
+    }
+    return buffer;
+}
+
 BuildingRenderBuffer build_native_portal_render_buffer(
     const SbcMap& map,
     const std::vector<NamedBlockMesh>& block_meshes,

@@ -291,6 +291,10 @@ BuildingRenderBuffer build_native_building_render_buffer(
     const SbbBuilding& building,
     const std::vector<NamedBlockMesh>& block_meshes,
     const std::vector<NamedBuildblockTemplate>& buildblock_templates);
+BuildingRenderBuffer build_city_building_full_render_buffer(
+    const SbbBuilding& building,
+    const std::vector<NamedBlockMesh>& block_meshes,
+    const std::vector<NamedBuildblockTemplate>& buildblock_templates);
 BuildingRenderBuffer build_native_building_tool_preview_render_buffer(
     const SbbBuilding& building,
     const std::vector<NamedBlockMesh>& block_meshes,

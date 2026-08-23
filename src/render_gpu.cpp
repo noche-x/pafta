@@ -161,7 +161,7 @@ void start_async_render_buffer_rebuild(EditorProject& project) {
                 progress->current = building.name;
             }
             const auto begin = Clock::now();
-            auto city_buffer = build_native_building_render_buffer(building.data, blocks, templates);
+            auto city_buffer = build_city_building_full_render_buffer(building.data, blocks, templates);
             const auto end = Clock::now();
             const auto ms = std::chrono::duration<double, std::milli>(end - begin).count();
             const auto expanded_vertex_count = city_buffer.triangles.size() * 3U;
@@ -1227,7 +1227,7 @@ void rebuild_single_building_render(EditorProject& project, std::size_t index) {
     const auto blocks = block_meshes(project);
     const auto templates = buildblock_templates(project);
     project.building_render_buffers[index] =
-        build_native_building_render_buffer(project.buildings[index].data, blocks, templates);
+        build_city_building_full_render_buffer(project.buildings[index].data, blocks, templates);
     project.building_gpu_models[index] =
         upload_building_render_model(project.building_render_buffers[index], project.buildings[index].data, project);
 }

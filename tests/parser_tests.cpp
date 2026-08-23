@@ -990,6 +990,75 @@ void native_building_tool_preview_uses_frame_faces_for_buildblock_opening() {
     }));
 }
 
+void city_building_render_buffer_uses_full_building_preview_geometry() {
+    map_editor::SblBlockMesh interior_mesh{};
+    interior_mesh.width = 1;
+    interior_mesh.height = 1;
+    interior_mesh.depth = 1;
+    interior_mesh.faces.push_back({
+        0U,
+        {
+            {0.0F, 1.0F, 0.0F},
+            {1.0F, 1.0F, 0.0F},
+            {1.0F, 0.0F, 0.0F},
+            {0.0F, 0.0F, 0.0F},
+        },
+        {
+            {0.0F, 1.0F},
+            {1.0F, 1.0F},
+            {1.0F, 0.0F},
+            {0.0F, 0.0F},
+        },
+        false,
+        0x60000U,
+    });
+
+    map_editor::SblLayer layer{};
+    layer.index = 1;
+    layer.portal_type = 0;
+    layer.bounds = {0.25F, 0.5F, 0.25F, 0.5F};
+    layer.windows.push_back({0U, 0.375F, 0.25F, 0.4F, 0.2F});
+    layer.beams.push_back({0U, 0.1F, 0.8F, 0.7F, 0.08F});
+
+    map_editor::SblTemplate buildblock{};
+    buildblock.version = 1;
+    buildblock.layers.resize(2);
+    buildblock.layers[1] = layer;
+
+    map_editor::SbbBuilding building{};
+    building.extent_x = 1;
+    building.extent_y = 1;
+    building.extent_z = 1;
+    building.block_names = {"portal"};
+    building.piece_names = {"interior"};
+    auto cell = map_editor::SbbCell{
+        0,
+        0,
+        0,
+        0,
+        {0x40000000U, 0x80000000U, 0U, 4U, 0U, 0U},
+        0,
+        true,
+        {
+            map_editor::SbbCellPayload{map_editor::PayloadKind::Block, 0x40000000U, 0U},
+            map_editor::SbbCellPayload{map_editor::PayloadKind::Piece, 0x80000000U, 0U},
+        },
+    };
+    cell.shorts[14] = 46U;
+    cell.shorts[8] = 91U;
+    cell.shorts[3] = 12U;
+    building.cells.push_back(cell);
+
+    const auto buffer = map_editor::build_city_building_full_render_buffer(
+        building,
+        {map_editor::NamedBlockMesh{"interior", interior_mesh}},
+        {map_editor::NamedBuildblockTemplate{"portal", buildblock}});
+
+    assert(std::ranges::any_of(buffer.material_runs, [](const map_editor::RenderBufferMaterialRun& run) {
+        return run.material == 91U;
+    }));
+}
+
 void native_building_tool_preview_leaves_buildblock_opening_empty() {
     map_editor::SblLayer layer{};
     layer.index = 1;
@@ -3051,6 +3120,7 @@ int main() {
     native_building_render_buffer_uses_cell_material_slots();
     native_city_building_render_buffer_keeps_plain_buildblock_walls_untextured();
     native_building_tool_preview_uses_frame_faces_for_buildblock_opening();
+    city_building_render_buffer_uses_full_building_preview_geometry();
     native_building_tool_preview_leaves_buildblock_opening_empty();
     picks_nearest_occupied_building_cell_with_native_anchor();
     building_cell_picker_respects_visible_floor_filter();
