@@ -1185,9 +1185,41 @@ void draw_gpu_building_model(
     }
 }
 
-void draw_sbb_scene_for_app(const SbbBuilding& building, GpuBuildingRenderModel& model, const SbbCell* selected) {
+void draw_sbb_scene_for_app(
+    const SbbBuilding& building,
+    GpuBuildingRenderModel& model,
+    const SbbCell* selected,
+    std::uint32_t guide_floor) {
     constexpr auto unit_size = 4.0F;
-    DrawGrid(96, unit_size);
+    constexpr std::uint32_t grid_cells = 64;
+    const auto floor = std::min(guide_floor, building.size_z > 0U ? building.size_z - 1U : 0U);
+    const auto grid_y = (static_cast<float>(floor) - static_cast<float>(building.anchor_y)) * unit_size + 0.02F;
+    const auto grid_min_x = -static_cast<float>(building.anchor_x) * unit_size;
+    const auto grid_min_z = -static_cast<float>(building.anchor_z) * unit_size;
+    const auto grid_max_x = (static_cast<float>(grid_cells) - static_cast<float>(building.anchor_x)) * unit_size;
+    const auto grid_max_z = (static_cast<float>(grid_cells) - static_cast<float>(building.anchor_z)) * unit_size;
+
+    // editor.exe draws a fixed 64-cell work grid with 65 lines in each axis.
+    // Every fourth line is stronger so block-sized groups remain legible.
+    for (std::uint32_t index = 0; index <= grid_cells; ++index) {
+        const auto color = index % 4U == 0U
+            ? Color{105, 125, 140, 180}
+            : Color{70, 82, 92, 120};
+        const auto x = (static_cast<float>(index) - static_cast<float>(building.anchor_x)) * unit_size;
+        const auto z = (static_cast<float>(index) - static_cast<float>(building.anchor_z)) * unit_size;
+        DrawLine3D({x, grid_y, grid_min_z}, {x, grid_y, grid_max_z}, color);
+        DrawLine3D({grid_min_x, grid_y, z}, {grid_max_x, grid_y, z}, color);
+    }
+
+    // Show the authored footprint in the same anchor-relative coordinates as
+    // the mesh and picker.
+    const auto bound_max_x = (static_cast<float>(building.size_x) - static_cast<float>(building.anchor_x)) * unit_size;
+    const auto bound_max_z = (static_cast<float>(building.size_y) - static_cast<float>(building.anchor_z)) * unit_size;
+    const auto bound_color = Color{220, 74, 72, 230};
+    DrawLine3D({grid_min_x, grid_y, grid_min_z}, {bound_max_x, grid_y, grid_min_z}, bound_color);
+    DrawLine3D({bound_max_x, grid_y, grid_min_z}, {bound_max_x, grid_y, bound_max_z}, bound_color);
+    DrawLine3D({bound_max_x, grid_y, bound_max_z}, {grid_min_x, grid_y, bound_max_z}, bound_color);
+    DrawLine3D({grid_min_x, grid_y, bound_max_z}, {grid_min_x, grid_y, grid_min_z}, bound_color);
     // The tool preview mesh is built in un-anchored cell space (cell.x*unit), but
     // the picker and selection box live in anchored space ((cell.x-anchor)*unit).
     // Translate the model by -anchor*unit so geometry, selection, and clicks all
@@ -1266,10 +1298,14 @@ const RenderTexture2D* building_thumbnail(EditorProject& project, std::size_t in
 
     // Frame the whole building from a 3/4 view.
     const float sx = static_cast<float>(std::max(1U, building.size_x)) * unit_size;
-    const float sy = static_cast<float>(std::max(1U, building.size_y)) * unit_size;
-    const float sz = static_cast<float>(std::max(1U, building.size_z)) * unit_size;
+    const float sy = static_cast<float>(std::max(1U, building.size_z)) * unit_size;
+    const float sz = static_cast<float>(std::max(1U, building.size_y)) * unit_size;
     const float r = 0.5F * std::sqrt(sx * sx + sy * sy + sz * sz);
-    const Vector3 center{0.0F, sy * 0.5F, 0.0F};
+    const Vector3 center{
+        (static_cast<float>(building.size_x) * 0.5F - static_cast<float>(building.anchor_x)) * unit_size,
+        (static_cast<float>(building.size_z) * 0.5F - static_cast<float>(building.anchor_y)) * unit_size,
+        (static_cast<float>(building.size_y) * 0.5F - static_cast<float>(building.anchor_z)) * unit_size,
+    };
     const float dist = std::max(unit_size * 2.0F, r * 2.4F);
     Camera3D cam{};
     cam.position = {center.x + dist * 0.7F, center.y + dist * 0.6F, center.z + dist * 0.7F};
@@ -1289,7 +1325,7 @@ const RenderTexture2D* building_thumbnail(EditorProject& project, std::size_t in
     rlEnableDepthTest();
     draw_gpu_building_model(model, anchor_offset, 0, false, false, nullptr, GfxDebugDrawCategory::CityCells);
     // A subtle ground plane gives the building a sense of scale/orientation.
-    DrawGrid(static_cast<int>(std::max(building.size_x, building.size_z)) + 2, unit_size);
+    DrawGrid(static_cast<int>(std::max(building.size_x, building.size_y)) + 2, unit_size);
     EndMode3D();
     EndTextureMode();
     GenTextureMipmaps(&target.texture);
@@ -1377,9 +1413,9 @@ void draw_city_building_model(
         const float min_x = -static_cast<float>(template_file.anchor_x) * unit_size;
         const float max_x = (static_cast<float>(template_file.size_x) - static_cast<float>(template_file.anchor_x)) * unit_size;
         const float min_y = -static_cast<float>(template_file.anchor_y) * unit_size;
-        const float max_y = (static_cast<float>(template_file.size_y) - static_cast<float>(template_file.anchor_y)) * unit_size;
+        const float max_y = (static_cast<float>(template_file.size_z) - static_cast<float>(template_file.anchor_y)) * unit_size;
         const float min_z = -static_cast<float>(template_file.anchor_z) * unit_size;
-        const float max_z = (static_cast<float>(template_file.size_z) - static_cast<float>(template_file.anchor_z)) * unit_size;
+        const float max_z = (static_cast<float>(template_file.size_y) - static_cast<float>(template_file.anchor_z)) * unit_size;
 
         const std::array<Vector3, 8> corners{
             Vector3{min_x, min_y, min_z},
@@ -1445,9 +1481,14 @@ void draw_city_building_model(
     if (selected && use_lod) {
         // The far LOD has no mesh to shell; fall back to a glow box on the bounds.
         const auto sx = static_cast<float>(std::max(1U, template_file.size_x)) * unit_size;
-        const auto sy = static_cast<float>(std::max(1U, template_file.size_y)) * unit_size;
-        const auto sz = static_cast<float>(std::max(1U, template_file.size_z)) * unit_size;
-        const auto center = Vector3{origin.x, origin.y + sy * 0.5F, origin.z};
+        const auto sy = static_cast<float>(std::max(1U, template_file.size_z)) * unit_size;
+        const auto sz = static_cast<float>(std::max(1U, template_file.size_y)) * unit_size;
+        const Vector3 local_center{
+            (static_cast<float>(template_file.size_x) * 0.5F - static_cast<float>(template_file.anchor_x)) * unit_size,
+            (static_cast<float>(template_file.size_z) * 0.5F - static_cast<float>(template_file.anchor_y)) * unit_size,
+            (static_cast<float>(template_file.size_y) * 0.5F - static_cast<float>(template_file.anchor_z)) * unit_size,
+        };
+        const auto center = city_transform(origin, local_center, placement.rotation);
         const auto rotated = (placement.rotation & 1) != 0;
         const auto box = Vector3{rotated ? sz : sx, sy, rotated ? sx : sz};
         draw_selection_glow_box(center, box, Color{255, 225, 90, 255});

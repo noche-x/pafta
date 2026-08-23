@@ -511,7 +511,7 @@ void draw_building_asset_panel(EditorProject& project, EditorUi& ui) {
     const bool was_floor_only = ui.building_view_floor_only;
     ui.building_view_floor_only = view_mode == 1;
     if (ui.building_view_floor_only) {
-        const int max_floor = std::max(0, static_cast<int>(building.size_y) - 1);
+        const int max_floor = std::max(0, static_cast<int>(building.size_z) - 1);
         ui.building_view_floor = std::clamp(ui.building_view_floor, 0, max_floor);
         bool changed = ui.building_view_floor_only != was_floor_only;
         if (ImGui::Button("-") && ui.building_view_floor > 0) { --ui.building_view_floor; changed = true; }

@@ -1299,9 +1299,9 @@ void draw_city_building_models_full_detail(
         const float min_x = -static_cast<float>(building.anchor_x) * unit_size;
         const float max_x = (static_cast<float>(std::max(1U, building.size_x)) - static_cast<float>(building.anchor_x)) * unit_size;
         const float min_y = -static_cast<float>(building.anchor_y) * unit_size;
-        const float max_y = (static_cast<float>(std::max(1U, building.size_y)) - static_cast<float>(building.anchor_y)) * unit_size;
+        const float max_y = (static_cast<float>(std::max(1U, building.size_z)) - static_cast<float>(building.anchor_y)) * unit_size;
         const float min_z = -static_cast<float>(building.anchor_z) * unit_size;
-        const float max_z = (static_cast<float>(std::max(1U, building.size_z)) - static_cast<float>(building.anchor_z)) * unit_size;
+        const float max_z = (static_cast<float>(std::max(1U, building.size_y)) - static_cast<float>(building.anchor_z)) * unit_size;
         const std::array<Vec3, 8> local_corners{{
             {min_x, min_y, min_z},
             {max_x, min_y, min_z},
@@ -3247,10 +3247,19 @@ std::optional<FocusTarget> focus_target_for_selection(const EditorProject& proje
             float ex = unit, ey = unit, ez = unit;
             if (sbb != nullptr) {
                 ex = static_cast<float>(std::max(1U, sbb->size_x)) * unit;
-                ey = static_cast<float>(std::max(1U, sbb->size_y)) * unit;
-                ez = static_cast<float>(std::max(1U, sbb->size_z)) * unit;
+                ey = static_cast<float>(std::max(1U, sbb->size_z)) * unit;
+                ez = static_cast<float>(std::max(1U, sbb->size_y)) * unit;
             }
-            const Vector3 center{o.x, o.y + ey * 0.5F, o.z};
+            auto center = Vector3{o.x, o.y + ey * 0.5F, o.z};
+            if (sbb != nullptr) {
+                const Vec3 local_center{
+                    (static_cast<float>(sbb->size_x) * 0.5F - static_cast<float>(sbb->anchor_x)) * unit,
+                    (static_cast<float>(sbb->size_z) * 0.5F - static_cast<float>(sbb->anchor_y)) * unit,
+                    (static_cast<float>(sbb->size_y) * 0.5F - static_cast<float>(sbb->anchor_z)) * unit,
+                };
+                const auto transformed = native_city_building_transform_point(b, local_center, unit);
+                center = {transformed.x, transformed.y, transformed.z};
+            }
             const auto r = 0.5F * std::sqrt(ex * ex + ey * ey + ez * ez);
             return FocusTarget{center, fit_radius(r)};
         }
@@ -3285,7 +3294,11 @@ std::optional<FocusTarget> focus_target_for_selection(const EditorProject& proje
     } else if (ui.tab == EditorTab::Buildings && !project.buildings.empty()) {
         // Frame the whole building, centred on its mesh.
         const auto& building = project.buildings[std::min(ui.selected_building, project.buildings.size() - 1U)].data;
-        const Vector3 center{0.0F, static_cast<float>(std::max(1U, building.size_y)) * unit * 0.5F, 0.0F};
+        const Vector3 center{
+            (static_cast<float>(building.size_x) * 0.5F - static_cast<float>(building.anchor_x)) * unit,
+            (static_cast<float>(building.size_z) * 0.5F - static_cast<float>(building.anchor_y)) * unit,
+            (static_cast<float>(building.size_y) * 0.5F - static_cast<float>(building.anchor_z)) * unit,
+        };
         const auto r = 0.5F * std::sqrt(
             std::pow(static_cast<float>(std::max(1U, building.size_x)) * unit, 2.0F) +
             std::pow(static_cast<float>(std::max(1U, building.size_y)) * unit, 2.0F) +
@@ -3975,7 +3988,8 @@ int run_editor_app() {
                             draw_sbb_scene_for_app(
                                 project->buildings[ui.selected_building].data,
                                 preview_model,
-                                selected);
+                                selected,
+                                static_cast<std::uint32_t>(std::max(0, ui.building_view_floor)));
                         }
                     } else if (ui.tab == EditorTab::Pieces && project->city && !project->city->data.city_blocks.empty()) {
                         ui.selected_city_block = std::min(ui.selected_city_block, project->city->data.city_blocks.size() - 1U);

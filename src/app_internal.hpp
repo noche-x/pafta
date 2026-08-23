@@ -613,7 +613,11 @@ const Texture2D* find_project_texture(const EditorProject& project, std::string_
 // color tile otherwise). Edits selected in place; returns true on change.
 bool material_swatch_picker(const EditorProject& project, const char* id, const std::vector<std::string>& materials, std::size_t& selected);
 void draw_mesh_faces(const SblBlockMesh& mesh, float scale, Color fill);
-void draw_sbb_scene_for_app(const SbbBuilding& building, GpuBuildingRenderModel& model, const SbbCell* selected);
+void draw_sbb_scene_for_app(
+    const SbbBuilding& building,
+    GpuBuildingRenderModel& model,
+    const SbbCell* selected,
+    std::uint32_t guide_floor);
 void draw_city_building_model(
     const SbbBuilding& template_file,
     GpuBuildingRenderModel& model,
