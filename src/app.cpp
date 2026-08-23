@@ -116,6 +116,7 @@ void load_editor_fonts(ImGuiIO& io) {
     };
     constexpr float base_size = 15.0F;
     const char* candidates[] = {
+        "/System/Library/Fonts/Avenir Next.ttc",
         "/System/Library/Fonts/Supplemental/Arial.ttf",
         "/Library/Fonts/Arial.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -2594,7 +2595,7 @@ void mark_block_changed(EditorProject& project, EditorUi& ui, SblBlockMesh& bloc
     invalidate_portal_render_models(project);
 }
 
-// Saves whichever tab's edited copy is active, mirroring the Inspector Save
+// Saves whichever tab's edited copy is active, mirroring the Properties Save
 // buttons. Used by the Ctrl+S hotkey.
 void save_active_tab(EditorProject& project, EditorUi& ui, std::string& status) {
     switch (ui.tab) {
@@ -2621,7 +2622,7 @@ bool has_unsaved_changes(const EditorUi& ui) {
 }
 
 // Saves every category that has pending edits, using the same per-asset save path
-// as the Inspector buttons (each writes the currently-selected asset of its kind).
+// as the Properties buttons (each writes the currently-selected asset of its kind).
 void save_all_dirty(EditorProject& project, EditorUi& ui, std::string& status) {
     if (ui.city_dirty) {
         save_city(project, ui, status);
@@ -2732,6 +2733,7 @@ void select_city_thing(
     switch (picked.kind) {
         case CitySelectionKind::Building: {
             ui.city_selection = CitySelectionKind::Building;
+            ui.city_library_roads = false;
             ui.selected_city_building = picked.index;
             if (additive) {
                 toggle_in_selection(ui.selected_city_buildings, picked.index);
@@ -2756,12 +2758,14 @@ void select_city_thing(
         }
         case CitySelectionKind::Road:
             ui.city_selection = CitySelectionKind::Road;
+            ui.city_library_roads = true;
             ui.selected_city_street = picked.index;
             ui.selected_city_buildings.clear();
             ui.selected_portals.clear();
             break;
         case CitySelectionKind::Node:
             ui.city_selection = CitySelectionKind::Node;
+            ui.city_library_roads = true;
             ui.selected_city_intersection = picked.index;
             ui.selected_city_buildings.clear();
             ui.selected_portals.clear();
@@ -3176,7 +3180,7 @@ void draw_road_lay_preview(const EditorProject& project, const EditorUi& ui, std
 }
 
 // Collapsible reference of the controls active for the current tab/mode. Lives
-// at the top of the Inspector so the keyboard map is discoverable without leaving
+// at the bottom of Properties so the keyboard map is discoverable without leaving
 // the editing surface. Collapsed by default; a short fixed list, no scrolling.
 void draw_controls_help(const EditorUi& ui) {
     if (!ImGui::CollapsingHeader("Controls")) {
@@ -3195,7 +3199,7 @@ void draw_controls_help(const EditorUi& ui) {
             ImGui::Text("Selected building/piece shows a gizmo  |  %s rotate  |  Del delete", k(KEY_R).c_str());
         } else if (ui.city_tool == CityTool::Building) {
             ImGui::TextUnformatted("Click drops the chosen building template on the ground");
-            ImGui::Text("Pick a template in the Inspector  |  %s rotate", k(KEY_R).c_str());
+            ImGui::Text("Pick a template in Properties  |  %s rotate", k(KEY_R).c_str());
         } else if (ui.city_tool == CityTool::Road) {
             ImGui::TextUnformatted("Click lays a road chain (axis-locked, snaps to nodes, splits roads)  |  Esc ends");
             ImGui::Text("%s %s left width  |  %s %s right width  |  %s %s district",
@@ -3219,7 +3223,7 @@ void draw_controls_help(const EditorUi& ui) {
     }
 }
 
-// Translates keyboard input into the same edit operations the Inspector buttons
+// Translates keyboard input into the same edit operations the Properties buttons
 // drive. Runs only when ImGui does not want the keyboard and the freecam is not
 // World point the camera should frame for the current selection, plus a framing
 // radius (how far back to sit). Returns nullopt when nothing is selected, so the
@@ -3668,6 +3672,7 @@ int run_editor_app() {
     using namespace app_internal;
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
     InitWindow(1440, 900, "map_editor_cpp");
+    SetWindowMinSize(1100, 700);
     SetTargetFPS(60);
     // Esc must not quit the app: it is used to cancel a gizmo drag, and closing
     // is gated by the unsaved-changes prompt below. KEY_NULL also removes Esc
@@ -3700,6 +3705,8 @@ int run_editor_app() {
 
     bool show_demo_window = false;
     bool show_graphics_debug = false;
+    bool show_activity = false;
+    bool show_history = false;
     GfxDebugStats gfx_debug_stats;
 
     // Close gating: a close request (window X, Alt+F4, Exit menu) sets this; with
@@ -3719,14 +3726,22 @@ int run_editor_app() {
     if (const char* env = std::getenv("MAPED_AUTOLOAD")) {
         pending_load_folder = std::filesystem::path{env};
     }
+    // Repeatable visual QA: capture the loaded editor after 300 frames. The
+    // optional tab selects city, buildings, pieces, buildblocks, or blocks.
+    std::optional<std::filesystem::path> screenshot_path;
+    if (const char* env = std::getenv("MAPED_SCREENSHOT")) {
+        screenshot_path = std::filesystem::path{env};
+    }
+    const std::string screenshot_tab = std::getenv("MAPED_SCREENSHOT_TAB") == nullptr
+        ? std::string{}
+        : std::getenv("MAPED_SCREENSHOT_TAB");
+    int screenshot_ready_frames = 0;
 
     // Mesh-export options dialog. Opened by File > Export Mesh; the popup shows a
     // context-aware title + what-to-export checkboxes, then runs the native save
     // dialog. Options persist across exports during the session.
     bool open_export_popup = false;
     ExportOptions export_options{};
-    bool layout_checked = false;
-
     while (running) {
         MAPED_PROFILE_BLOCK("editor frame");
         gfx_debug_stats.reset_frame();
@@ -3768,6 +3783,10 @@ int run_editor_app() {
             // Manual fly cancels any in-progress focus glide so they never fight.
             ui.focus_animating = false;
             update_free_fly_camera(camera, ui.camera_fly_speed);
+        }
+        if (project && ui.focus_selection_requested) {
+            ui.focus_selection_requested = false;
+            focus_current_selection(*project, ui, camera);
         }
         update_focus_animation(ui, camera);
 
@@ -4279,21 +4298,15 @@ int run_editor_app() {
         const auto imgui_begin = std::chrono::steady_clock::now();
         rlImGuiBegin();
 
-        draw_editor_dockspace(reset_layout_requested);
-        reset_layout_requested = false;
-
-        // Warm the thumbnail caches a few per frame after load, and show a loading
-        // overlay with progress until render buffers + thumbnails are all ready.
-        if (project) {
-            service_pregeneration(*project);
-            draw_loading_overlay(*project);
-        }
-
         bool open_folder_requested = open_folder_hotkey_requested;
         bool export_mesh_requested = false;
         bool run_export_after_popup = false;
 
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(9.0F, 8.0F));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(7.0F, 7.0F));
         if (ImGui::BeginMainMenuBar()) {
+            ImGui::TextColored(ImVec4(0.91F, 0.66F, 0.30F, 1.0F), ICON_FA_MAP "  SRC MAP");
+            ImGui::Separator();
             if (ImGui::BeginMenu("File")) {
                 if (ImGui::MenuItem("Open Folder...", "Ctrl+O")) {
                     open_folder_requested = true;
@@ -4312,6 +4325,9 @@ int run_editor_app() {
                 if (ImGui::MenuItem("Reset Dock Layout")) {
                     reset_layout_requested = true;
                 }
+                ImGui::Separator();
+                ImGui::MenuItem("Activity", nullptr, &show_activity);
+                ImGui::MenuItem("History", nullptr, &show_history);
                 ImGui::MenuItem("Graphics Debug", "F3", &show_graphics_debug);
                 if (ImGui::BeginMenu("Developer")) {
                     ImGui::MenuItem("ImGui Demo Window", nullptr, &show_demo_window);
@@ -4322,41 +4338,117 @@ int run_editor_app() {
             ImGui::Separator();
             if (project) {
                 ImGui::TextDisabled("%s", project->root.filename().string().c_str());
-                ImGui::SameLine();
-                if (ImGui::SmallButton(active_tab_dirty(ui) ? "Save *" : "Save")) {
-                    save_active_tab(*project, ui, status);
+                if (has_unsaved_changes(ui)) {
+                    ImGui::SameLine(0.0F, 4.0F);
+                    ImGui::TextColored(ImVec4(0.91F, 0.66F, 0.30F, 1.0F), "*");
                 }
-                ImGui::SameLine();
+                ImGui::Separator();
+
+                struct WorkspaceButton {
+                    const char* label;
+                    EditorTab tab;
+                };
+                constexpr std::array workspaces{
+                    WorkspaceButton{"City", EditorTab::City},
+                    WorkspaceButton{"Buildings", EditorTab::Buildings},
+                    WorkspaceButton{"Pieces", EditorTab::Pieces},
+                    WorkspaceButton{"Buildblocks", EditorTab::Buildblocks},
+                    WorkspaceButton{"Blocks", EditorTab::Blocks},
+                };
+                auto next_tab = ui.tab;
+                for (const auto& workspace : workspaces) {
+                    const bool active = ui.tab == workspace.tab;
+                    ImGui::PushStyleColor(ImGuiCol_Button, active
+                        ? ImVec4(0.16F, 0.29F, 0.32F, 1.0F)
+                        : ImVec4(0.0F, 0.0F, 0.0F, 0.0F));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.19F, 0.34F, 0.37F, 1.0F));
+                    if (ImGui::Button(workspace.label)) {
+                        next_tab = workspace.tab;
+                    }
+                    if (active) {
+                        const auto min = ImGui::GetItemRectMin();
+                        const auto max = ImGui::GetItemRectMax();
+                        ImGui::GetWindowDrawList()->AddLine(
+                            ImVec2(min.x, max.y - 1.0F), ImVec2(max.x, max.y - 1.0F),
+                            IM_COL32(101, 163, 171, 255), 2.0F);
+                    }
+                    ImGui::PopStyleColor(2);
+                    ImGui::SameLine();
+                }
+                if (next_tab != ui.tab) {
+                    ui.tab = next_tab;
+                    if (ui.tab == EditorTab::City) {
+                        focus_camera_on_city(camera, *project);
+                    } else {
+                        camera = default_camera();
+                        if (ui.tab == EditorTab::Buildings) {
+                            focus_current_selection(*project, ui, camera);
+                        }
+                    }
+                }
+
+                constexpr float action_width = 330.0F;
+                const auto action_x = ImGui::GetWindowWidth() - action_width;
+                auto status_label = status;
+                if (status_label.size() > 32U) {
+                    status_label.resize(29U);
+                    status_label += "...";
+                }
+                const auto status_width = ImGui::CalcTextSize(status_label.c_str()).x;
+                if (ImGui::GetCursorPosX() + status_width + 22.0F < action_x) {
+                    ImGui::SetCursorPosX(action_x - status_width - 18.0F);
+                    ImGui::TextDisabled("%s", status_label.c_str());
+                    ImGui::SameLine();
+                }
+                ImGui::SetCursorPosX(action_x);
                 const bool city_history_active = ui.tab == EditorTab::City || ui.tab == EditorTab::Pieces;
                 ImGui::BeginDisabled(!city_history_active || project->undo_stack.empty());
-                if (ImGui::SmallButton("Undo")) {
+                if (ImGui::Button(ICON_FA_ROTATE_LEFT "##undo")) {
                     undo_city(*project, ui, status);
                 }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Undo");
                 ImGui::EndDisabled();
                 ImGui::SameLine();
                 ImGui::BeginDisabled(!city_history_active || project->redo_stack.empty());
-                if (ImGui::SmallButton("Redo")) {
+                if (ImGui::Button(ICON_FA_ROTATE_RIGHT "##redo")) {
                     redo_city(*project, ui, status);
                 }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Redo");
                 ImGui::EndDisabled();
                 ImGui::SameLine();
-                if (ImGui::SmallButton("Focus")) {
+                if (ImGui::Button(ICON_FA_CROSSHAIRS " Focus")) {
                     focus_current_selection(*project, ui, camera);
                 }
                 ImGui::SameLine();
-                if (ImGui::SmallButton("Export")) {
+                if (ImGui::Button(ICON_FA_ARROW_UP_FROM_BRACKET " Export")) {
                     export_mesh_requested = true;
                 }
                 ImGui::SameLine();
-                ImGui::TextDisabled("%s", active_tool_label(ui));
-                if (has_unsaved_changes(ui)) {
-                    ImGui::SameLine();
-                    ImGui::TextColored(ImVec4(0.94F, 0.79F, 0.35F, 1.0F), "Unsaved");
+                if (active_tab_dirty(ui)) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.82F, 0.56F, 0.22F, 1.0F));
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.08F, 0.09F, 0.10F, 1.0F));
                 }
-            } else if (ImGui::SmallButton("Open map folder...")) {
+                if (ImGui::Button(ICON_FA_FLOPPY_DISK " Save")) {
+                    save_active_tab(*project, ui, status);
+                }
+                if (active_tab_dirty(ui)) {
+                    ImGui::PopStyleColor(2);
+                }
+            } else if (ImGui::Button(ICON_FA_FOLDER_OPEN " Open map folder")) {
                 open_folder_requested = true;
             }
             ImGui::EndMainMenuBar();
+        }
+        ImGui::PopStyleVar(2);
+
+        draw_editor_dockspace(reset_layout_requested);
+        reset_layout_requested = false;
+
+        // Warm the thumbnail caches a few per frame after load, and show a loading
+        // overlay with progress until render buffers + thumbnails are all ready.
+        if (project) {
+            service_pregeneration(*project);
+            draw_loading_overlay(*project);
         }
 
         if (show_demo_window) {
@@ -4365,7 +4457,7 @@ int run_editor_app() {
         is_viewport_hovered = false;
         if (show_3d_viewport) {
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-            ImGui::Begin("Viewport 3D");
+            ImGui::Begin("Scene");
             {
                 ImVec2 size = ImGui::GetContentRegionAvail();
 
@@ -4409,65 +4501,53 @@ int run_editor_app() {
             ImGui::PopStyleVar();
         }
 
-        ImGui::Begin("Asset Browser");
-        if (!layout_checked) {
-            layout_checked = true;
-            reset_layout_requested = ImGui::GetWindowWidth() < 220.0F;
-        }
+        ImGui::Begin("Library");
         if (!project) {
-            ImGui::Text("No project loaded.");
-            if (ImGui::Button("Open Folder")) {
+            ImGui::TextColored(ImVec4(0.91F, 0.66F, 0.30F, 1.0F), "NO MAP OPEN");
+            ImGui::TextWrapped("Open a Sub Rosa map folder to browse and edit its content.");
+            ImGui::Spacing();
+            if (ImGui::Button(ICON_FA_FOLDER_OPEN " Open map folder", ImVec2(-FLT_MIN, 36.0F))) {
                 open_folder_requested = true;
             }
         } else {
-            ImGui::Text("Project: %s", project->root.filename().string().c_str());
+            const char* section = "CITY CONTENT";
+            if (ui.tab == EditorTab::Buildings) section = "BUILDING FILES";
+            if (ui.tab == EditorTab::Pieces) section = "PIECE CATALOG";
+            if (ui.tab == EditorTab::Buildblocks) section = "BUILDBLOCK LIBRARY";
+            if (ui.tab == EditorTab::Blocks) section = "BLOCK LIBRARY";
+            ImGui::TextColored(ImVec4(0.39F, 0.64F, 0.67F, 1.0F), "%s", section);
+            ImGui::TextDisabled("%s", project->root.filename().string().c_str());
             ImGui::Separator();
-
-            EditorTab next_tab = ui.tab;
-            if (ImGui::BeginTabBar("##workspace_tabs", ImGuiTabBarFlags_FittingPolicyResizeDown)) {
-                const auto tab = [&](const char* label, EditorTab value) {
-                    if (ImGui::BeginTabItem(label)) {
-                        next_tab = value;
-                        ImGui::EndTabItem();
-                    }
-                };
-                tab("City", EditorTab::City);
-                tab("Buildings", EditorTab::Buildings);
-                tab("Pieces", EditorTab::Pieces);
-                tab("Buildblocks", EditorTab::Buildblocks);
-                tab("Blocks", EditorTab::Blocks);
-                ImGui::EndTabBar();
-            }
-            if (next_tab != ui.tab) {
-                ui.tab = next_tab;
-                if (ui.tab == EditorTab::City) {
-                    focus_camera_on_city(camera, *project);
-                } else {
-                    camera = default_camera();
-                }
-            }
 
             auto& search = ui.asset_search[static_cast<std::size_t>(ui.tab)];
             ImGui::SetNextItemWidth(-FLT_MIN);
-            ImGui::InputTextWithHint("##asset_search", "Search this workspace...", search.data(), search.size());
+            ImGui::InputTextWithHint("##asset_search", ICON_FA_MAGNIFYING_GLASS "  Filter by name", search.data(), search.size());
             ImGui::Spacing();
 
             if (ui.tab == EditorTab::City) {
                 if (project->city) {
                     ImGui::Text("city2.sbc");
-                    ImGui::TextDisabled("Active tool: %s", active_tool_label(ui));
                     ImGui::Separator();
-                    ImGui::TextUnformatted("Preview:");
+                    ImGui::TextDisabled("VIEW MODE");
                     int preview_mode = ui.render_roads && ui.render_terrain ? 1 : 0;
-                    if (ImGui::RadioButton("Editor", &preview_mode, 0)) {
+                    const auto mode_width = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5F;
+                    ImGui::PushStyleColor(ImGuiCol_Button, preview_mode == 0
+                        ? ImVec4(0.16F, 0.29F, 0.32F, 1.0F)
+                        : ImGui::GetStyle().Colors[ImGuiCol_Button]);
+                    if (ImGui::Button("Editor guide", ImVec2(mode_width, 0.0F))) {
                         ui.render_roads = false;
                         ui.render_terrain = false;
                     }
+                    ImGui::PopStyleColor();
                     ImGui::SameLine();
-                    if (ImGui::RadioButton("In game", &preview_mode, 1)) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, preview_mode == 1
+                        ? ImVec4(0.16F, 0.29F, 0.32F, 1.0F)
+                        : ImGui::GetStyle().Colors[ImGuiCol_Button]);
+                    if (ImGui::Button("Game preview", ImVec2(mode_width, 0.0F))) {
                         ui.render_roads = true;
                         ui.render_terrain = true;
                     }
+                    ImGui::PopStyleColor();
                     if (ImGui::IsItemHovered()) {
                         ImGui::SetTooltip("Show the game terrain and finished road surfaces");
                     }
@@ -4496,31 +4576,52 @@ int run_editor_app() {
                             }
                         }
                     } else {
-                        // Select/Road/Erase: list placed buildings and roads to pick.
-                        if (!project->city->data.buildings.empty()) {
-                            const auto names = city_building_names(project->city->data);
-                            std::vector<std::size_t> visible;
-                            visible.reserve(names.size());
-                            for (std::size_t i = 0; i < names.size(); ++i) {
-                                if (asset_search_matches(ui, names[i])) {
-                                    visible.push_back(i);
-                                }
-                            }
-                            ImGui::Text("Placed Buildings (%zu):", visible.size());
-                            if (ImGui::BeginListBox("##placed_bldgs", ImVec2(-FLT_MIN, 150.0F))) {
+                        const auto building_names = city_building_names(project->city->data);
+                        const auto road_names = city_street_names(project->city->data);
+                        std::vector<std::size_t> visible_buildings;
+                        std::vector<std::size_t> visible_roads;
+                        for (std::size_t i = 0; i < building_names.size(); ++i) {
+                            if (asset_search_matches(ui, building_names[i])) visible_buildings.push_back(i);
+                        }
+                        for (std::size_t i = 0; i < road_names.size(); ++i) {
+                            if (asset_search_matches(ui, road_names[i])) visible_roads.push_back(i);
+                        }
+
+                        const auto section_width = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5F;
+                        ImGui::PushStyleColor(ImGuiCol_Button, !ui.city_library_roads
+                            ? ImVec4(0.16F, 0.29F, 0.32F, 1.0F)
+                            : ImGui::GetStyle().Colors[ImGuiCol_Button]);
+                        if (ImGui::Button((ICON_FA_BUILDING "  Buildings  " + std::to_string(building_names.size())).c_str(),
+                            ImVec2(section_width, 0.0F))) {
+                            ui.city_library_roads = false;
+                        }
+                        ImGui::PopStyleColor();
+                        ImGui::SameLine();
+                        ImGui::PushStyleColor(ImGuiCol_Button, ui.city_library_roads
+                            ? ImVec4(0.16F, 0.29F, 0.32F, 1.0F)
+                            : ImGui::GetStyle().Colors[ImGuiCol_Button]);
+                        if (ImGui::Button((ICON_FA_ROAD "  Roads  " + std::to_string(road_names.size())).c_str(),
+                            ImVec2(section_width, 0.0F))) {
+                            ui.city_library_roads = true;
+                        }
+                        ImGui::PopStyleColor();
+
+                        if (!ui.city_library_roads) {
+                            ImGui::TextDisabled("%zu shown", visible_buildings.size());
+                            if (ImGui::BeginListBox("##placed_bldgs", ImVec2(-FLT_MIN, -FLT_MIN))) {
                                 ImGuiListClipper clipper;
-                                clipper.Begin(static_cast<int>(visible.size()));
+                                clipper.Begin(static_cast<int>(visible_buildings.size()));
                                 while (clipper.Step()) {
                                     for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
-                                        const auto i = visible[static_cast<std::size_t>(row)];
+                                        const auto i = visible_buildings[static_cast<std::size_t>(row)];
                                         ImGui::PushID(static_cast<int>(i));
                                         const bool in_group = std::find(ui.selected_city_buildings.begin(), ui.selected_city_buildings.end(), i) != ui.selected_city_buildings.end();
                                         const bool active = ui.city_selection == CitySelectionKind::Building &&
                                             (ui.selected_city_building == i || in_group);
-                                        if (ImGui::Selectable(names[i].c_str(), active)) {
+                                        const auto label = ICON_FA_BUILDING "  " + building_names[i];
+                                        if (ImGui::Selectable(label.c_str(), active)) {
                                             ui.selected_city_building = i;
                                             ui.city_selection = CitySelectionKind::Building;
-                                            // Ctrl/Shift-click in the list toggles group membership.
                                             if (ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift) {
                                                 toggle_in_selection(ui.selected_city_buildings, i);
                                             } else {
@@ -4532,25 +4633,17 @@ int run_editor_app() {
                                 }
                                 ImGui::EndListBox();
                             }
-                        }
-                        if (!project->city->data.streets.empty()) {
-                            const auto names = city_street_names(project->city->data);
-                            std::vector<std::size_t> visible;
-                            visible.reserve(names.size());
-                            for (std::size_t i = 0; i < names.size(); ++i) {
-                                if (asset_search_matches(ui, names[i])) {
-                                    visible.push_back(i);
-                                }
-                            }
-                            ImGui::Text("Roads (%zu):", visible.size());
+                        } else {
+                            ImGui::TextDisabled("%zu shown", visible_roads.size());
                             if (ImGui::BeginListBox("##roads", ImVec2(-FLT_MIN, -FLT_MIN))) {
                                 ImGuiListClipper clipper;
-                                clipper.Begin(static_cast<int>(visible.size()));
+                                clipper.Begin(static_cast<int>(visible_roads.size()));
                                 while (clipper.Step()) {
                                     for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
-                                        const auto i = visible[static_cast<std::size_t>(row)];
+                                        const auto i = visible_roads[static_cast<std::size_t>(row)];
                                         ImGui::PushID(static_cast<int>(i));
-                                        if (ImGui::Selectable(names[i].c_str(), ui.city_selection == CitySelectionKind::Road && ui.selected_city_street == i)) {
+                                        const auto label = ICON_FA_ROAD "  " + road_names[i];
+                                        if (ImGui::Selectable(label.c_str(), ui.city_selection == CitySelectionKind::Road && ui.selected_city_street == i)) {
                                             ui.selected_city_street = i;
                                             ui.city_selection = CitySelectionKind::Road;
                                         }
@@ -4626,128 +4719,117 @@ int run_editor_app() {
         }
         ImGui::End();
 
-        ImGui::Begin("Inspector");
+        ImGui::Begin("Properties");
         if (project) {
-            draw_controls_help(ui);
+            ImGui::TextColored(ImVec4(0.91F, 0.66F, 0.30F, 1.0F), "ACTIVE TOOL");
+            ImGui::TextUnformatted(active_tool_label(ui));
+            ImGui::Separator();
             if (ui.tab == EditorTab::City && ui.city_selection == CitySelectionKind::None) {
-                ImGui::SeparatorText("Selection");
-                ImGui::TextUnformatted("Nothing selected");
-                ImGui::TextWrapped("Use Select in the viewport, then click a building, road, node, or piece.");
+                ImGui::BeginChild("##empty_selection", ImVec2(0.0F, 145.0F), true);
+                ImGui::TextColored(ImVec4(0.39F, 0.64F, 0.67F, 1.0F), ICON_FA_ARROW_POINTER "  NOTHING SELECTED");
+                ImGui::Spacing();
+                ImGui::TextWrapped("Choose Select, then click a building, road, node, or piece in the scene.");
+                ImGui::Spacing();
+                if (ui.city_tool != CityTool::Select && ImGui::Button("Switch to Select", ImVec2(-FLT_MIN, 0.0F))) {
+                    ui.city_tool = CityTool::Select;
+                    ui.pending_road_intersection.reset();
+                }
+                ImGui::EndChild();
             }
             if (ui.tab == EditorTab::City && project->city) {
-                if ((ui.city_selection == CitySelectionKind::Road || ui.city_selection == CitySelectionKind::Node) &&
-                    (!project->city->data.intersections.empty() || !project->city->data.streets.empty())) {
-                    if (!project->city->data.intersections.empty()) {
-                        ui.selected_city_intersection =
-                            std::min(ui.selected_city_intersection, project->city->data.intersections.size() - 1U);
-                        const auto& node = project->city->data.intersections[ui.selected_city_intersection];
-                        ImGui::Text("Node Inspector");
-                        ImGui::Separator();
-                        ImGui::Text("Node: %zu", ui.selected_city_intersection);
-                        ImGui::Text("Grid: %d, %d, %d", node.x, node.y, node.z);
-                        if (ui.pending_road_intersection.has_value()) {
-                            ImGui::Text("Road Start: %zu", *ui.pending_road_intersection);
-                        }
+                if (ui.city_selection == CitySelectionKind::Node && !project->city->data.intersections.empty()) {
+                    ui.selected_city_intersection =
+                        std::min(ui.selected_city_intersection, project->city->data.intersections.size() - 1U);
+                    const auto& node = project->city->data.intersections[ui.selected_city_intersection];
+                    ImGui::TextColored(ImVec4(0.39F, 0.64F, 0.67F, 1.0F), "NODE %zu", ui.selected_city_intersection);
+                    ImGui::Separator();
+                    ImGui::Text("Grid position: %d, %d, %d", node.x, node.y, node.z);
+                    if (ui.pending_road_intersection.has_value()) {
+                        ImGui::Text("Road Start: %zu", *ui.pending_road_intersection);
                     }
-                    if (!project->city->data.streets.empty()) {
-                        ImGui::Spacing();
-                        ImGui::Separator();
+                } else if (ui.city_selection == CitySelectionKind::Road && !project->city->data.streets.empty()) {
                     ui.selected_city_street = std::min(ui.selected_city_street, project->city->data.streets.size() - 1U);
                     auto& street = project->city->data.streets[ui.selected_city_street];
-                    ImGui::Text("Road Inspector");
-                    ImGui::Separator();
-                    ImGui::Text("Name: %s", street.name.c_str());
-                    ImGui::Text("From Node: %d", street.from_intersection);
-                    ImGui::Text("To Node: %d", street.to_intersection);
-                    ImGui::Text("Left Width: %d | Right Width: %d", street.left_width, street.right_width);
-                    ImGui::Text("District: %d", street.district);
+                    ImGui::TextColored(ImVec4(0.39F, 0.64F, 0.67F, 1.0F), "ROAD %zu", ui.selected_city_street);
+                    ImGui::TextUnformatted(street.name.c_str());
+                    ImGui::SeparatorText("Geometry");
+                    int endpoints[2]{street.from_intersection, street.to_intersection};
+                    ImGui::TextDisabled("NODES · FROM / TO");
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::InputInt2("##road_nodes", endpoints)) {
+                        begin_city_action(*project, ui, "edit road nodes");
+                        nudge_city_street_endpoint(*project, ui, 0, endpoints[0] - street.from_intersection);
+                        nudge_city_street_endpoint(*project, ui, 1, endpoints[1] - street.to_intersection);
+                    }
+                    int widths[2]{street.left_width, street.right_width};
+                    ImGui::TextDisabled("WIDTH · LEFT / RIGHT");
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::InputInt2("##road_width", widths)) {
+                        begin_city_action(*project, ui, "edit road width");
+                        nudge_city_street_width(*project, ui, 0, widths[0] - street.left_width);
+                        nudge_city_street_width(*project, ui, 1, widths[1] - street.right_width);
+                    }
+                    int district = street.district;
+                    ImGui::TextDisabled("DISTRICT");
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::InputInt("##road_district", &district)) {
+                        begin_city_action(*project, ui, "edit road district");
+                        nudge_city_street_district(*project, ui, district - street.district);
+                    }
+
+                    ImGui::SeparatorText("Actions");
+                    const auto action_width = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5F;
+                    if (ImGui::Button(ICON_FA_COPY " Duplicate", ImVec2(action_width, 0.0F))) {
+                        begin_city_action(*project, ui, "duplicate road");
+                        duplicate_city_street(*project, ui);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button(ICON_FA_TRASH " Delete", ImVec2(action_width, 0.0F))) {
+                        begin_city_action(*project, ui, "delete road");
+                        delete_city_street(*project, ui);
+                    }
 
                     ImGui::Spacing();
-                    ImGui::Separator();
-                    ImGui::Text("Actions:");
-                    
-                    if (ImGui::Button("F-")) nudge_city_street_endpoint(*project, ui, 0, -1);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Decrement from node");
-                    ImGui::SameLine();
-                    if (ImGui::Button("F+")) nudge_city_street_endpoint(*project, ui, 0, 1);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Increment from node");
-                    ImGui::SameLine();
-                    if (ImGui::Button("T-")) nudge_city_street_endpoint(*project, ui, 1, -1);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Decrement to node");
-                    ImGui::SameLine();
-                    if (ImGui::Button("T+")) nudge_city_street_endpoint(*project, ui, 1, 1);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Increment to node");
-
-                    if (ImGui::Button("L-")) nudge_city_street_width(*project, ui, 0, -1);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Decrement left width");
-                    ImGui::SameLine();
-                    if (ImGui::Button("L+")) nudge_city_street_width(*project, ui, 0, 1);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Increment left width");
-                    ImGui::SameLine();
-                    if (ImGui::Button("R-")) nudge_city_street_width(*project, ui, 1, -1);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Decrement right width");
-                    ImGui::SameLine();
-                    if (ImGui::Button("R+")) nudge_city_street_width(*project, ui, 1, 1);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Increment right width");
-
-                    if (ImGui::Button("D-")) nudge_city_street_district(*project, ui, -1);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Decrement district index");
-                    ImGui::SameLine();
-                    if (ImGui::Button("D+")) nudge_city_street_district(*project, ui, 1);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Increment district index");
-                    ImGui::SameLine();
-                    if (ImGui::Button("Duplicate")) duplicate_city_street(*project, ui);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Duplicate current street (Ctrl+D)");
-                    ImGui::SameLine();
-                    if (ImGui::Button("Delete")) delete_city_street(*project, ui);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete current street (Del)");
-
-                    ImGui::Spacing();
-                    if (ImGui::Button(ui.city_dirty ? "Save City *" : "Save City", ImVec2(-FLT_MIN, 35))) {
+                    if (ImGui::Button(ui.city_dirty ? ICON_FA_FLOPPY_DISK " Save city *" : ICON_FA_FLOPPY_DISK " Save city", ImVec2(-FLT_MIN, 35))) {
                         save_city(*project, ui, status);
                     }
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Save city changes to city2.edited.sbc");
-                    }
                 } else if (ui.city_selection == CitySelectionKind::Building && !project->city->data.buildings.empty()) {
                     ui.selected_city_building = std::min(ui.selected_city_building, project->city->data.buildings.size() - 1U);
                     auto& building = project->city->data.buildings[ui.selected_city_building];
-                    ImGui::Text("Building Placement");
-                    ImGui::Separator();
-                    ImGui::Text("Name: %s", building.name.c_str());
-                    ImGui::Text("Position: [%d, %d, %d]", building.x, building.y, building.z);
-                    ImGui::Text("Rotation: %d", building.rotation);
+                    ImGui::TextColored(ImVec4(0.39F, 0.64F, 0.67F, 1.0F), "BUILDING %zu", ui.selected_city_building);
+                    ImGui::TextUnformatted(building.name.c_str());
+                    ImGui::SeparatorText("Transform");
+                    int position[3]{building.x, building.y, building.z};
+                    ImGui::TextDisabled("GRID POSITION · X / Y / Z");
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::InputInt3("##building_position", position)) {
+                        begin_city_action(*project, ui, "move building");
+                        nudge_city_building(*project, ui,
+                            position[0] - building.x, position[1] - building.y, position[2] - building.z, 0);
+                    }
+                    int rotation = building.rotation & 3;
+                    constexpr const char* rotations[] = {"0 degrees", "90 degrees", "180 degrees", "270 degrees"};
+                    ImGui::TextDisabled("ROTATION");
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::Combo("##building_rotation", &rotation, rotations, 4)) {
+                        begin_city_action(*project, ui, "rotate building");
+                        nudge_city_building(*project, ui, 0, 0, 0, (rotation - building.rotation) & 3);
+                    }
 
-                    ImGui::Spacing();
-                    ImGui::Separator();
-                    ImGui::Text("Actions:");
-                    if (ImGui::Button("X-")) nudge_city_building(*project, ui, -1, 0, 0, 0);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Nudge X left");
+                    ImGui::SeparatorText("Actions");
+                    const auto action_width = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5F;
+                    if (ImGui::Button(ICON_FA_COPY " Duplicate", ImVec2(action_width, 0.0F))) {
+                        begin_city_action(*project, ui, "duplicate building");
+                        duplicate_city_building(*project, ui);
+                    }
                     ImGui::SameLine();
-                    if (ImGui::Button("X+")) nudge_city_building(*project, ui, 1, 0, 0, 0);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Nudge X right");
-                    ImGui::SameLine();
-                    if (ImGui::Button("Z-")) nudge_city_building(*project, ui, 0, 0, -1, 0);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Nudge Z back");
-                    ImGui::SameLine();
-                    if (ImGui::Button("Z+")) nudge_city_building(*project, ui, 0, 0, 1, 0);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Nudge Z forward");
-
-                    if (ImGui::Button("Y-")) nudge_city_building(*project, ui, 0, -1, 0, 0);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Nudge Y down");
-                    ImGui::SameLine();
-                    if (ImGui::Button("Y+")) nudge_city_building(*project, ui, 0, 1, 0, 0);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Nudge Y up");
-                    ImGui::SameLine();
-                    if (ImGui::Button("Rotate")) nudge_city_building(*project, ui, 0, 0, 0, 1);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Rotate building 90 degrees (%s, Shift+%s back)", key_label(KEY_R).c_str(), key_label(KEY_R).c_str());
-
-                    if (ImGui::Button("Duplicate")) duplicate_city_building(*project, ui);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Duplicate current building (Ctrl+%s)", key_label(KEY_D).c_str());
-                    ImGui::SameLine();
-                    if (ImGui::Button("Delete")) delete_city_building(*project, ui);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete building placement (Del)");
-                    ImGui::SameLine();
-                    if (ImGui::Button(ui.city_dirty ? "Save City *" : "Save City")) {
+                    if (ImGui::Button(ICON_FA_TRASH " Delete", ImVec2(action_width, 0.0F))) {
+                        begin_city_action(*project, ui, "delete building");
+                        delete_city_building(*project, ui);
+                    }
+                    if (ImGui::Button(ui.city_dirty ? ICON_FA_FLOPPY_DISK " Save city *" : ICON_FA_FLOPPY_DISK " Save city",
+                        ImVec2(-FLT_MIN, 35.0F))) {
                         save_city(*project, ui, status);
                     }
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Save city changes to city2.edited.sbc");
@@ -4885,8 +4967,11 @@ int run_editor_app() {
             } else if (ui.tab == EditorTab::Buildblocks) {
                 draw_buildblock_inspector(*project, ui, status);
             }
+            ImGui::Spacing();
+            ImGui::Separator();
+            draw_controls_help(ui);
         } else {
-            ImGui::Text("Please load a project.");
+            ImGui::TextDisabled("Properties appear here after you open a map.");
         }
         ImGui::End();
 
@@ -4895,7 +4980,7 @@ int run_editor_app() {
             project->city &&
             (ui.city_tool == CityTool::Piece || ui.city_selection == CitySelectionKind::Piece) &&
             !project->city->data.portals.empty()) {
-            ImGui::Begin("2D Preview");
+            ImGui::Begin("Plan View");
             static RenderTexture2D preview_texture = LoadRenderTexture(300, 300);
             ImVec2 p_size = ImGui::GetContentRegionAvail();
             if (p_size.x > 0 && p_size.y > 0) {
@@ -4943,55 +5028,59 @@ int run_editor_app() {
         }
 
         if (project && ui.tab == EditorTab::Buildblocks) {
-            ImGui::Begin("Buildblock 2D Preview");
+            ImGui::Begin("Buildblock Plan");
             draw_buildblock_preview_panel(*project, ui);
             ImGui::End();
         }
 
-        ImGui::Begin("Console / Status");
-        ImGui::Text("Status: %s", status.c_str());
-        if (project) {
-            ImGui::Text("Render: %s", project->status.c_str());
-            ImGui::Separator();
-            ImGui::BeginChild("render-log", ImVec2(0, 120), true);
-            for (const auto& line : project->render_logs) {
-                ImGui::TextUnformatted(line.c_str());
+        if (show_activity) {
+            if (ImGui::Begin("Activity", &show_activity)) {
+                ImGui::Text("Status: %s", status.c_str());
+                if (project) {
+                    ImGui::Text("Render: %s", project->status.c_str());
+                    ImGui::Separator();
+                    ImGui::BeginChild("render-log", ImVec2(0, 120), true);
+                    for (const auto& line : project->render_logs) {
+                        ImGui::TextUnformatted(line.c_str());
+                    }
+                    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) {
+                        ImGui::SetScrollHereY(1.0F);
+                    }
+                    ImGui::EndChild();
+                }
+                ImGui::Text("Camera: %.1f  %.1f  %.1f", camera.position.x, camera.position.y, camera.position.z);
+                ImGui::Text("Fly speed: %.1f", ui.camera_fly_speed);
             }
-            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) {
-                ImGui::SetScrollHereY(1.0F);
-            }
-            ImGui::EndChild();
+            ImGui::End();
         }
-        ImGui::Text("Camera Pos: [%.2f, %.2f, %.2f]", camera.position.x, camera.position.y, camera.position.z);
-        ImGui::Text("Fly Speed: %.1f", ui.camera_fly_speed);
-        ImGui::End();
 
         // History backlog: the list of actions done, with undo/redo controls.
-        ImGui::Begin("History");
-        if (project && project->city) {
-            const bool can_undo = !project->undo_stack.empty();
-            const bool can_redo = !project->redo_stack.empty();
-            ImGui::BeginDisabled(!can_undo);
-            if (ImGui::Button("Undo")) undo_city(*project, ui, status);
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            ImGui::BeginDisabled(!can_redo);
-            if (ImGui::Button("Redo")) redo_city(*project, ui, status);
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            ImGui::TextDisabled("%s+Z / %s+Y", key_label(KEY_LEFT_CONTROL).c_str(), key_label(KEY_LEFT_CONTROL).c_str());
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Clear log")) project->action_log.clear();
-            ImGui::Separator();
-            ImGui::BeginChild("action-log", ImVec2(0, 0), true);
-            for (auto it = project->action_log.rbegin(); it != project->action_log.rend(); ++it) {
-                ImGui::TextUnformatted(it->c_str());
+        if (show_history) {
+            if (ImGui::Begin("History", &show_history)) {
+                if (project && project->city) {
+                    const bool can_undo = !project->undo_stack.empty();
+                    const bool can_redo = !project->redo_stack.empty();
+                    ImGui::BeginDisabled(!can_undo);
+                    if (ImGui::Button("Undo")) undo_city(*project, ui, status);
+                    ImGui::EndDisabled();
+                    ImGui::SameLine();
+                    ImGui::BeginDisabled(!can_redo);
+                    if (ImGui::Button("Redo")) redo_city(*project, ui, status);
+                    ImGui::EndDisabled();
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Clear log")) project->action_log.clear();
+                    ImGui::Separator();
+                    ImGui::BeginChild("action-log", ImVec2(0, 0), true);
+                    for (auto it = project->action_log.rbegin(); it != project->action_log.rend(); ++it) {
+                        ImGui::TextUnformatted(it->c_str());
+                    }
+                    ImGui::EndChild();
+                } else {
+                    ImGui::TextDisabled("No city loaded.");
+                }
             }
-            ImGui::EndChild();
-        } else {
-            ImGui::TextDisabled("No city loaded.");
+            ImGui::End();
         }
-        ImGui::End();
 
         const auto imgui_end = std::chrono::steady_clock::now();
         gfx_debug_stats.add_phase_ms(
@@ -5118,6 +5207,13 @@ int run_editor_app() {
         EndDrawing();
         g_gfx_debug_stats = nullptr;
 
+        if (screenshot_path && project && ++screenshot_ready_frames >= 300) {
+            auto screenshot = LoadImageFromScreen();
+            ExportImage(screenshot, screenshot_path->string().c_str());
+            UnloadImage(screenshot);
+            running = false;
+        }
+
         // Run a deferred load now that the normal frame has been presented. Paint
         // a dedicated "Parsing..." frame first so the screen shows progress, then
         // run the blocking synchronous parse and apply the result.
@@ -5133,10 +5229,25 @@ int run_editor_app() {
             if (project) {
                 set_status(*project);
                 status = "loaded " + project->root.filename().string();
+                if (screenshot_tab == "buildings") ui.tab = EditorTab::Buildings;
+                if (screenshot_tab == "pieces") ui.tab = EditorTab::Pieces;
+                if (screenshot_tab == "buildblocks") ui.tab = EditorTab::Buildblocks;
+                if (screenshot_tab == "blocks") ui.tab = EditorTab::Blocks;
+                if (screenshot_path && project->city && !project->city->data.buildings.empty()) {
+                    ui.city_tool = CityTool::Select;
+                    if (ui.tab == EditorTab::City) {
+                        ui.city_selection = CitySelectionKind::Building;
+                        ui.selected_city_building = 0U;
+                        ui.selected_city_buildings = {0U};
+                    }
+                }
                 if (ui.tab == EditorTab::City) {
                     focus_camera_on_city(camera, *project);
                 } else {
                     camera = default_camera();
+                    if (ui.tab == EditorTab::Buildings) {
+                        focus_current_selection(*project, ui, camera);
+                    }
                 }
             }
         }

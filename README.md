@@ -98,7 +98,7 @@ Drop a map folder into the window or click `Open Folder`. The expected folder la
 
 Camera (freecam): hold **right mouse**, then **WASD** to move, **Space/Shift** for up/down, **Ctrl** for 2x speed, and the **mouse wheel** to change fly speed. The keyboard edit shortcuts below are inactive while flying or while typing in a field.
 
-Selection is click-to-select: a plain left-click in the viewport selects whatever is under the cursor, and placement actions sit on modifiers so they no longer fight selection. A selected building gets a shader silhouette outline (inverted-hull, no bloom); selected roads and pieces get a pulsing highlight. The Inspector buttons remain as a secondary path and show their hotkey in tooltips; a collapsible **Controls** section at the top of the Inspector lists the bindings for the current tab/mode.
+Selection is click-to-select: a plain left-click in the Scene picks whatever is under the cursor. The left **Library** switches between placed buildings and roads, while **Properties** exposes direct position, rotation, width, node, and district fields for the current selection. A selected building gets a shader silhouette outline (inverted-hull, no bloom); selected roads and pieces get a pulsing highlight. The compact strip along the bottom of the Scene shows only the controls for the active tool, and the full reference stays under **Controls** in Properties.
 
 Key labels in the help text and tooltips are localized to your keyboard layout (an AZERTY user sees ZQSD, not WASD). The keys still fire on the same physical positions on every layout — only the printed labels change.
 

@@ -483,6 +483,7 @@ void draw_building_asset_panel(EditorProject& project, EditorUi& ui) {
                     if (ImGui::Selectable(names[i].c_str(), selected, ImGuiSelectableFlags_SpanAllColumns)) {
                         ui.selected_building = i;
                         ui.selected_building_cell = 0;
+                        ui.focus_selection_requested = true;
                         project.building_floor_preview_dirty = true;
                     }
                     ImGui::TableNextColumn();
@@ -1495,33 +1496,32 @@ void draw_buildblock_inspector(EditorProject& project, EditorUi& ui, std::string
 
 namespace {
 
-// Font Awesome 6 Solid icon prefixes for tool buttons (the atlas merges FA in
-// load_editor_fonts). Trailing space separates the glyph from the label.
-#define ICON_SELECT ICON_FA_ARROW_POINTER " "
-#define ICON_DRAW   ICON_FA_ROAD " "
-#define ICON_MOVE   ICON_FA_UP_DOWN_LEFT_RIGHT " "
-#define ICON_COPY   ICON_FA_COPY " "
-#define ICON_PLACE  ICON_FA_CUBE " "
-#define ICON_ERASE  ICON_FA_ERASER " "
-#define ICON_PAINT  ICON_FA_FILL_DRIP " "
+// Font Awesome 6 Solid icons used by the viewport task rail.
+#define ICON_SELECT ICON_FA_ARROW_POINTER
+#define ICON_DRAW   ICON_FA_ROAD
+#define ICON_MOVE   ICON_FA_UP_DOWN_LEFT_RIGHT
+#define ICON_PLACE  ICON_FA_CUBE
+#define ICON_ERASE  ICON_FA_ERASER
+#define ICON_PAINT  ICON_FA_FILL_DRIP
 
 // One tool button: highlighted when active, sets the target on click. Returns
 // true if it was clicked. Uniform width so the column reads as a tidy stack.
 template <typename T>
-bool tool_button(const char* label, const char* tip, T& target, T value) {
+bool tool_button(const char* icon, const char* label, const char* tip, T& target, T value) {
     const bool active = target == value;
     if (active) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.82F, 0.56F, 0.22F, 1.0F));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.08F, 0.09F, 0.10F, 1.0F));
     }
-    const bool clicked = ImGui::Button(label, ImVec2(118.0F, 26.0F));
+    const bool clicked = ImGui::Button(icon, ImVec2(38.0F, 38.0F));
     if (active) {
-        ImGui::PopStyleColor();
+        ImGui::PopStyleColor(2);
     }
     if (clicked) {
         target = value;
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("%s", tip);
+        ImGui::SetTooltip("%s\n%s", label, tip);
     }
     return clicked;
 }
@@ -1538,18 +1538,17 @@ bool draw_viewport_toolbar(EditorProject& project, EditorUi& ui, float origin_x,
         return false;
     }
 
-    ImGui::SetNextWindowPos(ImVec2(origin_x + 12.0F, origin_y + 12.0F), ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.88F);
+    ImGui::SetNextWindowPos(ImVec2(origin_x + 14.0F, origin_y + 14.0F), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.96F);
     constexpr auto flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
         ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
 
-    // Roomier padding + rounding so the overlay reads as a floating tool panel
-    // rather than buttons jammed into the corner.
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0F, 10.0F));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0F);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0F);
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0F, 6.0F));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0F, 6.0F));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 3.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 2.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0F, 4.0F));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.35F, 0.42F, 0.45F, 0.80F));
 
     bool hovered = false;
     if (ImGui::Begin("##viewport_toolbar", nullptr, flags)) {
@@ -1558,35 +1557,24 @@ bool draw_viewport_toolbar(EditorProject& project, EditorUi& ui, float origin_x,
         if (city) {
             // Unified city tools (no Roads/Buildings/Pieces sub-mode).
             const auto prev_tool = ui.city_tool;
-            tool_button(ICON_SELECT "Select", "Pick anything (building/road/node/piece); gizmo to move", ui.city_tool, CityTool::Select);
-            tool_button(ICON_MOVE "Building", "Place the chosen building template on the ground", ui.city_tool, CityTool::Building);
-            tool_button(ICON_DRAW "Road", "Draw road chains (snaps to nodes, splits roads)", ui.city_tool, CityTool::Road);
-            tool_button(ICON_PLACE "Piece", "Place/draw the chosen piece (hold-drag)", ui.city_tool, CityTool::Piece);
-            tool_button(ICON_ERASE "Erase", "Delete whatever you click (hold-drag erases pieces)", ui.city_tool, CityTool::Erase);
+            tool_button(ICON_SELECT, "Select", "Pick and move anything", ui.city_tool, CityTool::Select);
+            tool_button(ICON_MOVE, "Place building", "Place the chosen building template", ui.city_tool, CityTool::Building);
+            if (tool_button(ICON_DRAW, "Draw road", "Draw an axis-aligned road chain", ui.city_tool, CityTool::Road)) {
+                ui.city_library_roads = true;
+            }
+            tool_button(ICON_PLACE, "Place piece", "Place or drag the chosen piece", ui.city_tool, CityTool::Piece);
+            tool_button(ICON_ERASE, "Erase", "Click or drag to remove map content", ui.city_tool, CityTool::Erase);
             if (ui.city_tool != prev_tool && ui.city_tool != CityTool::Road) {
                 ui.pending_road_intersection.reset(); // leaving the road tool ends any chain
             }
         } else { // Buildings editor
-            tool_button(ICON_SELECT "Select", "Pick a cell (raycast)", ui.building_tool, BuildingTool::Select);
-            tool_button(ICON_PLACE "Place", "Add a block against the clicked face (click-drag for fast fill)", ui.building_tool, BuildingTool::PlaceBlock);
-            tool_button(ICON_PAINT "Paint", "Paint the clicked face's texture", ui.building_tool, BuildingTool::PaintTexture);
-            ImGui::Separator();
-            auto& bld = project.buildings[std::min(ui.selected_building, project.buildings.size() - 1U)].data;
-            if (ui.building_tool == BuildingTool::PlaceBlock) {
-                ImGui::TextDisabled("Configure the block in\nthe Inspector, then click\na face to place it.");
-            } else if (ui.building_tool == BuildingTool::PaintTexture) {
-                int side = ui.paint_interior ? 1 : 0;
-                const char* sides[] = {"Exterior", "Interior"};
-                ImGui::SetNextItemWidth(118.0F);
-                if (ImGui::Combo("##tb_side", &side, sides, 2)) {
-                    ui.paint_interior = side == 1;
-                }
-                ImGui::TextDisabled("Texture:");
-                material_swatch_picker(project, "tb_paint", bld.materials, ui.paint_material_index);
-            }
+            tool_button(ICON_SELECT, "Select cell", "Pick an occupied building cell", ui.building_tool, BuildingTool::Select);
+            tool_button(ICON_PLACE, "Place block", "Add blocks by clicking or dragging", ui.building_tool, BuildingTool::PlaceBlock);
+            tool_button(ICON_PAINT, "Paint texture", "Paint the clicked face", ui.building_tool, BuildingTool::PaintTexture);
         }
     }
     ImGui::End();
+    ImGui::PopStyleColor();
     ImGui::PopStyleVar(4);
     return hovered;
 }
@@ -1659,105 +1647,100 @@ void draw_controls_overlay(const EditorUi& ui, float origin_x, float origin_y, f
     }
 
     auto* draw = ImGui::GetForegroundDrawList();
-    const float pad = 9.0F;
-    const float row_h = ImGui::GetTextLineHeight() + 8.0F;
+    constexpr float pad = 8.0F;
+    constexpr float gap = 7.0F;
+    constexpr float group_gap = 14.0F;
     const float cap_h = ImGui::GetTextLineHeight() + 4.0F;
-    const float gap = 8.0F; // between key cap and action text.
-
-    // Measure: widest row = caps width + gap + action width.
-    float panel_w = 0.0F;
+    float panel_w = pad * 2.0F;
     for (const auto& hint : hints) {
-        const float cap_w = ImGui::CalcTextSize(hint.key.c_str()).x + 12.0F;
-        const float act_w = ImGui::CalcTextSize(hint.action.c_str()).x;
-        panel_w = std::max(panel_w, cap_w + gap + act_w);
+        panel_w += ImGui::CalcTextSize(hint.key.c_str()).x + 12.0F + gap +
+            ImGui::CalcTextSize(hint.action.c_str()).x + group_gap;
     }
-    panel_w += pad * 2.0F;
-    const float panel_h = pad * 2.0F + row_h * static_cast<float>(hints.size());
+    panel_w -= group_gap;
+    const float panel_h = cap_h + pad * 2.0F;
+    const float x0 = origin_x + (width - panel_w) * 0.5F;
+    const float y0 = origin_y + height - panel_h - 12.0F;
 
-    const float x1 = origin_x + width - 12.0F;
-    const float y1 = origin_y + height - 12.0F;
-    const float x0 = x1 - panel_w;
-    const float y0 = y1 - panel_h;
+    draw->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + panel_w, y0 + panel_h), IM_COL32(13, 18, 22, 220), 3.0F);
+    draw->AddLine(ImVec2(x0, y0), ImVec2(x0 + panel_w, y0), IM_COL32(211, 146, 57, 230), 2.0F);
 
-    draw->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(20, 23, 27, 205), 7.0F);
-    draw->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(80, 90, 102, 220), 7.0F);
-
-    float y = y0 + pad;
+    float x = x0 + pad;
     for (const auto& hint : hints) {
         const float cap_w = ImGui::CalcTextSize(hint.key.c_str()).x + 12.0F;
-        const float cap_x = x0 + pad;
-        const ImVec2 cap_min(cap_x, y + (row_h - cap_h) * 0.5F);
-        const ImVec2 cap_max(cap_x + cap_w, cap_min.y + cap_h);
-        // Key-cap shape: rounded filled rect with a lighter top edge.
-        draw->AddRectFilled(cap_min, cap_max, IM_COL32(58, 64, 72, 255), 4.0F);
-        draw->AddRect(cap_min, cap_max, IM_COL32(120, 130, 142, 255), 4.0F);
+        const ImVec2 cap_min(x, y0 + pad);
+        const ImVec2 cap_max(x + cap_w, cap_min.y + cap_h);
+        draw->AddRectFilled(cap_min, cap_max, IM_COL32(41, 52, 59, 255), 2.0F);
+        draw->AddRect(cap_min, cap_max, IM_COL32(94, 110, 120, 255), 2.0F);
         const ImVec2 key_text_size = ImGui::CalcTextSize(hint.key.c_str());
         draw->AddText(
-            ImVec2(cap_x + (cap_w - key_text_size.x) * 0.5F, cap_min.y + (cap_h - key_text_size.y) * 0.5F),
+            ImVec2(x + (cap_w - key_text_size.x) * 0.5F, cap_min.y + (cap_h - key_text_size.y) * 0.5F),
             IM_COL32(235, 240, 245, 255),
             hint.key.c_str());
         draw->AddText(
-            ImVec2(cap_x + cap_w + gap, y + (row_h - ImGui::GetTextLineHeight()) * 0.5F),
-            IM_COL32(205, 212, 220, 255),
+            ImVec2(x + cap_w + gap, cap_min.y + (cap_h - ImGui::GetTextLineHeight()) * 0.5F),
+            IM_COL32(184, 194, 200, 255),
             hint.action.c_str());
-        y += row_h;
+        x += cap_w + gap + ImGui::CalcTextSize(hint.action.c_str()).x + group_gap;
     }
 }
 
 void apply_editor_imgui_style() {
     ImGui::StyleColorsDark();
     auto& style = ImGui::GetStyle();
-    style.WindowPadding = ImVec2(10.0F, 10.0F);
+    style.WindowPadding = ImVec2(12.0F, 11.0F);
     style.FramePadding = ImVec2(9.0F, 6.0F);
-    style.CellPadding = ImVec2(8.0F, 5.0F);
-    style.ItemSpacing = ImVec2(8.0F, 7.0F);
-    style.ItemInnerSpacing = ImVec2(6.0F, 5.0F);
-    style.ScrollbarSize = 13.0F;
-    style.GrabMinSize = 10.0F;
+    style.CellPadding = ImVec2(9.0F, 6.0F);
+    style.ItemSpacing = ImVec2(8.0F, 8.0F);
+    style.ItemInnerSpacing = ImVec2(7.0F, 5.0F);
+    style.ScrollbarSize = 11.0F;
+    style.GrabMinSize = 12.0F;
     style.WindowBorderSize = 1.0F;
     style.ChildBorderSize = 1.0F;
     style.PopupBorderSize = 1.0F;
     style.FrameBorderSize = 0.0F;
     style.TabBorderSize = 0.0F;
-    style.WindowRounding = 5.0F;
-    style.ChildRounding = 5.0F;
-    style.FrameRounding = 4.0F;
-    style.PopupRounding = 5.0F;
-    style.ScrollbarRounding = 8.0F;
-    style.GrabRounding = 4.0F;
-    style.TabRounding = 4.0F;
+    style.WindowRounding = 2.0F;
+    style.ChildRounding = 2.0F;
+    style.FrameRounding = 2.0F;
+    style.PopupRounding = 3.0F;
+    style.ScrollbarRounding = 3.0F;
+    style.GrabRounding = 2.0F;
+    style.TabRounding = 2.0F;
 
     auto& colors = style.Colors;
-    colors[ImGuiCol_Text] = ImVec4(0.89F, 0.91F, 0.91F, 1.00F);
-    colors[ImGuiCol_TextDisabled] = ImVec4(0.43F, 0.48F, 0.50F, 1.00F);
-    colors[ImGuiCol_WindowBg] = ImVec4(0.075F, 0.083F, 0.090F, 1.00F);
-    colors[ImGuiCol_ChildBg] = ImVec4(0.055F, 0.061F, 0.067F, 1.00F);
-    colors[ImGuiCol_PopupBg] = ImVec4(0.070F, 0.078F, 0.086F, 0.98F);
-    colors[ImGuiCol_Border] = ImVec4(0.18F, 0.22F, 0.24F, 1.00F);
-    colors[ImGuiCol_FrameBg] = ImVec4(0.12F, 0.14F, 0.15F, 1.00F);
-    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.18F, 0.22F, 0.24F, 1.00F);
-    colors[ImGuiCol_FrameBgActive] = ImVec4(0.24F, 0.30F, 0.33F, 1.00F);
-    colors[ImGuiCol_TitleBg] = ImVec4(0.060F, 0.066F, 0.073F, 1.00F);
-    colors[ImGuiCol_TitleBgActive] = ImVec4(0.10F, 0.12F, 0.13F, 1.00F);
-    colors[ImGuiCol_MenuBarBg] = ImVec4(0.055F, 0.061F, 0.067F, 1.00F);
-    colors[ImGuiCol_Button] = ImVec4(0.18F, 0.25F, 0.28F, 1.00F);
-    colors[ImGuiCol_ButtonHovered] = ImVec4(0.24F, 0.34F, 0.38F, 1.00F);
-    colors[ImGuiCol_ButtonActive] = ImVec4(0.32F, 0.48F, 0.52F, 1.00F);
-    colors[ImGuiCol_Header] = ImVec4(0.18F, 0.28F, 0.31F, 1.00F);
-    colors[ImGuiCol_HeaderHovered] = ImVec4(0.25F, 0.39F, 0.43F, 1.00F);
-    colors[ImGuiCol_HeaderActive] = ImVec4(0.31F, 0.50F, 0.55F, 1.00F);
-    colors[ImGuiCol_Separator] = ImVec4(0.22F, 0.27F, 0.29F, 1.00F);
-    colors[ImGuiCol_ResizeGrip] = ImVec4(0.24F, 0.34F, 0.38F, 0.65F);
-    colors[ImGuiCol_ResizeGripHovered] = ImVec4(0.31F, 0.50F, 0.55F, 0.85F);
-    colors[ImGuiCol_ResizeGripActive] = ImVec4(0.40F, 0.64F, 0.68F, 1.00F);
-    colors[ImGuiCol_Tab] = ImVec4(0.12F, 0.15F, 0.16F, 1.00F);
-    colors[ImGuiCol_TabHovered] = ImVec4(0.25F, 0.39F, 0.43F, 1.00F);
-    colors[ImGuiCol_TabActive] = ImVec4(0.20F, 0.31F, 0.34F, 1.00F);
-    colors[ImGuiCol_DockingPreview] = ImVec4(0.34F, 0.62F, 0.66F, 0.70F);
+    colors[ImGuiCol_Text] = ImVec4(0.91F, 0.93F, 0.94F, 1.00F);
+    colors[ImGuiCol_TextDisabled] = ImVec4(0.47F, 0.53F, 0.56F, 1.00F);
+    colors[ImGuiCol_WindowBg] = ImVec4(0.071F, 0.090F, 0.106F, 1.00F);
+    colors[ImGuiCol_ChildBg] = ImVec4(0.051F, 0.067F, 0.078F, 1.00F);
+    colors[ImGuiCol_PopupBg] = ImVec4(0.063F, 0.082F, 0.094F, 0.98F);
+    colors[ImGuiCol_Border] = ImVec4(0.18F, 0.23F, 0.26F, 1.00F);
+    colors[ImGuiCol_FrameBg] = ImVec4(0.105F, 0.137F, 0.157F, 1.00F);
+    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.15F, 0.20F, 0.23F, 1.00F);
+    colors[ImGuiCol_FrameBgActive] = ImVec4(0.19F, 0.26F, 0.30F, 1.00F);
+    colors[ImGuiCol_TitleBg] = ImVec4(0.043F, 0.059F, 0.071F, 1.00F);
+    colors[ImGuiCol_TitleBgActive] = ImVec4(0.075F, 0.102F, 0.118F, 1.00F);
+    colors[ImGuiCol_MenuBarBg] = ImVec4(0.035F, 0.047F, 0.055F, 1.00F);
+    colors[ImGuiCol_Button] = ImVec4(0.12F, 0.17F, 0.20F, 1.00F);
+    colors[ImGuiCol_ButtonHovered] = ImVec4(0.20F, 0.29F, 0.33F, 1.00F);
+    colors[ImGuiCol_ButtonActive] = ImVec4(0.28F, 0.43F, 0.47F, 1.00F);
+    colors[ImGuiCol_Header] = ImVec4(0.14F, 0.21F, 0.24F, 1.00F);
+    colors[ImGuiCol_HeaderHovered] = ImVec4(0.22F, 0.33F, 0.37F, 1.00F);
+    colors[ImGuiCol_HeaderActive] = ImVec4(0.82F, 0.56F, 0.22F, 1.00F);
+    colors[ImGuiCol_CheckMark] = ImVec4(0.91F, 0.66F, 0.30F, 1.00F);
+    colors[ImGuiCol_SliderGrab] = ImVec4(0.39F, 0.62F, 0.66F, 1.00F);
+    colors[ImGuiCol_SliderGrabActive] = ImVec4(0.91F, 0.66F, 0.30F, 1.00F);
+    colors[ImGuiCol_Separator] = ImVec4(0.20F, 0.27F, 0.30F, 1.00F);
+    colors[ImGuiCol_ResizeGrip] = ImVec4(0.24F, 0.39F, 0.42F, 0.65F);
+    colors[ImGuiCol_ResizeGripHovered] = ImVec4(0.39F, 0.62F, 0.66F, 0.85F);
+    colors[ImGuiCol_ResizeGripActive] = ImVec4(0.91F, 0.66F, 0.30F, 1.00F);
+    colors[ImGuiCol_Tab] = ImVec4(0.08F, 0.11F, 0.13F, 1.00F);
+    colors[ImGuiCol_TabHovered] = ImVec4(0.18F, 0.28F, 0.31F, 1.00F);
+    colors[ImGuiCol_TabActive] = ImVec4(0.13F, 0.21F, 0.24F, 1.00F);
+    colors[ImGuiCol_DockingPreview] = ImVec4(0.91F, 0.66F, 0.30F, 0.70F);
 }
 
 void load_default_imgui_layout() {
-    const auto dockspace = ImHashStr("SRCMapEditorDockSpace");
+    const auto dockspace = ImHashStr("SRCMapEditorDockSpaceV3");
     const auto* viewport = ImGui::GetMainViewport();
     ImGui::DockBuilderRemoveNode(dockspace);
     ImGui::DockBuilderAddNode(dockspace, ImGuiDockNodeFlags_DockSpace);
@@ -1765,25 +1748,25 @@ void load_default_imgui_layout() {
     ImGui::DockBuilderSetNodeSize(dockspace, viewport->WorkSize);
 
     ImGuiID center = dockspace;
-    const auto left = ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, 0.22F, nullptr, &center);
-    const auto right = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.26F, nullptr, &center);
-    const auto bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.18F, nullptr, &center);
+    const auto left = ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, 0.20F, nullptr, &center);
+    const auto right = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.27F, nullptr, &center);
 
-    ImGui::DockBuilderDockWindow("Asset Browser", left);
-    ImGui::DockBuilderDockWindow("Inspector", right);
-    ImGui::DockBuilderDockWindow("Console / Status", bottom);
-    ImGui::DockBuilderDockWindow("History", bottom);
-    ImGui::DockBuilderDockWindow("Viewport 3D", center);
-    ImGui::DockBuilderDockWindow("2D Preview", center);
-    ImGui::DockBuilderDockWindow("Buildblock 2D Preview", center);
+    ImGui::DockBuilderDockWindow("Library", left);
+    ImGui::DockBuilderDockWindow("Properties", right);
+    ImGui::DockBuilderDockWindow("Activity", right);
+    ImGui::DockBuilderDockWindow("History", right);
+    ImGui::DockBuilderDockWindow("Scene", center);
+    ImGui::DockBuilderDockWindow("Plan View", center);
+    ImGui::DockBuilderDockWindow("Buildblock Plan", center);
     ImGui::DockBuilderFinish(dockspace);
 }
 
 void draw_editor_dockspace(bool reset_layout) {
-    if (reset_layout) {
+    const auto dockspace = ImHashStr("SRCMapEditorDockSpaceV3");
+    if (reset_layout || ImGui::DockBuilderGetNode(dockspace) == nullptr) {
         load_default_imgui_layout();
     }
-    ImGui::DockSpaceOverViewport(ImHashStr("SRCMapEditorDockSpace"), ImGui::GetMainViewport());
+    ImGui::DockSpaceOverViewport(dockspace, ImGui::GetMainViewport());
 }
 
 } // namespace map_editor::app_internal

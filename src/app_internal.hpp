@@ -471,6 +471,7 @@ struct CityGridPoint {
 
 struct EditorUi {
     EditorTab tab{EditorTab::City};
+    bool city_library_roads{};
     // One persistent search query per workspace tab. Keeping the queries separate
     // prevents a Buildings search from making another tab appear empty.
     std::array<std::array<char, 128>, 5> asset_search{};
@@ -552,6 +553,7 @@ struct EditorUi {
     // Animated camera focus (F key): when active, the camera eases from the start
     // pose to the target pose over focus_duration. Cancelled by manual fly input.
     bool focus_animating{false};
+    bool focus_selection_requested{};
     float focus_t{};
     float focus_duration{0.6F};
     Vector3 focus_start_position{};
