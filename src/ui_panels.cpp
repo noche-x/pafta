@@ -20,6 +20,20 @@
 
 namespace map_editor::app_internal {
 
+void invalidate_buildblock_preview_scene(EditorProject& project) {
+    project.cached_buildblock_preview_index.reset();
+}
+
+const BuildblockPreviewScene& buildblock_preview_scene(EditorProject& project, std::size_t index) {
+    if (!project.cached_buildblock_preview_index.has_value() ||
+        *project.cached_buildblock_preview_index != index) {
+        project.cached_buildblock_preview_scene =
+            build_buildblock_preview_scene(project.buildblocks[index].data);
+        project.cached_buildblock_preview_index = index;
+    }
+    return project.cached_buildblock_preview_scene;
+}
+
 std::string hex_u32(std::uint32_t value) {
     std::ostringstream stream;
     stream << "0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << value;
@@ -616,7 +630,7 @@ void draw_buildblock_gallery(EditorProject& project, EditorUi& ui) {
     }
 
     ui.selected_buildblock_layer = std::min(ui.selected_buildblock_layer, buildblock.layers.size() - 1U);
-    const auto scene = build_buildblock_preview_scene(buildblock);
+    const auto& scene = buildblock_preview_scene(project, ui.selected_buildblock);
     const auto spacing = ImGui::GetStyle().ItemSpacing.x;
     const auto avail_x = std::max(1.0F, ImGui::GetContentRegionAvail().x);
     const auto min_tile_w = 92.0F;
@@ -674,7 +688,7 @@ void draw_buildblock_preview_panel(EditorProject& project, EditorUi& ui) {
     ImGui::SameLine();
     ImGui::TextDisabled("Face %zu", layer_id);
 
-    const auto scene = build_buildblock_preview_scene(buildblock);
+    const auto& scene = buildblock_preview_scene(project, ui.selected_buildblock);
     const auto canvas_min = ImGui::GetCursorScreenPos();
     const auto avail = ImGui::GetContentRegionAvail();
     const auto canvas_size = ImVec2{

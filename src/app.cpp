@@ -1861,6 +1861,7 @@ void nudge_buildblock_geometry(EditorProject& project, EditorUi& ui, int steps) 
     ui.buildblock_dirty = true;
     project.render_buffers_dirty = true;
     project.building_floor_preview_dirty = true;
+    invalidate_buildblock_preview_scene(project);
     invalidate_portal_render_models(project);
 }
 
@@ -2571,6 +2572,7 @@ void mark_buildblock_changed(EditorProject& project, EditorUi& ui) {
     ui.buildblock_dirty = true;
     project.render_buffers_dirty = true;
     project.building_floor_preview_dirty = true;
+    invalidate_buildblock_preview_scene(project);
     // Editing buildblock data invalidates the cached buildblock-template catalog.
     invalidate_render_input_cache(project);
     invalidate_portal_render_models(project);
@@ -3755,6 +3757,9 @@ int run_editor_app() {
         if (project && !io.WantCaptureKeyboard && !IsCursorHidden()) {
             handle_editor_hotkeys(*project, ui, camera, status, is_viewport_hovered);
         }
+        const bool open_folder_hotkey_requested =
+            !io.WantCaptureKeyboard && !IsCursorHidden() &&
+            (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) && IsKeyPressed(KEY_O);
 
         const SbcBuilding* outline_selected_building = nullptr;
         const SbcBuilding* outline_hovered_building = nullptr;
@@ -4260,7 +4265,7 @@ int run_editor_app() {
             draw_loading_overlay(*project);
         }
 
-        bool open_folder_requested = false;
+        bool open_folder_requested = open_folder_hotkey_requested;
         bool export_mesh_requested = false;
         bool run_export_after_popup = false;
 

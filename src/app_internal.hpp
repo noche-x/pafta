@@ -371,6 +371,10 @@ struct EditorProject {
     std::vector<bool> building_thumbnail_ready;
     std::vector<RenderTexture2D> city_block_thumbnails;
     std::vector<bool> city_block_thumbnail_ready;
+    // The buildblock gallery and its 2D preview share this derived scene.
+    // Rebuild it only when the selected template or its data changes.
+    BuildblockPreviewScene cached_buildblock_preview_scene;
+    std::optional<std::size_t> cached_buildblock_preview_index;
     // Undo/redo of the city map. Each entry is a full SbcMap snapshot plus the
     // label of the action that produced the state AFTER it. undo_stack.back() is
     // the current state; popping it (onto redo_stack) reverts. The action_log is a
@@ -722,6 +726,7 @@ const RenderTexture2D* city_block_thumbnail(EditorProject& project, std::size_t 
 void draw_city_building_template_gallery(EditorProject& project, EditorUi& ui);
 void draw_city_piece_template_gallery(EditorProject& project, EditorUi& ui);
 void draw_buildblock_preview_panel(EditorProject& project, EditorUi& ui);
+void invalidate_buildblock_preview_scene(EditorProject& project);
 void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& status);
 // Viewport-left tool overlay (mode combobox + tool buttons). Anchored at the
 // screen-space top-left of the render image (origin_x, origin_y). Returns true

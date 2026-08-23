@@ -14,7 +14,7 @@ Current implementation:
 - Exposes portable SBB cell, SBC building, SBL word, and SBL layer portal edit/save commands for persisted field changes.
 - Launches as a no-argument editor app with folder drag/drop and native folder selection.
 - Loads map-folder assets from `city2.sbc`, `building/*.sbb`, `block/*.sbl`, and `buildblock/*.sbl`.
-- Provides raygui tabs for City, Buildings, Pieces, Buildblocks, and Blocks.
+- Provides ImGui workspace tabs for City, Buildings, Pieces, Buildblocks, and Blocks, with a separate search query for each tab.
 - Uses a right-mouse freecam workflow instead of orbit camera control.
 - Supports City-tab road selection, endpoint/width/district edits, road duplication/deletion, viewport click-to-lay road intersections/segments, placed-building selection, X/Y/Z nudging, rotation, viewport click-to-move, Shift-click copy placement, building duplication/deletion, native portal-voxel piece placement/clearing, and save-to-copy as `city2.edited.sbc`.
 - Supports Buildings-tab occupied-cell selection, SBB field nudging, and save-to-copy as `*.edited.sbb`.
@@ -106,7 +106,7 @@ A selected city building shows a **drag gizmo**: grab the red/green/blue axis ha
 
 Closing the window, **Alt+F4**, or File → Exit is blocked while there are unsaved changes: a prompt offers **Save & Exit**, **Discard & Exit**, or **Cancel**. Saving writes the usual `*.edited.*` copies.
 
-Global: **Ctrl+S** saves the active tab's `*.edited.*` copy, **F** focuses the camera on the city, **Ctrl+O** opens a folder.
+Global: **Ctrl+S** saves the active tab's `*.edited.*` copy, **F** frames the current selection (or the city when nothing is selected), and **Ctrl+O** opens a folder.
 
 City tab:
 
