@@ -243,6 +243,10 @@ void invalidate_portal_render_models(EditorProject& project) {
     project.portal_preview_render_dirty = true;
 }
 
+void invalidate_city_block_preview_scene(EditorProject& project) {
+    project.cached_city_block_preview_index.reset();
+}
+
 void service_render_rebuild(EditorProject& project) {
     MAPED_PROFILE_FUNCTION();
     if (project.render_buffers_dirty && !project.render_build_in_progress) {
@@ -1686,30 +1690,6 @@ GpuBuildingRenderModel upload_city_terrain_model(const BuildingRenderBuffer& buf
     });
 }
 
-// Simple-mode blockout: flat colored rectangles for road/curb tiles and flat
-// squares for intersections, drawn immediate-mode at the authored height. Only
-// used when the roads toggle is OFF, so the triangle count is small.
-void draw_city_roads_flat_blockout(const MapScene& scene) {
-    const auto half = scene.unit_size * 0.5F;
-    for (const auto& tile : scene.city_tiles) {
-        const auto cx = (static_cast<float>(tile.x) + 0.5F) * scene.unit_size;
-        const auto cz = (static_cast<float>(tile.z) + 0.5F) * scene.unit_size;
-        const auto y = tile.base_y + scene.unit_size + 0.05F;
-        const Vector3 a{cx - half, y, cz - half};
-        const Vector3 b{cx + half, y, cz - half};
-        const Vector3 c{cx + half, y, cz + half};
-        const Vector3 d{cx - half, y, cz + half};
-        const Color color = tile.kind == CityTileKind::Curb
-            ? Color{150, 154, 151, 255}
-            : Color{43, 47, 50, 255};
-        DrawTriangle3D(a, b, c, color);
-        DrawTriangle3D(a, c, d, color);
-        if (g_gfx_debug_stats != nullptr) {
-            g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::RoadsCurbs, 2U, 6U, 2U);
-        }
-    }
-}
-
 void draw_city_scene(
     EditorProject& project,
     const MapScene& scene,
@@ -1734,8 +1714,6 @@ void draw_city_scene(
         GfxDebugMaybeTimer timer{GfxDebugTimingPhase::CityRoadDraw};
         if (render_roads) {
             draw_uploaded_city_model(project.city_tile_gpu_model, GfxDebugDrawCategory::RoadsCurbs);
-        } else {
-            draw_city_roads_flat_blockout(scene);
         }
     }
 
@@ -1777,15 +1755,15 @@ void draw_city_scene(
 
 void draw_city_editor_overlay(const EditorProject&, const MapScene& scene) {
     GfxDebugMaybeTimer timer{GfxDebugTimingPhase::CityRoadDraw};
-    const auto marker_size = scene.unit_size * 0.42F;
-    const auto marker_lift = marker_size * 0.5F + 0.04F;
+    constexpr float marker_size = 2.0F;
+    constexpr float road_surface_offset = 0.25F;
     const auto marker_fill = Color{76, 139, 214, 170};
     const auto marker_wire = Color{218, 236, 255, 235};
     const auto segment_color = Color{255, 225, 112, 235};
 
     for (const auto& intersection : scene.intersections) {
         auto position = to_raylib(intersection.position);
-        position.y += marker_lift;
+        position.y = static_cast<float>(intersection.source->y) * scene.unit_size;
         const Vector3 size{marker_size, marker_size, marker_size};
         DrawCubeV(position, size, marker_fill);
         DrawCubeWiresV(position, size, marker_wire);
@@ -1798,7 +1776,7 @@ void draw_city_editor_overlay(const EditorProject&, const MapScene& scene) {
             (road.to.z - road.from.z) * (road.to.z - road.from.z));
         const auto steps = std::clamp(static_cast<int>(seg_len / scene.unit_size), 1, 256);
         auto height_at = [&](float t) {
-            return road.from.y + (road.to.y - road.from.y) * t + marker_lift;
+            return road.from.y + (road.to.y - road.from.y) * t - road_surface_offset;
         };
 
         auto prev = Vector3{
@@ -2074,9 +2052,14 @@ void draw_city_road_selection(const EditorProject& project, const EditorUi& ui, 
 
 
 
-void draw_city_block_preview(const SbcCityBlock& city_block, const std::vector<NamedBlockMesh>& meshes, std::size_t selected_layer, std::size_t selected_slot) {
+void draw_city_block_preview(EditorProject& project, const SbcCityBlock& city_block, const std::vector<NamedBlockMesh>& meshes, std::size_t city_block_index, std::size_t selected_layer, std::size_t selected_slot) {
     DrawGrid(24, 4.0F);
-    const auto scene = build_city_block_preview_scene(city_block, meshes);
+    if (!project.cached_city_block_preview_index.has_value() ||
+        *project.cached_city_block_preview_index != city_block_index) {
+        project.cached_city_block_preview_scene = build_city_block_preview_scene(city_block, meshes);
+        project.cached_city_block_preview_index = city_block_index;
+    }
+    const auto& scene = project.cached_city_block_preview_scene;
     if (scene.solid_cell.has_value()) {
         draw_render_buffer_faces(scene.solid_cell->buffer, {98, 148, 204, 220});
     }

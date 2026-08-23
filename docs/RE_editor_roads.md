@@ -7,6 +7,21 @@
 
 ---
 
+## Fresh verification — 2026-08-24
+
+The old Ghidra project could not reopen after a processor-language version change, so `editor.exe` was imported and analyzed again as `/codex_temp/editor.exe`. The fresh decompilation confirms the main result in this document:
+
+- `StreetPieceTool_CanvasRender @ 0x14006c400` calls the mesh-bucket pass and the street overlay pass separately.
+- `BuildStreetToolMeshBuckets @ 0x140076e70` only gathers existing world objects. It does not create road tiles.
+- `RenderStreetToolNodeAndSegmentOverlays @ 0x14007c990` draws node markers with scale `2.0` at authored node height `gridY * 4`.
+- The same overlay function submits four line vertices per street record from stored extent fields at `+0x30`, `+0x34`, and `+0x38`. The exact mapping from those fields to the current `SbcStreet` structure is still open.
+
+The current port now keeps its two views separate. **Editor** hides terrain and all road-tile geometry, then draws the abstract street overlay. **In game** draws terrain and generated road tiles without editor markers. The port still draws one center guide per street, so the native extent-based segment guides remain a known approximation.
+
+Fresh game-side checks also confirm that road tiles belong to the runtime. `/subrosa.exe.THIS_ONE` uses `MapConnector_PlaceStreetSegmentTilesAndSlopes @ 0x00020580` and its perimeter routine at `0x00020130`. `/subrosa.x64` independently shows the older slope-block path in `buildcitystreet @ 0x000866d2`.
+
+---
+
 ## 1. Executive Verdict
 
 **editor.exe does NOT render roads or intersections as placed voxel tiles, block-mesh instances, or tessellated road ribbons.**  

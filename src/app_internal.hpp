@@ -371,6 +371,10 @@ struct EditorProject {
     std::vector<bool> building_thumbnail_ready;
     std::vector<RenderTexture2D> city_block_thumbnails;
     std::vector<bool> city_block_thumbnail_ready;
+    // The Pieces-tab preview is derived from one city-block definition and the
+    // current block-mesh catalog. Keep it across frames and rebuild on edits.
+    CityBlockPreviewScene cached_city_block_preview_scene;
+    std::optional<std::size_t> cached_city_block_preview_index;
     // The buildblock gallery and its 2D preview share this derived scene.
     // Rebuild it only when the selected template or its data changes.
     BuildblockPreviewScene cached_buildblock_preview_scene;
@@ -531,9 +535,8 @@ struct EditorUi {
     std::size_t selected_piece_rotation{};
     std::size_t selected_portal{};
     bool portal_preview_textured{true};
-    // City ground rendering toggles. On = full game roads/terrain meshes.
-    // render_roads off => flat rectangle/square blockout for roads+intersections.
-    // render_terrain off => terrain hidden entirely.
+    // City preview mode. Both true shows the game terrain and finished road mesh;
+    // both false shows only the native editor-style node and segment overlays.
     bool render_roads{true};
     bool render_terrain{true};
     std::size_t selected_building_cell{};
@@ -595,6 +598,7 @@ void set_status(EditorProject& project);
 
 void service_render_rebuild(EditorProject& project);
 void invalidate_portal_render_models(EditorProject& project);
+void invalidate_city_block_preview_scene(EditorProject& project);
 GpuBuildingRenderModel upload_building_render_model(const BuildingRenderBuffer& buffer, const SbbBuilding& building, const EditorProject& project);
 GpuBuildingRenderModel& building_tool_floor_preview_model(EditorProject& project, std::size_t building_index, std::optional<std::uint32_t> floor);
 Texture2D load_city_window_gradient_texture();
@@ -647,7 +651,7 @@ void draw_city_edit_grid(CityGridPoint center, const MapScene& scene);
 // Roads-mode selection/hover overlay: distinct styling for the selected node, the
 // selected road, and the node/road under the cursor (hover_city_* in ui).
 void draw_city_road_selection(const EditorProject& project, const EditorUi& ui, const MapScene& scene);
-void draw_city_block_preview(const SbcCityBlock& city_block, const std::vector<NamedBlockMesh>& meshes, std::size_t selected_layer, std::size_t selected_slot);
+void draw_city_block_preview(EditorProject& project, const SbcCityBlock& city_block, const std::vector<NamedBlockMesh>& meshes, std::size_t city_block_index, std::size_t selected_layer, std::size_t selected_slot);
 void draw_buildblock_preview_3d(const BuildblockPreviewScene& scene);
 
 Camera3D default_camera();

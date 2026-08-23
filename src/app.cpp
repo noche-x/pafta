@@ -1502,6 +1502,7 @@ void undo_city(EditorProject& project, EditorUi& ui, std::string& status) {
     project.redo_stack.emplace_back(label, project.city->data);
     project.city->data = std::move(snapshot);
     project.action_log.push_back("undo: " + label);
+    invalidate_city_block_preview_scene(project);
     invalidate_portal_render_models(project);
     ui.city_selection = CitySelectionKind::None;
     ui.selected_city_buildings.clear();
@@ -1520,6 +1521,7 @@ void redo_city(EditorProject& project, EditorUi& ui, std::string& status) {
     project.undo_stack.emplace_back(label, project.city->data);
     project.city->data = std::move(snapshot);
     project.action_log.push_back("redo: " + label);
+    invalidate_city_block_preview_scene(project);
     invalidate_portal_render_models(project);
     ui.city_selection = CitySelectionKind::None;
     ui.selected_city_buildings.clear();
@@ -1931,6 +1933,7 @@ void nudge_block_header(EditorProject& project, EditorUi& ui, int delta) {
     ui.block_dirty = true;
     refresh_sbl_block_faces(block);
     project.render_buffers_dirty = true;
+    invalidate_city_block_preview_scene(project);
     invalidate_portal_render_models(project);
 }
 
@@ -1973,6 +1976,7 @@ void nudge_block_patch(EditorProject& project, EditorUi& ui, int steps) {
     ui.block_dirty = true;
     refresh_sbl_block_faces(block);
     project.render_buffers_dirty = true;
+    invalidate_city_block_preview_scene(project);
     invalidate_portal_render_models(project);
 }
 
@@ -2528,6 +2532,7 @@ void nudge_city_block_slot(EditorProject& project, EditorUi& ui, int delta) {
         index = (index + 1U) % names.size();
     }
     slot = names[index];
+    invalidate_city_block_preview_scene(project);
     invalidate_portal_render_models(project);
     ui.city_dirty = true;
 }
@@ -2545,6 +2550,7 @@ void clear_city_block_slot(EditorProject& project, EditorUi& ui) {
     ui.selected_city_block_layer = std::min(ui.selected_city_block_layer, city_block.layers.size() - 1U);
     ui.selected_city_block_slot = std::min<std::size_t>(ui.selected_city_block_slot, 7U);
     city_block.layers[ui.selected_city_block_layer][ui.selected_city_block_slot].clear();
+    invalidate_city_block_preview_scene(project);
     invalidate_portal_render_models(project);
     ui.city_dirty = true;
 }
@@ -2584,6 +2590,7 @@ void mark_block_changed(EditorProject& project, EditorUi& ui, SblBlockMesh& bloc
     project.render_buffers_dirty = true;
     // Editing block data invalidates the cached block-mesh catalog.
     invalidate_render_input_cache(project);
+    invalidate_city_block_preview_scene(project);
     invalidate_portal_render_models(project);
 }
 
@@ -3839,8 +3846,11 @@ int run_editor_app() {
                             project->city_scene_gpu_valid = true;
                         }
                         const auto& city_scene = project->city_scene_cache;
-                        draw_city_scene(*project, city_scene, selected_street, ui.render_roads, ui.render_terrain);
-                        draw_city_editor_overlay(*project, city_scene);
+                        const bool game_preview = ui.render_roads && ui.render_terrain;
+                        draw_city_scene(*project, city_scene, selected_street, game_preview, game_preview);
+                        if (!game_preview) {
+                            draw_city_editor_overlay(*project, city_scene);
+                        }
                         // Unified hover: the Select tool (or Erase) highlights
                         // whatever is under the cursor - building, road, node, or
                         // piece - so a click is predictable. nearest wins.
@@ -3974,7 +3984,7 @@ int run_editor_app() {
                             ui.selected_city_block_layer = std::min(ui.selected_city_block_layer, city_block.layers.size() - 1U);
                             ui.selected_city_block_slot = std::min<std::size_t>(ui.selected_city_block_slot, 7U);
                         }
-                        draw_city_block_preview(city_block, block_meshes(*project), ui.selected_city_block_layer, ui.selected_city_block_slot);
+                        draw_city_block_preview(*project, city_block, block_meshes(*project), ui.selected_city_block, ui.selected_city_block_layer, ui.selected_city_block_slot);
                     } else if (ui.tab == EditorTab::Blocks && !project->blocks.empty()) {
                         ui.selected_block = std::min(ui.selected_block, project->blocks.size() - 1U);
                         draw_mesh_faces(project->blocks[ui.selected_block].data, 4.0F, {98, 148, 204, 220});
