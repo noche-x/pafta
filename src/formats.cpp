@@ -372,25 +372,6 @@ std::uint32_t native_default_face_orientation(std::uint32_t face_dir) {
     }
 }
 
-std::uint32_t native_light_face_orientation(std::size_t face_dir) {
-    switch (face_dir) {
-        case 0:
-            return 0x30000U;
-        case 1:
-            return 0x60000U;
-        case 2:
-            return 0x10000U;
-        case 3:
-            return 0x50000U;
-        case 4:
-            return 0x20000U;
-        case 5:
-            return 0x40000U;
-        default:
-            return 0U;
-    }
-}
-
 void emit_exterior_plane(std::vector<SblBlockFace>& faces, std::uint32_t face_dir, const std::vector<std::array<std::uint32_t, 3>>& cells) {
     const auto base = default_block_face_quad(face_dir);
     const auto orientation = native_default_face_orientation(face_dir);
@@ -671,7 +652,13 @@ void emit_sbl_light_faces(
             continue;
         }
         const auto& corners = light_face_corners[face];
-        const auto orientation = native_light_face_orientation(face);
+        // LoadAndInitBlockTemplates_SBL calculates the orientation from the
+        // emitted light-face triangle normal. It does not use the face index:
+        // light points can describe a rotated or non-cubic surface. A fixed
+        // cube orientation flips UVs on authored light faces.
+        const auto edge_a = subtract(points[corners[1]], points[corners[0]]);
+        const auto edge_b = subtract(points[corners[2]], points[corners[0]]);
+        const auto orientation = native_orientation_from_normal(normalize(cross(edge_a, edge_b)));
         std::vector<Vec3f> vertices{points[corners[0]], points[corners[1]], points[corners[2]], points[corners[3]]};
         std::vector<Vec2f> uvs;
         uvs.reserve(vertices.size());
@@ -1035,7 +1022,13 @@ SbcMap parse_sbc(const std::vector<std::uint8_t>& bytes) {
 
     if (map.version > 9) {
         const auto count = reader.u32(offset);
-        offset += 4 + static_cast<std::size_t>(count) * 0x40;
+        offset += 4;
+        if (count > (bytes.size() - offset) / 64) throw std::runtime_error("Truncated SBC header table");
+        for (std::uint32_t i = 0; i < count; ++i) {
+            std::array<std::uint8_t, 64> record{};
+            std::copy_n(bytes.begin() + offset, 64, record.begin());
+            map.header_records.push_back(record); offset += 64;
+        }
     }
 
     const auto intersection_count = reader.u32(offset);
@@ -1328,8 +1321,10 @@ std::vector<std::uint8_t> rebuild_sbb(const SbbBuilding& building) {
         if (cell.exterior_block() == 0 && cell.interior_block() == 0) {
             continue;
         }
-        size_x = std::max(size_x, cell.x + 1U);
-        size_y = std::max(size_y, cell.z + 1U);
+        // X/Z sizes are the highest index (the grid below spans 0..size
+        // inclusive); Y is the floor count.
+        size_x = std::max(size_x, cell.x);
+        size_y = std::max(size_y, cell.z);
         size_z = std::max(size_z, cell.y + 1U);
     }
 
@@ -1696,10 +1691,14 @@ std::vector<std::uint8_t> rebuild_sbc_layout(const std::vector<std::uint8_t>& by
 }
 
 std::vector<std::uint8_t> rebuild_sbc(const SbcMap& map) {
+    for (const auto& portal : map.portals)
+        if (std::any_of(portal.legacy_blocks.begin(), portal.legacy_blocks.end(), [](auto word) { return word != 0; }))
+            throw std::runtime_error("Promote legacy district geometry before writing SBC v12");
     std::vector<std::uint8_t> rebuilt;
     append_u32(rebuilt, 0x0c);
 
-    append_u32(rebuilt, 0);
+    append_u32(rebuilt, static_cast<std::uint32_t>(map.header_records.size()));
+    for (const auto& record : map.header_records) rebuilt.insert(rebuilt.end(), record.begin(), record.end());
 
     append_u32(rebuilt, static_cast<std::uint32_t>(map.intersections.size()));
     for (const auto& intersection : map.intersections) {
@@ -1831,6 +1830,76 @@ std::vector<std::uint8_t> patch_sbl_layer_portal_type(
     }
     writer.u32(offset, portal_type);
     return std::move(writer).bytes();
+}
+
+std::vector<std::uint8_t> rebuild_sbl_block(const SblBlockMesh& block) {
+    // Materialize evaluated quads as linear patches. Used for converting native
+    // procedural catalog entries, never to rewrite an imported curved mesh.
+    std::vector<std::uint8_t> bytes;
+    const auto number = [&](float value) {
+        std::uint32_t bits; std::memcpy(&bits, &value, 4); append_u32(bytes, bits);
+    };
+    append_u32(bytes, 2);
+    append_u32(bytes, std::max(1U, block.width));
+    append_u32(bytes, std::max(1U, block.height));
+    append_u32(bytes, std::max(1U, block.depth));
+    for (int i = 0; i < 6; ++i) append_u32(bytes, 0);
+    append_u32(bytes, static_cast<std::uint32_t>(block.faces.size()));
+    for (const auto& face : block.faces) {
+        if (face.vertices.size() != 4 || face.uvs.size() != 4)
+            throw std::runtime_error("Legacy conversion requires quad faces with UVs");
+        append_u32(bytes, 1); append_u32(bytes, 1);
+        append_u32(bytes, 1); append_u32(bytes, 1);
+        append_u32(bytes, face.material & 0xffffU); append_u32(bytes, 0);
+        for (int row = 0; row < 4; ++row) for (int column = 0; column < 4; ++column) {
+            const float u = column / 3.0F, v = row / 3.0F;
+            const auto interpolate = [&](auto value) {
+                return (value(0) * (1-u) + value(1) * u) * (1-v) +
+                    (value(3) * (1-u) + value(2) * u) * v;
+            };
+            number(interpolate([&](int i) { return face.vertices[i].x; }));
+            number(interpolate([&](int i) { return face.vertices[i].y; }));
+            number(interpolate([&](int i) { return face.vertices[i].z; }));
+            number(interpolate([&](int i) { return face.uvs[i].u; }));
+            number(interpolate([&](int i) { return face.uvs[i].v; }));
+        }
+    }
+    append_u32(bytes, 0); // No supplemental v2 records.
+    return bytes;
+}
+
+std::vector<std::uint8_t> rebuild_sbl_buildblock(const SblTemplate& template_file) {
+    if (template_file.block || template_file.layers.size() > 16)
+        throw std::runtime_error("Expected a buildblock with at most 16 faces");
+    std::vector<std::uint8_t> bytes;
+    // All shipped buildblock templates use header 1. Block-mesh SBL v2 is a
+    // different layout; setting this to 2 is not a buildblock upgrade.
+    append_u32(bytes, 1);
+    const auto number = [&](float value) {
+        const auto offset = bytes.size();
+        bytes.resize(offset + 4);
+        std::uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        for (unsigned i = 0; i < 4; ++i) bytes[offset + i] = static_cast<std::uint8_t>(bits >> (i * 8));
+    };
+    for (const auto& layer : template_file.layers) {
+        if (layer.doors.size() > 2 || layer.windows.size() > 16 || layer.beams.size() > 16)
+            throw std::runtime_error("Buildblock face exceeds its opening limits");
+        append_u32(bytes, layer.portal_type);
+        for (const auto value : layer.bounds) number(value);
+        append_u32(bytes, static_cast<std::uint32_t>(layer.doors.size()));
+        for (const auto& door : layer.doors) {
+            append_u32(bytes, door.type); number(door.x); number(door.y);
+        }
+        const auto rectangles = [&](const auto& rects) {
+            append_u32(bytes, static_cast<std::uint32_t>(rects.size()));
+            for (const auto& rect : rects) {
+                append_u32(bytes, rect.type); number(rect.x); number(rect.width); number(rect.y); number(rect.height);
+            }
+        };
+        rectangles(layer.windows); rectangles(layer.beams);
+    }
+    return bytes;
 }
 
 std::vector<std::uint8_t> patch_sbl_layers(const std::vector<std::uint8_t>& bytes, const SblTemplate& template_file) {

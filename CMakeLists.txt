@@ -8,6 +8,27 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(MAP_EDITOR_CPP_BUILD_TESTS "Build map_editor_cpp tests" ON)
 option(MAP_EDITOR_CPP_ENABLE_PROFILER "Build map_editor_cpp with yse/easy_profiler instrumentation" OFF)
+option(MAP_EDITOR_CPP_BUILD_WEB "Build the browser/WASM editor shell" OFF)
+set(MAP_EDITOR_CPP_WEB_PRELOAD_PROJECT "" CACHE PATH
+  "QA-only map folder to embed at /web_project in the Emscripten build")
+
+if(EMSCRIPTEN)
+  set(MAP_EDITOR_CPP_BUILD_WEB ON CACHE BOOL "Build the browser/WASM editor shell" FORCE)
+  # raylib defaults to the desktop platform unless these cache values are
+  # explicit. ES3 is required by the renderer's packed-depth and shadow paths.
+  set(PLATFORM Web CACHE STRING "raylib platform" FORCE)
+  set(GRAPHICS GRAPHICS_API_OPENGL_ES3 CACHE STRING "raylib graphics API" FORCE)
+  if(MAP_EDITOR_CPP_WEB_PRELOAD_PROJECT)
+    if(NOT IS_DIRECTORY "${MAP_EDITOR_CPP_WEB_PRELOAD_PROJECT}")
+      message(FATAL_ERROR
+        "MAP_EDITOR_CPP_WEB_PRELOAD_PROJECT is not a directory: "
+        "${MAP_EDITOR_CPP_WEB_PRELOAD_PROJECT}")
+    endif()
+  endif()
+elseif(MAP_EDITOR_CPP_WEB_PRELOAD_PROJECT)
+  message(FATAL_ERROR
+    "MAP_EDITOR_CPP_WEB_PRELOAD_PROJECT is only supported for Emscripten builds")
+endif()
 
 include(FetchContent)
 set(FETCHCONTENT_UPDATES_DISCONNECTED ON)
@@ -76,30 +97,39 @@ target_include_directories(imgui_rlimgui PUBLIC
   ${rlimgui_SOURCE_DIR}
 )
 target_link_libraries(imgui_rlimgui PUBLIC raylib)
+# The editor merges Font Awesome itself (ui_windows.cpp apply_editor_style) at the
+# text size with a fixed glyph width, so icons line up with each other and the text.
+target_compile_definitions(imgui_rlimgui PUBLIC NO_FONT_AWESOME)
 
-FetchContent_Declare(
-  portable_file_dialogs
-  URL https://github.com/samhocevar/portable-file-dialogs/archive/refs/tags/0.1.0.tar.gz
-  SOURCE_SUBDIR cmake-do-not-add
-)
-FetchContent_MakeAvailable(portable_file_dialogs)
+if(NOT EMSCRIPTEN)
+  FetchContent_Declare(
+    portable_file_dialogs
+    URL https://github.com/samhocevar/portable-file-dialogs/archive/refs/tags/0.1.0.tar.gz
+    SOURCE_SUBDIR cmake-do-not-add
+  )
+  FetchContent_MakeAvailable(portable_file_dialogs)
+endif()
 
 # tinygltf ships tiny_gltf.h + json.hpp + stb_image{,_write}.h in its repo root;
 # header-only, used by src/mesh_export.cpp to write glTF.
-FetchContent_Declare(
-  tinygltf
-  URL https://github.com/syoyo/tinygltf/archive/refs/tags/v2.9.3.tar.gz
-  SOURCE_SUBDIR cmake-do-not-add
-)
-FetchContent_MakeAvailable(tinygltf)
+if(NOT EMSCRIPTEN)
+  FetchContent_Declare(
+    tinygltf
+    URL https://github.com/syoyo/tinygltf/archive/refs/tags/v2.9.3.tar.gz
+    SOURCE_SUBDIR cmake-do-not-add
+  )
+  FetchContent_MakeAvailable(tinygltf)
+endif()
 
 # nativefiledialog-extended: real native save/open dialogs (Cocoa NSSavePanel on
 # macOS) instead of pfd's unreliable osascript shell-out. Provides the `nfd` target.
-FetchContent_Declare(
-  nfd
-  URL https://github.com/btzy/nativefiledialog-extended/archive/refs/tags/v1.3.0.tar.gz
-)
-FetchContent_MakeAvailable(nfd)
+if(NOT EMSCRIPTEN)
+  FetchContent_Declare(
+    nfd
+    URL https://github.com/btzy/nativefiledialog-extended/archive/refs/tags/v1.3.0.tar.gz
+  )
+  FetchContent_MakeAvailable(nfd)
+endif()
 
 if(MAP_EDITOR_CPP_ENABLE_PROFILER)
   set(EASY_PROFILER_NO_GUI ON CACHE BOOL "" FORCE)
@@ -131,32 +161,94 @@ target_compile_options(map_editor_core PRIVATE
   $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
 )
 
-add_executable(map_editor_cpp
-  src/app.cpp
-  src/main.cpp
-  src/mesh_export.cpp
-  src/render_gpu.cpp
-  src/ui_panels.cpp
-  src/viewport.cpp
-)
-target_include_directories(map_editor_cpp PRIVATE
-  "${portable_file_dialogs_SOURCE_DIR}"
-  "${tinygltf_SOURCE_DIR}"
-)
-target_link_libraries(map_editor_cpp PRIVATE map_editor_core imgui_rlimgui raylib nfd)
-if(MAP_EDITOR_CPP_ENABLE_PROFILER)
-  target_compile_definitions(map_editor_cpp PRIVATE
-    BUILD_WITH_EASY_PROFILER
-    MAP_EDITOR_CPP_ENABLE_PROFILER=1
+if(NOT EMSCRIPTEN)
+  add_executable(map_editor_cpp
+    src/app.cpp
+    src/main.cpp
+    src/mesh_export.cpp
+    src/render_gpu.cpp
+    src/ui_panels.cpp
+    src/ui_limits_buildblock.cpp
+    src/ui_windows.cpp
+    src/ui_workspace.cpp
+    src/viewport.cpp
   )
-  target_link_libraries(map_editor_cpp PRIVATE easy_profiler)
+  target_compile_definitions(map_editor_cpp PRIVATE MAPED_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets")
+  target_include_directories(map_editor_cpp PRIVATE
+    "${portable_file_dialogs_SOURCE_DIR}"
+    "${tinygltf_SOURCE_DIR}"
+  )
+  target_link_libraries(map_editor_cpp PRIVATE map_editor_core imgui_rlimgui raylib nfd)
+  if(MAP_EDITOR_CPP_ENABLE_PROFILER)
+    target_compile_definitions(map_editor_cpp PRIVATE
+      BUILD_WITH_EASY_PROFILER
+      MAP_EDITOR_CPP_ENABLE_PROFILER=1
+    )
+    target_link_libraries(map_editor_cpp PRIVATE easy_profiler)
+  endif()
+  target_compile_options(map_editor_cpp PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/W4>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+  )
 endif()
-target_compile_options(map_editor_cpp PRIVATE
-  $<$<CXX_COMPILER_ID:MSVC>:/W4>
-  $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
-)
 
-if(MAP_EDITOR_CPP_BUILD_TESTS)
+if(MAP_EDITOR_CPP_BUILD_WEB)
+  # The browser uses the same application, panels, viewport, and renderer as
+  # the desktop target.  Only OS file dialogs and glTF export are replaced by
+  # browser-safe paths in app.cpp/web_main.cpp.
+  add_executable(map_editor_web
+    src/app.cpp
+    src/web_main.cpp
+    src/render_gpu.cpp
+    src/ui_panels.cpp
+    src/ui_limits_buildblock.cpp
+    src/ui_windows.cpp
+    src/ui_workspace.cpp
+    src/viewport.cpp
+  )
+  target_link_libraries(map_editor_web PRIVATE map_editor_core imgui_rlimgui raylib)
+  target_compile_definitions(map_editor_web PRIVATE MAP_EDITOR_CPP_WEB=1)
+  target_compile_options(map_editor_web PRIVATE
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+  )
+  target_link_options(map_editor_web PRIVATE
+    "--shell-file=${CMAKE_CURRENT_SOURCE_DIR}/web/shell.html"
+    "-sUSE_GLFW=3"
+    # The renderer uses GLSL ES 3.00, MRT color attachment 1, and a depth
+    # texture. Do not let Emscripten fall back to a WebGL 1 context at runtime.
+    "-sMIN_WEBGL_VERSION=2"
+    "-sMAX_WEBGL_VERSION=2"
+    "-sALLOW_MEMORY_GROWTH=1"
+    "-sASYNCIFY"
+    "-sASYNCIFY_STACK_SIZE=1048576"
+    "-sASSERTIONS=1"
+    "-sEXPORTED_RUNTIME_METHODS=['FS','ccall']"
+    "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/web/file_upload.js"
+  )
+  if(MAP_EDITOR_CPP_WEB_PRELOAD_PROJECT)
+    # This option is deliberately opt-in. It is for browser QA builds that need
+    # a real map available on startup; normal web builds remain asset-free and
+    # continue to use the folder picker/drop target.
+    target_compile_definitions(map_editor_web PRIVATE
+      MAP_EDITOR_CPP_WEB_PRELOAD_ROOT="/web_project"
+      MAP_EDITOR_CPP_WEB_QA_START_BUILDINGS=1
+    )
+    target_link_options(map_editor_web PRIVATE
+      "--preload-file=${MAP_EDITOR_CPP_WEB_PRELOAD_PROJECT}@/web_project"
+      # city.bin is a 171 MiB game runtime cache. The editor reads city2.sbc
+      # and the CSX/SBB/SBL assets instead; excluding this unused cache keeps
+      # the real-map QA package small without changing editor load semantics.
+      "--exclude-file=${MAP_EDITOR_CPP_WEB_PRELOAD_PROJECT}/city.bin"
+      # test2 also contains a duplicate distribution archive alongside all of
+      # its loose editor sources. Keep QA focused on the authored files; normal
+      # browser folder loads still support CSX-only maps.
+      "--exclude-file=${MAP_EDITOR_CPP_WEB_PRELOAD_PROJECT}/test.csx"
+    )
+  endif()
+  set_target_properties(map_editor_web PROPERTIES SUFFIX ".html")
+endif()
+
+if(MAP_EDITOR_CPP_BUILD_TESTS AND NOT EMSCRIPTEN)
   enable_testing()
   add_executable(map_editor_tests tests/parser_tests.cpp)
   target_link_libraries(map_editor_tests PRIVATE map_editor_core)

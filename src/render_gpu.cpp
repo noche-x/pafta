@@ -3,6 +3,11 @@
 
 #include <rlgl.h>
 #include <raymath.h>
+#ifdef __EMSCRIPTEN__
+#include <GLES3/gl3.h>
+#else
+#include <external/glad.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -14,12 +19,29 @@
 #include <limits>
 #include <optional>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
 #include <vector>
+
+#ifdef __EMSCRIPTEN__
+#define MAPED_GLSL_VERSION "#version 300 es\nprecision highp float;\nprecision highp int;\n"
+#else
+#define MAPED_GLSL_VERSION "#version 330 core\n"
+#endif
 
 namespace map_editor::app_internal {
 
 GfxDebugStats* g_gfx_debug_stats = nullptr;
+float g_world_time_hours = 12.0F;
+
+Vector3 game_light_direction() {
+    constexpr float reset_angle = 6.02138591938F;
+    const float angle = reset_angle + (g_world_time_hours - 12.0F)*(2.0F*PI/24.0F);
+    return Vector3RotateByAxisAngle(
+        Vector3Normalize(Vector3{0.0F, 1.0F, 0.5F}),
+        Vector3{0.0F, 0.4472135901F, -0.8944271803F},
+        angle);
+}
 
 std::string format_ms(double ms) {
     std::ostringstream stream;
@@ -56,21 +78,381 @@ Color lerp_color(Color from, Color to, float t) {
     };
 }
 
-Texture2D load_city_window_gradient_texture() {
-    // Flat mid-gray window surface (no gradient/mullions) to match the exported
-    // window planes.
-    Image image = GenImageColor(4, 4, Color{128, 128, 128, 255});
-    auto texture = LoadTextureFromImage(image);
-    if (texture.id != 0U) {
-        SetTextureFilter(texture, TEXTURE_FILTER_BILINEAR);
-        SetTextureWrap(texture, TEXTURE_WRAP_REPEAT);
+struct GameRenderResources {
+    Texture2D packed_depth{};
+    Texture2D shadow_factor{};
+    RenderTexture2D display{};
+    unsigned int stencil_buffer{};
+    Texture2D direct_light{};
+};
+
+std::unordered_map<unsigned int, GameRenderResources>& game_render_resources() {
+    static std::unordered_map<unsigned int, GameRenderResources> resources;
+    return resources;
+}
+
+namespace {
+bool g_depth_output_cache_valid = false;
+bool g_depth_output_cached_enabled = false;
+}  // namespace
+
+void reset_game_render_depth_output_cache() {
+    // begin_game_texture_mode()/end_game_texture_mode() rebind draw buffers
+    // directly, so the cached state below would otherwise go stale.
+    g_depth_output_cache_valid = false;
+}
+
+void set_game_render_depth_output(bool enabled) {
+    // Repeated calls with the same value are extremely common (once per
+    // building per frame); skip the batch flush and GL queries when the
+    // state already matches.
+    if (g_depth_output_cache_valid && g_depth_output_cached_enabled == enabled) return;
+    g_depth_output_cache_valid = true;
+    g_depth_output_cached_enabled = enabled;
+
+    rlDrawRenderBatchActive();
+    // The game surface shader writes both the lit color and the packed linear
+    // distance used by the atmosphere pass. WebGL2 requires every active draw
+    // buffer to have a matching fragment output, so enable both attachments
+    // only while that shader is submitting geometry. Raylib's utility shaders
+    // (grids, lines, cursors, and ImGui) write one output and must use color 0.
+    GLint framebuffer = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &framebuffer);
+    GLint depth_attachment_type = GL_NONE;
+    if (framebuffer != 0) {
+        glGetFramebufferAttachmentParameteriv(
+            GL_DRAW_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT1,
+            GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,
+            &depth_attachment_type);
     }
-    UnloadImage(image);
-    return texture;
+    if (enabled && depth_attachment_type != GL_NONE) {
+        const GLenum color_and_depth[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2};
+        glDrawBuffers(3, color_and_depth);
+    } else {
+        const GLenum color_only[] = {GL_COLOR_ATTACHMENT0};
+        glDrawBuffers(1, color_only);
+    }
+}
+
+RenderTexture2D load_game_render_texture(int width, int height) {
+#ifdef __EMSCRIPTEN__
+    // WebGL2 supports the same two color outputs as the native path.  Raylib's
+    // default web target only has a depth renderbuffer, so replace it with one
+    // packed depth/stencil renderbuffer before adding the depth color map.
+    auto target = LoadRenderTexture(width, height);
+    if (target.id == 0U) return target;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, target.id);
+    if (target.depth.id != 0U) {
+        glDeleteRenderbuffers(1, &target.depth.id);
+    }
+    glGenRenderbuffers(1, &target.depth.id);
+    glBindRenderbuffer(GL_RENDERBUFFER, target.depth.id);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, target.depth.id);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, target.depth.id);
+
+    Texture2D packed_depth{
+        rlLoadTexture(nullptr, width, height, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1),
+        width,
+        height,
+        1,
+        PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
+    };
+    Texture2D shadow_factor{
+        rlLoadTexture(nullptr, width, height, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1),
+        width,
+        height,
+        1,
+        PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
+    };
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, packed_depth.id, 0);
+    const GLenum draw_buffers[] = {GL_COLOR_ATTACHMENT0};
+    glDrawBuffers(1, draw_buffers);
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        TRACELOG(LOG_WARNING, "MAP EDITOR: WebGL2 game render target is incomplete");
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, 0, 0);
+        UnloadTexture(packed_depth);
+        UnloadTexture(shadow_factor);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        return target;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    game_render_resources()[target.id] = {packed_depth, shadow_factor, LoadRenderTexture(width, height), 0};
+    return target;
+#else
+    auto target = LoadRenderTexture(width, height);
+    rlUnloadTexture(target.texture.id);
+    target.texture = {
+        rlLoadTexture(nullptr, width, height, PIXELFORMAT_UNCOMPRESSED_R16G16B16A16, 1),
+        width,
+        height,
+        1,
+        PIXELFORMAT_UNCOMPRESSED_R16G16B16A16,
+    };
+    Texture2D packed_depth{
+        rlLoadTexture(nullptr, width, height, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1),
+        width,
+        height,
+        1,
+        PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
+    };
+    Texture2D shadow_factor{
+        rlLoadTexture(nullptr, width, height, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1),
+        width,
+        height,
+        1,
+        PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
+    };
+    glBindFramebuffer(GL_FRAMEBUFFER, target.id);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.texture.id, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, packed_depth.id, 0);
+    glDeleteRenderbuffers(1, &target.depth.id);
+    glGenRenderbuffers(1, &target.depth.id);
+    glBindRenderbuffer(GL_RENDERBUFFER, target.depth.id);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, target.depth.id);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, target.depth.id);
+    const unsigned int stencil_buffer = 0; // Owned by target.depth and released with the target.
+    const GLenum draw_buffers[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+    glDrawBuffers(2, draw_buffers);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    game_render_resources()[target.id] = {packed_depth, shadow_factor, LoadRenderTexture(width, height), stencil_buffer};
+    return target;
+#endif
+}
+
+void begin_game_texture_mode(RenderTexture2D target) {
+    reset_game_render_depth_output_cache();
+    BeginTextureMode(target);
+    rlDrawRenderBatchActive();
+#ifdef __EMSCRIPTEN__
+    // Raylib's rlEnableFramebuffer() omits GRAPHICS_API_OPENGL_ES3 in this
+    // bundled release. BeginTextureMode still sets the viewport and matrices,
+    // but leaves the default framebuffer bound, so explicitly bind the target.
+    glBindFramebuffer(GL_FRAMEBUFFER, target.id);
+#else
+    glBindFramebuffer(GL_FRAMEBUFFER, target.id);
+#endif
+    // The sky pass detaches color attachment 1 so it can sample the packed
+    // scene depth without an attachment feedback loop. Reattach it at the
+    // start of every frame on every platform. Previously this happened only
+    // on WebGL, leaving native sky and shadow composition stuck on frame one.
+    if (const auto it = game_render_resources().find(target.id); it != game_render_resources().end()) {
+        glFramebufferTexture2D(
+            GL_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT1,
+            GL_TEXTURE_2D,
+            it->second.packed_depth.id,
+            0);
+        if (it->second.direct_light.id == 0U) {
+            it->second.direct_light = {rlLoadTexture(nullptr, target.texture.width, target.texture.height, target.texture.format, 1),
+                target.texture.width, target.texture.height, 1, target.texture.format};
+        }
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, it->second.direct_light.id, 0);
+        const GLenum color_only[] = {GL_COLOR_ATTACHMENT0};
+        glDrawBuffers(1, color_only);
+    }
+    // A tab change can interrupt the city shadow pass. Never carry its write
+    // masks or stencil test into the next viewport frame.
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_TRUE);
+    glStencilMask(0xff);
+    glDisable(GL_STENCIL_TEST);
+}
+
+void end_game_texture_mode() {
+    reset_game_render_depth_output_cache();
+    rlDrawRenderBatchActive();
+    const auto target = rlGetActiveFramebuffer();
+    if (game_render_resources().contains(target)) {
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, 0, 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, 0, 0);
+        const GLenum color_only[] = {GL_COLOR_ATTACHMENT0};
+        glDrawBuffers(1, color_only);
+    }
+#ifdef __EMSCRIPTEN__
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+#endif
+    EndTextureMode();
+}
+
+void unload_game_render_texture(RenderTexture2D target) {
+    if (target.id == 0U) return;
+    auto& resources = game_render_resources();
+    if (const auto it = resources.find(target.id); it != resources.end()) {
+        glDeleteRenderbuffers(1, &it->second.stencil_buffer);
+        UnloadTexture(it->second.packed_depth);
+        UnloadTexture(it->second.shadow_factor);
+        UnloadTexture(it->second.direct_light);
+        UnloadRenderTexture(it->second.display);
+        resources.erase(it);
+    }
+    UnloadRenderTexture(target);
+}
+
+Texture2D game_render_packed_depth(RenderTexture2D target) {
+    const auto& resources = game_render_resources();
+    const auto it = resources.find(target.id);
+    return it == resources.end() ? Texture2D{} : it->second.packed_depth;
+}
+
+void clear_game_render_packed_depth() {
+    if (game_render_resources().empty()) return;
+    constexpr GLfloat clear_depth[] = {1.0F, 1.0F, 1.0F, 1.0F};
+    rlDrawRenderBatchActive();
+    const GLenum outputs[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2};
+    glDrawBuffers(3, outputs);
+    glClearBufferfv(GL_COLOR, 1, clear_depth);
+    constexpr GLfloat no_light[] = {0, 0, 0, 0};
+    glClearBufferfv(GL_COLOR, 2, no_light);
+    const GLenum color_only[] = {GL_COLOR_ATTACHMENT0};
+    glDrawBuffers(1, color_only);
+}
+
+void clear_game_render_shadow_factor() {
+    if (game_render_resources().empty()) return;
+    GLint framebuffer = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &framebuffer);
+    const auto resource = game_render_resources().find(static_cast<unsigned int>(framebuffer));
+    if (resource == game_render_resources().end()) return;
+    GLint scene_color = 0;
+    glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+        GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &scene_color);
+    glFramebufferTexture2D(
+        GL_FRAMEBUFFER,
+        GL_COLOR_ATTACHMENT0,
+        GL_TEXTURE_2D,
+        resource->second.shadow_factor.id,
+        0);
+    const GLenum shadow_only[] = {GL_COLOR_ATTACHMENT0};
+    glDrawBuffers(1, shadow_only);
+    constexpr GLfloat fully_lit[] = {1.0F, 1.0F, 1.0F, 1.0F};
+    glClearBufferfv(GL_COLOR, 0, fully_lit);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, static_cast<GLuint>(scene_color), 0);
+    const GLenum color_only[] = {GL_COLOR_ATTACHMENT0};
+    glDrawBuffers(1, color_only);
+}
+
+struct GameTonemapShader {
+    Shader shader{};
+    int resolution_loc{-1};
+    int apply_tonemap_loc{-1};
+    int shadow_factor_loc{-1};
+    int packed_depth_loc{-1};
+    int direct_light_loc{-1};
+};
+
+GameTonemapShader& game_tonemap_shader_cache() {
+    static GameTonemapShader cache = [] {
+        GameTonemapShader value;
+        value.shader = LoadShaderFromMemory(nullptr, MAPED_GLSL_VERSION R"glsl(
+in vec2 fragTexCoord;
+uniform sampler2D texture0;
+uniform sampler2D shadowFactor;
+uniform sampler2D directLight;
+uniform sampler2D packedDepth;
+uniform vec2 resolution;
+uniform int applyTonemap;
+out vec4 finalColor;
+vec3 convertToSrgb(vec3 linearColor) {
+    bvec3 cutoff=lessThan(linearColor,vec3(0.0031308));
+    vec3 higher=vec3(1.055)*pow(linearColor,vec3(1.0/2.4))-vec3(0.055);
+    vec3 lower=linearColor*vec3(12.92);
+    return mix(higher,lower,cutoff);
+}
+vec3 sceneColor(vec2 uv) {
+    // Native world.frag shadows direct diffuse/specular only. Preserve sky,
+    // ambient light and reflections instead of darkening the final image.
+    return max(texture(texture0, uv).rgb - texture(directLight, uv).rgb * (1.0-texture(shadowFactor, uv).r), vec3(0.0));
+}
+vec3 fxaa(vec2 uv) {
+    vec2 inverseResolution=1.0/resolution;
+    vec3 rgbNW=sceneColor(uv+vec2(-1.0,-1.0)*inverseResolution);
+    vec3 rgbNE=sceneColor(uv+vec2( 1.0,-1.0)*inverseResolution);
+    vec3 rgbSW=sceneColor(uv+vec2(-1.0, 1.0)*inverseResolution);
+    vec3 rgbSE=sceneColor(uv+vec2( 1.0, 1.0)*inverseResolution);
+    vec3 rgbM =sceneColor(uv);
+    vec3 luma=vec3(0.299,0.587,0.114);
+    float lumaNW=dot(rgbNW,luma);
+    float lumaNE=dot(rgbNE,luma);
+    float lumaSW=dot(rgbSW,luma);
+    float lumaSE=dot(rgbSE,luma);
+    float lumaM=dot(rgbM,luma);
+    float lumaMin=min(lumaM,min(min(lumaNW,lumaNE),min(lumaSW,lumaSE)));
+    float lumaMax=max(lumaM,max(max(lumaNW,lumaNE),max(lumaSW,lumaSE)));
+    vec2 direction=vec2(-((lumaNW+lumaNE)-(lumaSW+lumaSE)),
+                         (lumaNW+lumaSW)-(lumaNE+lumaSE));
+    float reduce=max((lumaNW+lumaNE+lumaSW+lumaSE)*0.03125,0.0078125);
+    float inverseDirection=1.0/(min(abs(direction.x),abs(direction.y))+reduce);
+    direction=clamp(direction*inverseDirection,vec2(-8.0),vec2(8.0))*inverseResolution;
+    vec3 resultA=0.5*(
+        sceneColor(uv+direction*(1.0/3.0-0.5))+
+        sceneColor(uv+direction*(2.0/3.0-0.5)));
+    vec3 resultB=resultA*0.5+0.25*(
+        sceneColor(uv+direction*-0.5)+
+        sceneColor(uv+direction* 0.5));
+    float lumaB=dot(resultB,luma);
+    return (lumaB<lumaMin || lumaB>lumaMax) ? resultA : resultB;
+}
+void main() {
+    vec3 color=fxaa(fragTexCoord);
+    if (applyTonemap==1) {
+        color=color/(color+vec3(1.0));
+        color=convertToSrgb(color);
+    }
+    finalColor=vec4(color,1.0);
+}
+)glsl");
+        value.resolution_loc = GetShaderLocation(value.shader, "resolution");
+        value.apply_tonemap_loc = GetShaderLocation(value.shader, "applyTonemap");
+        value.shadow_factor_loc = GetShaderLocation(value.shader, "shadowFactor");
+        value.packed_depth_loc = GetShaderLocation(value.shader, "packedDepth");
+        value.direct_light_loc = GetShaderLocation(value.shader, "directLight");
+        return value;
+    }();
+    return cache;
+}
+
+void resolve_game_render_texture(RenderTexture2D target) {
+    const auto it = game_render_resources().find(target.id);
+    if (it == game_render_resources().end()) return;
+    if (it->second.display.id == 0U) return;
+    begin_game_texture_mode(it->second.display);
+    ClearBackground(BLACK);
+    auto& tonemap = game_tonemap_shader_cache();
+    auto& shader = tonemap.shader;
+    const Vector2 resolution{
+        static_cast<float>(target.texture.width),
+        static_cast<float>(target.texture.height),
+    };
+    SetShaderValue(shader, tonemap.resolution_loc, &resolution.x, SHADER_UNIFORM_VEC2);
+    const int apply_tonemap =
+#ifdef __EMSCRIPTEN__
+        0;
+#else
+        1;
+#endif
+    SetShaderValue(shader, tonemap.apply_tonemap_loc, &apply_tonemap, SHADER_UNIFORM_INT);
+    BeginShaderMode(shader);
+    SetShaderValueTexture(shader, tonemap.shadow_factor_loc, it->second.shadow_factor);
+    SetShaderValueTexture(shader, tonemap.direct_light_loc, it->second.direct_light);
+    SetShaderValueTexture(shader, tonemap.packed_depth_loc, it->second.packed_depth);
+    DrawTextureRec(target.texture, {0.0F, 0.0F, static_cast<float>(target.texture.width), -static_cast<float>(target.texture.height)}, {0.0F, 0.0F}, WHITE);
+    EndShaderMode();
+    end_game_texture_mode();
+}
+
+const RenderTexture2D* game_render_display_texture(RenderTexture2D target) {
+    const auto it = game_render_resources().find(target.id);
+    return it == game_render_resources().end() ? nullptr : &it->second.display;
 }
 
 void append_render_log(EditorProject& project, std::string message) {
-    std::cerr << "[render] " << message << '\n';
+    // Progress, not errors: stdout keeps it out of the browser's error console.
+    std::cout << "[render] " << message << '\n';
     project.render_logs.push_back(std::move(message));
     if (project.render_logs.size() > 80U) {
         project.render_logs.erase(project.render_logs.begin(), project.render_logs.begin() + static_cast<std::ptrdiff_t>(project.render_logs.size() - 80U));
@@ -128,9 +510,9 @@ void drain_render_build_progress(EditorProject& project) {
 
 void start_async_render_buffer_rebuild(EditorProject& project) {
     MAPED_PROFILE_FUNCTION();
-    const auto buildings = project.buildings;
-    const auto blocks = block_meshes(project);
-    const auto templates = buildblock_templates(project);
+    auto buildings = project.buildings;
+    auto blocks = block_meshes(project);
+    auto templates = buildblock_templates(project);
     const auto generation = ++project.render_build_generation;
     auto progress = std::make_shared<RenderBuildProgress>();
     progress->generation = generation;
@@ -140,21 +522,37 @@ void start_async_render_buffer_rebuild(EditorProject& project) {
     project.render_build_in_progress = true;
     project.building_render_buffers.clear();
     project.building_render_buffers.resize(buildings.size());
-    project.building_gpu_models.clear();
+    // Keep the current models drawing until each replacement uploads (the
+    // upload move-assigns over them); clearing here blanked the whole city.
     project.building_gpu_models.resize(buildings.size());
     project.building_floor_preview_dirty = true;
     project.pending_gpu_upload_indices.clear();
     project.pending_gpu_upload_index = 0;
     append_render_log(project, "render build queued: " + std::to_string(buildings.size()) + " buildings");
 
-    project.render_build_future = std::async(std::launch::async, [buildings, blocks, templates, generation, progress]() {
+    project.render_build_future = std::async(std::launch::async, [
+        buildings = std::move(buildings),
+        blocks = std::move(blocks),
+        templates = std::move(templates),
+        generation,
+        progress]() {
         MAPED_PROFILE_THREAD("Building render rebuild");
         MAPED_PROFILE_BLOCK("build async building render buffers");
         using Clock = std::chrono::steady_clock;
         RenderBuildResult result;
         result.generation = generation;
         const auto total_begin = Clock::now();
-        for (std::size_t building_index = 0; building_index < buildings.size(); ++building_index) {
+        std::atomic<std::size_t> next_building{0};
+        const auto worker_count = std::min<std::size_t>(
+            buildings.size(),
+            std::min(8U, std::max(1U, std::thread::hardware_concurrency())));
+        std::vector<std::future<void>> workers;
+        workers.reserve(worker_count);
+        for (std::size_t worker = 0; worker < worker_count; ++worker) {
+            workers.push_back(std::async(std::launch::async, [&] {
+            for (auto building_index = next_building.fetch_add(1);
+                 building_index < buildings.size();
+                 building_index = next_building.fetch_add(1)) {
             const auto& building = buildings[building_index];
             {
                 std::scoped_lock lock(progress->mutex);
@@ -179,7 +577,10 @@ void start_async_render_buffer_rebuild(EditorProject& project) {
                     std::move(city_buffer),
                 });
             }
+            }
+            }));
         }
+        for (auto& worker : workers) worker.get();
 
         {
             std::scoped_lock lock(progress->mutex);
@@ -191,6 +592,49 @@ void start_async_render_buffer_rebuild(EditorProject& project) {
         return result;
     });
 }
+
+#ifdef __EMSCRIPTEN__
+void start_incremental_render_buffer_rebuild(EditorProject& project) {
+    const auto generation = ++project.render_build_generation;
+    auto progress = std::make_shared<RenderBuildProgress>();
+    progress->generation = generation;
+    progress->total = project.buildings.size();
+    // build_next_browser_render_buffer then builds one building per frame.
+    project.render_build_progress = std::move(progress);
+    project.render_buffers_dirty = false;
+    project.render_build_in_progress = !project.buildings.empty();
+    project.building_render_buffers.clear();
+    project.building_render_buffers.resize(project.buildings.size());
+    // Keep the current models drawing until each replacement uploads.
+    project.building_gpu_models.resize(project.buildings.size());
+    project.building_floor_preview_dirty = true;
+    project.pending_gpu_upload_indices.clear();
+    project.pending_gpu_upload_index = 0;
+}
+
+void build_next_browser_render_buffer(EditorProject& project) {
+    if (!project.render_build_in_progress || project.render_build_progress == nullptr) {
+        return;
+    }
+    const auto index = project.render_build_progress->completed;
+    if (index >= project.buildings.size()) {
+        project.render_build_in_progress = false;
+        project.render_build_progress.reset();
+        return;
+    }
+    project.render_build_progress->current = project.buildings[index].name;
+    project.building_render_buffers[index] = build_city_building_full_render_buffer(
+        project.buildings[index].data,
+        block_meshes(project),
+        buildblock_templates(project));
+    project.pending_gpu_upload_indices.push_back(index);
+    ++project.render_build_progress->completed;
+    if (project.render_build_progress->completed >= project.buildings.size()) {
+        project.render_build_in_progress = false;
+        project.render_build_progress.reset();
+    }
+}
+#endif
 
 void accept_render_build_result(EditorProject& project, RenderBuildResult result) {
     drain_render_build_progress(project);
@@ -250,9 +694,16 @@ void invalidate_city_block_preview_scene(EditorProject& project) {
 void service_render_rebuild(EditorProject& project) {
     MAPED_PROFILE_FUNCTION();
     if (project.render_buffers_dirty && !project.render_build_in_progress) {
+#ifdef __EMSCRIPTEN__
+        start_incremental_render_buffer_rebuild(project);
+#else
         start_async_render_buffer_rebuild(project);
+#endif
     }
 
+#ifdef __EMSCRIPTEN__
+    build_next_browser_render_buffer(project);
+#else
     drain_render_build_progress(project);
 
     if (project.render_build_future.has_value()) {
@@ -263,8 +714,9 @@ void service_render_rebuild(EditorProject& project) {
             accept_render_build_result(project, std::move(result));
         }
     }
+#endif
 
-    if (!project.render_build_in_progress) {
+    if (!project.pending_gpu_upload_indices.empty()) {
         if (g_gfx_debug_stats != nullptr) {
             GfxDebugScopedTimer timer{*g_gfx_debug_stats, GfxDebugTimingPhase::GpuUpload};
             upload_next_pending_building(project);
@@ -372,11 +824,11 @@ Color native_material_color(std::uint32_t material, bool selected, bool window_m
     if (selected) {
         return {235, 194, 82, 210};
     }
+    if (window_material) {
+        return {170, 190, 201, 220};
+    }
     if (material == 0x100U) {
         return {0, 0, 0, 191};
-    }
-    if (window_material) {
-        return {92, 205, 226, 185};
     }
     switch (material % 6U) {
         case 1:
@@ -403,6 +855,39 @@ const Texture2D* find_project_texture(const EditorProject& project, std::string_
     return match == project.textures.end() ? nullptr : &match->texture;
 }
 
+const Texture2D* find_project_material_texture(const EditorProject& project, std::string_view name) {
+    const auto key = lower_name(name);
+    const auto match = std::ranges::find_if(project.material_textures, [&key](const LoadedTexture& texture) {
+        return lower_name(texture.name) == key;
+    });
+    return match == project.material_textures.end() ? nullptr : &match->texture;
+}
+
+const Texture2D& generated_game_landscape_color_texture() {
+    static Texture2D texture = [] {
+        // client/src/hooks/landscapeGenerateTexture.hpp reproduces the game's
+        // generated 0x400-square green landscape color texture as RGBA
+        // (0x40, 0x54, 0x26, 0xff). bc_grass01b is a building texture and was
+        // the source of the bright green distant landscape patches.
+        Image image = GenImageColor(0x400, 0x400, Color{0x40, 0x54, 0x26, 0xff});
+        auto loaded = LoadTextureFromImage(image);
+        UnloadImage(image);
+        GenTextureMipmaps(&loaded);
+        SetTextureWrap(loaded, TEXTURE_WRAP_REPEAT);
+        SetTextureFilter(loaded, TEXTURE_FILTER_TRILINEAR);
+        SetTextureFilter(loaded, TEXTURE_FILTER_ANISOTROPIC_16X);
+        return loaded;
+    }();
+    return texture;
+}
+
+std::string_view game_surface_texture_name(std::string_view name) {
+    if (name == "city_road_asphalt") return "asphalt2";
+    if (name == "city_curb_concrete") return "concrete";
+    if (name == "city_terrain_grass") return "bc_grass01b";
+    return name;
+}
+
 const Texture2D* texture_for_material(const EditorProject& project, const SbbBuilding& building, std::uint32_t material_id) {
     if (material_id == 0x100U) {
         return nullptr;
@@ -411,19 +896,39 @@ const Texture2D* texture_for_material(const EditorProject& project, const SbbBui
     if (local_slot < building.materials.size()) {
         return find_project_texture(project, building.materials[local_slot]);
     }
-    return project.textures.empty() ? nullptr : &project.textures.front().texture;
+    return nullptr;
+}
+
+const Texture2D* material_texture_for_material(const EditorProject& project, const SbbBuilding& building, std::uint32_t material_id) {
+    if (material_id == 0x100U) {
+        return nullptr;
+    }
+    const auto local_slot = static_cast<std::size_t>(material_id & 0xffU);
+    return local_slot < building.materials.size()
+        ? find_project_material_texture(project, building.materials[local_slot])
+        : nullptr;
 }
 
 const Texture2D* texture_for_buffer_material(const EditorProject& project, const BuildingRenderBuffer& buffer, std::uint32_t material_id) {
     if (material_id >= buffer.material_names.size()) {
         return nullptr;
     }
-    return find_project_texture(project, buffer.material_names[material_id]);
+    if (buffer.material_names[material_id] == "city_terrain_grass") {
+        if (const auto* detail = find_project_texture(project, "bc_grass01b")) return detail;
+        return &generated_game_landscape_color_texture();
+    }
+    return find_project_texture(project, game_surface_texture_name(buffer.material_names[material_id]));
 }
 
-float baked_directional_light(Vector3 normal);
-Color shade_color(Color base, float light);
-Shader scene_lit_shader();
+const Texture2D* material_texture_for_buffer_material(const EditorProject& project, const BuildingRenderBuffer& buffer, std::uint32_t material_id) {
+    if (material_id >= buffer.material_names.size()) {
+        return nullptr;
+    }
+    return find_project_material_texture(project, game_surface_texture_name(buffer.material_names[material_id]));
+}
+
+Shader game_surface_shader();
+Texture2D default_game_material_texture();
 
 GpuBuildingMeshChunk upload_mesh_chunk(
     const BuildingRenderBuffer& buffer,
@@ -431,6 +936,7 @@ GpuBuildingMeshChunk upload_mesh_chunk(
     std::uint32_t triangle_count,
     std::uint32_t material_id,
     const Texture2D* texture,
+    const Texture2D* material_texture,
     bool window_material = false
 ) {
     GpuBuildingMeshChunk chunk;
@@ -507,7 +1013,6 @@ GpuBuildingMeshChunk upload_mesh_chunk(
                 e1.z * e2.x - e1.x * e2.z,
                 e1.x * e2.y - e1.y * e2.x,
             };
-            const auto vertex_light = shade_color(WHITE, baked_directional_light(face_normal));
             const auto fn_len = std::sqrt(face_normal.x * face_normal.x + face_normal.y * face_normal.y + face_normal.z * face_normal.z);
             const auto fn_inv = fn_len > 1e-6F ? 1.0F / fn_len : 0.0F;
             const Vector3 unit_normal{face_normal.x * fn_inv, face_normal.y * fn_inv, face_normal.z * fn_inv};
@@ -521,10 +1026,10 @@ GpuBuildingMeshChunk upload_mesh_chunk(
                 *out++ = position.z;
                 *out_uv++ = vertex.u;
                 *out_uv++ = vertex.v;
-                *out_color++ = vertex_light.r;
-                *out_color++ = vertex_light.g;
-                *out_color++ = vertex_light.b;
-                *out_color++ = vertex_light.a;
+                *out_color++ = 255;
+                *out_color++ = 255;
+                *out_color++ = 255;
+                *out_color++ = 255;
                 *out_normal++ = unit_normal.x;
                 *out_normal++ = unit_normal.y;
                 *out_normal++ = unit_normal.z;
@@ -533,8 +1038,11 @@ GpuBuildingMeshChunk upload_mesh_chunk(
 
         UploadMesh(&fallback.mesh, false);
         fallback.material = LoadMaterialDefault();
-        fallback.material.shader = scene_lit_shader();
+        fallback.material.shader = game_surface_shader();
         fallback.material.maps[MATERIAL_MAP_DIFFUSE].color = native_material_color(material_id, false, window_material);
+        fallback.material.maps[MATERIAL_MAP_METALNESS].texture = material_texture != nullptr && material_texture->id != 0U
+            ? *material_texture
+            : default_game_material_texture();
         if (texture != nullptr && texture->id != 0U) {
             fallback.material.maps[MATERIAL_MAP_DIFFUSE].texture = *texture;
             fallback.source_texture = *texture;
@@ -600,14 +1108,10 @@ GpuBuildingMeshChunk upload_mesh_chunk(
         vertices.push_back(position.z);
         texcoords.push_back(vertex.u);
         texcoords.push_back(vertex.v);
-        const auto light = source_index < vertex_normals.size()
-            ? baked_directional_light(vertex_normals[source_index])
-            : 1.0F;
-        const auto vertex_light = shade_color(WHITE, light);
-        colors.push_back(vertex_light.r);
-        colors.push_back(vertex_light.g);
-        colors.push_back(vertex_light.b);
-        colors.push_back(vertex_light.a);
+        colors.push_back(255);
+        colors.push_back(255);
+        colors.push_back(255);
+        colors.push_back(255);
         // Per-pixel lighting normal (smoothed). The lit shader recomputes the same
         // model from this; the baked color above stays as a per-vertex fallback.
         const auto raw_n = source_index < vertex_normals.size() ? vertex_normals[source_index] : Vector3{0.0F, 1.0F, 0.0F};
@@ -673,79 +1177,17 @@ GpuBuildingMeshChunk upload_mesh_chunk(
 
     UploadMesh(&chunk.mesh, false);
     chunk.material = LoadMaterialDefault();
-    chunk.material.shader = scene_lit_shader();
+    chunk.material.shader = game_surface_shader();
     chunk.material.maps[MATERIAL_MAP_DIFFUSE].color = native_material_color(material_id, false, window_material);
+    chunk.material.maps[MATERIAL_MAP_METALNESS].texture = material_texture != nullptr && material_texture->id != 0U
+        ? *material_texture
+        : default_game_material_texture();
     if (texture != nullptr && texture->id != 0U) {
         chunk.material.maps[MATERIAL_MAP_DIFFUSE].texture = *texture;
         chunk.source_texture = *texture;
         chunk.textured = true;
     }
     return chunk;
-}
-
-// Bakes a simple directional + ambient term for a world-space normal into a
-// brightness multiplier. One fixed sun direction; faces toward it are brighter,
-// faces away sit at the ambient floor. Cheap, asset-free shading that makes
-// terrain slopes, road grades, and curbs read as 3D without a custom GLSL shader.
-//
-// City slopes are shallow (1/16..1/7 grades, 3-8 degrees), so a physically
-// scaled term barely changes brightness; the horizontal normal components are
-// exaggerated before lighting so grades and terrain undulation actually read.
-// Hemisphere + key sun + fill light, returned as a single luminance multiplier so
-// it stays a drop-in for the baked-vertex-color path. Compared to the old single
-// sun + flat ambient floor, surfaces facing away from the sun now read by their
-// orientation (sky-vs-ground hemisphere) and a dim opposite fill keeps shadow
-// sides from going flat. Tuned so a flat up-facing ground reads ~1.0.
-float baked_directional_light(Vector3 normal) {
-    constexpr Vector3 sun{0.40F, 0.78F, 0.48F};   // key light, high and off-axis
-    constexpr Vector3 fill{-0.45F, 0.30F, -0.40F};  // dim fill, roughly opposite
-    constexpr float key_strength = 0.55F;
-    constexpr float fill_strength = 0.18F;
-    constexpr float sky_amount = 0.50F;   // hemisphere brightness facing up
-    constexpr float ground_amount = 0.30F;  // hemisphere brightness facing down
-    constexpr float slope_boost = 2.0F;
-
-    const auto len = std::sqrt(normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
-    if (len <= 0.0001F) {
-        return 1.0F;
-    }
-    Vector3 n{normal.x / len, normal.y / len, normal.z / len};
-    // Backface culling is off and ground top faces wind so their geometric normal
-    // points DOWN; treat those as up-facing so slopes read instead of clamping.
-    if (n.y < 0.0F) {
-        n = {-n.x, -n.y, -n.z};
-    }
-    // Exaggerate tilt only for mostly-up faces (ground) so grade reads; walls keep
-    // their true angle.
-    Vector3 lit_n = n;
-    if (n.y > 0.7F) {
-        lit_n.x *= slope_boost;
-        lit_n.z *= slope_boost;
-        const auto boosted = std::sqrt(lit_n.x * lit_n.x + lit_n.y * lit_n.y + lit_n.z * lit_n.z);
-        lit_n = {lit_n.x / boosted, lit_n.y / boosted, lit_n.z / boosted};
-    }
-
-    const auto sun_len = std::sqrt(sun.x * sun.x + sun.y * sun.y + sun.z * sun.z);
-    const auto fill_len = std::sqrt(fill.x * fill.x + fill.y * fill.y + fill.z * fill.z);
-    const auto ndotl = (lit_n.x * sun.x + lit_n.y * sun.y + lit_n.z * sun.z) / sun_len;
-    const auto ndotf = (lit_n.x * fill.x + lit_n.y * fill.y + lit_n.z * fill.z) / fill_len;
-
-    // Hemisphere ambient: lerp ground->sky by the up component (remapped 0..1).
-    const auto up = n.y * 0.5F + 0.5F;
-    const auto hemisphere = ground_amount + (sky_amount - ground_amount) * up;
-    // Wrapped diffuse (half-Lambert) on the key so the terminator is soft, not a
-    // hard cut to black on the shadow side.
-    const auto key = key_strength * std::max(0.0F, ndotl * 0.5F + 0.5F);
-    const auto fill_light = fill_strength * std::max(0.0F, ndotf);
-
-    return std::min(1.35F, hemisphere + key + fill_light);
-}
-
-Color shade_color(Color base, float light) {
-    const auto scale = [light](unsigned char c) {
-        return static_cast<unsigned char>(std::min(255.0F, static_cast<float>(c) * light));
-    };
-    return {scale(base.r), scale(base.g), scale(base.b), base.a};
 }
 
 // Uploads a whole city render buffer (roads/curbs or terrain) as GPU mesh chunks,
@@ -755,10 +1197,34 @@ Color shade_color(Color base, float light) {
 GpuBuildingRenderModel upload_city_buffer_model(
     const BuildingRenderBuffer& buffer,
     const EditorProject& project,
+    bool smooth_normals,
     const std::function<Color(std::uint32_t)>& color_for_material) {
     GpuBuildingRenderModel model;
     model.wire_lines = buffer.wire_lines;
     model.chunks.reserve(buffer.material_runs.size());
+
+    std::vector<Vector3> vertex_normals(buffer.vertices.size(), Vector3{});
+    if (smooth_normals) {
+        for (const auto& triangle : buffer.triangles) {
+            if (triangle.indices[0] >= buffer.vertices.size() ||
+                triangle.indices[1] >= buffer.vertices.size() ||
+                triangle.indices[2] >= buffer.vertices.size()) {
+                continue;
+            }
+            const auto& a = buffer.vertices[triangle.indices[0]].position;
+            const auto& b = buffer.vertices[triangle.indices[1]].position;
+            const auto& c = buffer.vertices[triangle.indices[2]].position;
+            const Vector3 face = Vector3CrossProduct(
+                {b.x-a.x, b.y-a.y, b.z-a.z},
+                {c.x-a.x, c.y-a.y, c.z-a.z});
+            for (const auto index : triangle.indices) {
+                vertex_normals[index] = Vector3Add(vertex_normals[index], face);
+            }
+        }
+        for (auto& normal : vertex_normals) {
+            normal = Vector3LengthSqr(normal) > 1e-12F ? Vector3Normalize(normal) : Vector3{0.0F, 1.0F, 0.0F};
+        }
+    }
 
     for (const auto& run : buffer.material_runs) {
         const auto clamped_end = std::min<std::uint32_t>(
@@ -779,10 +1245,12 @@ GpuBuildingRenderModel upload_city_buffer_model(
         chunk.mesh.vertices = static_cast<float*>(MemAlloc(static_cast<unsigned int>(chunk.mesh.vertexCount * 3 * sizeof(float))));
         chunk.mesh.texcoords = static_cast<float*>(MemAlloc(static_cast<unsigned int>(chunk.mesh.vertexCount * 2 * sizeof(float))));
         chunk.mesh.colors = static_cast<unsigned char*>(MemAlloc(static_cast<unsigned int>(chunk.mesh.vertexCount * 4 * sizeof(unsigned char))));
-        if (chunk.mesh.vertices == nullptr || chunk.mesh.texcoords == nullptr || chunk.mesh.colors == nullptr) {
+        chunk.mesh.normals = static_cast<float*>(MemAlloc(static_cast<unsigned int>(chunk.mesh.vertexCount * 3 * sizeof(float))));
+        if (chunk.mesh.vertices == nullptr || chunk.mesh.texcoords == nullptr || chunk.mesh.colors == nullptr || chunk.mesh.normals == nullptr) {
             if (chunk.mesh.vertices != nullptr) { MemFree(chunk.mesh.vertices); }
             if (chunk.mesh.texcoords != nullptr) { MemFree(chunk.mesh.texcoords); }
             if (chunk.mesh.colors != nullptr) { MemFree(chunk.mesh.colors); }
+            if (chunk.mesh.normals != nullptr) { MemFree(chunk.mesh.normals); }
             continue;
         }
 
@@ -790,6 +1258,7 @@ GpuBuildingRenderModel upload_city_buffer_model(
         auto* out = chunk.mesh.vertices;
         auto* out_uv = chunk.mesh.texcoords;
         auto* out_col = chunk.mesh.colors;
+        auto* out_normal = chunk.mesh.normals;
         for (auto triangle_index = run.first_triangle; triangle_index < clamped_end; ++triangle_index) {
             const auto& triangle = buffer.triangles[triangle_index];
             std::array<Vec3, 3> p{};
@@ -807,30 +1276,44 @@ GpuBuildingRenderModel upload_city_buffer_model(
                 e1.z * e2.x - e1.x * e2.z,
                 e1.x * e2.y - e1.y * e2.x,
             };
-            const auto light = baked_directional_light(face_normal);
-            const auto shaded = shade_color(base_color, light);
+            const auto normal_length = std::sqrt(
+                face_normal.x * face_normal.x +
+                face_normal.y * face_normal.y +
+                face_normal.z * face_normal.z);
+            const auto normal_scale = normal_length > 1e-6F ? 1.0F / normal_length : 0.0F;
             for (int i = 0; i < 3; ++i) {
                 *out++ = p[i].x;
                 *out++ = p[i].y;
                 *out++ = p[i].z;
                 *out_uv++ = v[i].u;
                 *out_uv++ = v[i].v;
-                *out_col++ = shaded.r;
-                *out_col++ = shaded.g;
-                *out_col++ = shaded.b;
-                *out_col++ = shaded.a;
+                *out_col++ = 255;
+                *out_col++ = 255;
+                *out_col++ = 255;
+                *out_col++ = 255;
+                const auto normal = smooth_normals && triangle.indices[i] < vertex_normals.size()
+                    ? vertex_normals[triangle.indices[i]]
+                    : Vector3{face_normal.x * normal_scale, face_normal.y * normal_scale, face_normal.z * normal_scale};
+                *out_normal++ = normal.x;
+                *out_normal++ = normal.y;
+                *out_normal++ = normal.z;
             }
         }
 
         UploadMesh(&chunk.mesh, false);
         chunk.material = LoadMaterialDefault();
-        chunk.material.maps[MATERIAL_MAP_DIFFUSE].color = WHITE;  // baked into vertex colors
+        chunk.material.shader = game_surface_shader();
+        chunk.material.maps[MATERIAL_MAP_DIFFUSE].color = base_color;
         if (const auto* texture = texture_for_buffer_material(project, buffer, run.material);
             texture != nullptr && texture->id != 0U) {
             chunk.material.maps[MATERIAL_MAP_DIFFUSE].texture = *texture;
             chunk.source_texture = *texture;
             chunk.textured = true;
         }
+        const auto* material_texture = material_texture_for_buffer_material(project, buffer, run.material);
+        chunk.material.maps[MATERIAL_MAP_METALNESS].texture = material_texture != nullptr && material_texture->id != 0U
+            ? *material_texture
+            : default_game_material_texture();
         model.uploaded_vertices += static_cast<std::size_t>(chunk.mesh.vertexCount);
         model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.vertexCount) * (3U * sizeof(float) + 2U * sizeof(float) + 4U);
         model.chunks.push_back(std::move(chunk));
@@ -838,9 +1321,65 @@ GpuBuildingRenderModel upload_city_buffer_model(
     return model;
 }
 
+void cache_shadow_faces(GpuBuildingRenderModel& model, const BuildingRenderBuffer& buffer) {
+    // Cache opaque face adjacency once. Window triangles do not occlude, so
+    // their openings remain openings in the building shadow silhouette.
+    struct EdgeKey {
+        std::array<std::int32_t, 3> first{};
+        std::array<std::int32_t, 3> second{};
+        bool operator==(const EdgeKey&) const = default;
+    };
+    struct EdgeHash {
+        std::size_t operator()(const EdgeKey& edge) const {
+            std::size_t hash = 1469598103934665603ULL;
+            for (const auto value : {edge.first[0], edge.first[1], edge.first[2], edge.second[0], edge.second[1], edge.second[2]}) {
+                hash ^= static_cast<std::uint32_t>(value);
+                hash *= 1099511628211ULL;
+            }
+            return hash;
+        }
+    };
+    struct EdgeOwner { std::size_t face{}; std::size_t edge{}; };
+    const auto point_key = [](Vec3 point) {
+        return std::array<std::int32_t, 3>{
+            static_cast<std::int32_t>(std::lround(point.x * 1024.0F)),
+            static_cast<std::int32_t>(std::lround(point.y * 1024.0F)),
+            static_cast<std::int32_t>(std::lround(point.z * 1024.0F)),
+        };
+    };
+    std::unordered_map<EdgeKey, EdgeOwner, EdgeHash> open_edges;
+    model.shadow_faces.reserve(buffer.triangles.size());
+    for (const auto& triangle : buffer.triangles) {
+        if (triangle.city_window_surface ||
+            triangle.indices[0] >= buffer.vertices.size() ||
+            triangle.indices[1] >= buffer.vertices.size() ||
+            triangle.indices[2] >= buffer.vertices.size()) continue;
+        GpuBuildingRenderModel::ShadowFace face;
+        for (std::size_t vertex = 0; vertex < 3; ++vertex) {
+            face.vertices[vertex] = buffer.vertices[triangle.indices[vertex]].position;
+        }
+        const auto face_index = model.shadow_faces.size();
+        model.shadow_faces.push_back(face);
+        for (std::size_t edge = 0; edge < 3; ++edge) {
+            auto first = point_key(face.vertices[edge]);
+            auto second = point_key(face.vertices[(edge + 1U) % 3U]);
+            if (second < first) std::swap(first, second);
+            const EdgeKey key{first, second};
+            if (const auto owner = open_edges.find(key); owner != open_edges.end()) {
+                model.shadow_faces[face_index].adjacent[edge] = static_cast<std::int32_t>(owner->second.face);
+                model.shadow_faces[owner->second.face].adjacent[owner->second.edge] = static_cast<std::int32_t>(face_index);
+                open_edges.erase(owner);
+            } else {
+                open_edges.emplace(key, EdgeOwner{face_index, edge});
+            }
+        }
+    }
+}
+
 GpuBuildingRenderModel upload_building_render_model(const BuildingRenderBuffer& buffer, const SbbBuilding& building, const EditorProject& project) {
     GpuBuildingRenderModel model;
     model.wire_lines = buffer.wire_lines;
+    cache_shadow_faces(model, buffer);
     model.chunks.reserve(buffer.material_runs.size());
     for (const auto& run : buffer.material_runs) {
         auto chunk = upload_mesh_chunk(
@@ -849,6 +1388,7 @@ GpuBuildingRenderModel upload_building_render_model(const BuildingRenderBuffer& 
             run.triangle_count,
             run.material,
             texture_for_material(project, building, run.material),
+            material_texture_for_material(project, building, run.material),
             run.city_window_surface);
         if (chunk.mesh.vertexCount > 0) {
             model.uploaded_vertices += static_cast<std::size_t>(chunk.mesh.vertexCount);
@@ -892,12 +1432,12 @@ MaskShader& mask_shader() {
     static MaskShader cache;
     if (!cache.loaded) {
         const char* vs =
-            "#version 330\n"
+            MAPED_GLSL_VERSION
             "in vec3 vertexPosition;\n"
             "uniform mat4 mvp;\n"
             "void main() { gl_Position = mvp * vec4(vertexPosition, 1.0); }\n";
         const char* fs =
-            "#version 330\n"
+            MAPED_GLSL_VERSION
             "out vec4 finalColor;\n"
             "void main() { finalColor = vec4(1.0); }\n";
         cache.shader = LoadShaderFromMemory(vs, fs);
@@ -906,74 +1446,645 @@ MaskShader& mask_shader() {
     return cache;
 }
 
-// Per-pixel scene lighting: the same hemisphere + key sun + fill model as the
-// baked baked_directional_light, but evaluated per fragment from the interpolated
-// world normal so large faces shade smoothly instead of per-vertex. The vertex
-// color still arrives (used as ambient occlusion / tint); the fragment multiplies
-// texture * colDiffuse * vertexColor * light.
+// Sub Rosa's world shader reads color + material maps, lights them with its world
+// light, and uses the color alpha as window shine for sky reflection. The editor
+// keeps that contract and evaluates the native atmosphere used by its backdrop.
 struct LitShader {
     Shader shader{};
+    int view_position_loc{-1};
+    int window_surface_loc{-1};
+    int building_surface_loc{-1};
+    int terrain_surface_loc{-1};
+    int atmosphere_world_position_loc{-1};
+    int light_direction_loc{-1};
+    int light_ambient_loc{-1};
+    int light_diffuse_loc{-1};
+    int env_face_loc{-1};
+    int ground_color_loc{-1};
     bool loaded{false};
 };
+
+struct GameLightColors {
+    Vector3 ambient{};
+    Vector3 diffuse{};
+};
+
+// Port of subrosa.exe WorldShading @0xa61f0. Optical depth through a sphere of
+// radius 512 seen from radius 496 (constants @0x278aec/@0x278ae8/@0x278958),
+// scaled by 0.029296875 (@0x278174); the fixed axis probes carry an extra
+// sqrt(0.09765625) (@0x2781e8). Wavelengths @0x2b23d0 are (0.5, 0.625, 1.0).
+GameLightColors game_light_colors(Vector3 light) {
+    const auto depth = [](float dy) {
+        return std::sqrt(262144.0F - (246016.0F - dy*dy*246016.0F)) - dy*496.0F;
+    };
+    constexpr float wavelength[3] = {0.5F, 0.625F, 1.0F};
+    const float light_depth = depth(light.y)*0.029296875F;
+    const float horizon_depth = depth(0.0F)*0.3125F*0.029296875F;
+    const float zenith_depth = depth(1.0F)*0.3125F*0.029296875F;
+    const float rise = 1.0F - light.y;
+    const float height = 1.0F - rise*rise*rise*rise;
+    GameLightColors colors;
+    float* ambient = &colors.ambient.x;
+    float* diffuse = &colors.diffuse.x;
+    for (int i = 0; i < 3; ++i) {
+        ambient[i] = (4.0F*std::exp(-wavelength[i]*horizon_depth)*0.5F +
+                      std::exp(-wavelength[i]*zenith_depth)*0.75F)*height*0.75F;
+        diffuse[i] = std::exp(-wavelength[i]*light_depth)*1.125F;
+    }
+    return colors;
+}
+
+// Lit landscape below the horizon: landscape.frag with the generated grass
+// color (0x40,0x54,0x26) and a mid-grey detail texel, n = up.
+Vector3 game_ground_color(Vector3 light) {
+    const auto colors = game_light_colors(light);
+    const Vector3 grass_srgb{0x40/255.0F, 0x54/255.0F, 0x26/255.0F};
+    const auto to_linear = [](float c) {
+        return c < 0.04045F ? c/12.92F : std::pow((c + 0.055F)/1.055F, 2.4F);
+    };
+    float ground_scale = 0.25F + std::max(light.y, 0.0F)*0.75F;
+    ground_scale = (4.0F/3.0F)*(1.0F - 1.0F/(1.0F + 3.0F*ground_scale));
+    Vector3 ground{};
+    for (int i = 0; i < 3; ++i) {
+        const float base = to_linear((&grass_srgb.x)[i])*0.5F;
+        (&ground.x)[i] = base*(&colors.ambient.x)[i]*(0.375F + light.y*0.125F) +
+                         base*(&colors.diffuse.x)[i]*ground_scale*0.625F;
+    }
+    return ground;
+}
+
+// CPU twin of the shader skyColor() without the sun disc, used to average the
+// sky over each cube face the way the game's blurred landscape cubemap does.
+Vector3 analytic_sky_color(Vector3 direction, Vector3 light, Vector3 world_position) {
+    constexpr float atmo_x = 0.0502275936F;
+    constexpr float atmo_z = 6.4F;
+    constexpr float atmo_w = 637.1F;
+    const Vector3 wavelength{0.625F, 0.75F, 1.0F};
+    const auto ray_distance = [](Vector3 position, Vector3 dir, float radius) {
+        const float scale = Vector3DotProduct(position, dir);
+        const float b2 = Vector3DotProduct(position, position) - scale*scale;
+        return std::sqrt(std::max(0.0F, radius*radius - b2)) - scale;
+    };
+    const auto ray_distance2 = [](Vector3 position, Vector3 dir, float radius) {
+        const float scale = -Vector3DotProduct(position, dir);
+        if (scale < 0.0F) return 0.0F;
+        const float b2 = Vector3DotProduct(position, position) - scale*scale;
+        if (b2 > radius*radius) return 0.0F;
+        return scale - std::sqrt(std::max(0.0F, radius*radius - b2));
+    };
+    const auto view = Vector3Normalize(direction);
+    float view_length = ray_distance2(world_position, view, atmo_w);
+    if (view_length <= 0.0F) view_length = ray_distance(world_position, view, atmo_w + atmo_z);
+    float phase = Vector3DotProduct(view, light);
+    phase = 3.0F/(16.0F*PI)*(1.0F + phase*phase);
+    const Vector3 out_scatter = Vector3Scale(wavelength, atmo_x);
+    const Vector3 in_scatter = Vector3Scale(wavelength, phase*atmo_x);
+    Vector3 color{};
+    float dist = 1.0F - 0.125F;
+    for (int count = 0; count < 4; ++count) {
+        const auto ray_position = Vector3Add(world_position, Vector3Scale(view, view_length*dist));
+        const float ray_length = ray_distance(ray_position, light, atmo_w + atmo_z);
+        float h = 1.0F - (Vector3Length(ray_position) - atmo_w)/atmo_z;
+        h = std::clamp(h, 0.0F, 1.0F);
+        h *= h;
+        const float density = h*8.0F;
+        for (int i = 0; i < 3; ++i) {
+            const float rayleigh = (&in_scatter.x)[i]*density*8.0F*std::exp(-ray_length*density*0.25F*atmo_x*(&wavelength.x)[i]);
+            const float extinction = (&out_scatter.x)[i]*density*0.5F;
+            const float transmit = std::exp(-extinction*view_length*0.25F);
+            (&color.x)[i] = (&color.x)[i]*transmit + (1.0F - transmit)*(rayleigh/std::max(extinction, 1e-8F));
+        }
+        dist -= 0.25F;
+    }
+    return color;
+}
 
 LitShader& lit_shader() {
     static LitShader cache;
     if (!cache.loaded) {
-        const char* vs =
-            "#version 330\n"
-            "in vec3 vertexPosition;\n"
-            "in vec2 vertexTexCoord;\n"
-            "in vec3 vertexNormal;\n"
-            "in vec4 vertexColor;\n"
-            "uniform mat4 mvp;\n"
-            "uniform mat4 matModel;\n"
-            "uniform mat4 matNormal;\n"
-            "out vec2 fragTexCoord;\n"
-            "out vec4 fragColor;\n"
-            "out vec3 fragNormal;\n"
-            "void main() {\n"
-            "    fragTexCoord = vertexTexCoord;\n"
-            "    fragColor = vertexColor;\n"
-            "    fragNormal = normalize((matNormal * vec4(vertexNormal, 0.0)).xyz);\n"
-            "    gl_Position = mvp * vec4(vertexPosition, 1.0);\n"
-            "}\n";
-        const char* fs =
-            "#version 330\n"
-            "in vec2 fragTexCoord;\n"
-            "in vec4 fragColor;\n"
-            "in vec3 fragNormal;\n"
-            "uniform sampler2D texture0;\n"
-            "uniform vec4 colDiffuse;\n"
-            "out vec4 finalColor;\n"
-            // Mirror baked_directional_light: hemisphere + half-Lambert key + fill.
-            "const vec3 SUN = normalize(vec3(0.40, 0.78, 0.48));\n"
-            "const vec3 FILL = normalize(vec3(-0.45, 0.30, -0.40));\n"
-            "void main() {\n"
-            "    vec3 n = normalize(fragNormal);\n"
-            "    if (n.y < 0.0) n = -n;\n"   // ground faces wind downward; treat as up
-            "    float up = n.y * 0.5 + 0.5;\n"
-            "    float hemisphere = mix(0.30, 0.50, up);\n"
-            "    float key = 0.55 * max(0.0, dot(n, SUN) * 0.5 + 0.5);\n"
-            "    float fill = 0.18 * max(0.0, dot(n, FILL));\n"
-            "    float light = min(1.35, hemisphere + key + fill);\n"
-            "    vec4 tex = texture(texture0, fragTexCoord);\n"
-            // The mesh vertex colors already bake the same light term; the shader
-            // recomputes it per-pixel from the normal, so DON'T multiply fragColor
-            // again or lighting would be applied twice (light^2).
-            "    finalColor = tex * colDiffuse * vec4(vec3(light), 1.0);\n"
-            "}\n";
+        const char* vs = MAPED_GLSL_VERSION R"glsl(
+in vec3 vertexPosition;
+in vec2 vertexTexCoord;
+in vec3 vertexNormal;
+uniform mat4 mvp;
+uniform mat4 matModel;
+uniform mat4 matNormal;
+out vec2 fragTexCoord;
+out vec3 fragNormal;
+out vec3 fragPosition;
+void main() {
+    fragTexCoord = vertexTexCoord;
+    fragNormal = normalize((matNormal * vec4(vertexNormal, 0.0)).xyz);
+    fragPosition = (matModel * vec4(vertexPosition, 1.0)).xyz;
+    gl_Position = mvp * vec4(vertexPosition, 1.0);
+}
+)glsl";
+        const char* fs = MAPED_GLSL_VERSION R"glsl(
+in vec2 fragTexCoord;
+in vec3 fragNormal;
+in vec3 fragPosition;
+uniform sampler2D texture0;
+uniform sampler2D texture1;
+uniform vec4 colDiffuse;
+uniform vec3 viewPosition;
+uniform vec3 atmosphereWorldPosition;
+uniform int windowSurface;
+uniform int buildingSurface;
+uniform int terrainSurface;
+uniform vec3 lightDirection;
+// subrosa.exe WorldShading @0xa61f0 derives these from the sun height every
+// frame; the world shader only reads lightdiffuse, the landscape shader both.
+uniform vec3 lightAmbient;
+uniform vec3 lightDiffuse;
+// Per-face averages of the game's blurred landscape cubemap (+x,-x,+y,-y,+z,-z)
+// and the lit ground color below the horizon. world.frag samples the cubemap
+// at lod 8 (one texel per face) for diffuse environment light.
+uniform vec3 envFace[6];
+uniform vec3 groundColor;
+layout(location=0) out vec4 finalColor;
+layout(location=1) out vec4 packedDepth;
+layout(location=2) out vec4 directLight;
+const float PI = 3.1415926;
+vec3 envDiffuse(vec3 n) {
+    vec3 w = n*n;
+    return w.x*(n.x > 0.0 ? envFace[0] : envFace[1])
+         + w.y*(n.y > 0.0 ? envFace[2] : envFace[3])
+         + w.z*(n.z > 0.0 ? envFace[4] : envFace[5]);
+}
+const vec4 ATMOSPHERE = vec4(0.0502275936, 0.0001, 6.4, 637.1);
+const vec3 WAVELENGTH = vec3(0.625, 0.75, 1.0);
+vec3 toLinear(vec3 color) {
+    bvec3 cutoff = lessThan(color, vec3(0.04045));
+    return mix(pow((color + vec3(0.055))/vec3(1.055), vec3(2.4)), color/vec3(12.92), cutoff);
+}
+vec3 toSrgb(vec3 color) {
+    bvec3 cutoff = lessThan(color, vec3(0.0031308));
+    return mix(vec3(1.055)*pow(max(color, vec3(0.0)), vec3(1.0/2.4))-vec3(0.055), color*vec3(12.92), cutoff);
+}
+vec3 fresnelFactor(vec3 f0, float product) {
+    return mix(f0, vec3(1.0), pow(1.01-product, 5.0));
+}
+float distributionGgx(float roughness, float ndh) {
+    float m = roughness*roughness;
+    float m2 = m*m;
+    float d = (ndh*m2-ndh)*ndh+1.0;
+    return m2/(PI*d*d);
+}
+float geometrySchlick(float roughness, float ndv, float ndl) {
+    float k = roughness*roughness*0.5;
+    return 0.25/((ndv*(1.0-k)+k)*(ndl*(1.0-k)+k));
+}
+float atmosphereRayDistance(vec3 position, vec3 direction, float radius) {
+    float scale = dot(position, direction);
+    float b2 = dot(position, position)-scale*scale;
+    return sqrt(max(0.0, radius*radius-b2))-scale;
+}
+float atmosphereRayDistance2(vec3 position, vec3 direction, float radius) {
+    float scale = -dot(position, direction);
+    if (scale < 0.0) return 0.0;
+    float b2 = dot(position, position)-scale*scale;
+    if (b2 > radius*radius) return 0.0;
+    return scale-sqrt(max(0.0, radius*radius-b2));
+}
+vec3 skyColor(vec3 direction) {
+    vec3 viewNormal = normalize(direction);
+    float viewLength = atmosphereRayDistance2(atmosphereWorldPosition, viewNormal, ATMOSPHERE.w);
+    if (viewLength <= 0.0) viewLength = atmosphereRayDistance(atmosphereWorldPosition, viewNormal, ATMOSPHERE.w+ATMOSPHERE.z);
+    float phase = dot(viewNormal, lightDirection);
+    phase = 3.0/(16.0*PI)*(1.0+phase*phase);
+    vec3 outScatter = WAVELENGTH*ATMOSPHERE.x;
+    vec3 inScatter = phase*WAVELENGTH*ATMOSPHERE.x;
+    vec3 color = vec3(0.0);
+    if (viewLength > 4.0) {
+        float sun = max(dot(viewNormal, lightDirection)-0.9998, 0.0)*262144.0;
+        color = vec3(min(sun, 16.0));
+    }
+    float inverseSamples = 0.25;
+    float dist = 1.0-inverseSamples*0.5;
+    for (int count = 0; count < 4; ++count) {
+        vec3 rayPosition = atmosphereWorldPosition+viewNormal*viewLength*dist;
+        float rayLength = atmosphereRayDistance(rayPosition, lightDirection, ATMOSPHERE.w+ATMOSPHERE.z);
+        float height = 1.0-(length(rayPosition)-ATMOSPHERE.w)/ATMOSPHERE.z;
+        height = clamp(height, 0.0, 1.0);
+        height *= height;
+        float density = height*8.0;
+        vec3 rayleigh = inScatter*density*8.0*exp(-rayLength*density*0.25*ATMOSPHERE.x*WAVELENGTH);
+        vec3 extinction = outScatter*density*0.5;
+        color *= exp(-extinction*viewLength*inverseSamples);
+        color += (1.0-exp(-extinction*viewLength*inverseSamples))*(rayleigh/max(extinction, vec3(1e-8)));
+        dist -= inverseSamples;
+    }
+    return color;
+}
+void main() {
+    // The game uses mipmapped linear minification. Add a small distance-only
+    // bias so sub-pixel facade and window texels converge on a stable mip
+    // instead of alternating between bright and dark samples while the camera
+    // moves. Near surfaces retain their full-resolution texture.
+    float textureDistance = length(viewPosition-fragPosition);
+    float mipBias = smoothstep(160.0, 900.0, textureDistance)*0.65;
+    vec4 textureSample = texture(texture0, fragTexCoord, mipBias);
+    vec4 sampled = textureSample * colDiffuse;
+    vec3 albedo = toLinear(sampled.rgb);
+    // Native world.frag applies the same sRGB-to-linear conversion to the
+    // material texture before reading its metallic and roughness channels.
+    vec3 material = toLinear(texture(texture1, fragTexCoord, mipBias).rgb);
+    float metallic = clamp(material.r, 0.0, 1.0);
+    float roughness = clamp(material.g, 0.0, 1.0);
+    vec3 n = buildingSurface == 1
+        ? normalize(cross(dFdx(fragPosition), dFdy(fragPosition)))
+        : normalize(fragNormal);
+    if (!gl_FrontFacing) n = -n;
+    vec3 v = normalize(viewPosition-fragPosition);
+    vec3 color;
+    vec3 direct;
+    if (terrainSurface == 1) {
+        // landscape.frag: wrapped diffuse with rho=3, ambient keyed to the sun
+        // height, and a detail-driven view shine. texture0 is tex_detail and
+        // colDiffuse stands in for the generated tex_color landscape map.
+        vec3 base = toLinear(textureSample.rgb)*toLinear(colDiffuse.rgb);
+        float ndl0 = dot(n, lightDirection);
+        float scale = 0.25+max(ndl0, 0.0)*0.75;
+        scale = (4.0/3.0)*(1.0-1.0/(1.0+3.0*scale));
+        vec3 ambientPart = base*lightAmbient*(0.375+ndl0*0.125);
+        direct = base*lightDiffuse*scale*0.625;
+        float shine = 0.0625+(1.0-textureSample.r)*0.5;
+        float rim = 1.0-abs(dot(v, n));
+        rim *= rim;
+        rim *= rim;
+        shine = (shine+(1.0-shine)*rim)*0.25;
+        vec3 rv = normalize(reflect(lightDirection, n));
+        direct += pow(max(dot(rv, v), 0.0), 2.0)*shine*lightDiffuse;
+        color = ambientPart+direct;
+    } else {
+        vec3 h = normalize(v+lightDirection);
+        float ndl = max(0.001, dot(n, lightDirection));
+        float ndv = max(0.001, dot(n, v));
+        float ndh = max(0.001, dot(n, h));
+        float hdv = max(0.001, dot(h, v));
+        vec3 f = fresnelFactor(mix(vec3(0.02), albedo, metallic), hdv);
+        vec3 specular = f * geometrySchlick(roughness+0.0625, ndv, ndl) * distributionGgx(roughness+0.0625, ndh) * ndl;
+        float wrap = 1.0-pow(1.0-ndl, 1.0+roughness*3.0);
+        vec3 diffuse = (vec3(1.0)-f)*wrap*(1.0-roughness*0.375);
+        specular *= lightDiffuse;
+        diffuse *= lightDiffuse;
+        direct = diffuse*1.5*mix(albedo, vec3(0.0), metallic)+specular;
+        // Diffuse environment: one cubemap texel per face (lod 8).
+        diffuse += envDiffuse(n)*0.75;
+        diffuse *= 1.5;
+        // Specular environment: lod roughness^2*8, so smooth surfaces see the
+        // sharp sky/ground and rough ones converge on the face average.
+        vec3 r = reflect(-v, n);
+        vec3 sharp = r.y >= 0.0 ? skyColor(r) : groundColor;
+        vec3 reflected = mix(sharp, envDiffuse(r), clamp(roughness*roughness*8.0/6.0, 0.0, 1.0));
+        specular += reflected*0.75*fresnelFactor(mix(vec3(0.02), albedo, metallic), ndv)*(1.0-roughness*0.5);
+        color = diffuse*mix(albedo, vec3(0.0), metallic)+specular;
+        if (windowSurface == 1) {
+            // array_world.frag window shine: sharp cubemap reflection faded
+            // toward half the ambient blue at grazing angles.
+            float scale = 1.0-abs(dot(-v, n));
+            scale = 0.5+pow(scale, 2.5)*0.5;
+            vec3 reflection = sharp*scale+vec3((1.0-scale)*0.5*lightAmbient.b);
+            color = mix(color, reflection, textureSample.a);
+            direct *= 1.0-textureSample.a;
+        }
+    }
+    finalColor = vec4(color, windowSurface == 1 ? 1.0 : sampled.a);
+    directLight = vec4(direct, windowSurface == 1 ? 1.0 : sampled.a);
+    float fragmentDepth = length(viewPosition-fragPosition);
+    vec3 encodedDepth = fract(vec3(fragmentDepth*0.0000152587890625, fragmentDepth*0.00390625, fragmentDepth));
+    packedDepth = vec4(floor(encodedDepth*256.0)/255.0, 1.0);
+}
+)glsl";
         cache.shader = LoadShaderFromMemory(vs, fs);
-        // matModel/matNormal are standard raylib locations; bind them so the shader
-        // gets the model + normal matrices for world-space normals.
         cache.shader.locs[SHADER_LOC_MATRIX_MODEL] = GetShaderLocation(cache.shader, "matModel");
         cache.shader.locs[SHADER_LOC_MATRIX_NORMAL] = GetShaderLocation(cache.shader, "matNormal");
+        cache.shader.locs[SHADER_LOC_MAP_METALNESS] = GetShaderLocation(cache.shader, "texture1");
+        cache.view_position_loc = GetShaderLocation(cache.shader, "viewPosition");
+        cache.window_surface_loc = GetShaderLocation(cache.shader, "windowSurface");
+        cache.building_surface_loc = GetShaderLocation(cache.shader, "buildingSurface");
+        cache.terrain_surface_loc = GetShaderLocation(cache.shader, "terrainSurface");
+        cache.atmosphere_world_position_loc = GetShaderLocation(cache.shader, "atmosphereWorldPosition");
+        cache.light_direction_loc = GetShaderLocation(cache.shader, "lightDirection");
+        cache.light_ambient_loc = GetShaderLocation(cache.shader, "lightAmbient");
+        cache.light_diffuse_loc = GetShaderLocation(cache.shader, "lightDiffuse");
+        cache.env_face_loc = GetShaderLocation(cache.shader, "envFace");
+        cache.ground_color_loc = GetShaderLocation(cache.shader, "groundColor");
         cache.loaded = true;
     }
     return cache;
 }
 
-Shader scene_lit_shader() {
+Shader game_surface_shader() {
     return lit_shader().shader;
+}
+
+Texture2D default_game_material_texture() {
+    static Texture2D texture = [] {
+        // The material map is decoded from sRGB by world.frag. 188 encodes a
+        // linear roughness of about 0.5; zero red keeps fallback surfaces
+        // dielectric instead of making every missing material partly metallic.
+        Image image = GenImageColor(1, 1, Color{0, 188, 0, 255});
+        auto loaded = LoadTextureFromImage(image);
+        UnloadImage(image);
+        SetTextureWrap(loaded, TEXTURE_WRAP_REPEAT);
+        SetTextureFilter(loaded, TEXTURE_FILTER_BILINEAR);
+        return loaded;
+    }();
+    return texture;
+}
+
+void set_game_surface_camera(Vector3 position) {
+    auto& shader = lit_shader();
+    if (shader.shader.id != 0U && shader.view_position_loc >= 0) {
+        SetShaderValue(shader.shader, shader.view_position_loc, &position.x, SHADER_UNIFORM_VEC3);
+        const Vector3 atmosphere_position{
+            position.x*0.0001F,
+            position.y*0.0001F+637.1F,
+            position.z*0.0001F,
+        };
+        SetShaderValue(shader.shader, shader.atmosphere_world_position_loc, &atmosphere_position.x, SHADER_UNIFORM_VEC3);
+        const auto light = Vector3Normalize(game_light_direction());
+        SetShaderValue(shader.shader, shader.light_direction_loc, &light.x, SHADER_UNIFORM_VEC3);
+        const auto colors = game_light_colors(light);
+        SetShaderValue(shader.shader, shader.light_ambient_loc, &colors.ambient.x, SHADER_UNIFORM_VEC3);
+        SetShaderValue(shader.shader, shader.light_diffuse_loc, &colors.diffuse.x, SHADER_UNIFORM_VEC3);
+
+        const Vector3 ground = game_ground_color(light);
+        SetShaderValue(shader.shader, shader.ground_color_loc, &ground.x, SHADER_UNIFORM_VEC3);
+
+        // Cube-face averages of sky (upper hemisphere) and ground (lower), the
+        // lod-8 cubemap texel world.frag reads. Cached on the light direction;
+        // the 0.0001-scaled camera offset is negligible at this blur level.
+        static Vector3 cached_light{0.0F, 0.0F, 0.0F};
+        static std::array<Vector3, 6> faces{};
+        static Vector3 cached_ground{};
+        if (Vector3LengthSqr(Vector3Subtract(cached_light, light)) > 1e-8F ||
+            Vector3LengthSqr(Vector3Subtract(cached_ground, ground)) > 1e-10F) {
+            cached_light = light;
+            cached_ground = ground;
+            const Vector3 origin{0.0F, 637.1F, 0.0F};
+            constexpr int grid = 6;
+            for (int face = 0; face < 6; ++face) {
+                Vector3 sum{};
+                for (int u = 0; u < grid; ++u) {
+                    for (int w = 0; w < grid; ++w) {
+                        const float a = (static_cast<float>(u) + 0.5F)/grid*2.0F - 1.0F;
+                        const float b = (static_cast<float>(w) + 0.5F)/grid*2.0F - 1.0F;
+                        const float sign = (face & 1) != 0 ? -1.0F : 1.0F;
+                        Vector3 dir{};
+                        switch (face >> 1) {
+                            case 0: dir = {sign, a, b}; break;
+                            case 1: dir = {a, sign, b}; break;
+                            default: dir = {a, b, sign}; break;
+                        }
+                        dir = Vector3Normalize(dir);
+                        sum = Vector3Add(sum, dir.y >= 0.0F ? analytic_sky_color(dir, light, origin) : ground);
+                    }
+                }
+                faces[static_cast<std::size_t>(face)] = Vector3Scale(sum, 1.0F/(grid*grid));
+            }
+        }
+        SetShaderValueV(shader.shader, shader.env_face_loc, faces.data(), SHADER_UNIFORM_VEC3, 6);
+    }
+}
+
+void set_game_surface_terrain(bool enabled) {
+    auto& shader = lit_shader();
+    const int value = enabled ? 1 : 0;
+    if (shader.shader.id != 0U && shader.terrain_surface_loc >= 0) {
+        SetShaderValue(shader.shader, shader.terrain_surface_loc, &value, SHADER_UNIFORM_INT);
+    }
+}
+
+void set_game_world_time(float hours) {
+    g_world_time_hours = std::clamp(hours, 0.0F, 24.0F);
+}
+
+void set_game_surface_window(bool enabled) {
+    auto& shader = lit_shader();
+    const int value = enabled ? 1 : 0;
+    if (shader.shader.id != 0U && shader.window_surface_loc >= 0) {
+        SetShaderValue(shader.shader, shader.window_surface_loc, &value, SHADER_UNIFORM_INT);
+    }
+}
+
+void set_game_surface_building(bool enabled) {
+    auto& shader = lit_shader();
+    const int value = enabled ? 1 : 0;
+    if (shader.shader.id != 0U && shader.building_surface_loc >= 0) {
+        SetShaderValue(shader.shader, shader.building_surface_loc, &value, SHADER_UNIFORM_INT);
+    }
+}
+
+struct SkyShader {
+    Shader shader{};
+    int light_direction_loc{-1};
+    int world_position_loc{-1};
+    int depth_texture_loc{-1};
+    int inverse_resolution_loc{-1};
+    int ground_color_loc{-1};
+    int mvp_loc{-1};
+    unsigned int vao{0};
+    unsigned int vbo{0};
+    bool loaded{false};
+};
+
+SkyShader& sky_shader() {
+    static SkyShader cache;
+    if (!cache.loaded) {
+        const char* vs = MAPED_GLSL_VERSION R"glsl(
+uniform mat4 modelviewprojectionmatrix;
+uniform vec3 lightdirection;
+layout(location=0) in vec3 position_in;
+layout(location=1) in vec3 viewvec_in;
+out vec3 lightvec;
+out vec3 viewvec;
+void main() {
+    lightvec=lightdirection;
+    viewvec=viewvec_in;
+    gl_Position=modelviewprojectionmatrix*vec4(position_in,1.0);
+}
+)glsl";
+        const char* fs = MAPED_GLSL_VERSION R"glsl(
+out vec4 finalColor;
+in vec3 lightvec;
+in vec3 viewvec;
+uniform vec3 worldPosition;
+uniform vec3 groundColor;
+uniform sampler2D depthTexture;
+uniform vec2 inverseResolution;
+const vec4 ATMOSPHERE = vec4(0.0502275936, 0.0001, 6.4, 637.1);
+const vec3 WAVELENGTH = vec3(0.625, 0.75, 1.0);
+const int SAMPLE_COUNT = 4;
+float rayDistanceSphere(vec3 position, vec3 direction, float radius) {
+    float scale = dot(position, direction);
+    float b2 = dot(position, position)-scale*scale;
+    return sqrt(max(0.0, radius*radius-b2))-scale;
+}
+float rayDistanceSphere2(vec3 position, vec3 direction, float radius) {
+    float scale = -dot(position, direction);
+    if (scale < 0.0) return 0.0;
+    float b2 = dot(position, position)-scale*scale;
+    if (b2 > radius*radius) return 0.0;
+    return scale-sqrt(max(0.0, radius*radius-b2));
+}
+vec4 rayleighScattering(vec3 position, vec3 viewNormal, vec3 lightNormal) {
+    float inverseSamples = 1.0/float(SAMPLE_COUNT);
+    float viewLength = length(position);
+    float phase = dot(viewNormal, lightNormal);
+    phase = 3.0/(16.0*3.14159265359)*(1.0+phase*phase);
+    vec3 outScatter = WAVELENGTH*ATMOSPHERE.x;
+    vec3 inScatter = phase*WAVELENGTH*ATMOSPHERE.x;
+    vec3 color = vec3(0.0);
+    if (viewLength > 4.0) {
+        float sun = max(dot(viewNormal, lightNormal)-0.9998, 0.0)*262144.0;
+        color = vec3(min(sun, 16.0));
+    }
+    float dist = 1.0-inverseSamples*0.5;
+    for (int count = 0; count < SAMPLE_COUNT; ++count) {
+        vec3 rayPosition = worldPosition+viewNormal*viewLength*dist;
+        float rayLength = rayDistanceSphere(rayPosition, lightNormal, ATMOSPHERE.w+ATMOSPHERE.z);
+        float height = 1.0-(length(rayPosition)-ATMOSPHERE.w)/ATMOSPHERE.z;
+        height = clamp(height, 0.0, 1.0);
+        height *= height;
+        float density = height*8.0;
+        vec3 rayleigh = inScatter*density*8.0*exp(-rayLength*density*0.25*ATMOSPHERE.x*WAVELENGTH);
+        vec3 extinction = outScatter*density*0.5;
+        color *= exp(-extinction*viewLength*inverseSamples);
+        color += (1.0-exp(-extinction*viewLength*inverseSamples))*(rayleigh/max(extinction, vec3(1e-8)));
+        dist -= inverseSamples;
+    }
+    return vec4(color, 1.0);
+}
+void main() {
+    vec3 viewNormal = normalize(viewvec);
+    vec3 lightNormal = normalize(lightvec);
+    vec2 depthTexCoord = (gl_FragCoord.xy+vec2(0.125))*inverseResolution;
+    vec3 encodedDepth = texture(depthTexture, depthTexCoord).rgb;
+    float distance = encodedDepth.r*65536.0+encodedDepth.g*256.0+encodedDepth.b;
+    bool skyPixel = distance > 65536.0;
+    if (skyPixel) {
+        distance = rayDistanceSphere2(worldPosition, viewNormal, ATMOSPHERE.w);
+        if (distance <= 0.0) distance = rayDistanceSphere(worldPosition, viewNormal, ATMOSPHERE.w+ATMOSPHERE.z);
+    } else {
+        distance *= ATMOSPHERE.y;
+    }
+    finalColor = rayleighScattering(viewNormal*distance, viewNormal, lightNormal);
+    // The game always has landscape under the horizon; without terrain loaded
+    // show the lit ground color instead of the black inside of the atmosphere.
+    if (skyPixel && viewNormal.y < 0.0) {
+        finalColor.rgb = mix(finalColor.rgb, groundColor, clamp(-viewNormal.y*8.0, 0.0, 1.0));
+    }
+}
+)glsl";
+        cache.shader = LoadShaderFromMemory(vs, fs);
+        cache.light_direction_loc = GetShaderLocation(cache.shader, "lightdirection");
+        cache.world_position_loc = GetShaderLocation(cache.shader, "worldPosition");
+        cache.depth_texture_loc = GetShaderLocation(cache.shader, "depthTexture");
+        cache.inverse_resolution_loc = GetShaderLocation(cache.shader, "inverseResolution");
+        cache.ground_color_loc = GetShaderLocation(cache.shader, "groundColor");
+        cache.mvp_loc = GetShaderLocation(cache.shader, "modelviewprojectionmatrix");
+        glGenVertexArrays(1, &cache.vao);
+        glGenBuffers(1, &cache.vbo);
+        glBindVertexArray(cache.vao);
+        glBindBuffer(GL_ARRAY_BUFFER, cache.vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(float)*24, nullptr, GL_DYNAMIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(float)*6, nullptr);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(float)*6, reinterpret_cast<void*>(sizeof(float)*3));
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        cache.loaded = true;
+    }
+    return cache;
+}
+
+void draw_game_sky(const Camera3D& camera, Vector2 viewport_size, Texture2D depth_texture) {
+    if (viewport_size.x <= 0.0F || viewport_size.y <= 0.0F) {
+        return;
+    }
+    if (depth_texture.id == 0U) {
+        return;
+    }
+    auto& sky = sky_shader();
+    const auto forward = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+    const auto right = Vector3Normalize(Vector3CrossProduct(forward, camera.up));
+    const auto up = Vector3Normalize(Vector3CrossProduct(right, forward));
+    const float aspect = viewport_size.x / viewport_size.y;
+    const float vertical_fov = std::tan(camera.fovy * DEG2RAD * 0.5F);
+    const float horizontal_fov = vertical_fov*aspect;
+    // Native reset-time daylight: counter 0x244140 converted to the world-light
+    // angle, rotating normalized (0, 1, 0.5) around (0, 1/sqrt(5), -2/sqrt(5)).
+    const Vector3 light_direction = game_light_direction();
+    const Vector3 world_position{
+        camera.position.x*0.0001F,
+        camera.position.y*0.0001F+637.1F,
+        camera.position.z*0.0001F,
+    };
+    const Vector2 inverse_resolution{1.0F/viewport_size.x, 1.0F/viewport_size.y};
+    const auto ray = [&](float horizontal, float vertical) {
+        return Vector3Add(forward, Vector3Add(Vector3Scale(right, horizontal), Vector3Scale(up, vertical)));
+    };
+    const Vector3 rays[] = {
+        ray(-horizontal_fov, -vertical_fov),
+        ray( horizontal_fov, -vertical_fov),
+        ray( horizontal_fov,  vertical_fov),
+        ray(-horizontal_fov,  vertical_fov),
+    };
+    const float vertices[] = {
+        -1.0F, -1.0F, 0.0F, rays[0].x, rays[0].y, rays[0].z,
+         1.0F, -1.0F, 0.0F, rays[1].x, rays[1].y, rays[1].z,
+         1.0F,  1.0F, 0.0F, rays[2].x, rays[2].y, rays[2].z,
+        -1.0F,  1.0F, 0.0F, rays[3].x, rays[3].y, rays[3].z,
+    };
+    constexpr float identity[] = {
+        1.0F, 0.0F, 0.0F, 0.0F,
+        0.0F, 1.0F, 0.0F, 0.0F,
+        0.0F, 0.0F, 1.0F, 0.0F,
+        0.0F, 0.0F, 0.0F, 1.0F,
+    };
+    const unsigned int framebuffer = rlGetActiveFramebuffer();
+    rlDrawRenderBatchActive();
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, 0, 0);
+    const GLenum color_only[] = {GL_COLOR_ATTACHMENT0};
+    glDrawBuffers(1, color_only);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_SRC_ALPHA);
+    glUseProgram(sky.shader.id);
+    glUniform3fv(sky.light_direction_loc, 1, &light_direction.x);
+    glUniform3fv(sky.world_position_loc, 1, &world_position.x);
+    glUniform2fv(sky.inverse_resolution_loc, 1, &inverse_resolution.x);
+    const auto ground = game_ground_color(Vector3Normalize(light_direction));
+    glUniform3fv(sky.ground_color_loc, 1, &ground.x);
+    glUniformMatrix4fv(sky.mvp_loc, 1, GL_FALSE, identity);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, depth_texture.id);
+    glUniform1i(sky.depth_texture_loc, 0);
+    glBindVertexArray(sky.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, sky.vbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertices), vertices);
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(rlGetShaderIdDefault());
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    glEnable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, depth_texture.id, 0);
+    const GLenum color_only_after_sky[] = {GL_COLOR_ATTACHMENT0};
+    glDrawBuffers(1, color_only_after_sky);
+    rlEnableFramebuffer(framebuffer);
 }
 
 struct MaskOutlineShader {
@@ -987,7 +2098,7 @@ MaskOutlineShader& mask_outline_shader() {
     static MaskOutlineShader cache;
     if (!cache.loaded) {
         const char* fs =
-            "#version 330\n"
+            MAPED_GLSL_VERSION
             "in vec2 fragTexCoord;\n"
             "in vec4 fragColor;\n"
             "out vec4 finalColor;\n"
@@ -1140,24 +2251,21 @@ void draw_gpu_building_model(
     std::int32_t rotation,
     bool selected,
     bool draw_wires,
-    const Texture2D* city_window_texture = nullptr,
     GfxDebugDrawCategory category = GfxDebugDrawCategory::CityCells
 ) {
     const auto transform = building_transform_matrix(origin, rotation);
+    set_game_render_depth_output(true);
     rlDisableBackfaceCulling();
     for (auto& chunk : model.chunks) {
         if (chunk.material.maps == nullptr || chunk.mesh.vertexCount <= 0) {
             continue;
         }
-        const auto use_window_texture = city_window_texture != nullptr &&
-            city_window_texture->id != 0U &&
-            chunk.window_material;
-        chunk.material.maps[MATERIAL_MAP_DIFFUSE].texture = use_window_texture
-            ? *city_window_texture
-            : chunk.source_texture;
-        chunk.material.maps[MATERIAL_MAP_DIFFUSE].color = (chunk.textured || use_window_texture)
+        chunk.material.maps[MATERIAL_MAP_DIFFUSE].texture = chunk.source_texture;
+        chunk.material.maps[MATERIAL_MAP_DIFFUSE].color = chunk.textured
             ? (selected ? Color{255, 236, 170, 255} : WHITE)
-            : native_material_color(chunk.material_id, selected, false);
+            : native_material_color(chunk.material_id, selected, chunk.window_material);
+        set_game_surface_window(chunk.window_material);
+        set_game_surface_building(true);
         DrawMesh(chunk.mesh, chunk.material, transform);
         if (g_gfx_debug_stats != nullptr) {
             g_gfx_debug_stats->add_draw(
@@ -1168,6 +2276,7 @@ void draw_gpu_building_model(
         }
     }
     rlEnableBackfaceCulling();
+    set_game_render_depth_output(false);
 
     if (!draw_wires) {
         return;
@@ -1199,6 +2308,16 @@ void draw_sbb_scene_for_app(
     const auto grid_max_x = (static_cast<float>(grid_cells) - static_cast<float>(building.anchor_x)) * unit_size;
     const auto grid_max_z = (static_cast<float>(grid_cells) - static_cast<float>(building.anchor_z)) * unit_size;
 
+    const Vector3 anchor_offset{
+        -static_cast<float>(building.anchor_x) * unit_size,
+        -static_cast<float>(building.anchor_y) * unit_size,
+        -static_cast<float>(building.anchor_z) * unit_size,
+    };
+    draw_gpu_building_model(model, anchor_offset, 0, false, true, GfxDebugDrawCategory::CityCells);
+    rlDrawRenderBatchActive();
+    rlDisableDepthTest();
+    rlDisableDepthMask();
+
     // editor.exe draws a fixed 64-cell work grid with 65 lines in each axis.
     // Every fourth line is stronger so block-sized groups remain legible.
     for (std::uint32_t index = 0; index <= grid_cells; ++index) {
@@ -1209,6 +2328,12 @@ void draw_sbb_scene_for_app(
         const auto z = (static_cast<float>(index) - static_cast<float>(building.anchor_z)) * unit_size;
         DrawLine3D({x, grid_y, grid_min_z}, {x, grid_y, grid_max_z}, color);
         DrawLine3D({grid_min_x, grid_y, z}, {grid_max_x, grid_y, z}, color);
+        if (index % 4U == 0U) {
+            DrawCylinderEx({x, grid_y, grid_min_z}, {x, grid_y, grid_max_z},
+                unit_size * 0.025F, unit_size * 0.025F, 4, color);
+            DrawCylinderEx({grid_min_x, grid_y, z}, {grid_max_x, grid_y, z},
+                unit_size * 0.025F, unit_size * 0.025F, 4, color);
+        }
     }
 
     // Show the authored footprint in the same anchor-relative coordinates as
@@ -1224,12 +2349,9 @@ void draw_sbb_scene_for_app(
     // the picker and selection box live in anchored space ((cell.x-anchor)*unit).
     // Translate the model by -anchor*unit so geometry, selection, and clicks all
     // share one origin (fixes the constant anchor offset between them).
-    const Vector3 anchor_offset{
-        -static_cast<float>(building.anchor_x) * unit_size,
-        -static_cast<float>(building.anchor_y) * unit_size,
-        -static_cast<float>(building.anchor_z) * unit_size,
-    };
-    draw_gpu_building_model(model, anchor_offset, 0, false, true, nullptr, GfxDebugDrawCategory::CityCells);
+    rlDrawRenderBatchActive();
+    rlEnableDepthMask();
+    rlEnableDepthTest();
 
     if (selected != nullptr) {
         const auto center = Vector3{
@@ -1279,17 +2401,29 @@ const RenderTexture2D* building_thumbnail(EditorProject& project, std::size_t in
     if (project.building_thumbnail_ready[index]) {
         return &project.building_thumbnails[index];
     }
+    if (project.thumbnail_budget <= 0) {
+        return nullptr;
+    }
+    --project.thumbnail_budget;
 
     constexpr int kSize = 192; // render larger than displayed for crisp downscale.
     constexpr float unit_size = 4.0F;
     auto& building = project.buildings[index].data;
 
-    // Build the building mesh fresh (the shared tool-preview cache is keyed to a
-    // single building, so we don't reuse it here) and upload a throwaway model.
-    const auto blocks = block_meshes(project);
-    const auto templates = buildblock_templates(project);
-    const auto buffer = build_native_building_tool_preview_render_buffer(building, blocks, templates, std::nullopt);
-    auto model = upload_building_render_model(buffer, building, project);
+    // Reuse the city GPU model when it is already uploaded; only fall back to a
+    // fresh CPU build for buildings whose render model is not ready yet.
+    GpuBuildingRenderModel local_model;
+    GpuBuildingRenderModel* model_ptr = nullptr;
+    if (index < project.building_gpu_models.size() && !project.building_gpu_models[index].chunks.empty()) {
+        model_ptr = &project.building_gpu_models[index];
+    } else {
+        const auto& blocks = block_meshes(project);
+        const auto& templates = buildblock_templates(project);
+        const auto buffer = build_native_building_tool_preview_render_buffer(building, blocks, templates, std::nullopt);
+        local_model = upload_building_render_model(buffer, building, project);
+        model_ptr = &local_model;
+    }
+    auto& model = *model_ptr;
 
     auto& target = project.building_thumbnails[index];
     if (target.id == 0U) {
@@ -1319,19 +2453,22 @@ const RenderTexture2D* building_thumbnail(EditorProject& project, std::size_t in
         -static_cast<float>(building.anchor_y) * unit_size,
         -static_cast<float>(building.anchor_z) * unit_size,
     };
-    BeginTextureMode(target);
+    begin_game_texture_mode(target);
     ClearBackground(Color{32, 36, 41, 255});
     BeginMode3D(cam);
+    set_game_surface_camera(cam.position);
     rlEnableDepthTest();
-    draw_gpu_building_model(model, anchor_offset, 0, false, false, nullptr, GfxDebugDrawCategory::CityCells);
+    draw_gpu_building_model(model, anchor_offset, 0, false, false, GfxDebugDrawCategory::CityCells);
     // A subtle ground plane gives the building a sense of scale/orientation.
     DrawGrid(static_cast<int>(std::max(building.size_x, building.size_y)) + 2, unit_size);
     EndMode3D();
-    EndTextureMode();
+    end_game_texture_mode();
     GenTextureMipmaps(&target.texture);
     SetTextureFilter(target.texture, TEXTURE_FILTER_BILINEAR);
 
-    unload_city_render_model(model);
+    if (model_ptr == &local_model) {
+        unload_city_render_model(local_model);
+    }
     project.building_thumbnail_ready[index] = true;
     return &target;
 }
@@ -1347,6 +2484,10 @@ const RenderTexture2D* city_block_thumbnail(EditorProject& project, std::size_t 
     if (project.city_block_thumbnail_ready[index]) {
         return &project.city_block_thumbnails[index];
     }
+    if (project.thumbnail_budget <= 0) {
+        return nullptr;
+    }
+    --project.thumbnail_budget;
 
     constexpr int kSize = 192;
     const auto meshes = block_meshes(project);
@@ -1368,9 +2509,10 @@ const RenderTexture2D* city_block_thumbnail(EditorProject& project, std::size_t 
     cam.fovy = 45.0F;
     cam.projection = CAMERA_PERSPECTIVE;
 
-    BeginTextureMode(target);
+    begin_game_texture_mode(target);
     ClearBackground(Color{32, 36, 41, 255});
     BeginMode3D(cam);
+    set_game_surface_camera(cam.position);
     rlEnableDepthTest();
     if (scene.solid_cell.has_value()) {
         draw_render_buffer_faces(scene.solid_cell->buffer, {120, 160, 210, 255});
@@ -1379,7 +2521,7 @@ const RenderTexture2D* city_block_thumbnail(EditorProject& project, std::size_t 
         draw_mesh_faces(piece.mesh, piece.origin, scene.unit_size, {120, 160, 210, 255});
     }
     EndMode3D();
-    EndTextureMode();
+    end_game_texture_mode();
     GenTextureMipmaps(&target.texture);
     SetTextureFilter(target.texture, TEXTURE_FILTER_BILINEAR);
 
@@ -1388,10 +2530,47 @@ const RenderTexture2D* city_block_thumbnail(EditorProject& project, std::size_t 
 }
 
 const LoadedAsset<SbbBuilding>* find_building_asset(const EditorProject& project, std::string_view name) {
-    const auto match = std::ranges::find_if(project.buildings, [name](const LoadedAsset<SbbBuilding>& asset) {
-        return asset.name == name || asset.data.name == name;
+    // Archive filenames are identities. A shared display name must never steal
+    // a placement from an exact asset-name match.
+    const auto key = lower_name(name);
+    const auto exact = std::ranges::find_if(project.buildings, [&](const auto& asset) {
+        return lower_name(asset.name) == key;
     });
-    return match == project.buildings.end() ? nullptr : &*match;
+    if (exact != project.buildings.end()) return &*exact;
+    const LoadedAsset<SbbBuilding>* alias = nullptr;
+    for (const auto& asset : project.buildings) if (lower_name(asset.data.name) == key) {
+        if (alias != nullptr) return nullptr; // Ambiguous legacy display name.
+        alias = &asset;
+    }
+    return alias;
+}
+
+const std::vector<std::optional<std::size_t>>& resolve_placement_asset_indices(EditorProject& project) {
+    const auto building_count = project.city ? project.city->data.buildings.size() : 0U;
+    const auto fingerprint = project.city ? city_scene_fingerprint(project.city->data) : 0U;
+    // ponytail: fingerprint already walks every placement's name/transform for
+    // the scene-rebuild check above, so reusing it here to detect renames is
+    // cheap and avoids threading a dirty flag through every mutation site.
+    if (!project.placement_assets_dirty &&
+        project.placement_asset_indices.size() == building_count &&
+        project.placement_asset_indices_building_count == project.buildings.size() &&
+        project.placement_asset_indices_fingerprint == fingerprint) {
+        return project.placement_asset_indices;
+    }
+
+    project.placement_asset_indices.clear();
+    project.placement_asset_indices.reserve(building_count);
+    if (project.city) {
+        for (const auto& placement : project.city->data.buildings) {
+            const auto* asset = find_building_asset(project, placement.name);
+            project.placement_asset_indices.push_back(
+                asset != nullptr ? std::optional<std::size_t>(static_cast<std::size_t>(asset - project.buildings.data())) : std::nullopt);
+        }
+    }
+    project.placement_asset_indices_building_count = project.buildings.size();
+    project.placement_asset_indices_fingerprint = fingerprint;
+    project.placement_assets_dirty = false;
+    return project.placement_asset_indices;
 }
 
 void draw_city_building_model(
@@ -1400,14 +2579,14 @@ void draw_city_building_model(
     const SbcBuilding& placement,
     bool selected,
     bool use_lod,
-    const Texture2D* city_window_texture,
     bool hovered) {
     constexpr auto unit_size = 4.0F;
     (void)hovered;
     const auto render_origin = native_city_building_render_origin(placement, unit_size);
     const auto origin = Vector3{render_origin.x, render_origin.y, render_origin.z};
-    const auto fill = selected ? Color{235, 194, 82, 210} : Color{126, 151, 174, 170};
-    const auto wire = selected ? Color{255, 240, 150, 255} : Color{30, 36, 42, 170};
+    // Solid neutral grey: a see-through blue box read as a hover/ghost highlight.
+    const auto fill = selected ? Color{235, 194, 82, 255} : Color{118, 122, 128, 255};
+    const auto wire = selected ? Color{255, 240, 150, 255} : Color{40, 44, 50, 255};
 
     if (use_lod) {
         const float min_x = -static_cast<float>(template_file.anchor_x) * unit_size;
@@ -1475,7 +2654,7 @@ void draw_city_building_model(
             g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::WireOverlay, 0U, 24U, 12U);
         }
     } else {
-        draw_gpu_building_model(model, origin, placement.rotation, false, false, city_window_texture, GfxDebugDrawCategory::CityCells);
+        draw_gpu_building_model(model, origin, placement.rotation, false, false, GfxDebugDrawCategory::CityCells);
     }
 
     if (selected && use_lod) {
@@ -1524,17 +2703,237 @@ void draw_city_building_models(EditorProject& project, const SbcBuilding* select
             placement,
             selected_building == &placement,
             use_lod,
-            nullptr);
+            false);
     }
+}
+
+const std::vector<Vec3>& cached_shadow_volume_vertices(
+    const GpuBuildingRenderModel& model,
+    std::int32_t rotation,
+    Vector3 light,
+    Vector3 extrusion) {
+    const Vec3 light_value{light.x, light.y, light.z};
+    const auto light_delta = Vector3Subtract(
+        Vector3{model.shadow_volume_light.x, model.shadow_volume_light.y, model.shadow_volume_light.z},
+        light);
+    if (!model.shadow_volume_light_valid || Vector3LengthSqr(light_delta) > 1e-10F ||
+        Vector3LengthSqr(Vector3Subtract(extrusion, {model.shadow_volume_extrusion.x, model.shadow_volume_extrusion.y, model.shadow_volume_extrusion.z})) > 1e-10F) {
+        model.shadow_volume_light = light_value;
+        model.shadow_volume_extrusion = {extrusion.x, extrusion.y, extrusion.z};
+        model.shadow_volume_light_valid = true;
+        model.shadow_volume_valid.fill(false);
+        model.shadow_volume_mesh_uploaded.fill(false);
+        for (auto& vertices : model.shadow_volume_vertices) vertices.clear();
+    }
+
+    const auto rotation_index = static_cast<std::size_t>(rotation & 3);
+    auto& vertices = model.shadow_volume_vertices[rotation_index];
+    if (model.shadow_volume_valid[rotation_index]) return vertices;
+
+    std::vector<std::uint8_t> faces_light(model.shadow_faces.size(), 0U);
+    const auto append_triangle = [&vertices](Vector3 a, Vector3 b, Vector3 c) {
+        vertices.push_back({a.x, a.y, a.z});
+        vertices.push_back({b.x, b.y, b.z});
+        vertices.push_back({c.x, c.y, c.z});
+    };
+    vertices.reserve(model.shadow_faces.size() * 6U);
+    for (std::size_t face_index = 0; face_index < model.shadow_faces.size(); ++face_index) {
+        const auto& face = model.shadow_faces[face_index];
+        std::array<Vector3, 3> p{};
+        std::array<Vector3, 3> q{};
+        for (std::size_t index = 0; index < 3; ++index) {
+            const auto& local = face.vertices[index];
+            p[index] = city_transform(Vector3{}, {local.x, local.y, local.z}, rotation);
+            q[index] = Vector3Add(p[index], extrusion);
+        }
+        const auto normal = Vector3CrossProduct(Vector3Subtract(p[1], p[0]), Vector3Subtract(p[2], p[0]));
+        if (Vector3DotProduct(normal, light) < 0.0F) continue;
+        faces_light[face_index] = 1U;
+        append_triangle(p[0], p[1], p[2]);
+        append_triangle(q[0], q[2], q[1]);
+        for (std::size_t edge = 0; edge < 3; ++edge) {
+            const auto next = (edge + 1U) % 3U;
+            const auto adjacent = face.adjacent[edge];
+            if (adjacent >= 0 && static_cast<std::size_t>(adjacent) < faces_light.size()) continue;
+            append_triangle(p[next], p[edge], q[next]);
+            append_triangle(q[next], p[edge], q[edge]);
+        }
+    }
+    for (std::size_t face_index = 0; face_index < model.shadow_faces.size(); ++face_index) {
+        if (!faces_light[face_index]) continue;
+        const auto& face = model.shadow_faces[face_index];
+        for (std::size_t edge = 0; edge < 3; ++edge) {
+            const auto adjacent = face.adjacent[edge];
+            if (adjacent < 0 || static_cast<std::size_t>(adjacent) >= faces_light.size() || faces_light[adjacent]) continue;
+            const auto next = (edge + 1U) % 3U;
+            const auto& local_from = face.vertices[edge];
+            const auto& local_to = face.vertices[next];
+            const auto from = city_transform(Vector3{}, {local_from.x, local_from.y, local_from.z}, rotation);
+            const auto to = city_transform(Vector3{}, {local_to.x, local_to.y, local_to.z}, rotation);
+            const auto far_from = Vector3Add(from, extrusion);
+            const auto far_to = Vector3Add(to, extrusion);
+            append_triangle(to, from, far_to);
+            append_triangle(far_to, from, far_from);
+        }
+    }
+    model.shadow_volume_valid[rotation_index] = true;
+    return vertices;
+}
+
+// GPU-mesh counterpart of cached_shadow_volume_vertices(): same cache key
+// (light + extrusion + rotation), but uploads the vertex list into a Mesh
+// once instead of resubmitting it through rlVertex3f every frame.
+const Mesh& cached_shadow_volume_mesh(
+    const GpuBuildingRenderModel& model,
+    std::int32_t rotation,
+    Vector3 light,
+    Vector3 extrusion) {
+    const auto& vertices = cached_shadow_volume_vertices(model, rotation, light, extrusion);
+    const auto rotation_index = static_cast<std::size_t>(rotation & 3);
+    auto& mesh = model.shadow_volume_meshes[rotation_index];
+    if (model.shadow_volume_mesh_uploaded[rotation_index]) {
+        return mesh;
+    }
+    if (mesh.vaoId != 0U || mesh.vboId != nullptr) {
+        UnloadMesh(mesh);
+    }
+    mesh = {};
+    mesh.vertexCount = static_cast<int>(vertices.size());
+    mesh.triangleCount = static_cast<int>(vertices.size() / 3U);
+    if (!vertices.empty()) {
+        mesh.vertices = static_cast<float*>(MemAlloc(static_cast<unsigned int>(vertices.size() * 3U * sizeof(float))));
+        for (std::size_t i = 0; i < vertices.size(); ++i) {
+            mesh.vertices[i * 3U + 0U] = vertices[i].x;
+            mesh.vertices[i * 3U + 1U] = vertices[i].y;
+            mesh.vertices[i * 3U + 2U] = vertices[i].z;
+        }
+        UploadMesh(&mesh, false);
+    }
+    model.shadow_volume_mesh_uploaded[rotation_index] = true;
+    return mesh;
+}
+
+void draw_city_shadow_volumes(EditorProject& project, const Camera3D& camera, float max_distance) {
+    if (!project.city) return;
+    const auto& placement_asset_indices = resolve_placement_asset_indices(project);
+
+    rlDrawRenderBatchActive();
+    glEnable(GL_STENCIL_TEST);
+    glStencilMask(0xff);
+    glClearStencil(0);
+    glClear(GL_STENCIL_BUFFER_BIT);
+    glStencilFunc(GL_ALWAYS, 0, 0xff);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glStencilOpSeparate(GL_FRONT, GL_KEEP, GL_DECR_WRAP, GL_KEEP);
+    glStencilOpSeparate(GL_BACK, GL_KEEP, GL_INCR_WRAP, GL_KEEP);
+
+    const auto light = Vector3Normalize(game_light_direction());
+
+    // Color writes are masked off (glColorMask above) so the material's shader
+    // only needs to exist and take a position; reuse the outline mask shader
+    // rather than defining a dedicated one.
+    Material mask_material = LoadMaterialDefault();
+    mask_material.shader = mask_shader().shader;
+
+    for (std::size_t placement_index = 0; placement_index < project.city->data.buildings.size(); ++placement_index) {
+        const auto& placement = project.city->data.buildings[placement_index];
+        if (!placement_asset_indices[placement_index].has_value()) continue;
+        const auto asset_index = *placement_asset_indices[placement_index];
+        if (asset_index >= project.building_gpu_models.size()) continue;
+        const auto* asset = &project.buildings[asset_index];
+        const auto& model = project.building_gpu_models[asset_index];
+        const auto origin_value = native_city_building_render_origin(placement, 4.0F);
+        const Vector3 origin{origin_value.x, origin_value.y, origin_value.z};
+        const auto camera_delta = Vector3Subtract(origin, camera.position);
+        if (max_distance > 0.0F && Vector3LengthSqr(camera_delta) > max_distance * max_distance) continue;
+
+        const float length = static_cast<float>(asset->data.size_z + 1U) * 8.0F / std::max(light.y, 0.125F);
+        const auto extrusion = Vector3Scale(light, -length);
+        const auto& mesh = cached_shadow_volume_mesh(model, placement.rotation, light, extrusion);
+        if (mesh.vertexCount > 0) {
+            DrawMesh(mesh, mask_material, MatrixTranslate(origin.x, origin.y, origin.z));
+        }
+    }
+    // Native queued district meshes use a 32-unit extrusion (0x2787d4).
+    // Vertices are already world-space, so no translation is needed.
+    const auto& pieces_mesh = cached_shadow_volume_mesh(project.portal_gpu_model, 0, light, Vector3Scale(light, -32.0F));
+    if (pieces_mesh.vertexCount > 0) {
+        DrawMesh(pieces_mesh, mask_material, MatrixIdentity());
+    }
+    rlDrawRenderBatchActive();
+    MemFree(mask_material.maps);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_TRUE);
+    glEnable(GL_CULL_FACE);
+    glDisable(GL_STENCIL_TEST);
+}
+
+void composite_city_shadows(Vector2 viewport_size) {
+    rlDrawRenderBatchActive();
+    const auto framebuffer = rlGetActiveFramebuffer();
+    const auto resource = game_render_resources().find(framebuffer);
+    if (resource == game_render_resources().end() || resource->second.shadow_factor.id == 0U) {
+        glDisable(GL_STENCIL_TEST);
+        glStencilMask(0xff);
+        return;
+    }
+
+    // Native shaders consume a screen-space shadow factor texture. Preserve
+    // the completed scene color in attachment 0 and write the stencil result
+    // into a separate factor attachment instead of painting black over the
+    // frame. The resolve shader samples this factor after all scene drawing.
+    GLint scene_color = 0;
+    glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+        GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &scene_color);
+    glFramebufferTexture2D(
+        GL_FRAMEBUFFER,
+        GL_COLOR_ATTACHMENT0,
+        GL_TEXTURE_2D,
+        resource->second.shadow_factor.id,
+        0);
+    const GLenum shadow_only[] = {GL_COLOR_ATTACHMENT0};
+    glDrawBuffers(1, shadow_only);
+    glDisable(GL_STENCIL_TEST);
+    constexpr GLfloat fully_lit[] = {1.0F, 1.0F, 1.0F, 1.0F};
+    glClearBufferfv(GL_COLOR, 0, fully_lit);
+
+    glEnable(GL_STENCIL_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glStencilMask(0x00);
+    glStencilFunc(GL_NOTEQUAL, 0, 0xff);
+    DrawRectangle(
+        0,
+        0,
+        static_cast<int>(viewport_size.x),
+        static_cast<int>(viewport_size.y),
+        Color{0, 0, 0, 255});
+    rlDrawRenderBatchActive();
+
+    const GLenum color_only[] = {GL_COLOR_ATTACHMENT0};
+    glDrawBuffers(1, color_only);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, static_cast<GLuint>(scene_color), 0);
+    glDisable(GL_STENCIL_TEST);
+    glStencilMask(0xff);
+    glEnable(GL_DEPTH_TEST);
 }
 
 GpuBuildingRenderModel upload_portal_render_model(const BuildingRenderBuffer& buffer, const EditorProject& project, bool textured) {
     GpuBuildingRenderModel model;
     model.wire_lines = buffer.wire_lines;
+    cache_shadow_faces(model, buffer);
     model.chunks.reserve(buffer.material_runs.size());
     for (const auto& run : buffer.material_runs) {
         const auto* texture = textured ? texture_for_buffer_material(project, buffer, run.material) : nullptr;
-        auto chunk = upload_mesh_chunk(buffer, run.first_triangle, run.triangle_count, run.material, texture);
+        auto chunk = upload_mesh_chunk(
+            buffer,
+            run.first_triangle,
+            run.triangle_count,
+            run.material,
+            texture,
+            material_texture_for_buffer_material(project, buffer, run.material));
         if (chunk.mesh.vertexCount > 0) {
             model.uploaded_vertices += static_cast<std::size_t>(chunk.mesh.vertexCount);
             model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.vertexCount) * 3U * sizeof(float);
@@ -1580,9 +2979,19 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
     // Kick a worker to rebuild the (potentially large) all-portals buffer when the
     // pieces changed; the previous mesh keeps rendering until the new one lands, so
     // placing a piece never blocks the frame.
+    // Rebuilding every piece is heavy, so wait for a paint stroke to finish
+    // instead of rebuilding on each stamped cell.
     if ((project.portal_render_dirty || project.portal_render_textured != textured) &&
-        !project.portal_rebuild_in_progress) {
+        !project.portal_rebuild_in_progress && !project.defer_heavy_rebuilds) {
         MAPED_PROFILE_BLOCK("portal_render_model queue async rebuild");
+#ifdef __EMSCRIPTEN__
+        // The browser build has no pthreads (std::async aborts there), so
+        // rebuild inline.
+        project.portal_render_dirty = false;
+        project.portal_render_textured = textured;
+        project.portal_render_buffer = build_native_portal_render_buffer(project.city->data, blocks, std::nullopt, bb_templates, tex_names);
+        project.portal_gpu_model = upload_portal_render_model(project.portal_render_buffer, project, textured);
+#else
         const auto map = project.city->data;
         const auto blocks_copy = blocks;
         const auto bb_copy = bb_templates;
@@ -1595,6 +3004,7 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
             MAPED_PROFILE_BLOCK("build async portal render buffer");
             return build_native_portal_render_buffer(map, blocks_copy, std::nullopt, bb_copy, tex_copy);
         });
+#endif
         MAPED_PROFILE_END_BLOCK;
     }
     if (project.portal_rebuild_future.has_value() &&
@@ -1647,7 +3057,7 @@ void draw_city_piece_voxels(
     auto& model = portal_render_model(project, textured, isolate_selected ? selected_portal : std::nullopt);
     // Native world cells sit 0.25 above their level; without the lift the piece
     // ground cells are coplanar with their stamped terrain plots and z-fight.
-    draw_gpu_building_model(model, {0.0F, 0.25F, 0.0F}, 0, false, draw_wires, nullptr, GfxDebugDrawCategory::Pieces);
+    draw_gpu_building_model(model, {0.0F, 0.25F, 0.0F}, 0, false, draw_wires, GfxDebugDrawCategory::Pieces);
 
     // Per-voxel selection/hover glow is drawn by the caller (draw_city_piece_glow)
     // now that pieces are selected one block at a time, not by the whole portal.
@@ -1668,6 +3078,8 @@ void draw_city_piece_glow(CityGridPoint cell, Color color) {
 Color city_tile_material_color(const BuildingRenderBuffer& buffer, std::uint32_t material) {
     if (material < buffer.material_names.size()) {
         const auto& name = buffer.material_names[material];
+        if (name == "city_road_line_yellow") return Color{226, 190, 72, 255};
+        if (name == "city_road_line_white") return Color{224, 229, 226, 255};
         if (name == "city_curb_concrete") {
             return {150, 154, 151, 255};
         }
@@ -1679,14 +3091,18 @@ Color city_tile_material_color(const BuildingRenderBuffer& buffer, std::uint32_t
 }
 
 Color terrain_material_color(const BuildingRenderBuffer&, std::uint32_t) {
-    return {64, 83, 67, 255};
+    return Color{0x40, 0x54, 0x26, 0xff};
 }
 
 // Draws pre-uploaded GPU chunks with an identity transform. One DrawMesh per
 // material run instead of one immediate-mode call per triangle.
-void draw_uploaded_city_model(GpuBuildingRenderModel& model, GfxDebugDrawCategory category) {
+void draw_uploaded_city_model(GpuBuildingRenderModel& model, GfxDebugDrawCategory category, bool terrain = false) {
     const auto transform = MatrixIdentity();
+    set_game_render_depth_output(true);
     rlDisableBackfaceCulling();
+    set_game_surface_window(false);
+    set_game_surface_building(false);
+    set_game_surface_terrain(terrain);
     for (auto& chunk : model.chunks) {
         if (chunk.material.maps == nullptr || chunk.mesh.vertexCount <= 0) {
             continue;
@@ -1701,6 +3117,8 @@ void draw_uploaded_city_model(GpuBuildingRenderModel& model, GfxDebugDrawCategor
         }
     }
     rlEnableBackfaceCulling();
+    set_game_surface_terrain(false);
+    set_game_render_depth_output(false);
 }
 
 // Frees the GPU meshes/materials a city model owns before it is replaced, so the
@@ -1714,21 +3132,86 @@ void unload_city_render_model(GpuBuildingRenderModel& model) {
     // and abort with a double free.
     model.chunks.clear();
     model.wire_lines.clear();
+    model.unload_shadow_volume_meshes();
+    model.shadow_volume_valid.fill(false);
+    model.shadow_volume_light_valid = false;
     model.uploaded_vertices = 0;
     model.uploaded_indices = 0;
     model.uploaded_bytes = 0;
 }
 
 GpuBuildingRenderModel upload_city_tile_model(const BuildingRenderBuffer& buffer, const EditorProject& project) {
-    return upload_city_buffer_model(buffer, project, [&buffer](std::uint32_t material) {
+    return upload_city_buffer_model(buffer, project, false, [&buffer](std::uint32_t material) {
         return city_tile_material_color(buffer, material);
     });
 }
 
 GpuBuildingRenderModel upload_city_terrain_model(const BuildingRenderBuffer& buffer, const EditorProject& project) {
-    return upload_city_buffer_model(buffer, project, [&buffer](std::uint32_t material) {
+    return upload_city_buffer_model(buffer, project, true, [&buffer](std::uint32_t material) {
         return terrain_material_color(buffer, material);
     });
+}
+
+void draw_city_road_markings(const MapScene& scene) {
+    constexpr float line_width = 0.26F;
+    const auto center_color = Color{226, 190, 72, 230};
+    const auto edge_color = Color{224, 229, 226, 210};
+    std::uint64_t triangles = 0U;
+
+    rlDisableBackfaceCulling();
+    for (const auto& road : scene.roads) {
+        const auto dx = road.to.x - road.from.x;
+        const auto dz = road.to.z - road.from.z;
+        const auto length = std::sqrt(dx * dx + dz * dz);
+        if (length <= scene.unit_size) {
+            continue;
+        }
+        const Vector3 direction{dx / length, 0.0F, dz / length};
+        const Vector3 perpendicular{-direction.z, 0.0F, direction.x};
+        const auto trim = std::min(road.width * 0.5F, length * 0.22F);
+        const auto start = trim;
+        const auto end = length - trim;
+        if (end <= start) {
+            continue;
+        }
+
+        const auto point = [&](float distance, float offset) {
+            const auto t = distance / length;
+            return Vector3{
+                road.from.x + direction.x * distance + perpendicular.x * offset,
+                road.from.y + (road.to.y - road.from.y) * t + 0.10F,
+                road.from.z + direction.z * distance + perpendicular.z * offset,
+            };
+        };
+        const auto stripe = [&](float from, float to, float offset, float width, Color color) {
+            const auto a = point(from, offset - width * 0.5F);
+            const auto b = point(from, offset + width * 0.5F);
+            const auto c = point(to, offset + width * 0.5F);
+            const auto d = point(to, offset - width * 0.5F);
+            DrawTriangle3D(a, b, c, color);
+            DrawTriangle3D(a, c, d, color);
+            triangles += 2U;
+        };
+
+        const auto edge_offset = std::max(scene.unit_size * 0.75F, road.width * 0.5F - scene.unit_size * 0.22F);
+        stripe(start, end, -edge_offset, line_width, edge_color);
+        stripe(start, end, edge_offset, line_width, edge_color);
+
+        const auto dash = scene.unit_size * 1.45F;
+        const auto gap = scene.unit_size * 0.65F;
+        for (auto distance = start; distance < end; distance += dash + gap) {
+            stripe(distance, std::min(distance + dash, end), 0.0F, line_width * 1.35F, center_color);
+        }
+    }
+    rlEnableBackfaceCulling();
+
+    if (g_gfx_debug_stats != nullptr && triangles > 0U) {
+        g_gfx_debug_stats->add_draw(
+            GfxDebugDrawCategory::RoadsCurbs,
+            triangles,
+            triangles * 3U,
+            triangles / 2U);
+    }
 }
 
 void draw_city_scene(
@@ -1748,7 +3231,7 @@ void draw_city_scene(
 
     if (render_terrain) {
         GfxDebugMaybeTimer timer{GfxDebugTimingPhase::TerrainDraw};
-        draw_uploaded_city_model(project.terrain_gpu_model, GfxDebugDrawCategory::Terrain);
+        draw_uploaded_city_model(project.terrain_gpu_model, GfxDebugDrawCategory::Terrain, true);
     }
 
     {
@@ -1869,11 +3352,13 @@ Model build_traffic_light_pole_model(float unit_size) {
     model.meshMaterial = reinterpret_cast<int*>(MemAlloc(static_cast<unsigned int>(boxes.size() * sizeof(int))));
     model.materials = static_cast<Material*>(MemAlloc(2 * sizeof(Material)));
     model.materials[0] = LoadMaterialDefault();
-    model.materials[0].shader = scene_lit_shader();
+    model.materials[0].shader = game_surface_shader();
     model.materials[0].maps[MATERIAL_MAP_DIFFUSE].color = Color{40, 43, 45, 255};
+    model.materials[0].maps[MATERIAL_MAP_METALNESS].texture = default_game_material_texture();
     model.materials[1] = LoadMaterialDefault();
-    model.materials[1].shader = scene_lit_shader();
+    model.materials[1].shader = game_surface_shader();
     model.materials[1].maps[MATERIAL_MAP_DIFFUSE].color = Color{205, 48, 38, 255};
+    model.materials[1].maps[MATERIAL_MAP_METALNESS].texture = default_game_material_texture();
 
     for (std::size_t index = 0; index < boxes.size(); ++index) {
         const auto& box = boxes[index];
@@ -1891,6 +3376,58 @@ Model build_traffic_light_pole_model(float unit_size) {
     return model;
 }
 
+// Bakes every pole's boxes of one material into world-space meshes, split so
+// each stays under raylib's 16-bit index limit.
+std::vector<Mesh> merge_traffic_light_poles(const Model& pole_model, const std::vector<CityTrafficLightPole>& poles, int material) {
+    constexpr int kMaxVertices = 60000;
+    std::vector<Mesh> merged;
+    std::vector<float> positions, normals, texcoords;
+    std::vector<unsigned short> indices;
+    const auto flush = [&] {
+        if (positions.empty()) return;
+        Mesh mesh{};
+        mesh.vertexCount = static_cast<int>(positions.size() / 3);
+        mesh.triangleCount = static_cast<int>(indices.size() / 3);
+        mesh.vertices = static_cast<float*>(MemAlloc(static_cast<unsigned int>(positions.size() * sizeof(float))));
+        mesh.normals = static_cast<float*>(MemAlloc(static_cast<unsigned int>(normals.size() * sizeof(float))));
+        mesh.texcoords = static_cast<float*>(MemAlloc(static_cast<unsigned int>(texcoords.size() * sizeof(float))));
+        mesh.indices = static_cast<unsigned short*>(MemAlloc(static_cast<unsigned int>(indices.size() * sizeof(unsigned short))));
+        std::copy(positions.begin(), positions.end(), mesh.vertices);
+        std::copy(normals.begin(), normals.end(), mesh.normals);
+        std::copy(texcoords.begin(), texcoords.end(), mesh.texcoords);
+        std::copy(indices.begin(), indices.end(), mesh.indices);
+        UploadMesh(&mesh, false);
+        merged.push_back(mesh);
+        positions.clear(); normals.clear(); texcoords.clear(); indices.clear();
+    };
+    for (const auto& pole : poles) {
+        // Same transform DrawModelEx applied per pole: the arm points along -Z,
+        // and raylib's +Y yaw is right-handed, so X is negated to aim it along
+        // arm_direction (the same handedness flip as the building rotations).
+        const auto yaw = std::atan2(-pole.arm_direction.x, -pole.arm_direction.z);
+        const auto rotation = MatrixRotateY(yaw);
+        const auto transform = MatrixMultiply(rotation, MatrixTranslate(pole.base.x, pole.base.y, pole.base.z));
+        for (int m = 0; m < pole_model.meshCount; ++m) {
+            if (pole_model.meshMaterial[m] != material) continue;
+            const auto& box = pole_model.meshes[m];
+            if (static_cast<int>(positions.size() / 3) + box.vertexCount > kMaxVertices) flush();
+            const auto base_index = static_cast<unsigned short>(positions.size() / 3);
+            for (int v = 0; v < box.vertexCount; ++v) {
+                const auto p = Vector3Transform({box.vertices[v * 3], box.vertices[v * 3 + 1], box.vertices[v * 3 + 2]}, transform);
+                const auto n = Vector3Transform({box.normals[v * 3], box.normals[v * 3 + 1], box.normals[v * 3 + 2]}, rotation);
+                positions.insert(positions.end(), {p.x, p.y, p.z});
+                normals.insert(normals.end(), {n.x, n.y, n.z});
+                texcoords.insert(texcoords.end(), {box.texcoords[v * 2], box.texcoords[v * 2 + 1]});
+            }
+            for (int i = 0; i < box.triangleCount * 3; ++i) {
+                indices.push_back(static_cast<unsigned short>(base_index + box.indices[i]));
+            }
+        }
+    }
+    flush();
+    return merged;
+}
+
 void draw_city_traffic_light_poles(const MapScene& scene) {
     static float cached_unit = -1.0F;
     static Model pole_model{};
@@ -1902,27 +3439,44 @@ void draw_city_traffic_light_poles(const MapScene& scene) {
         cached_unit = scene.unit_size;
     }
 
+    // Every pole shares one model, so bake them all into a few meshes (one
+    // draw per chunk and material) instead of a draw per box per pole. Rebake
+    // when the pole set changes.
+    static std::array<std::vector<Mesh>, 2> merged;
+    static std::size_t merged_key = 0;
+    std::size_t key = scene.traffic_light_poles.size();
     for (const auto& pole : scene.traffic_light_poles) {
-        const auto base = to_raylib(pole.base);
-        // The model's arm points along -Z; raylib's +Y rotation is right-handed
-        // (yaw +90 maps -Z to -X), so the X component is negated to aim the arm
-        // along arm_direction (same handedness flip as the building rotations).
-        const auto yaw = std::atan2(-pole.arm_direction.x, -pole.arm_direction.z) * RAD2DEG;
-        DrawModelEx(pole_model, base, Vector3{0.0F, 1.0F, 0.0F}, yaw, Vector3{1.0F, 1.0F, 1.0F}, WHITE);
-        if (g_gfx_debug_stats != nullptr) {
-            std::uint64_t triangles = 0;
-            std::uint64_t vertices = 0;
-            for (int mesh_index = 0; mesh_index < pole_model.meshCount; ++mesh_index) {
-                triangles += static_cast<std::uint64_t>(std::max(pole_model.meshes[mesh_index].triangleCount, 0));
-                vertices += static_cast<std::uint64_t>(std::max(pole_model.meshes[mesh_index].vertexCount, 0));
+        key = key * 31U + std::hash<float>{}(pole.base.x) + std::hash<float>{}(pole.base.y) * 7U +
+            std::hash<float>{}(pole.base.z) * 13U + std::hash<float>{}(pole.arm_direction.x) * 17U +
+            std::hash<float>{}(pole.arm_direction.z) * 19U;
+    }
+    if (key != merged_key) {
+        for (auto& chunks : merged) {
+            for (auto& mesh : chunks) UnloadMesh(mesh);
+            chunks.clear();
+        }
+        for (int material = 0; material < 2; ++material) {
+            merged[static_cast<std::size_t>(material)] = merge_traffic_light_poles(pole_model, scene.traffic_light_poles, material);
+        }
+        merged_key = key;
+    }
+
+    set_game_surface_window(false);
+    set_game_surface_building(false);
+    set_game_render_depth_output(true);
+    for (int material = 0; material < 2; ++material) {
+        for (const auto& mesh : merged[static_cast<std::size_t>(material)]) {
+            DrawMesh(mesh, pole_model.materials[material], MatrixIdentity());
+            if (g_gfx_debug_stats != nullptr) {
+                g_gfx_debug_stats->add_draw(
+                    GfxDebugDrawCategory::TrafficLightPoles,
+                    static_cast<std::uint64_t>(mesh.triangleCount),
+                    static_cast<std::uint64_t>(mesh.vertexCount),
+                    1U);
             }
-            g_gfx_debug_stats->add_draw(
-                GfxDebugDrawCategory::TrafficLightPoles,
-                triangles,
-                vertices,
-                static_cast<std::uint64_t>(std::max(pole_model.meshCount, 0)));
         }
     }
+    set_game_render_depth_output(false);
 }
 
 void draw_city_cursor(CityGridPoint point, float unit_size, CityTool tool) {
@@ -1955,9 +3509,8 @@ void draw_city_edit_grid(CityGridPoint center, const MapScene& scene) {
     const float max_z = static_cast<float>(center.z + half_cells) * unit;
 
     // Modelled on raylib's DrawGrid: one rlBegin(RL_LINES) batch with raw
-    // rlVertex3f/rlColor4ub instead of N DrawLine3D calls. Lines on every 10th
-    // absolute grid coordinate are "major": brighter and a 3-line bundle so they
-    // read as thicker without per-line width.
+    // rlVertex3f/rlColor4ub instead of N DrawLine3D calls. Major lines get
+    // world-space width below; GL line width is unreliable on core profiles.
     const auto is_major = [](std::int32_t coord) { return coord % 10 == 0; };
     const auto set_color = [](bool axis, bool major) {
         if (axis) {
@@ -1979,27 +3532,31 @@ void draw_city_edit_grid(CityGridPoint center, const MapScene& scene) {
         const bool major = axis || is_major(gx);
         set_color(axis, major);
         const float wx = static_cast<float>(gx) * unit;
-        const int bundle = major ? 1 : 0;
-        for (int b = -bundle; b <= bundle; ++b) {
-            const float off = static_cast<float>(b) * unit * 0.05F;
-            rlVertex3f(wx + off, plane_y, min_z);
-            rlVertex3f(wx + off, plane_y, max_z);
-        }
+        rlVertex3f(wx, plane_y, min_z);
+        rlVertex3f(wx, plane_y, max_z);
     }
     for (std::int32_t gz = center.z - half_cells; gz <= center.z + half_cells; ++gz) {
         const bool axis = gz == center.z;
         const bool major = axis || is_major(gz);
         set_color(axis, major);
         const float wz = static_cast<float>(gz) * unit;
-        const int bundle = major ? 1 : 0;
-        for (int b = -bundle; b <= bundle; ++b) {
-            const float off = static_cast<float>(b) * unit * 0.05F;
-            rlVertex3f(min_x, plane_y, wz + off);
-            rlVertex3f(max_x, plane_y, wz + off);
-        }
+        rlVertex3f(min_x, plane_y, wz);
+        rlVertex3f(max_x, plane_y, wz);
     }
     rlEnd();
     rlDrawRenderBatchActive();
+    for (std::int32_t gx = center.x - half_cells; gx <= center.x + half_cells; ++gx) {
+        if (!is_major(gx) && gx != center.x) continue;
+        const float x = static_cast<float>(gx) * unit;
+        DrawCylinderEx({x, plane_y, min_z}, {x, plane_y, max_z}, unit * 0.025F,
+            unit * 0.025F, 4, Color{170, 195, 220, 180});
+    }
+    for (std::int32_t gz = center.z - half_cells; gz <= center.z + half_cells; ++gz) {
+        if (!is_major(gz) && gz != center.z) continue;
+        const float z = static_cast<float>(gz) * unit;
+        DrawCylinderEx({min_x, plane_y, z}, {max_x, plane_y, z}, unit * 0.025F,
+            unit * 0.025F, 4, Color{170, 195, 220, 180});
+    }
     rlEnableDepthMask();
     rlEnableDepthTest();
 }
@@ -2158,6 +3715,10 @@ void draw_buildblock_preview_3d(const BuildblockPreviewScene& scene) {
         DrawCubeV(pos, sz, Color{ 255, 210, 115, 255 });
         DrawCubeWiresV(pos, sz, WHITE);
     }
+}
+
+void draw_gpu_building_model_public(GpuBuildingRenderModel& model, Vector3 origin, std::int32_t rotation) {
+    draw_gpu_building_model(model, origin, rotation, false, false, GfxDebugDrawCategory::CityCells);
 }
 
 } // namespace map_editor::app_internal

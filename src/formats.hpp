@@ -24,6 +24,8 @@ struct SbbCellPayload {
     // Block/Piece id decoded from low payload bits. Piece uses word & 0x3ff
     // in native UI paths; legacy block payload tests keep the broader low word.
     std::uint32_t index{};
+
+    bool operator==(const SbbCellPayload&) const = default;
 };
 
 struct SbbCell {
@@ -66,6 +68,8 @@ struct SbbCell {
     std::uint32_t& exterior_portal_face() { return words[exterior_portal_face_word]; }
     std::uint32_t& interior_portal_face() { return words[interior_portal_face_word]; }
     std::uint32_t& placed_flag() { return words[placed_flag_word]; }
+
+    bool operator==(const SbbCell&) const = default;
 };
 
 struct SbbBuilding {
@@ -88,6 +92,8 @@ struct SbbBuilding {
     std::uint32_t lod_marker{};
     std::uint32_t lod_group_count{};
     std::vector<std::uint8_t> lod_tail;
+
+    bool operator==(const SbbBuilding&) const = default;
 };
 
 struct SbcIntersection {
@@ -95,6 +101,8 @@ struct SbcIntersection {
     std::int32_t x{};
     std::int32_t y{};
     std::int32_t z{};
+
+    bool operator==(const SbcIntersection&) const = default;
 };
 
 struct SbcStreet {
@@ -105,6 +113,8 @@ struct SbcStreet {
     std::int32_t left_width{};
     std::int32_t right_width{};
     std::string name;
+
+    bool operator==(const SbcStreet&) const = default;
 };
 
 struct SbcBuilding {
@@ -114,12 +124,16 @@ struct SbcBuilding {
     std::int32_t y{};
     std::int32_t z{};
     std::int32_t rotation{};
+
+    bool operator==(const SbcBuilding&) const = default;
 };
 
 struct SbcCityBlock {
     std::size_t index{};
     std::string name;
     std::vector<std::array<std::string, 8>> layers;
+
+    bool operator==(const SbcCityBlock&) const = default;
 };
 
 inline constexpr std::string_view native_default_city_block_display_name = "nblock";
@@ -144,32 +158,43 @@ struct SbcPortal {
     const std::vector<std::uint32_t>& voxel_blocks() const {
         return blocks.empty() ? legacy_blocks : blocks;
     }
+
+    bool operator==(const SbcPortal&) const = default;
 };
 
 struct SbcPortalConnection {
     std::size_t index{};
     std::array<std::int32_t, 3> fields{};
+
+    bool operator==(const SbcPortalConnection&) const = default;
 };
 
 struct SbcMap {
     std::uint32_t version{};
+    std::vector<std::array<std::uint8_t, 64>> header_records;
     std::vector<SbcIntersection> intersections;
     std::vector<SbcStreet> streets;
     std::vector<SbcBuilding> buildings;
     std::vector<SbcCityBlock> city_blocks;
     std::vector<SbcPortal> portals;
     std::vector<SbcPortalConnection> portal_connections;
+
+    bool operator==(const SbcMap&) const = default;
 };
 
 struct Vec3f {
     float x{};
     float y{};
     float z{};
+
+    bool operator==(const Vec3f&) const = default;
 };
 
 struct Vec2f {
     float u{};
     float v{};
+
+    bool operator==(const Vec2f&) const = default;
 };
 
 struct SblBlockFace {
@@ -178,18 +203,24 @@ struct SblBlockFace {
     std::vector<Vec2f> uvs;
     bool authored{};
     std::uint32_t orientation{};
+
+    bool operator==(const SblBlockFace&) const = default;
 };
 
 struct SblBlockLight {
     std::array<Vec3f, 8> points{};
     std::array<std::uint32_t, 6> scalars{};
     std::uint32_t final_value{};
+
+    bool operator==(const SblBlockLight&) const = default;
 };
 
 struct SblControlPoint {
     Vec3f position{};
     float u{};
     float v{};
+
+    bool operator==(const SblControlPoint&) const = default;
 };
 
 struct SblAuthoredPatch {
@@ -202,6 +233,8 @@ struct SblAuthoredPatch {
     std::uint32_t normal_flag_a{};
     std::uint32_t normal_flag_b{};
     std::vector<SblControlPoint> control_points;
+
+    bool operator==(const SblAuthoredPatch&) const = default;
 };
 
 struct SblBlockMesh {
@@ -214,12 +247,16 @@ struct SblBlockMesh {
     std::vector<SblBlockFace> faces;
     std::vector<SblAuthoredPatch> authored_patches;
     std::vector<SblBlockLight> lights;
+
+    bool operator==(const SblBlockMesh&) const = default;
 };
 
 struct SblDoor {
     std::uint32_t type{};
     float x{};
     float y{};
+
+    bool operator==(const SblDoor&) const = default;
 };
 
 struct SblPortalRect {
@@ -228,6 +265,8 @@ struct SblPortalRect {
     float width{};
     float y{};
     float height{};
+
+    bool operator==(const SblPortalRect&) const = default;
 };
 
 struct SblLayer {
@@ -242,6 +281,8 @@ struct SblLayer {
     std::vector<SblPortalRect> windows;
     std::uint32_t beam_count{};
     std::vector<SblPortalRect> beams;
+
+    bool operator==(const SblLayer&) const = default;
 };
 
 struct SblTemplate {
@@ -250,6 +291,8 @@ struct SblTemplate {
     // buildblock .sbl whose layers drive portal/edge wall geometry.
     std::optional<SblBlockMesh> block;
     std::vector<SblLayer> layers;
+
+    bool operator==(const SblTemplate&) const = default;
 };
 
 using SblBuildblockTemplate = SblTemplate;
@@ -306,6 +349,8 @@ std::vector<std::uint8_t> patch_sbl_layer_portal_type(
     const SblTemplate& template_file,
     std::size_t layer_index,
     std::uint32_t portal_type);
+std::vector<std::uint8_t> rebuild_sbl_block(const SblBlockMesh& block);
+std::vector<std::uint8_t> rebuild_sbl_buildblock(const SblTemplate& template_file);
 std::vector<std::uint8_t> patch_sbl_layers(const std::vector<std::uint8_t>& bytes, const SblTemplate& template_file);
 std::vector<std::uint8_t> build_csx(const CsxArchive& archive);
 

@@ -110,17 +110,17 @@ void update_free_fly_camera(Camera3D& camera, float fly_speed) {
     if (IsKeyDown(KEY_A)) {
         movement = subtract(movement, right_xz);
     }
-    if (IsKeyDown(KEY_SPACE)) {
+    if (IsKeyDown(KEY_SPACE) || IsKeyDown(KEY_E)) {
         movement = add(movement, kWorldUp);
     }
-    if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) {
+    if (IsKeyDown(KEY_Q)) {
         movement = subtract(movement, kWorldUp);
     }
 
     const auto movement_len = length(movement);
     if (movement_len > std::numeric_limits<float>::epsilon()) {
-        const auto ctrl_multiplier = (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) ? 2.0F : 1.0F;
-        const auto step = adjust_camera_fly_speed(fly_speed, 0.0F) * ctrl_multiplier * GetFrameTime();
+        const auto boost = (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) ? 3.0F : 1.0F;
+        const auto step = adjust_camera_fly_speed(fly_speed, 0.0F) * boost * GetFrameTime();
         const auto delta = scale(movement, step / movement_len);
         camera.position = add(camera.position, delta);
     }
@@ -145,17 +145,135 @@ Ray get_viewport_mouse_ray(const Camera3D& camera, Vector2 viewport_mouse_pos, V
         static_cast<int>(std::max(1.0F, viewport_size.y)));
 }
 
+void update_orbit_camera(Camera3D& camera, EditorUi& ui, Vector2 viewport_mouse_pos, Vector2 viewport_size,
+                         bool viewport_hovered, const MapScene* scene) {
+    constexpr float kFallbackPivotDistance = 50.0F;
+    const auto ray = get_viewport_mouse_ray(camera, viewport_mouse_pos, viewport_size);
+    // Terrain (or the y=0 plane) under the cursor, as the orbit/pan/zoom pivot.
+    const auto ground_distance = [&]() -> std::optional<float> {
+        if (scene != nullptr && scene->terrain.has_value()) {
+            const auto hit = ray_terrain_hit(*scene->terrain,
+                {ray.position.x, ray.position.y, ray.position.z}, {ray.direction.x, ray.direction.y, ray.direction.z});
+            if (hit.has_value()) {
+                return length(subtract(Vector3{hit->x, hit->y, hit->z}, ray.position));
+            }
+        } else if (std::fabs(ray.direction.y) > 0.0001F) {
+            const auto t = -ray.position.y / ray.direction.y;
+            if (t > 0.0F) return t;
+        }
+        return std::nullopt;
+    };
+
+    const bool alt = IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT);
+    if (viewport_hovered && ui.camera_drag == CameraDrag::None) {
+        const bool orbit = alt && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+        const bool pan = IsMouseButtonPressed(MOUSE_BUTTON_MIDDLE);
+        if (orbit || pan) {
+            ui.camera_drag = orbit ? CameraDrag::Orbit : CameraDrag::Pan;
+            ui.camera_pivot_distance = ground_distance().value_or(kFallbackPivotDistance);
+            ui.camera_pivot = add(ray.position, scale(ray.direction, ui.camera_pivot_distance));
+            ui.focus_animating = false;
+        }
+    }
+
+    const auto delta = GetMouseDelta();
+    auto forward = normalize_or(subtract(camera.target, camera.position), {0.0F, 0.0F, -1.0F});
+    if (ui.camera_drag == CameraDrag::Orbit) {
+        if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            ui.camera_drag = CameraDrag::None;
+        } else {
+            // Same rotation as free-fly mouse look, applied around the pivot.
+            const auto yaw = -delta.x * kMouseLookRadiansPerPixel;
+            auto offset = rotate_around_axis(subtract(camera.position, ui.camera_pivot), kWorldUp, yaw);
+            forward = normalize_or(rotate_around_axis(forward, kWorldUp, yaw), forward);
+            const auto current_pitch = std::asin(std::clamp(forward.y, -1.0F, 1.0F));
+            const auto target_pitch = std::clamp(current_pitch - delta.y * kMouseLookRadiansPerPixel, -kMaxPitchRadians, kMaxPitchRadians);
+            const auto right = normalize_or(cross(forward, kWorldUp), {1.0F, 0.0F, 0.0F});
+            offset = rotate_around_axis(offset, right, target_pitch - current_pitch);
+            forward = normalize_or(rotate_around_axis(forward, right, target_pitch - current_pitch), forward);
+            camera.position = add(ui.camera_pivot, offset);
+            camera.target = add(camera.position, forward);
+            camera.up = kWorldUp;
+        }
+    } else if (ui.camera_drag == CameraDrag::Pan) {
+        if (!IsMouseButtonDown(MOUSE_BUTTON_MIDDLE)) {
+            ui.camera_drag = CameraDrag::None;
+        } else {
+            // World units per pixel at the pivot depth, so the grabbed point
+            // stays under the cursor.
+            const auto units_per_pixel = 2.0F * ui.camera_pivot_distance *
+                std::tan(camera.fovy * 0.5F * DEG2RAD) / std::max(1.0F, viewport_size.y);
+            const auto right = normalize_or(cross(forward, kWorldUp), {1.0F, 0.0F, 0.0F});
+            const auto up = cross(right, forward);
+            const auto move = add(scale(right, -delta.x * units_per_pixel), scale(up, delta.y * units_per_pixel));
+            camera.position = add(camera.position, move);
+            camera.target = add(camera.target, move);
+        }
+    }
+
+    // Browsers and trackpads can report several notches in one event; cap a
+    // frame at one notch so a single flick cannot dive through the scene.
+    const auto wheel = std::clamp(GetMouseWheelMove(), -1.0F, 1.0F);
+    if (viewport_hovered && ui.camera_drag == CameraDrag::None && std::fabs(wheel) > 0.0F) {
+        // Each notch covers a fixed share of the distance to the point under the
+        // cursor, so zoom never passes through it.
+        const auto distance = ground_distance().value_or(kFallbackPivotDistance);
+        const auto step = distance * (1.0F - std::pow(0.8F, wheel));
+        const auto move = scale(ray.direction, step);
+        camera.position = add(camera.position, move);
+        camera.target = add(camera.target, move);
+        ui.focus_animating = false;
+    }
+}
+
 void focus_camera_on_city(Camera3D& camera, const EditorProject& project) {
     if (!project.city) {
         camera = default_camera();
         return;
     }
-    const auto scene = build_map_scene(project.city->data);
-    const float center_x = (scene.bounds.min_x + scene.bounds.max_x) * 0.5F;
-    const float center_z = (scene.bounds.min_z + scene.bounds.max_z) * 0.5F;
+    constexpr float unit_size = 4.0F;
+    float min_x = std::numeric_limits<float>::max();
+    float max_x = std::numeric_limits<float>::lowest();
+    float min_z = std::numeric_limits<float>::max();
+    float max_z = std::numeric_limits<float>::lowest();
+    float height_sum = 0.0F;
+    std::size_t point_count = 0;
+    const auto include = [&](std::int32_t x, std::int32_t y, std::int32_t z) {
+        const float world_x = static_cast<float>(x) * unit_size;
+        const float world_z = static_cast<float>(z) * unit_size;
+        min_x = std::min(min_x, world_x);
+        max_x = std::max(max_x, world_x);
+        min_z = std::min(min_z, world_z);
+        max_z = std::max(max_z, world_z);
+        height_sum += static_cast<float>(y) * unit_size;
+        ++point_count;
+    };
+    for (const auto& intersection : project.city->data.intersections) {
+        include(intersection.x, intersection.y, intersection.z);
+    }
+    for (const auto& building : project.city->data.buildings) {
+        include(building.x, building.y, building.z);
+    }
+    if (point_count == 0U) {
+        camera = default_camera();
+        return;
+    }
+    const float center_x = (min_x + max_x) * 0.5F;
+    const float center_z = (min_z + max_z) * 0.5F;
+    const float span_x = std::max(max_x - min_x, 1.0F);
+    const float span_z = std::max(max_z - min_z, 1.0F);
+    const float radius = 0.5F * std::sqrt(span_x * span_x + span_z * span_z);
+    const float center_y = height_sum / static_cast<float>(point_count);
+    // Fit the complete landscape instead of using the old fixed 96-unit offset,
+    // which placed the camera inside large maps. The diagonal view keeps both
+    // horizontal extents visible and leaves headroom for buildings. The
+    // bounding circle overstates a flat city seen from this angle; 1.65 radii
+    // fills most of the viewport (the old 2.7 left it at about half the width).
+    const float distance = std::max(160.0F, radius * 1.65F);
+    const Vector3 view_direction = normalize_or(Vector3{1.0F, 0.8F, 1.0F}, Vector3{1.0F, 0.0F, 1.0F});
 
-    camera.target = Vector3{center_x, 16.0F, center_z};
-    camera.position = Vector3{center_x + 96.0F, 80.0F, center_z + 96.0F};
+    camera.target = Vector3{center_x, center_y, center_z};
+    camera.position = add(camera.target, scale(view_direction, distance));
     camera.up = Vector3{0.0F, 1.0F, 0.0F};
     camera.fovy = 60.0F;
     camera.projection = CAMERA_PERSPECTIVE;

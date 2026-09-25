@@ -712,6 +712,16 @@ std::uint32_t material_for_cell_side(const SbbCell& cell, BuildingFaceSide side)
     return material_for_cell_slot(cell, static_cast<std::uint32_t>(slot));
 }
 
+std::uint32_t material_for_piece_face(const SbbCell& cell, std::uint32_t slot, bool interior) {
+    // RenderBuildingCellFaceGroupWorld/Preview clamp logical face slots to
+    // 0..7. Interior faces use the cell's interior texture set for slots 0..7;
+    // slots 8..15 address the exterior set after subtracting eight.
+    if (interior) {
+        return material_for_cell_slot(cell, slot < 8U ? slot + 8U : slot < 16U ? slot - 8U : 0U);
+    }
+    return material_for_cell_slot(cell, std::min(slot, 7U));
+}
+
 std::array<Vec3, 4> native_preview_cube_face_vertices(const SbbCell& cell, std::uint32_t face, float unit_size) {
     std::array<Vec3, 4> vertices{};
     const auto& corners = native_preview_face_corners[face];
@@ -1186,12 +1196,18 @@ void add_native_solid_cell_faces(
 
         std::vector<PortalRect> window_rects;
         const auto portal_side = portal_side_for_building_face(side.side);
-        if (portal_side.has_value()) {
+        // BuildBuildingBlockRenderBuffers only expands the exterior edge
+        // profile when the cell has no interior block (native
+        // interiorBlock == 0xffff). An interior piece owns that side's
+        // geometry and must not inherit the exterior window mask.
+        if (portal_side.has_value() && cell.interior_block() == 0xffffU) {
             const auto side_code = city_buildblock_side_code_for_face(cell, east, side.side);
             if (const auto* layer = buildblock_layer_for_side_code(template_file, side_code)) {
-                // FUN_140051c60 emits layer window rects as buildblock opening
-                // geometry; BuildBuildingBlockRenderBuffers tags itemset/opening
-                // quads with slot 0x100. Only these rects get the city window texture.
+                // FUN_140051c60 emits the window rectangles. The game then builds
+                // a per-signature texture-array layer from the wall texture and
+                // writes the window mask into its alpha channel. Keep the wall
+                // material on these separate quads so the shader sees the same
+                // base color instead of an unrelated replacement texture.
                 window_rects = city_buildblock_window_rects(*layer, *portal_side);
             }
         }
@@ -1222,7 +1238,7 @@ void add_native_solid_cell_faces(
                 cy,
                 cz,
                 rect,
-                0x100U,
+                wall_material,
                 true,
                 top_slope);
         }
@@ -2353,6 +2369,78 @@ BuildingRenderBuffer build_city_tile_render_buffer(const std::vector<CityTileCel
     return buffer;
 }
 
+void add_city_road_markings(
+    BuildingRenderBuffer& buffer,
+    const std::vector<RenderRoad>& roads,
+    const std::vector<CityTileCell>& tiles) {
+    VertexIndexMap vertex_indices;
+    const auto center_material = material_id_for_name(buffer, "city_road_line_yellow");
+    const auto edge_material = material_id_for_name(buffer, "city_road_line_white");
+    constexpr float line_width = 0.26F;
+    constexpr float surface_offset = 0.06F;
+    const std::array<Vec2f, 4> uvs{{{0.0F, 0.0F}, {1.0F, 0.0F}, {1.0F, 1.0F}, {0.0F, 1.0F}}};
+    std::unordered_map<std::uint64_t, const CityTileCell*> road_tiles;
+    road_tiles.reserve(tiles.size());
+    const auto tile_key = [](std::int32_t x, std::int32_t z) {
+        return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 32U) |
+            static_cast<std::uint32_t>(z);
+    };
+    for (const auto& tile : tiles) {
+        if (tile.kind == CityTileKind::Road) {
+            road_tiles[tile_key(tile.x, tile.z)] = &tile;
+        }
+    }
+    for (const auto& road : roads) {
+        const auto dx = road.to.x-road.from.x;
+        const auto dz = road.to.z-road.from.z;
+        const auto length = std::sqrt(dx*dx+dz*dz);
+        if (length <= buffer.unit_size) continue;
+        const Vec3 direction{dx/length, 0.0F, dz/length};
+        const Vec3 perpendicular{-direction.z, 0.0F, direction.x};
+        const auto trim = std::min(road.width*0.5F, length*0.22F);
+        const auto point = [&](float distance, float offset) {
+            const auto t = distance/length;
+            Vec3 result{
+                road.from.x+direction.x*distance+perpendicular.x*offset,
+                road.from.y+(road.to.y-road.from.y)*t,
+                road.from.z+direction.z*distance+perpendicular.z*offset,
+            };
+            const auto cell_x = static_cast<std::int32_t>(std::floor(result.x/buffer.unit_size));
+            const auto cell_z = static_cast<std::int32_t>(std::floor(result.z/buffer.unit_size));
+            if (const auto tile = road_tiles.find(tile_key(cell_x, cell_z)); tile != road_tiles.end()) {
+                const auto* surface = tile->second;
+                const auto center_x = (static_cast<float>(surface->x)+0.5F)*buffer.unit_size;
+                const auto center_z = (static_cast<float>(surface->z)+0.5F)*buffer.unit_size;
+                result.y = surface->base_y+buffer.unit_size+
+                    surface->slope_x*((result.x-center_x)/buffer.unit_size)+
+                    surface->slope_z*((result.z-center_z)/buffer.unit_size);
+            }
+            result.y += surface_offset;
+            return result;
+        };
+        const auto stripe = [&](float from, float to, float offset, float width, std::uint32_t material) {
+            // Follow the per-cell tilted road surface. A single long quad cuts
+            // through the game's slope tiles and loses markings on grades.
+            for (auto segment_from = from; segment_from < to; segment_from += buffer.unit_size) {
+                const auto segment_to = std::min(segment_from+buffer.unit_size, to);
+                add_quad(buffer, vertex_indices, {
+                    point(segment_from, offset-width*0.5F), point(segment_from, offset+width*0.5F),
+                    point(segment_to, offset+width*0.5F), point(segment_to, offset-width*0.5F),
+                }, uvs, material);
+            }
+        };
+        const auto edge = std::max(buffer.unit_size*0.75F, road.width*0.5F-buffer.unit_size*0.22F);
+        stripe(trim, length-trim, -edge, line_width, edge_material);
+        stripe(trim, length-trim, edge, line_width, edge_material);
+        const auto dash = buffer.unit_size*1.45F;
+        const auto gap = buffer.unit_size*0.65F;
+        for (auto distance = trim; distance < length-trim; distance += dash+gap) {
+            stripe(distance, std::min(distance+dash, length-trim), 0.0F, line_width*1.35F, center_material);
+        }
+    }
+    sort_triangles_into_native_material_runs(buffer);
+}
+
 std::optional<CityTerrain> build_city_terrain(
     const SbcMap& map,
     const NativeCityGraph& expanded_graph,
@@ -2454,13 +2542,23 @@ std::optional<CityTerrain> build_city_terrain(
         // Mesh/query resolution. The native heightfield below is computed at the
         // native 1 world-unit sample spacing; the emitted mesh samples it every
         // 2 units to keep the vertex count tractable.
+#ifdef __EMSCRIPTEN__
+        // The desktop path keeps a dense one-unit patched field. Building that
+        // field synchronously in WebAssembly can stall the editor for minutes
+        // when a map spans thousands of units. The browser keeps the complete
+        // 0x4000 landscape but samples its editable/query surface at the same
+        // four-unit cell scale used by city tools.
+        4.0F,
+#else
         2.0F,
+#endif
         {},
         {},
     };
 
     // Native 1-unit heightfield: base island field, then the hardcoded
     // intersection block patches.
+#ifndef __EMSCRIPTEN__
     CityHeightfield field;
     field.min_x = static_cast<std::int32_t>(terrain.min_x);
     field.min_z = static_cast<std::int32_t>(terrain.min_z);
@@ -2477,6 +2575,23 @@ std::optional<CityTerrain> build_city_terrain(
     for (const auto patch_index : native_city_terrain_patch_indices) {
         apply_native_city_terrain_patch(field, expanded_graph, stamps, patch_index);
     }
+#endif
+
+    const auto terrain_height = [&](float world_x, float world_z) {
+#ifdef __EMSCRIPTEN__
+        return native_like_city_terrain_height(world_x, world_z);
+#else
+        if (world_x >= terrain.min_x && world_x <= terrain.max_x &&
+            world_z >= terrain.min_z && world_z <= terrain.max_z) {
+            const auto sample_x = std::clamp(
+                static_cast<std::int32_t>(world_x), field.min_x, field.min_x + field.count_x - 1);
+            const auto sample_z = std::clamp(
+                static_cast<std::int32_t>(world_z), field.min_z, field.min_z + field.count_z - 1);
+            return field.get(sample_x, sample_z);
+        }
+        return native_like_city_terrain_height(world_x, world_z);
+#endif
+    };
 
     terrain.sample_count_x = std::max(2, static_cast<std::int32_t>(std::ceil((terrain.max_x - terrain.min_x) / terrain.sample_spacing)) + 1);
     terrain.sample_count_z = std::max(2, static_cast<std::int32_t>(std::ceil((terrain.max_z - terrain.min_z) / terrain.sample_spacing)) + 1);
@@ -2488,27 +2603,66 @@ std::optional<CityTerrain> build_city_terrain(
         for (auto x = 0; x < terrain.sample_count_x; ++x) {
             const auto world_x = std::min(terrain.max_x, terrain.min_x + static_cast<float>(x) * terrain.sample_spacing);
             const auto world_z = std::min(terrain.max_z, terrain.min_z + static_cast<float>(z) * terrain.sample_spacing);
-            const auto sample_x = std::clamp(
-                static_cast<std::int32_t>(world_x), field.min_x, field.min_x + field.count_x - 1);
-            const auto sample_z = std::clamp(
-                static_cast<std::int32_t>(world_z), field.min_z, field.min_z + field.count_z - 1);
-            const auto height = field.get(sample_x, sample_z);
-            terrain.heights.push_back(height);
-            terrain.mesh.vertices.push_back({{world_x, height - city_terrain_mesh_y_offset, world_z}, 0.0F, 0.0F});
+            terrain.heights.push_back(terrain_height(world_x, world_z));
+            // Keep the patched local height samples for picking and object
+            // placement. The render mesh is generated below in the native
+            // 128-unit landscape chunks.
         }
     }
 
-    for (auto z = 0; z < terrain.sample_count_z - 1; ++z) {
-        for (auto x = 0; x < terrain.sample_count_x - 1; ++x) {
+    // Native landscape dimensions proven in
+    // Terrain_RebuildLandTilesRoadPatchesAndChunkCaches @ d12e0:
+    // 2049 source samples, expanded 8x to a 0x4000-square world. Rendering
+    // splits that field into 128-unit subchunks and uses steps 1..64. Use the
+    // city as the stable editor focus (the game uses the camera) so the full
+    // island is always present without rebuilding terrain on every camera move.
+    constexpr float landscape_min = -4096.0F;
+    constexpr float landscape_max = landscape_min + 16384.0F;
+    constexpr std::int32_t chunk_size = 128;
+    const auto focus_x = (terrain.min_x + terrain.max_x) * 0.5F;
+    const auto focus_z = (terrain.min_z + terrain.max_z) * 0.5F;
+    auto lod_step = [&](float chunk_x, float chunk_z) {
+        const auto dx = chunk_x + 64.0F - focus_x;
+        const auto dz = chunk_z + 64.0F - focus_z;
+        const auto distance = std::sqrt(dx * dx + dz * dz);
+        // The native game streams only camera-visible subchunks. This editor
+        // mesh is persistent, so native near-LOD radii would expand to about
+        // five million uploaded vertices and starve UI input. Preserve the full
+        // 0x4000 world but keep high detail local to the authored city.
+        if (distance < 256.0F) return 4;
+        if (distance < 512.0F) return 8;
+        if (distance < 1024.0F) return 16;
+        if (distance < 2048.0F) return 32;
+        return 64;
+    };
+    auto render_height = terrain_height;
+
+    for (auto chunk_z = landscape_min; chunk_z < landscape_max; chunk_z += static_cast<float>(chunk_size)) {
+        for (auto chunk_x = landscape_min; chunk_x < landscape_max; chunk_x += static_cast<float>(chunk_size)) {
+            const auto step = lod_step(chunk_x, chunk_z);
+            const auto side = chunk_size / step + 1;
+            const auto first_vertex = static_cast<std::uint32_t>(terrain.mesh.vertices.size());
+            for (auto z = 0; z < side; ++z) {
+                for (auto x = 0; x < side; ++x) {
+                    const auto world_x = chunk_x + static_cast<float>(x * step);
+                    const auto world_z = chunk_z + static_cast<float>(z * step);
+                    terrain.mesh.vertices.push_back({
+                        {world_x, render_height(world_x, world_z) - city_terrain_mesh_y_offset, world_z},
+                        world_x/32.0F,
+                        1.0F-world_z/32.0F});
+                }
+            }
+            for (auto z = 0; z < side - 1; ++z) {
+                for (auto x = 0; x < side - 1; ++x) {
             // Skip terrain quads that sit under a road/curb tile — the tile's top
             // surface is the ground there, and the coincident terrain plane
             // z-fights it. The quad's footprint (2 units) fits inside one 4-unit
             // tile cell; test the four corners and skip only when all are covered
             // so the cut follows the tile footprint without leaving holes.
-            const auto quad_min_x = terrain.min_x + static_cast<float>(x) * terrain.sample_spacing;
-            const auto quad_min_z = terrain.min_z + static_cast<float>(z) * terrain.sample_spacing;
-            const auto quad_max_x = quad_min_x + terrain.sample_spacing;
-            const auto quad_max_z = quad_min_z + terrain.sample_spacing;
+            const auto quad_min_x = chunk_x + static_cast<float>(x * step);
+            const auto quad_min_z = chunk_z + static_cast<float>(z * step);
+            const auto quad_max_x = quad_min_x + static_cast<float>(step);
+            const auto quad_max_z = quad_min_z + static_cast<float>(step);
             const auto cell_of = [&](float wx, float wz) {
                 return cell_covered(
                     static_cast<std::int32_t>(std::floor(wx / unit_size)),
@@ -2523,12 +2677,14 @@ std::optional<CityTerrain> build_city_terrain(
                 cell_of(quad_max_x - eps, quad_max_z - eps)) {
                 continue;
             }
-            const auto i0 = static_cast<std::uint32_t>(z * terrain.sample_count_x + x);
-            const auto i1 = static_cast<std::uint32_t>(z * terrain.sample_count_x + x + 1);
-            const auto i2 = static_cast<std::uint32_t>((z + 1) * terrain.sample_count_x + x + 1);
-            const auto i3 = static_cast<std::uint32_t>((z + 1) * terrain.sample_count_x + x);
+            const auto i0 = first_vertex + static_cast<std::uint32_t>(z * side + x);
+            const auto i1 = i0 + 1U;
+            const auto i3 = first_vertex + static_cast<std::uint32_t>((z + 1) * side + x);
+            const auto i2 = i3 + 1U;
             terrain.mesh.triangles.push_back({{i0, i1, i2}, 0U, false});
             terrain.mesh.triangles.push_back({{i0, i2, i3}, 0U, false});
+                }
+            }
         }
     }
 
@@ -2711,7 +2867,34 @@ BuildingRenderBuffer build_native_building_render_buffer(
     BuildingRenderBuffer buffer;
     const auto unit_size = buffer.unit_size;
     VertexIndexMap vertex_indices;
+    vertex_indices.reserve(building.cells.size() * 4U);
+    buffer.vertices.reserve(building.cells.size() * 4U);
+    buffer.triangles.reserve(building.cells.size() * 6U);
     const auto cell_index = build_cell_index(building.cells);
+
+    const auto piece_resolution_count = begins_with_native_builtin_block_meshes(block_meshes)
+        ? std::max(building.piece_names.size(), block_meshes.size())
+        : building.piece_names.size();
+    std::vector<const SblBlockMesh*> resolved_piece_meshes(piece_resolution_count);
+    for (std::size_t index = 0; index < resolved_piece_meshes.size(); ++index) {
+        resolved_piece_meshes[index] = resolve_building_block_mesh(
+            block_meshes,
+            building.piece_names,
+            static_cast<std::uint32_t>(index));
+    }
+    std::vector<const SblTemplate*> resolved_buildblock_templates(building.block_names.size());
+    for (std::size_t index = 0; index < resolved_buildblock_templates.size(); ++index) {
+        resolved_buildblock_templates[index] = resolve_building_buildblock_template(
+            buildblock_templates,
+            building.block_names,
+            static_cast<std::uint32_t>(index));
+    }
+
+    const auto resolved_piece_mesh = [&](std::uint32_t index) -> const SblBlockMesh* {
+        return index < resolved_piece_meshes.size()
+            ? resolved_piece_meshes[index]
+            : &native_builtin_block_mesh_singleton();
+    };
 
     auto cell_origin = [&](const SbbCell& cell) {
         return Vec3{
@@ -2728,7 +2911,7 @@ BuildingRenderBuffer build_native_building_render_buffer(
 
         const auto piece_payload = exterior_piece_payload(cell);
         if (piece_payload.has_value()) {
-            if (const auto* mesh = resolve_building_block_mesh(block_meshes, building.piece_names, piece_payload->index)) {
+            if (const auto* mesh = resolved_piece_mesh(piece_payload->index)) {
                 const auto origin = cell_origin(cell);
                 const auto rotation = static_cast<std::int32_t>((piece_payload->word >> 24U) & 3U);
                 add_rotated_block_mesh_to_buffer(
@@ -2738,7 +2921,24 @@ BuildingRenderBuffer build_native_building_render_buffer(
                     origin,
                     rotation,
                     [&cell](BuildingRenderBuffer&, const SblBlockFace&, const NativeRotatedBlockFace& rotated_face) {
-                        return material_for_cell_slot(cell, rotated_face.material);
+                        return material_for_piece_face(cell, rotated_face.material, false);
+                    });
+            }
+        }
+
+        const auto interior_payload = interior_piece_payload(cell);
+        if (interior_payload.has_value()) {
+            if (const auto* mesh = resolved_piece_mesh(interior_payload->index)) {
+                const auto origin = cell_origin(cell);
+                const auto rotation = static_cast<std::int32_t>((interior_payload->word >> 24U) & 3U);
+                add_rotated_block_mesh_to_buffer(
+                    buffer,
+                    vertex_indices,
+                    *mesh,
+                    origin,
+                    rotation,
+                    [&cell](BuildingRenderBuffer&, const SblBlockFace&, const NativeRotatedBlockFace& rotated_face) {
+                        return material_for_piece_face(cell, rotated_face.material, true);
                     });
             }
         }
@@ -2756,10 +2956,9 @@ BuildingRenderBuffer build_native_building_render_buffer(
         const auto* north = find_cell_at(cell_index, cell.x, cell.y, cell.z - 1U);
         const auto* south = find_cell_at(cell_index, cell.x, cell.y, cell.z + 1U);
         const auto* up = find_cell_at(cell_index, cell.x, cell.y + 1U, cell.z);
-        const auto* template_file = resolve_building_buildblock_template(
-            buildblock_templates,
-            building.block_names,
-            cell.cell_type());
+        const auto* template_file = cell.cell_type() < resolved_buildblock_templates.size()
+            ? resolved_buildblock_templates[cell.cell_type()]
+            : (buildblock_templates.empty() ? nullptr : &buildblock_templates.front().template_file);
 
         // BuildBuildingBlockRenderBuffers_1400799d0.c:144-146 iterates native
         // faces 1..5 only. Down/face 0 is intentionally absent here.
@@ -2797,7 +2996,21 @@ BuildingRenderBuffer build_native_building_tool_preview_render_buffer(
     std::optional<std::uint32_t> floor) {
     BuildingRenderBuffer buffer;
     VertexIndexMap vertex_indices;
+    vertex_indices.reserve(building.cells.size() * 4U);
+    buffer.vertices.reserve(building.cells.size() * 4U);
+    buffer.triangles.reserve(building.cells.size() * 6U);
     const auto cell_index = build_cell_index(building.cells);
+
+    const auto piece_resolution_count = begins_with_native_builtin_block_meshes(block_meshes)
+        ? std::max(building.piece_names.size(), block_meshes.size())
+        : building.piece_names.size();
+    std::vector<const SblBlockMesh*> resolved_piece_meshes(piece_resolution_count);
+    for (std::size_t index = 0; index < resolved_piece_meshes.size(); ++index) {
+        resolved_piece_meshes[index] = resolve_building_block_mesh(
+            block_meshes,
+            building.piece_names,
+            static_cast<std::uint32_t>(index));
+    }
 
     auto cell_origin = [&](const SbbCell& cell) {
         return Vec3{
@@ -2807,8 +3020,10 @@ BuildingRenderBuffer build_native_building_tool_preview_render_buffer(
         };
     };
 
-    auto add_piece = [&](const SbbCell& cell, const SbbCellPayload& payload, std::uint32_t texture_base) {
-        const auto* mesh = resolve_building_block_mesh(block_meshes, building.piece_names, payload.index);
+    auto add_piece = [&](const SbbCell& cell, const SbbCellPayload& payload, bool interior) {
+        const auto* mesh = payload.index < resolved_piece_meshes.size()
+            ? resolved_piece_meshes[payload.index]
+            : &native_builtin_block_mesh_singleton();
         if (mesh == nullptr) {
             return;
         }
@@ -2819,9 +3034,8 @@ BuildingRenderBuffer build_native_building_tool_preview_render_buffer(
             *mesh,
             cell_origin(cell),
             rotation,
-            [&cell, texture_base](BuildingRenderBuffer&, const SblBlockFace&, const NativeRotatedBlockFace& rotated_face) {
-                const auto material_slot = std::min<std::uint32_t>(rotated_face.material, 7U);
-                return material_for_cell_slot(cell, texture_base + material_slot);
+            [&cell, interior](BuildingRenderBuffer&, const SblBlockFace&, const NativeRotatedBlockFace& rotated_face) {
+                return material_for_piece_face(cell, rotated_face.material, interior);
             });
     };
 
@@ -2835,10 +3049,10 @@ BuildingRenderBuffer build_native_building_tool_preview_render_buffer(
         }
 
         if (const auto payload = interior_piece_payload(cell)) {
-            add_piece(cell, *payload, 8U);
+            add_piece(cell, *payload, true);
         }
         if (const auto payload = exterior_piece_payload(cell)) {
-            add_piece(cell, *payload, 0U);
+            add_piece(cell, *payload, false);
         }
 
         if ((cell.exterior_block() & 0xe0000000U) != 0x40000000U) {
@@ -2901,30 +3115,14 @@ BuildingRenderBuffer build_city_building_full_render_buffer(
     const SbbBuilding& building,
     const std::vector<NamedBlockMesh>& block_meshes,
     const std::vector<NamedBuildblockTemplate>& buildblock_templates) {
-    auto buffer = build_native_building_tool_preview_render_buffer(
+    // City placement uses the runtime building buffer, not the editor's
+    // floor-tool preview. The preview interprets placed_flag bits as optional
+    // floor/ceiling guides; using it in the city dropped exposed face 5 on
+    // otherwise solid top cells and made roofs or top floors disappear.
+    return build_native_building_render_buffer(
         building,
         block_meshes,
-        buildblock_templates,
-        std::nullopt);
-    const Vec3 offset{
-        -static_cast<float>(building.anchor_x) * buffer.unit_size,
-        -static_cast<float>(building.anchor_y) * buffer.unit_size,
-        -static_cast<float>(building.anchor_z) * buffer.unit_size,
-    };
-    for (auto& vertex : buffer.vertices) {
-        vertex.position.x += offset.x;
-        vertex.position.y += offset.y;
-        vertex.position.z += offset.z;
-    }
-    for (auto& line : buffer.wire_lines) {
-        line.from.x += offset.x;
-        line.from.y += offset.y;
-        line.from.z += offset.z;
-        line.to.x += offset.x;
-        line.to.y += offset.y;
-        line.to.z += offset.z;
-    }
-    return buffer;
+        buildblock_templates);
 }
 
 BuildingRenderBuffer build_native_portal_render_buffer(
@@ -3697,8 +3895,6 @@ MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*
     scene.traffic_light_poles = build_city_traffic_light_poles(graph, scene.unit_size);
     expand_native_city_extents(graph);
     scene.terrain = build_city_terrain(map, graph, corner_stamps, scene.city_tiles, scene.unit_size);
-    scene.city_tile_buffer = build_city_tile_render_buffer(scene.city_tiles, scene.unit_size);
-
     for (const auto& street : graph.streets) {
         if (street.a < 0 || street.b < 0 || street.source_index < 0) {
             continue;
@@ -3766,6 +3962,8 @@ MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*
             editor_quad,
         });
     }
+    scene.city_tile_buffer = build_city_tile_render_buffer(scene.city_tiles, scene.unit_size);
+    add_city_road_markings(scene.city_tile_buffer, scene.roads, scene.city_tiles);
 
     for (std::size_t intersection_index = 0; intersection_index < map.intersections.size(); ++intersection_index) {
         const auto& intersection = map.intersections[intersection_index];

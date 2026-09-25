@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Sub Rosa Map Editor</title>
+    <style>
+      html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #12161d; }
+      canvas { display: block; width: 100%; height: 100%; outline: 0; }
+      #status { position: fixed; left: 12px; bottom: 8px; color: #7e8b9d; font: 12px system-ui, sans-serif; pointer-events: none; }
+    </style>
+  </head>
+  <body>
+    <canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="0"></canvas>
+    <div id="status">Sub Rosa Map Editor · WebAssembly</div>
+    <script>
+      var Module = {
+        canvas: document.getElementById('canvas'),
+        print: function(text) { console.log(text); },
+        printErr: function(text) { console.error(text); },
+        onRuntimeInitialized: function() {
+          if (typeof window.mapEditorBrowserInstallDropTarget === 'function') {
+            window.mapEditorBrowserInstallDropTarget(document.getElementById('canvas'));
+          }
+        }
+      };
+    </script>
+    {{{ SCRIPT }}}
+  </body>
+</html>

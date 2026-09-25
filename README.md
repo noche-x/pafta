@@ -14,13 +14,12 @@ Current implementation:
 - Exposes portable SBB cell, SBC building, SBL word, and SBL layer portal edit/save commands for persisted field changes.
 - Launches as a no-argument editor app with folder drag/drop and native folder selection.
 - Loads map-folder assets from `city2.sbc`, `building/*.sbb`, `block/*.sbl`, and `buildblock/*.sbl`.
-- Provides ImGui workspace tabs for City, Buildings, Pieces, Buildblocks, and Blocks, with a separate search query for each tab.
+- Provides two modes, City and Building (pieces are placed with the City Piece tool), plus the Buildblock window.
 - Uses a right-mouse freecam workflow instead of orbit camera control.
-- Supports City-tab road selection, endpoint/width/district edits, road duplication/deletion, viewport click-to-lay road intersections/segments, placed-building selection, X/Y/Z nudging, rotation, viewport click-to-move, Shift-click copy placement, building duplication/deletion, native portal-voxel piece placement/clearing, and save-to-copy as `city2.edited.sbc`.
-- Supports Buildings-tab occupied-cell selection, SBB field nudging, and save-to-copy as `*.edited.sbb`.
-- Supports Pieces-tab SBC city-block layer/slot inspection, resolved `block/*.sbl` mesh preview, viewport slot selection, Shift-click slot replacement from loaded block names, clearing, and save-to-copy through `city2.edited.sbc`.
-- Supports Buildblocks-tab layer selection, bounds/window/beam preview, door markers, portal-type edits, selected door/window/beam record selection, full selected-record field nudging in 1/16 units, and save-to-copy as `*.edited.sbl`.
-- Supports Blocks-tab block header inspection, width/height/depth nudging, exterior flag toggling, authored patch/control-point selection, authored x/y/z/u/v control-point nudging, and save-to-copy as `*.edited.sbl`.
+- Supports City-tab road selection, endpoint/width/district edits, road duplication/deletion, viewport click-to-lay road intersections/segments, placed-building selection, X/Y/Z nudging, rotation, viewport click-to-move, Shift-click copy placement, building duplication/deletion, native portal-voxel piece placement/clearing.
+- Supports Buildings-tab occupied-cell selection, SBB field nudging.
+- Supports Buildblocks-tab layer selection, bounds/window/beam preview, door markers, portal-type edits, selected door/window/beam record selection, full selected-record field nudging in 1/16 units.
+- Supports Blocks-tab block header inspection, width/height/depth nudging, exterior flag toggling, authored patch/control-point selection, authored x/y/z/u/v control-point nudging.
 - Builds a simple 4-unit cell scene from occupied SBB cells.
 - Resolves SBB piece payloads to sibling `block/*.sbl` meshes when opening an `.sbb` from a map folder.
 - Resolves SBB portal-edge cells to sibling `buildblock/*.sbl` templates and overlays native north/west/south/east side codes.
@@ -96,29 +95,35 @@ Drop a map folder into the window or click `Open Folder`. The expected folder la
 
 ### Controls
 
-Camera (freecam): hold **right mouse**, then **WASD** to move, **Space/Shift** for up/down, **Ctrl** for 2x speed, and the **mouse wheel** to change fly speed. The keyboard edit shortcuts below are inactive while flying or while typing in a field.
+Camera: **Alt+left drag** orbits around the point under the cursor, **middle drag** pans, and the **mouse wheel** zooms toward the cursor. Freecam: hold **right mouse**, then **WASD** to move, **E/Space** up, **Q** down, **Shift** for 3x speed, and the **mouse wheel** to change fly speed. The keyboard edit shortcuts below are inactive while flying or while typing in a field.
 
-Selection is click-to-select: a plain left-click in the Scene picks whatever is under the cursor. The left **Library** switches between placed buildings and roads, while **Properties** exposes direct position, rotation, width, node, and district fields for the current selection. A selected building gets a shader silhouette outline (inverted-hull, no bloom); selected roads and pieces get a pulsing highlight. The compact strip along the bottom of the Scene shows only the controls for the active tool, and the full reference stays under **Controls** in Properties.
+Undo (**Ctrl+Z**, **Ctrl+Y** or **Ctrl+Shift+Z**) follows what you are editing: the Buildblock window (while focused) undoes buildblock edits, the Building and Block editors undo their own assets, and City mode undoes map edits. Each has its own history. A click or drag that changed nothing adds no undo step, and one drag or slider sweep is one step. The Building and Road tools place on mouse release; drag away before releasing to cancel.
+
+Layout: the 3D view fills the window. A toolbar floats at its top (mode, tools, view, undo/redo) with a one-line hint for the active tool under it; an **asset drawer** along the bottom appears when a tool needs one (buildings to place, pieces to stamp, or which building to edit) and collapses with its arrow. The right-hand column holds the **Outliner** (every placed building and road) above **Properties** (the selection, or what the active tool will place). Changes since save, Keyboard shortcuts, and Preferences open as tabs beside Properties. **Ctrl+/** opens the full shortcut list.
+
+Selection is click-to-select: a plain left-click in the Scene picks whatever is under the cursor. A selected building gets a shader silhouette outline (inverted-hull, no bloom); selected roads and pieces get a pulsing highlight.
 
 Key labels in the help text and tooltips are localized to your keyboard layout (an AZERTY user sees ZQSD, not WASD). The keys still fire on the same physical positions on every layout — only the printed labels change.
 
 A selected city building shows a **drag gizmo**: grab the red/green/blue axis handles to slide it on X/Y/Z, or the yellow handle to rotate it to face the cursor. **Esc** cancels an in-progress drag (it does not quit the app).
 
-Closing the window, **Alt+F4**, or File → Exit is blocked while there are unsaved changes: a prompt offers **Save & Exit**, **Discard & Exit**, or **Cancel**. Saving writes the usual `*.edited.*` copies.
+Closing the window, **Alt+F4**, or File → Exit is blocked while there are unsaved changes: a prompt offers **Save & Exit**, **Discard & Exit**, or **Cancel**. In the browser build, closing or reloading the tab with unsaved changes asks first.
 
-Global: **Ctrl+S** saves the active tab's `*.edited.*` copy, **F** frames the current selection (or the city when nothing is selected), and **Ctrl+O** opens a folder.
+Saving (**Ctrl+S**) writes the map as a pair: the chosen `.sbc` and a `.csx` asset archive with the same name. The desktop editor asks where to save (defaulting to the loaded map, and the system dialog confirms before replacing it); the browser build downloads both files.
 
-City tab:
+Global: **Ctrl+1/2** switch to the City and Building modes, **Ctrl+S** saves the map, **F** frames the current selection (or the city when nothing is selected), **Ctrl+O** opens a folder, and **Ctrl+Shift+H** opens Changes since save (Ctrl reads as Cmd on macOS). The Outliner, Properties, and asset drawer toggles have no default key; use the Windows menu. The status bar at the bottom keeps the latest message; hover it for recent ones. In the browser build, preferences and window layout are kept between visits.
 
-- **Buildings** mode: click selects a placement; **Shift+click** moves the selected one to the cursor; **Ctrl+Shift+click** stamps a copy. Arrows move X/Z, **PgUp/PgDn** move Y, **R** rotates (**Shift+R** reverses), **Ctrl+D** duplicates, **Del** deletes.
-- **Roads** mode: **click lays a road chain** — the first click starts at the nearest existing node (or makes one), each further click adds a straight, axis-aligned segment (the end snaps to whichever of X/Z you moved more), and the new end node becomes the next start. New nodes take the terrain height, so roads run up and down with the land. Click the active start node again or press **Esc** to end the chain. **Shift+click** selects a road to edit; arrows adjust the from/to nodes, **`[` `]`** the left width, **`;` `'`** the right width, **`-` `=`** the district, **Ctrl+D** duplicates, **Del** deletes.
-- **Pieces** mode: **Shift+click** places a voxel, **Ctrl+click** clears it, **R** rotates the voxel before placing.
+City tools (**1**–**5**, or the toolbar):
 
-Buildings / Blocks / Buildblocks tabs: **Left/Right** nudge the selected field, **Up/Down** take the coarser step (and cycle the active field on the Buildings tab), **Tab/Shift+Tab** cycle the selected cell/field/layer record, and **Ctrl+S** saves the `*.edited.*` copy.
+- **Select**: click picks whatever is nearest under the cursor (the hover outline shows it first); drag a box to select many; **Shift**/**Ctrl** (**Cmd** on macOS) adds to the selection. Double-click a building to edit its template. With a building selected: arrows move X/Z, **PgUp/PgDn** move Y, **R** rotates (**Shift+R** reverses), **Ctrl+D** duplicates, **Del** deletes. With a road selected: **`[` `]`** change the left width, **`;` `'`** the right width, **Ctrl+D** duplicates, **Del** deletes. With a piece selected: arrows and **PgUp/PgDn** move it one cell, **Del** removes it.
+- **Building**: pick a template in the asset drawer (or drag one into the view). An outline and footprint box show exactly where it will land, centred on the cursor, and turn red (with the reason in Properties) when it would overlap a building or road; **R** turns it before placing. It places on mouse release; drag away first to cancel.
+- **Road**: the first click marks the start (snapped to a nearby node or road; nothing is created until the next click), each further click adds a straight, axis-aligned segment (the end snaps to whichever of X/Z you moved more), and the new end node becomes the next start. New nodes take the terrain height, so roads run up and down with the land. Click the start again or press **Esc** to end the chain. New roads use the width set in Properties and continue the district of a road already at the start node.
+- **Piece**: pick a piece (and its texture) in the asset drawer. A see-through ghost shows the piece, turned by **R**, in the cell a click fills; pointing at a piece's side or top targets the empty cell next to it. Drag to paint a run on the same layer.
+- **Erase**: click or drag over the highlighted building, road, or piece to remove exactly that one thing.
+
+Building editor (tools **1**–**4**; pick which building to edit in the asset drawer, and step through floors with the layers button): **Select** picks a block (**Del** removes it, **Tab/Shift+Tab** cycles blocks), **Add block** fills the cell against the clicked face (drag to keep adding along the surface), **Paint** applies the Properties material to the clicked face (drag to paint every face you pass over), and **Anchor** drags the building's anchor. In the Buildblock window **Tab/Shift+Tab** cycles layers.
 
 The Buildings tab has a **View** switch: **Whole building** renders every floor, or **Floor by floor** shows a single floor picked with a slider plus **-/+** step buttons (selecting a cell jumps the view to that cell's floor).
-
-In City Buildings mode, the building under the cursor gets a dim outline preview so you can see what a click will select before clicking.
 
 The argument-based file viewer and edit commands are retained as dev/test utilities so CTest can validate binary parsing and patching behavior; they are not the main editor workflow.
 
