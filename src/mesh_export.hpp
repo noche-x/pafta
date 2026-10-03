@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -59,6 +60,27 @@ struct ExportResult {
     ExportStats stats;
 };
 
+// A glTF export in three stages, so the heavy parts can leave the main thread:
+// build_gltf_export (CPU only, any thread), write_next_gltf_texture (GPU
+// readback, GL thread, one texture per call), write_gltf_export (file I/O, any
+// thread).
+struct GltfExport;
+struct GltfExportDeleter {
+    void operator()(GltfExport* job) const;
+};
+using GltfExportPtr = std::unique_ptr<GltfExport, GltfExportDeleter>;
+// Null with result.message set when there is nothing to export.
+GltfExportPtr build_gltf_export(
+    const std::filesystem::path& gltf_path,
+    const std::vector<ExportMeshGroup>& groups,
+    const ExportOptions& options,
+    ExportResult& result);
+std::size_t gltf_export_texture_count(const GltfExport& job);
+std::size_t gltf_export_textures_done(const GltfExport& job);
+// Writes the next texture PNG; false once every texture is done.
+bool write_next_gltf_texture(GltfExport& job, const EditorProject& project);
+ExportResult write_gltf_export(GltfExport& job);
+
 // Rough triangle count for a city, used to warn before a large export.
 std::size_t estimate_city_export_triangles(
     const SbcMap& map,
@@ -74,33 +96,17 @@ ExportResult export_groups_to_gltf(
     const EditorProject& project,
     const ExportOptions& options = {});
 
-// Convenience builders for the three view scopes. Each gathers the right
-// buffer(s) and calls export_groups_to_gltf.
-ExportResult export_building_to_gltf(
-    const std::filesystem::path& gltf_path,
-    const BuildingRenderBuffer& building,
-    const std::string& name,
-    const EditorProject& project,
-    const std::vector<std::string>* building_materials = nullptr,
-    const ExportOptions& options = {});
-
 // Converts a single block mesh's faces into a render buffer (positions, UVs, and
 // per-face material slots resolved to names) for export.
 BuildingRenderBuffer build_block_mesh_render_buffer(const SblBlockMesh& mesh, float unit_size = 4.0F);
 
-ExportResult export_block_to_gltf(
-    const std::filesystem::path& gltf_path,
-    const SblBlockMesh& mesh,
-    const std::string& name,
-    const EditorProject& project);
-
-ExportResult export_city_to_gltf(
-    const std::filesystem::path& gltf_path,
+// The city's export groups: terrain, roads, pieces, and each placed building
+// (placement_buffers[i] is placement i's building mesh, null when unresolved).
+std::vector<ExportMeshGroup> city_export_groups(
     const MapScene& scene,
-    const std::vector<BuildingRenderBuffer>& placement_buffers,
+    const std::vector<const BuildingRenderBuffer*>& placement_buffers,
     const std::vector<const SbbBuilding*>& placement_buildings,
     const BuildingRenderBuffer& piece_buffer,
-    const EditorProject& project,
     const ExportOptions& options = {});
 
 } // namespace map_editor

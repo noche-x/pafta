@@ -21,7 +21,7 @@ The canvas sets its work plane to `floor * 4`. All cell positions use the native
 
 ## Port status
 
-The Buildings viewport now draws the proven 65-line grid and fourth-line cadence in the same anchor-relative coordinate space as its mesh and picker. It also draws the saved SBB footprint as a red work bound. Its floor selector uses `size_z`, which is the parsed SBB height. The old selector used `size_y`, which is map depth. Thumbnail framing, selection focus, far-LOD bounds, and city frustum bounds now use the same axis mapping.
+The Buildings viewport now draws the proven 65-line grid and fourth-line cadence in the same anchor-relative coordinate space as its mesh and picker. It also draws the saved SBB footprint as a red work bound. Its floor selector uses `size_z`, which is the parsed SBB height. The old selector used `size_y`, which is map depth. Thumbnail framing, selection focus, and city frustum bounds now use the same axis mapping.
 
 The current port has no native-equivalent portal, itemset, or agent tool mode. Their mode-specific markers are therefore not drawn. The native cursor cross also depends on a free grid-plane cursor; the current picker only identifies occupied cells or hit faces. Adding marker-only controls without the matching edit operation would give false feedback, so this remains open.
 

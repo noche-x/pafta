@@ -1,6 +1,7 @@
 #include "editor_state.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 
 namespace map_editor {
@@ -246,6 +247,31 @@ void SblEditorState::adjust_selected_word(std::int32_t delta) {
         write_word(bytes_, selected_word_index_, next);
         dirty_ = true;
     }
+}
+
+float fly_speed_multiplier(bool slow, bool fast) {
+    if (slow) return fast ? 1.0F / 16.0F : 0.25F;
+    return fast ? 4.0F : 1.0F;
+}
+
+Vec3 fly_camera_step(Vec3 forward, const FlyInput& input, float speed, float seconds) {
+    const auto length = [](Vec3 v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); };
+    const auto forward_length = length(forward);
+    if (forward_length <= 0.0F) return {};
+    const Vec3 f{forward.x / forward_length, forward.y / forward_length, forward.z / forward_length};
+    // Level right (forward x up), so strafing never climbs or sinks.
+    Vec3 r{-f.z, 0.0F, f.x};
+    const auto right_length = length(r);
+    r = right_length > 1e-6F ? Vec3{r.x / right_length, 0.0F, r.z / right_length} : Vec3{1.0F, 0.0F, 0.0F};
+    const auto axis = [](bool plus, bool minus) { return (plus ? 1.0F : 0.0F) - (minus ? 1.0F : 0.0F); };
+    const auto along = axis(input.forward, input.back);
+    const auto side = axis(input.right, input.left);
+    const auto lift = axis(input.up, input.down);
+    const Vec3 move{f.x * along + r.x * side, f.y * along + lift, f.z * along + r.z * side};
+    const auto move_length = length(move);
+    if (move_length <= 1e-6F) return {};
+    const auto step = speed * fly_speed_multiplier(input.slow, input.fast) * seconds / move_length;
+    return {move.x * step, move.y * step, move.z * step};
 }
 
 } // namespace map_editor

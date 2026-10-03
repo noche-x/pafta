@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <future>
 #include <unordered_map>
 
 // raylib already links stb_image / stb_image_write; let tinygltf use the existing
@@ -108,17 +109,10 @@ std::string sanitize_filename(std::string s) {
     return s;
 }
 
-// Reads a project texture back off the GPU and re-flips it to upright. The loaded
-// GPU texture is vertically flipped (editor convention applied at load), so flip
-// once more to restore the original PNG orientation for DCC tools.
-bool write_texture_png(const Texture2D& texture, const std::filesystem::path& out) {
-    if (texture.id == 0U) {
-        return false;
-    }
-    Image image = LoadImageFromTexture(texture);
-    if (!IsImageValid(image)) {
-        return false;
-    }
+// Encodes a read-back texture as an upright PNG. The loaded GPU texture is
+// vertically flipped (editor convention applied at load), so flip once more to
+// restore the original PNG orientation for DCC tools. CPU only; takes `image`.
+bool encode_texture_png(Image image, const std::filesystem::path& out) {
     ImageFlipVertical(&image);
     ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
     const bool ok = ExportImage(image, out.string().c_str());
@@ -145,13 +139,27 @@ std::size_t estimate_city_export_triangles(
     return total;
 }
 
-ExportResult export_groups_to_gltf(
+struct GltfExport {
+    std::filesystem::path path;
+    tinygltf::Model model;
+    // Material index and name of each material that may take a project texture.
+    std::vector<std::pair<int, std::string>> textures;
+    std::size_t next_texture{};
+    std::unordered_map<std::string, int> texture_cache; // material name -> gltf texture index
+    // PNG encodes running off the GL thread, with their file names.
+    std::vector<std::pair<std::future<bool>, std::string>> encodes;
+    ExportStats stats;
+};
+
+void GltfExportDeleter::operator()(GltfExport* job) const {
+    delete job;
+}
+
+GltfExportPtr build_gltf_export(
     const std::filesystem::path& gltf_path,
     const std::vector<ExportMeshGroup>& groups,
-    const EditorProject& project,
-    const ExportOptions& options) {
-    ExportResult result;
-
+    const ExportOptions& options,
+    ExportResult& result) {
     // Collect material name -> primitive accumulator. Material 0 with no name still
     // gets a default bucket so untextured geometry exports.
     std::vector<std::string> material_order;
@@ -213,18 +221,16 @@ ExportResult export_groups_to_gltf(
 
     if (primitives.empty()) {
         result.message = "Nothing to export (no geometry in view).";
-        return result;
+        return nullptr;
     }
 
-    const auto out_dir = gltf_path.parent_path();
-    const auto stem = gltf_path.stem().string();
-
-    tinygltf::Model model;
+    GltfExportPtr job{new GltfExport};
+    job->path = gltf_path;
+    auto& model = job->model;
     model.asset.version = "2.0";
-    model.asset.generator = "map_editor_cpp";
-    tinygltf::Scene scene;
+    model.asset.generator = "Pafta " PAFTA_VERSION;
     tinygltf::Mesh mesh;
-    mesh.name = stem;
+    mesh.name = gltf_path.stem().string();
 
     // One shared .bin buffer holds all attribute + index data.
     tinygltf::Buffer gltf_buffer;
@@ -257,19 +263,14 @@ ExportResult export_groups_to_gltf(
         return static_cast<int>(model.bufferViews.size() - 1);
     };
 
-    std::size_t total_vertices = 0;
-    std::size_t total_triangles = 0;
-    std::size_t texture_count = 0;
-    std::unordered_map<std::string, int> texture_cache; // material name -> gltf texture index
-
     for (std::size_t pi = 0; pi < primitives.size(); ++pi) {
         auto& prim = primitives[pi];
         const auto vertex_count = prim.positions.size() / 3;
         if (vertex_count == 0) {
             continue;
         }
-        total_vertices += vertex_count;
-        total_triangles += vertex_count / 3;
+        job->stats.vertex_count += vertex_count;
+        job->stats.triangle_count += vertex_count / 3;
 
         std::vector<std::uint32_t> indices(vertex_count);
         for (std::uint32_t i = 0; i < vertex_count; ++i) {
@@ -315,7 +316,7 @@ ExportResult export_groups_to_gltf(
         model.accessors.push_back(idx_acc);
         const int idx_idx = static_cast<int>(model.accessors.size() - 1);
 
-        // Material + optional texture.
+        // Material; its texture is attached later on the GL thread.
         tinygltf::Material material;
         material.name = material_order[pi];
         material.pbrMetallicRoughness.metallicFactor = 0.0;
@@ -327,34 +328,9 @@ ExportResult export_groups_to_gltf(
         if (procedural_material_color(mat_name, proc_rgb)) {
             material.pbrMetallicRoughness.baseColorFactor = {proc_rgb[0], proc_rgb[1], proc_rgb[2], 1.0};
         }
-        if (mat_name != "_untextured") {
-            const Texture2D* tex = app_internal::find_project_texture(project, mat_name);
-            if (tex != nullptr && tex->id != 0U) {
-                int gltf_tex_index = -1;
-                auto cached = texture_cache.find(mat_name);
-                if (cached != texture_cache.end()) {
-                    gltf_tex_index = cached->second;
-                } else {
-                    const auto png_name = sanitize_filename(mat_name) + ".png";
-                    if (write_texture_png(*tex, out_dir / png_name)) {
-                        tinygltf::Image image;
-                        image.uri = png_name;
-                        model.images.push_back(image);
-                        tinygltf::Texture gltf_tex;
-                        gltf_tex.source = static_cast<int>(model.images.size() - 1);
-                        model.textures.push_back(gltf_tex);
-                        gltf_tex_index = static_cast<int>(model.textures.size() - 1);
-                        texture_cache.emplace(mat_name, gltf_tex_index);
-                        ++texture_count;
-                    }
-                }
-                if (gltf_tex_index >= 0) {
-                    material.pbrMetallicRoughness.baseColorTexture.index = gltf_tex_index;
-                }
-            }
-        }
         model.materials.push_back(material);
         const int mat_idx = static_cast<int>(model.materials.size() - 1);
+        if (mat_name != "_untextured") job->textures.emplace_back(mat_idx, mat_name);
 
         tinygltf::Primitive primitive;
         primitive.attributes["POSITION"] = pos_idx;
@@ -365,36 +341,100 @@ ExportResult export_groups_to_gltf(
         primitive.mode = TINYGLTF_MODE_TRIANGLES;
         mesh.primitives.push_back(primitive);
     }
+    job->stats.material_count = material_order.size();
 
-    model.buffers.push_back(gltf_buffer);
+    model.buffers.push_back(std::move(gltf_buffer));
     model.meshes.push_back(mesh);
 
     tinygltf::Node node;
     node.mesh = 0;
     model.nodes.push_back(node);
+    tinygltf::Scene scene;
     scene.nodes.push_back(0);
     model.scenes.push_back(scene);
     model.defaultScene = 0;
+    return job;
+}
 
+std::size_t gltf_export_texture_count(const GltfExport& job) {
+    return job.textures.size();
+}
+
+std::size_t gltf_export_textures_done(const GltfExport& job) {
+    return job.next_texture;
+}
+
+bool write_next_gltf_texture(GltfExport& job, const EditorProject& project) {
+    if (job.next_texture >= job.textures.size()) return false;
+    const auto& [material_index, mat_name] = job.textures[job.next_texture++];
+    const Texture2D* tex = app_internal::find_project_texture(project, mat_name);
+    if (tex == nullptr || tex->id == 0U) return true;
+    int gltf_tex_index = -1;
+    if (const auto cached = job.texture_cache.find(mat_name); cached != job.texture_cache.end()) {
+        gltf_tex_index = cached->second;
+    } else {
+        const auto png_name = sanitize_filename(mat_name) + ".png";
+        // Only the readback needs the GL thread; encoding runs on a worker.
+        Image pixels = LoadImageFromTexture(*tex);
+        if (IsImageValid(pixels)) {
+            job.encodes.emplace_back(
+                std::async(std::launch::async, [pixels, out = job.path.parent_path() / png_name] { return encode_texture_png(pixels, out); }),
+                png_name);
+            tinygltf::Image image;
+            image.uri = png_name;
+            job.model.images.push_back(image);
+            tinygltf::Texture gltf_tex;
+            gltf_tex.source = static_cast<int>(job.model.images.size() - 1);
+            job.model.textures.push_back(gltf_tex);
+            gltf_tex_index = static_cast<int>(job.model.textures.size() - 1);
+            job.texture_cache.emplace(mat_name, gltf_tex_index);
+            ++job.stats.texture_count;
+        }
+    }
+    if (gltf_tex_index >= 0) {
+        job.model.materials[static_cast<std::size_t>(material_index)].pbrMetallicRoughness.baseColorTexture.index = gltf_tex_index;
+    }
+    return true;
+}
+
+ExportResult write_gltf_export(GltfExport& job) {
+    ExportResult result;
+    for (auto& [encode, name] : job.encodes) {
+        if (!encode.get()) {
+            result.message = "Failed to write texture " + name;
+            return result;
+        }
+    }
+    job.encodes.clear();
     tinygltf::TinyGLTF writer;
     const bool ok = writer.WriteGltfSceneToFile(
-        &model, gltf_path.string(),
+        &job.model, job.path.string(),
         /*embedImages=*/false,
         /*embedBuffers=*/false,
         /*prettyPrint=*/true,
         /*writeBinary=*/false);
-
     if (!ok) {
-        result.message = "Failed to write glTF to " + gltf_path.string();
+        result.message = "Failed to write glTF to " + job.path.string();
         return result;
     }
-
     result.ok = true;
-    result.stats = {total_vertices, total_triangles, material_order.size(), texture_count};
-    result.message = "Exported " + std::to_string(total_triangles) + " triangles, " +
-                     std::to_string(material_order.size()) + " materials, " +
-                     std::to_string(texture_count) + " textures to " + gltf_path.filename().string();
+    result.stats = job.stats;
+    result.message = "Exported " + std::to_string(job.stats.triangle_count) + " triangles, " +
+                     std::to_string(job.stats.material_count) + " materials, " +
+                     std::to_string(job.stats.texture_count) + " textures to " + job.path.filename().string();
     return result;
+}
+
+ExportResult export_groups_to_gltf(
+    const std::filesystem::path& gltf_path,
+    const std::vector<ExportMeshGroup>& groups,
+    const EditorProject& project,
+    const ExportOptions& options) {
+    ExportResult result;
+    auto job = build_gltf_export(gltf_path, groups, options, result);
+    if (!job) return result;
+    while (write_next_gltf_texture(*job, project)) {}
+    return write_gltf_export(*job);
 }
 
 BuildingRenderBuffer build_block_mesh_render_buffer(const SblBlockMesh& mesh, float unit_size) {
@@ -432,36 +472,11 @@ BuildingRenderBuffer build_block_mesh_render_buffer(const SblBlockMesh& mesh, fl
     return buffer;
 }
 
-ExportResult export_block_to_gltf(
-    const std::filesystem::path& gltf_path,
-    const SblBlockMesh& mesh,
-    const std::string& name,
-    const EditorProject& project) {
-    const auto buffer = build_block_mesh_render_buffer(mesh);
-    return export_building_to_gltf(gltf_path, buffer, name, project);
-}
-
-ExportResult export_building_to_gltf(
-    const std::filesystem::path& gltf_path,
-    const BuildingRenderBuffer& building,
-    const std::string& name,
-    const EditorProject& project,
-    const std::vector<std::string>* building_materials,
-    const ExportOptions& options) {
-    ExportMeshGroup group;
-    group.name = name;
-    group.buffer = &building;
-    group.building_materials = building_materials;
-    return export_groups_to_gltf(gltf_path, {group}, project, options);
-}
-
-ExportResult export_city_to_gltf(
-    const std::filesystem::path& gltf_path,
+std::vector<ExportMeshGroup> city_export_groups(
     const MapScene& scene,
-    const std::vector<BuildingRenderBuffer>& placement_buffers,
+    const std::vector<const BuildingRenderBuffer*>& placement_buffers,
     const std::vector<const SbbBuilding*>& placement_buildings,
     const BuildingRenderBuffer& piece_buffer,
-    const EditorProject& project,
     const ExportOptions& options) {
     std::vector<ExportMeshGroup> groups;
 
@@ -502,12 +517,12 @@ ExportResult export_city_to_gltf(
     if (options.include_buildings) {
         for (std::size_t i = 0; i < scene.buildings.size() && i < placement_buffers.size(); ++i) {
             const auto& placement = scene.buildings[i];
-            if (placement.source == nullptr || placement_buffers[i].triangles.empty()) {
+            if (placement.source == nullptr || placement_buffers[i] == nullptr || placement_buffers[i]->triangles.empty()) {
                 continue;
             }
             ExportMeshGroup group;
             group.name = "building_" + std::to_string(i);
-            group.buffer = &placement_buffers[i];
+            group.buffer = placement_buffers[i];
             group.basis = native_city_building_rotation_basis(static_cast<std::int32_t>(placement.rotation));
             group.origin = native_city_building_render_origin(*placement.source, scene.unit_size);
             group.world_offset = recenter;
@@ -519,7 +534,7 @@ ExportResult export_city_to_gltf(
         }
     }
 
-    return export_groups_to_gltf(gltf_path, groups, project, options);
+    return groups;
 }
 
 } // namespace map_editor

@@ -163,7 +163,7 @@ const char* tool_hint(const EditorUi& ui) {
         switch (ui.building_tool) {
             case BuildingTool::Select: return "Click a block to select it. Delete removes it; Tab cycles blocks.";
             case BuildingTool::PlaceBlock: return "Click a face to add a block against it; drag to keep adding.";
-            case BuildingTool::PaintTexture: return "Pick a material in Properties, then click or drag over faces.";
+            case BuildingTool::PaintTexture: return ui.paint_side_code ? "Pick a wall type in Properties, then click walls." : "Pick a material in Properties, then click or drag over faces.";
             case BuildingTool::Anchor: return "Drag an arrow to move the building's anchor. Esc cancels.";
         }
         return "";
@@ -274,6 +274,10 @@ void draw_viewport_overlays(EditorProject* project, EditorUi& ui, Camera3D& came
                         ++ui.building_view_floor;
                         project->building_floor_preview_dirty = true;
                     }
+                }
+                ImGui::SameLine();
+                if (tool_button(ICON_FA_HOUSE, ui.building_hide_roofs, ui, "Hide roofs (see inside)")) {
+                    ui.building_hide_roofs = !ui.building_hide_roofs;
                 }
                 ImGui::SameLine();
                 if (tool_button(ICON_FA_TABLE_CELLS, ui.show_buildblock_window, ui, "Buildblock editor", EditorAction::WindowBuildblock)) {
@@ -408,6 +412,18 @@ void draw_outliner_window(EditorProject* project, EditorUi& ui) {
     ImGui::End();
 }
 
+// The placement height of the Road, Piece, and Building tools, relative to the
+// surface under the cursor.
+void draw_place_height(EditorUi& ui) {
+    field_label("Height");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::SliderInt("##place_height", &ui.place_height_offset, -32, 32,
+        ui.place_height_offset == 0 ? "On the surface" : "%+d cells");
+    help_tooltip(ui, ("Place above or below the surface under the cursor (" +
+        action_shortcut_label(ui, EditorAction::NudgeUp) + " / " +
+        action_shortcut_label(ui, EditorAction::NudgeDown) + ")").c_str());
+}
+
 void draw_properties_window(EditorProject* project, EditorUi& ui, std::string& status) {
     if (!ui.show_properties_window) return;
     std::string context;
@@ -437,6 +453,13 @@ void draw_properties_window(EditorProject* project, EditorUi& ui, std::string& s
         return;
     }
     if (ui.tab == EditorTab::City) {
+        // The placement height belongs to the tool, so it shows even while
+        // something is selected (the tool section below only shows without one).
+        if (project->city && ui.city_selection != CitySelectionKind::None &&
+            (ui.city_tool == CityTool::Road || ui.city_tool == CityTool::Piece || ui.city_tool == CityTool::Building)) {
+            ImGui::SeparatorText("Placing");
+            draw_place_height(ui);
+        }
         if (!project->city) {
             ImGui::TextDisabled("No city layout loaded.");
         } else if (ui.city_selection == CitySelectionKind::None) {
@@ -450,6 +473,7 @@ void draw_properties_window(EditorProject* project, EditorUi& ui, std::string& s
                 help_tooltip(ui, "Turn the building before placing it", EditorAction::RotateSelection);
                 ImGui::SameLine();
                 ImGui::Text("%d degrees", (ui.place_building_rotation & 3) * 90);
+                draw_place_height(ui);
                 if (!ui.placement_conflict.empty()) {
                     ImGui::TextColored(ImVec4(1.0F, 0.4F, 0.35F, 1.0F), ICON_FA_TRIANGLE_EXCLAMATION " %s", ui.placement_conflict.c_str());
                 }
@@ -463,10 +487,12 @@ void draw_properties_window(EditorProject* project, EditorUi& ui, std::string& s
                 help_tooltip(ui, "Turn the piece before placing it", EditorAction::RotateSelection);
                 ImGui::SameLine();
                 ImGui::Text("%zu degrees", ui.selected_piece_rotation * 90);
+                draw_place_height(ui);
             } else if (ui.city_tool == CityTool::Road) {
                 ImGui::SeparatorText("Laying roads");
                 ImGui::SetNextItemWidth(-FLT_MIN);
                 ImGui::SliderInt("##new_road_width", &ui.new_road_width, 2, 24, "Width: %d cells");
+                draw_place_height(ui);
                 ImGui::TextWrapped(ui.pending_road_start ? "Click to lay the next segment; Esc finishes." : "Click to start a road.");
             } else if (ui.city_tool == CityTool::Erase) {
                 ImGui::TextWrapped("Click or drag over the highlighted building, road, or piece to delete it.");
@@ -482,6 +508,14 @@ void draw_properties_window(EditorProject* project, EditorUi& ui, std::string& s
             auto& node = project->city->data.intersections[ui.selected_city_intersection];
             ImGui::SeparatorText("Road junction");
             ImGui::Text("Position: %d, %d, %d", node.x, node.y, node.z);
+            int level = node.y;
+            field_label("Level");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::InputInt("##junction_level", &level) && level != node.y) {
+                begin_city_action(*project, ui, "move junction");
+                nudge_city_junction_level(*project, ui, level - node.y);
+            }
+            help_tooltip(ui, "Junction height in cells; its roads slope to meet it", EditorAction::NudgeUp);
             if (ImGui::Button("Start road here")) {
                 ui.city_tool = CityTool::Road;
                 ui.pending_road_start = CityGridPoint{node.x, node.y, node.z};
@@ -499,6 +533,18 @@ void draw_properties_window(EditorProject* project, EditorUi& ui, std::string& s
                 street.right_width = width - street.left_width;
                 ui.city_dirty = true;
             }
+            ImGui::SeparatorText("Height");
+            if (ImGui::Button(ICON_FA_ARROW_UP " Raise")) {
+                begin_city_action(*project, ui, "raise road");
+                nudge_city_junction_level(*project, ui, 1);
+            }
+            help_tooltip(ui, "Move both ends of the road up one cell", EditorAction::NudgeUp);
+            ImGui::SameLine();
+            if (ImGui::Button(ICON_FA_ARROW_DOWN " Lower")) {
+                begin_city_action(*project, ui, "lower road");
+                nudge_city_junction_level(*project, ui, -1);
+            }
+            help_tooltip(ui, "Move both ends of the road down one cell", EditorAction::NudgeDown);
             if (ImGui::Button("Continue road")) {
                 ui.city_tool = CityTool::Road;
                 if (street.to_intersection >= 0 && static_cast<std::size_t>(street.to_intersection) < project->city->data.intersections.size()) {

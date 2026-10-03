@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.24)
 
 project(map_editor_cpp VERSION 0.1.0 LANGUAGES CXX)
 
+# Product name and version shown in the window title and menu bar.
+add_compile_definitions(PAFTA_VERSION="${PROJECT_VERSION}")
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -225,6 +228,9 @@ if(MAP_EDITOR_CPP_BUILD_WEB)
     "-sEXPORTED_RUNTIME_METHODS=['FS','ccall']"
     "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/web/file_upload.js"
   )
+  set_property(TARGET map_editor_web APPEND PROPERTY LINK_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/web/shell.html"
+    "${CMAKE_CURRENT_SOURCE_DIR}/web/file_upload.js")
   if(MAP_EDITOR_CPP_WEB_PRELOAD_PROJECT)
     # This option is deliberately opt-in. It is for browser QA builds that need
     # a real map available on startup; normal web builds remain asset-free and

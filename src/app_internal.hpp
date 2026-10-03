@@ -1,6 +1,7 @@
 #pragma once
 
 #include "formats.hpp"
+#include "editor_state.hpp"
 #include "scene.hpp"
 
 #include <raylib.h>
@@ -16,8 +17,10 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -33,66 +36,47 @@ struct LoadedAsset {
     bool newly_created{};
 };
 
-struct GpuBuildingMeshChunk {
-    Mesh mesh{};
-    Material material{};
-    Texture2D source_texture{};
+// One material range of a GpuMesh's index buffer.
+struct GpuMeshPart {
+    std::uint32_t first_index{};
+    std::uint32_t index_count{};
     std::uint32_t material_id{};
-    bool textured{};
+    unsigned int texture{};           // diffuse; 0 = untextured (uses color)
+    unsigned int material_texture{};  // metallic/roughness map
+    Color color{WHITE};
     bool window_material{};
+};
 
-    GpuBuildingMeshChunk() = default;
-    GpuBuildingMeshChunk(const GpuBuildingMeshChunk&) = delete;
-    GpuBuildingMeshChunk& operator=(const GpuBuildingMeshChunk&) = delete;
+// A whole render buffer in one VAO: interleaved position/uv/normal with 32-bit
+// indices, split into material parts. Drawn with glDrawElementsInstanced so every
+// placement of a template shares one draw per part (see draw_gpu_mesh_instances).
+struct GpuMesh {
+    unsigned int vao{};
+    unsigned int vbo{};
+    unsigned int ebo{};
+    std::uint32_t vertex_count{};
+    std::uint32_t index_count{};
+    std::vector<GpuMeshPart> parts;
 
-    GpuBuildingMeshChunk(GpuBuildingMeshChunk&& other) noexcept
-        : mesh(other.mesh),
-          material(other.material),
-          source_texture(other.source_texture),
-          material_id(other.material_id),
-          textured(other.textured),
-          window_material(other.window_material) {
-        other.mesh = {};
-        other.material = {};
-        other.source_texture = {};
-        other.material_id = 0;
-        other.textured = false;
-        other.window_material = false;
-    }
-
-    GpuBuildingMeshChunk& operator=(GpuBuildingMeshChunk&& other) noexcept {
+    GpuMesh() = default;
+    GpuMesh(const GpuMesh&) = delete;
+    GpuMesh& operator=(const GpuMesh&) = delete;
+    GpuMesh(GpuMesh&& other) noexcept { *this = std::move(other); }
+    GpuMesh& operator=(GpuMesh&& other) noexcept {
         if (this != &other) {
             unload();
-            mesh = other.mesh;
-            material = other.material;
-            source_texture = other.source_texture;
-            material_id = other.material_id;
-            textured = other.textured;
-            window_material = other.window_material;
-            other.mesh = {};
-            other.material = {};
-            other.source_texture = {};
-            other.material_id = 0;
-            other.textured = false;
-            other.window_material = false;
+            vao = std::exchange(other.vao, 0U);
+            vbo = std::exchange(other.vbo, 0U);
+            ebo = std::exchange(other.ebo, 0U);
+            vertex_count = std::exchange(other.vertex_count, 0U);
+            index_count = std::exchange(other.index_count, 0U);
+            parts = std::move(other.parts);
         }
         return *this;
     }
-
-    ~GpuBuildingMeshChunk() {
-        unload();
-    }
-
-    void unload() {
-        if (mesh.vertices != nullptr || mesh.vboId != nullptr || mesh.vaoId != 0U) {
-            UnloadMesh(mesh);
-            mesh = {};
-        }
-        if (material.maps != nullptr) {
-            MemFree(material.maps);
-            material = {};
-        }
-    }
+    ~GpuMesh() { unload(); }
+    [[nodiscard]] bool empty() const { return index_count == 0U; }
+    void unload();  // render_gpu.cpp
 };
 
 struct LoadedTexture {
@@ -135,76 +119,17 @@ struct LoadedTexture {
 };
 
 struct GpuBuildingRenderModel {
-    struct ShadowFace {
-        std::array<Vec3, 3> vertices{};
-        std::array<std::int32_t, 3> adjacent{{-1, -1, -1}};
-    };
-    std::vector<GpuBuildingMeshChunk> chunks;
+    GpuMesh mesh;
     std::vector<RenderLine> wire_lines;
-    // Opaque triangle topology used by the stencil shadow pass. Built once
-    // with the GPU model instead of rediscovering adjacency every frame.
-    std::vector<ShadowFace> shadow_faces;
-    // CPU fallback for platforms without the game's geometry-shader path.
-    // Rebuild only when the sun direction changes, not once per frame and
-    // once per placed instance.
-    mutable std::array<std::vector<Vec3>, 4> shadow_volume_vertices;
-    mutable std::array<bool, 4> shadow_volume_valid{};
-    mutable Vec3 shadow_volume_light{};
-    mutable Vec3 shadow_volume_extrusion{};
-    mutable bool shadow_volume_light_valid{};
-    // GPU copy of shadow_volume_vertices, uploaded once per rotation whenever
-    // the CPU vertex list above is (re)built, and drawn instead of pushing
-    // every vertex through rlVertex3f each frame. Positions only, unindexed.
-    // Unloaded in unload_city_render_model(); the destructor here mirrors
-    // GpuBuildingMeshChunk's pattern (UnloadMesh is safe on a zeroed Mesh).
-    mutable std::array<Mesh, 4> shadow_volume_meshes{};
-    mutable std::array<bool, 4> shadow_volume_mesh_uploaded{};
-    std::size_t uploaded_vertices{};
-    std::size_t uploaded_indices{};
+    // Light-independent stencil shadow volume, built once with the model: caps
+    // per face and a quad per edge, extruded in the vertex shader. Placements
+    // share it via instancing; the sun and extrusion length are uniforms.
+    GpuMesh shadow_volume;
+    // Highest vertex y, for the sector-based extrusion length.
+    float shadow_top{};
     std::size_t uploaded_bytes{};
 
-    GpuBuildingRenderModel() = default;
-    GpuBuildingRenderModel(const GpuBuildingRenderModel&) = delete;
-    GpuBuildingRenderModel& operator=(const GpuBuildingRenderModel&) = delete;
-    GpuBuildingRenderModel(GpuBuildingRenderModel&&) noexcept = default;
-
-    GpuBuildingRenderModel& operator=(GpuBuildingRenderModel&& other) noexcept {
-        if (this != &other) {
-            unload_shadow_volume_meshes();
-            chunks = std::move(other.chunks);
-            wire_lines = std::move(other.wire_lines);
-            shadow_faces = std::move(other.shadow_faces);
-            shadow_volume_vertices = std::move(other.shadow_volume_vertices);
-            shadow_volume_valid = other.shadow_volume_valid;
-            shadow_volume_light = other.shadow_volume_light;
-            shadow_volume_extrusion = other.shadow_volume_extrusion;
-            shadow_volume_light_valid = other.shadow_volume_light_valid;
-            shadow_volume_meshes = other.shadow_volume_meshes;
-            shadow_volume_mesh_uploaded = other.shadow_volume_mesh_uploaded;
-            other.shadow_volume_meshes.fill(Mesh{});
-            other.shadow_volume_mesh_uploaded.fill(false);
-            uploaded_vertices = other.uploaded_vertices;
-            uploaded_indices = other.uploaded_indices;
-            uploaded_bytes = other.uploaded_bytes;
-        }
-        return *this;
-    }
-
-    ~GpuBuildingRenderModel() {
-        unload_shadow_volume_meshes();
-    }
-
-    // UnloadMesh is safe on a default-constructed (zeroed) Mesh: raylib's
-    // implementation checks vaoId/vboId before freeing.
-    void unload_shadow_volume_meshes() {
-        for (auto& mesh : shadow_volume_meshes) {
-            if (mesh.vaoId != 0U || mesh.vboId != nullptr) {
-                UnloadMesh(mesh);
-            }
-            mesh = {};
-        }
-        shadow_volume_mesh_uploaded.fill(false);
-    }
+    [[nodiscard]] bool empty() const { return mesh.empty(); }
 };
 
 enum class GfxDebugDrawCategory : std::size_t {
@@ -321,6 +246,14 @@ struct GfxDebugScopedTimer {
 
 extern GfxDebugStats* g_gfx_debug_stats;
 
+// Performance settings the renderer reads (mirrored from EditorUi each frame).
+struct RenderSettings {
+    bool near_lod{true};           // rooms and glass within kNearLodDistance
+    float building_distance{0.0F}; // 0 = draw every placement
+    bool half_textures{false};     // halve texture resolution at load
+};
+extern RenderSettings g_render_settings;
+
 // Times a phase only when the debug overlay is active; no-op otherwise. Lets draw
 // code use one RAII line instead of branching on g_gfx_debug_stats everywhere.
 struct GfxDebugMaybeTimer {
@@ -403,11 +336,15 @@ struct EditorProject {
     std::optional<std::size_t> portal_preview_index;
     std::optional<std::size_t> building_floor_preview_building;
     std::optional<std::uint32_t> building_floor_preview_floor{};
+    bool building_floor_preview_roofs{true};
     bool building_floor_preview_dirty{true};
     bool render_buffers_dirty{true};
     // True while the user is mid-gesture (button held / gizmo drag): whole-scene
     // rebuilds wait for it to end so dragging stays smooth.
     bool defer_heavy_rebuilds{};
+    // City scene fingerprint of the map as it is now (set each City frame), to
+    // tell when a roads/terrain rebuild is waiting.
+    std::uint64_t city_scene_current_fingerprint{};
     // Per-placement resolved index into `buildings`, nullopt if unresolved.
     // Rebuilt lazily by resolve_placement_asset_indices() whenever it looks
     // stale (size mismatch or the city/asset list changed), so the three
@@ -416,6 +353,18 @@ struct EditorProject {
     std::vector<std::optional<std::size_t>> placement_asset_indices;
     std::size_t placement_asset_indices_building_count{};
     std::uint64_t placement_asset_indices_fingerprint{};
+    // Placements with cells overwritten by a later overlapping placement get
+    // their own model without those cells (refresh_placement_override_models).
+    std::unordered_map<std::size_t, GpuBuildingRenderModel> placement_override_models;
+    // Near-LOD meshes per template (building_near_mesh); far_vao ties each to
+    // the shell model it was built beside, so a template edit rebuilds it.
+    struct NearBuildingModel {
+        GpuMesh mesh;
+        double last_used{};
+        unsigned int far_vao{};
+    };
+    std::unordered_map<std::size_t, NearBuildingModel> building_near_models;
+    std::uint64_t placement_override_fingerprint{};
     bool placement_assets_dirty{true};
     MapScene city_scene_cache;
     std::uint64_t city_scene_cache_fingerprint{};
@@ -436,6 +385,8 @@ struct EditorProject {
     // re-upload when terrain-affecting inputs change (terrain_gpu_fingerprint),
     // so road/street edits skip the heavy terrain GPU upload.
     std::uint64_t terrain_gpu_fingerprint{};
+    // city_tile_fingerprint of the uploaded road/curb tile model.
+    std::optional<std::uint64_t> city_tile_gpu_fingerprint;
     bool terrain_gpu_valid{false};
     bool portal_render_dirty{true};
     bool portal_preview_render_dirty{true};
@@ -560,6 +511,11 @@ struct BlockToolConfig {
     // Down, South, West, North, East, Up - the renderer's slot order.
     std::array<std::size_t, 6> exterior_face_material{};
     std::array<std::size_t, 6> interior_face_material{};
+    // Place a piece (block mesh, building.piece_names) instead of a shell: the
+    // exterior word becomes 0x80000000 | rotation << 24 | piece index.
+    bool piece{false};
+    std::size_t piece_index{};
+    std::uint32_t piece_rotation{};
 };
 
 // Drag-gizmo handle on the selected city building. MoveX/MoveZ slide along the
@@ -653,6 +609,17 @@ enum class CameraDrag {
     Pan,
 };
 
+// Map screen options: street/avenue names on or off, and their font, as
+// "game:<name>" (a font in the game's font folder) or "file:<path>" (TTF/OTF).
+struct MapMenuOptions {
+    bool street_labels{true};
+    std::string font{"game:rockwell"};
+};
+struct MapFontChoice {
+    std::string key;
+    std::string label;
+};
+
 struct EditorUi {
     EditorTab tab{EditorTab::City};
     // Rebindable shortcuts, indexed by EditorAction. Loaded from the prefs file.
@@ -665,6 +632,18 @@ struct EditorUi {
     // The Buildblock window had focus last frame; undo then targets buildblocks.
     bool buildblock_window_focused{};
     bool show_changes_window{};
+    bool show_map_image_window{};
+    // Cells above (or below) the surface under the cursor at which the Road,
+    // Piece, and Building tools place; Page Up/Down change it.
+    int place_height_offset{};
+    // In-game coordinate readout over the viewport (camera and cursor).
+    bool show_coordinates{true};
+    // The editor camera this frame, for the map window's camera marker.
+    Vector3 view_camera_position{};
+    Vector3 view_camera_target{};
+    MapMenuOptions map_menu;
+    int map_export_size{512};
+    bool map_export_requested{};
     bool show_shortcuts_window{};
     bool show_preferences_window{};
     bool show_graphics_debug{};
@@ -747,7 +726,11 @@ struct EditorUi {
     Vector2 last_building_click_mouse{};
     std::array<std::uint32_t, 3> anchor_drag_start{};
     std::size_t paint_material_index{};
-    bool paint_interior{false};
+    // Paint tool writes a wall side code (0 open, 1 wall, 3.. buildblock layer)
+    // instead of a texture.
+    bool paint_side_code{false};
+    std::uint32_t paint_code{1};
+    std::size_t building_list_add{};
     // Click-and-hold stamping: the last grid cell a held-drag stamped, so dragging
     // across cells places fast without re-stamping the same cell every frame. Reset
     // on mouse release. {INT32_MIN} means "nothing stamped yet this drag".
@@ -791,8 +774,12 @@ struct EditorUi {
     // both false shows only the native editor-style node and segment overlays.
     bool render_roads{true};
     bool render_terrain{true};
-    float world_time_hours{12.0F};
-    int render_quality{1}; // 0 low, 1 balanced, 2 high
+    // Performance (Preferences): see RenderSettings.
+    bool near_lod{true};
+    float render_scale{1.0F};        // 3D view resolution, 0.5..1
+    float building_distance{0.0F};
+    bool half_textures{false};
+    float world_time_hours{11.0F};
     bool render_shadows{true};
     bool render_sky{true};
     float shadow_distance{700.0F};
@@ -805,6 +792,8 @@ struct EditorUi {
     std::size_t selected_buildblock_field{};
     // Buildings tab view: false => whole building, true => only building_view_floor.
     bool building_view_floor_only{false};
+    // Building editor: drop the upward outer faces so the rooms show from above.
+    bool building_hide_roofs{false};
     int building_view_floor{0};
     float camera_fly_speed{48.0F};
     // Orbit (Alt+left drag) / pan (middle drag) in progress, and its pivot.
@@ -848,6 +837,8 @@ void set_game_render_depth_output(bool enabled);
 // Rebuilds project.placement_asset_indices if it looks stale, then returns it.
 // Use this instead of find_building_asset() in per-frame, per-placement loops.
 const std::vector<std::optional<std::size_t>>& resolve_placement_asset_indices(EditorProject& project);
+// Rebuilds placement_override_models when placements or template models change.
+void refresh_placement_override_models(EditorProject& project);
 // Display label for a key, localized to the user's keyboard layout (printable
 // keys via glfwGetKeyName, fixed names for the rest). Defined in app.cpp.
 std::string key_label(int key);
@@ -858,9 +849,13 @@ void reset_shortcuts(EditorUi& ui);
 bool action_pressed(const EditorUi& ui, EditorAction action);
 std::string shortcut_label(const Shortcut& shortcut);
 std::string action_shortcut_label(const EditorUi& ui, EditorAction action);
+// Moves the selected junction, or both ends of the selected road, by delta levels.
+void nudge_city_junction_level(EditorProject& project, EditorUi& ui, int delta);
 std::filesystem::path preferences_path();
 void load_preferences(EditorUi& ui);
 void save_preferences(const EditorUi& ui);
+// Time-of-day slider for the sun; true when it changed.
+bool draw_world_time_slider(EditorUi& ui);
 #ifdef __EMSCRIPTEN__
 void web_restore_file(const std::filesystem::path& path, const char* key);
 void web_store_file(const std::filesystem::path& path, const char* key);
@@ -872,6 +867,18 @@ void draw_building_browser_window(EditorProject& project, EditorUi& ui);
 void draw_block_browser_window(EditorProject& project, EditorUi& ui);
 void draw_buildblock_window(EditorProject& project, EditorUi& ui, std::string& status);
 void draw_changes_window(EditorProject& project, EditorUi& ui, std::string& status);
+// The game's map screen image (render_gpu.cpp): rendered from the city, or the
+// map folder's map.png for the round map. nullptr until the city is built.
+const Texture2D* city_map_image(EditorProject& project);
+// Game fonts found next to the map, then the system's TTF/OTF fonts.
+std::vector<MapFontChoice> map_font_choices(const EditorProject& project);
+// The map screen (DrawMapMenu): the map image with its street labels, drawn at
+// `pixels` square like the game's screen-scaled viewport.
+const Texture2D* map_menu_texture(EditorProject& project, int pixels, const MapMenuOptions& options);
+// The same screen rendered at `pixels` square, as PNG bytes; empty when there
+// is no map image yet.
+std::vector<std::uint8_t> map_menu_png(EditorProject& project, int pixels, const MapMenuOptions& options);
+void draw_map_image_window(EditorProject& project, EditorUi& ui);
 void draw_shortcuts_window(EditorUi& ui);
 void draw_preferences_window(EditorUi& ui);
 void unload_preview_views(EditorUi& ui);
@@ -896,6 +903,32 @@ void focus_current_selection(EditorProject& project, EditorUi& ui, Camera3D& cam
 void begin_city_action(EditorProject& project, EditorUi& ui, std::string label);
 const LoadedAsset<SblTemplate>* buildblock_for_cell(const EditorProject& project, const SbbBuilding& building, const SbbCell& cell);
 void draw_gpu_building_model_public(GpuBuildingRenderModel& model, Vector3 origin, std::int32_t rotation);
+// Model matrix for a city placement (render origin + quarter-turn basis).
+Matrix city_placement_matrix(const SbcBuilding& placement);
+// Instanced draws of `model` at every transform in `transforms`, lit by the game
+// surface shader (or the flat mask shader). The caller owns the MRT state.
+enum class GpuSurface { World, Building, Terrain, Model, Unlit, Mask, ShadowVolume };
+void draw_gpu_mesh_instances(const GpuMesh& mesh, const std::vector<Matrix>& transforms, GpuSurface surface);
+// The game's near-LOD switch distance (_render_buildsectorlist: sector centre
+// within sqrt(36864) = 192 units).
+inline constexpr float kNearLodDistance = 192.0F;
+// A template's near-LOD mesh (rooms, doorways, glass; no shell window faces),
+// built on first use while `build_budget` > 0 (each build spends one).
+const GpuMesh* building_near_mesh(EditorProject& project, std::size_t asset_index, int& build_budget);
+// Drops near meshes unused for a few seconds.
+void evict_building_near_models(EditorProject& project);
+// One mesh and the transforms to instance it with, for draw_gpu_mesh_batch.
+struct GpuMeshDraw {
+    const GpuMesh* mesh{};
+    std::span<const Matrix> transforms;
+};
+// Draws several meshes with one program bind and one instance upload, and only
+// the texture and uniform changes between parts. Same output as one
+// draw_gpu_mesh_instances per mesh.
+// Which mesh parts to draw: all, only opaque ones, or only the window parts as
+// see-through glass (blended, both sides, after the opaque pass).
+enum class GpuPartFilter { All, Opaque, Glass };
+void draw_gpu_mesh_batch(const std::vector<GpuMeshDraw>& draws, GpuSurface surface, GpuPartFilter filter = GpuPartFilter::All);
 void draw_mesh_faces(const SblBlockMesh& mesh, Vec3 origin, float scale, Color fill);
 void undo_city(EditorProject& project, EditorUi& ui, std::string& status);
 void redo_city(EditorProject& project, EditorUi& ui, std::string& status);
@@ -931,7 +964,7 @@ void service_render_rebuild(EditorProject& project);
 void invalidate_portal_render_models(EditorProject& project);
 void invalidate_city_block_preview_scene(EditorProject& project);
 GpuBuildingRenderModel upload_building_render_model(const BuildingRenderBuffer& buffer, const SbbBuilding& building, const EditorProject& project);
-GpuBuildingRenderModel& building_tool_floor_preview_model(EditorProject& project, std::size_t building_index, std::optional<std::uint32_t> floor);
+GpuBuildingRenderModel& building_tool_floor_preview_model(EditorProject& project, std::size_t building_index, std::optional<std::uint32_t> floor, bool roofs = true);
 RenderTexture2D load_game_render_texture(int width, int height);
 void unload_game_render_texture(RenderTexture2D target);
 // Raylib's WebGL3 backend in this bundled version does not bind the target FBO
@@ -945,8 +978,10 @@ void clear_game_render_shadow_factor();
 void resolve_game_render_texture(RenderTexture2D target);
 const RenderTexture2D* game_render_display_texture(RenderTexture2D target);
 void draw_game_sky(const Camera3D& camera, Vector2 viewport_size, Texture2D depth_texture);
+// Recaptures the blurred landscape cubemap world surfaces sample for
+// environment light, when the sun, terrain or camera moved (render_gpu.cpp).
+void update_environment_cubemap(const GpuMesh* terrain, Vector3 camera_position);
 void set_game_surface_camera(Vector3 position);
-void set_game_surface_terrain(bool enabled);
 void set_game_world_time(float hours);
 // Loaded texture for a material name (matches project.textures by name), or
 // nullptr when the project has no texture by that name. Used to show real texture
@@ -964,24 +999,21 @@ void draw_sbb_scene_for_app(
     GpuBuildingRenderModel& model,
     const SbbCell* selected,
     std::uint32_t guide_floor);
-void draw_city_building_model(
-    const SbbBuilding& template_file,
-    GpuBuildingRenderModel& model,
-    const SbcBuilding& placement,
-    bool selected,
-    bool use_lod,
-    bool hovered = false);
 void draw_city_building_mask(GpuBuildingRenderModel& model, const SbcBuilding& placement);
 void draw_outline_from_mask(RenderTexture2D& mask, Vector2 viewport_size, Color tint);
 void draw_city_road_mask(const EditorProject& project, const MapScene& scene, std::size_t street_index);
-void draw_building_cell_mask(const SbbBuilding& building, const SbbCell& cell);
+// Silhouette masks from real geometry: a building cell's faces in the edit-view
+// mesh, one piece voxel's faces, a road junction's tiles.
+void draw_building_face_highlight(const BuildingRenderBuffer& buffer, std::size_t cell, std::uint32_t slot);
+void draw_building_cell_mask(const BuildingRenderBuffer& buffer, const SbbBuilding& building, const SbbCell& cell);
+void draw_city_piece_mask(const EditorProject& project, CityGridPoint cell);
+void draw_city_intersection_mask(const MapScene& scene, std::size_t intersection);
 void draw_city_piece_voxels(
     EditorProject& project,
     bool textured,
     std::optional<std::size_t> selected_portal = std::nullopt,
     bool draw_wires = false,
     bool isolate_selected = false);
-void draw_city_piece_glow(CityGridPoint cell, Color color);
 GpuBuildingRenderModel upload_city_tile_model(const BuildingRenderBuffer& buffer, const EditorProject& project);
 GpuBuildingRenderModel upload_city_terrain_model(const BuildingRenderBuffer& buffer, const EditorProject& project);
 void unload_city_render_model(GpuBuildingRenderModel& model);
@@ -991,18 +1023,20 @@ void draw_city_scene(
     const SbcStreet* selected_street,
     bool render_roads,
     bool render_terrain);
-void draw_city_road_markings(const MapScene& scene);
 void draw_city_editor_overlay(const EditorProject& project, const MapScene& scene);
-void draw_city_traffic_light_poles(const MapScene& scene);
+void draw_city_traffic_light_poles(const EditorProject& project, const MapScene& scene);
 void draw_city_shadow_volumes(EditorProject& project, const Camera3D& camera, float max_distance);
 void composite_city_shadows(Vector2 viewport_size);
 void draw_city_cursor(CityGridPoint point, float unit_size, CityTool tool);
 // Terrain-following grid drawn around the cursor while laying roads/pieces, so
 // the click cell and its neighbours are legible against the ground.
-void draw_city_edit_grid(CityGridPoint center, const MapScene& scene);
+// Work grids size their lines in screen pixels for this camera and viewport.
+void set_grid_view(const Camera3D& camera, float viewport_height);
+// Placement grid around the city tool's target; cell_fill tints the target cell
+// (pieces, buildings), otherwise the lines through the point are highlighted.
+void draw_city_edit_grid(CityGridPoint center, const MapScene& scene, Color accent, bool cell_fill);
 // Roads-mode selection/hover overlay: distinct styling for the selected node, the
 // selected road, and the node/road under the cursor (hover_city_* in ui).
-void draw_city_road_selection(const EditorProject& project, const EditorUi& ui, const MapScene& scene);
 void draw_city_block_preview(EditorProject& project, const SbcCityBlock& city_block, const std::vector<NamedBlockMesh>& meshes, std::size_t city_block_index, std::size_t selected_layer, std::size_t selected_slot);
 void draw_buildblock_preview_3d(const BuildblockPreviewScene& scene);
 
@@ -1011,7 +1045,8 @@ float adjust_camera_fly_speed(float current_speed, float wheel_delta);
 Ray get_viewport_mouse_ray(const Camera3D& camera, Vector2 viewport_mouse_pos, Vector2 viewport_size);
 Vector2 get_viewport_mouse_position(Vector2 viewport_pos, Vector2 viewport_size);
 void focus_camera_on_city(Camera3D& camera, const EditorProject& project);
-void update_free_fly_camera(Camera3D& camera, float fly_speed);
+FlyInput read_fly_input();
+void update_free_fly_camera(Camera3D& camera, float fly_speed, const FlyInput& input);
 // Alt+left drag orbits around the point under the cursor, middle drag pans, and
 // the wheel zooms toward the cursor. `scene` supplies terrain for the pivot.
 void update_orbit_camera(Camera3D& camera, EditorUi& ui, Vector2 viewport_mouse_pos, Vector2 viewport_size,

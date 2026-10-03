@@ -552,17 +552,33 @@ void draw_block_tool_panel(EditorProject& project, EditorUi& ui) {
     static constexpr std::array<const char*, 6> face_names{"Bottom", "South", "West", "North", "East", "Top"};
 
     ImGui::SeparatorText("Block to place");
-    ImGui::Checkbox("Exterior", &cfg.exterior);
+    if (ImGui::RadioButton("Shell", !cfg.piece)) cfg.piece = false;
     ImGui::SameLine();
-    ImGui::Checkbox("Interior", &cfg.interior);
-    if (!cfg.exterior && !cfg.interior) {
-        ImGui::Text("Enable a shell to place.");
-    }
+    if (ImGui::RadioButton("Piece", cfg.piece)) cfg.piece = true;
+    if (cfg.piece) {
+        if (building.piece_names.empty()) {
+            ImGui::TextWrapped("Add a piece to the Pieces list above first.");
+        } else {
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            catalog_combo("##block_piece", building.piece_names, cfg.piece_index);
+            static constexpr std::array<const char*, 4> rotations{"0\xC2\xB0", "90\xC2\xB0", "180\xC2\xB0", "270\xC2\xB0"};
+            int rotation = static_cast<int>(cfg.piece_rotation & 3U);
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::Combo("##block_piece_rotation", &rotation, rotations.data(), 4)) cfg.piece_rotation = static_cast<std::uint32_t>(rotation);
+        }
+    } else {
+        ImGui::Checkbox("Exterior", &cfg.exterior);
+        ImGui::SameLine();
+        ImGui::Checkbox("Interior", &cfg.interior);
+        if (!cfg.exterior && !cfg.interior) {
+            ImGui::Text("Enable a shell to place.");
+        }
 
-    ImGui::Spacing();
-    ImGui::TextUnformatted("Buildblock");
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    catalog_combo("##block_buildblock", building.block_names, cfg.buildblock_index);
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Buildblock");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        catalog_combo("##block_buildblock", building.block_names, cfg.buildblock_index);
+    }
 
     // Each face shows its current material as a thumbnail button; clicking opens a
     // popup swatch grid to choose a new one. A "set all" copies the first face.
@@ -607,10 +623,13 @@ void draw_block_tool_panel(EditorProject& project, EditorUi& ui) {
     };
 
     ImGui::Spacing();
-    if (cfg.exterior) {
+    if (cfg.piece) {
+        // A piece's material slots 0..5 read the cell's exterior texture set.
+        face_material_grid("Piece textures (slots 0-5)", cfg.exterior_face_material);
+    } else if (cfg.exterior) {
         face_material_grid("Exterior textures", cfg.exterior_face_material);
     }
-    if (cfg.interior) {
+    if (!cfg.piece && cfg.interior) {
         face_material_grid("Interior textures", cfg.interior_face_material);
     }
     ImGui::Spacing();
@@ -702,10 +721,83 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
         }
         ImGui::EndDisabled();
     }
+    // The buildblocks (cell_type) and piece meshes (piece payloads) this building
+    // may use. Entries are referenced by index, so only an unused buildblock can
+    // be removed; pieces are append-only.
+    const auto name_list = [&](const char* header, std::vector<std::string>& names, const std::vector<std::string>& library,
+                               bool removable) {
+        if (!ImGui::CollapsingHeader(header)) return;
+        ImGui::PushID(header);
+        if (names.empty()) ImGui::TextDisabled("None yet. Add one below.");
+        for (std::size_t i = 0; i < names.size(); ++i) {
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::Text("%zu  %s", i, names[i].c_str());
+            if (removable) {
+                const bool used = std::ranges::any_of(building.cells, [&](const SbbCell& c) { return c.occupied && c.cell_type() == i; });
+                ImGui::SameLine();
+                ImGui::BeginDisabled(used);
+                if (ImGui::SmallButton(ICON_FA_XMARK)) {
+                    names.erase(names.begin() + static_cast<std::ptrdiff_t>(i));
+                    for (auto& c : building.cells) if (c.cell_type() > i) --c.cell_type();
+                    mark_building_changed(project, ui);
+                    ImGui::EndDisabled();
+                    ImGui::PopID();
+                    break;
+                }
+                ImGui::EndDisabled();
+                if (used && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("In use by blocks");
+            }
+            ImGui::PopID();
+        }
+        catalog_combo("##add", library, ui.building_list_add);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(library.empty());
+        if (ImGui::Button("Add") && ui.building_list_add < library.size()) {
+            const auto& name = library[ui.building_list_add];
+            if (std::ranges::find(names, name) == names.end()) {
+                names.push_back(name);
+                mark_building_changed(project, ui);
+            }
+        }
+        ImGui::EndDisabled();
+        ImGui::PopID();
+    };
+    std::vector<std::string> buildblock_library;
+    for (const auto& asset : project.buildblocks) buildblock_library.push_back(asset.name);
+    name_list("Buildblocks", building.block_names, buildblock_library, true);
+    name_list("Pieces", building.piece_names, block_names(project), false);
+
     if (ui.building_tool == BuildingTool::PlaceBlock) draw_block_tool_panel(project, ui);
     if (ui.building_tool == BuildingTool::PaintTexture) {
-        ImGui::Checkbox("Paint inside faces", &ui.paint_interior);
-        material_swatch_picker(project, "paint_material", building.materials, ui.paint_material_index);
+        ImGui::SeparatorText("Paint");
+        if (ImGui::RadioButton("Texture", !ui.paint_side_code)) ui.paint_side_code = false;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Wall type", ui.paint_side_code)) ui.paint_side_code = true;
+        if (!ui.paint_side_code) {
+            material_swatch_picker(project, "paint_material", building.materials, ui.paint_material_index);
+        } else {
+            // Side code 0 leaves the side open, 1 is a plain wall, 3.. picks a
+            // layer (windows, doors) of the block's buildblock.
+            ImGui::TextUnformatted("Buildblock");
+            catalog_combo("##paint_buildblock", building.block_names, ui.block_config.buildblock_index);
+            const auto* asset = building.block_names.empty()
+                ? nullptr
+                : find_buildblock_asset(project, building.block_names[std::min(ui.block_config.buildblock_index, building.block_names.size() - 1U)]);
+            if (ImGui::Selectable("Open (no wall)", ui.paint_code == 0U)) ui.paint_code = 0U;
+            if (ImGui::Selectable("Plain wall", ui.paint_code == 1U)) ui.paint_code = 1U;
+            if (asset != nullptr) {
+                for (std::size_t layer = 0; layer < asset->data.layers.size() && layer < 13U; ++layer) {
+                    const auto& l = asset->data.layers[layer];
+                    const auto label = "Layer " + std::to_string(layer) + ": " + std::to_string(l.windows.size()) + " windows, " +
+                        std::to_string(l.doors.size()) + " doors";
+                    const auto code = static_cast<std::uint32_t>(layer + 3U);
+                    if (ImGui::Selectable(label.c_str(), ui.paint_code == code)) ui.paint_code = code;
+                }
+            } else if (!building.block_names.empty()) {
+                ImGui::TextDisabled("Buildblock not loaded.");
+            }
+            ImGui::TextWrapped("Click a wall face. Layers also set the block's buildblock.");
+        }
     }
 }
 

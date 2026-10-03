@@ -5,6 +5,7 @@
 #include <raymath.h>
 #ifdef __EMSCRIPTEN__
 #include <GLES3/gl3.h>
+#include <emscripten/html5.h>
 #else
 #include <external/glad.h>
 #endif
@@ -13,6 +14,9 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <fstream>
+#include <filesystem>
+#include <cstdio>
 #include <functional>
 #include <future>
 #include <iostream>
@@ -21,6 +25,7 @@
 #include <sstream>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef __EMSCRIPTEN__
@@ -32,15 +37,27 @@
 namespace map_editor::app_internal {
 
 GfxDebugStats* g_gfx_debug_stats = nullptr;
-float g_world_time_hours = 12.0F;
+RenderSettings g_render_settings;
+// Turns on the room-glass branch; the shader computes the pane's alpha itself.
+constexpr float kRoomGlassAlpha = 1.0F;
+// _resetgame starts the clock at 0x244140 = 11:00.
+float g_world_time_hours = 11.0F;
 
 Vector3 game_light_direction() {
-    constexpr float reset_angle = 6.02138591938F;
-    const float angle = reset_angle + (g_world_time_hours - 12.0F)*(2.0F*PI/24.0F);
+    // Game_RunFixedStep: angle = pi + t*2pi/5616000 in World mode (type 4),
+    // pi + t*2pi/5184000 in the others; DrawGameInfo shows t/216000 as the
+    // hour. So World's sun runs a 26-hour cycle against the 24-hour clock.
+    // The client reads the type as 4 bits (Net_ProcessServerSnapshotStream), so
+    // World-based modes such as Ultimate (type 4 + 16) also get the 26 hours.
+    // ponytail: World only; Round/Race/other types would need 24 here.
+    // Math_Vec3RotateAroundAxis @7b4d0 turns by -angle (v.cos + (v x a).sin),
+    // the opposite sense to raylib's rotation.
+    constexpr float kSunCycleHours = 26.0F;
+    const float angle = PI + g_world_time_hours*(2.0F*PI/kSunCycleHours);
     return Vector3RotateByAxisAngle(
         Vector3Normalize(Vector3{0.0F, 1.0F, 0.5F}),
         Vector3{0.0F, 0.4472135901F, -0.8944271803F},
-        angle);
+        -angle);
 }
 
 std::string format_ms(double ms) {
@@ -92,48 +109,37 @@ std::unordered_map<unsigned int, GameRenderResources>& game_render_resources() {
 }
 
 namespace {
-bool g_depth_output_cache_valid = false;
-bool g_depth_output_cached_enabled = false;
+// The bound game target has the packed-depth/direct-light attachments, and how
+// many draw buffers are enabled on it. Tracked here instead of queried: glGet*
+// forces a pipeline sync on some drivers (Apple's GL-on-Metal in particular).
+bool g_target_has_mrt = false;
+int g_draw_buffer_count = 1;
 }  // namespace
 
-void reset_game_render_depth_output_cache() {
-    // begin_game_texture_mode()/end_game_texture_mode() rebind draw buffers
-    // directly, so the cached state below would otherwise go stale.
-    g_depth_output_cache_valid = false;
-}
-
 void set_game_render_depth_output(bool enabled) {
-    // Repeated calls with the same value are extremely common (once per
-    // building per frame); skip the batch flush and GL queries when the
-    // state already matches.
-    if (g_depth_output_cache_valid && g_depth_output_cached_enabled == enabled) return;
-    g_depth_output_cache_valid = true;
-    g_depth_output_cached_enabled = enabled;
-
+    // The game surface shader writes the lit color, the packed linear distance
+    // used by the atmosphere pass, and the direct light the shadow resolve
+    // removes. WebGL2 requires every active draw buffer to have a matching
+    // fragment output, so all three are enabled only while that shader submits
+    // geometry; raylib's utility shaders (grids, lines, ImGui) write color 0.
+    const int wanted = enabled && g_target_has_mrt ? 3 : 1;
+    if (wanted == g_draw_buffer_count) return;
     rlDrawRenderBatchActive();
-    // The game surface shader writes both the lit color and the packed linear
-    // distance used by the atmosphere pass. WebGL2 requires every active draw
-    // buffer to have a matching fragment output, so enable both attachments
-    // only while that shader is submitting geometry. Raylib's utility shaders
-    // (grids, lines, cursors, and ImGui) write one output and must use color 0.
-    GLint framebuffer = 0;
-    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &framebuffer);
-    GLint depth_attachment_type = GL_NONE;
-    if (framebuffer != 0) {
-        glGetFramebufferAttachmentParameteriv(
-            GL_DRAW_FRAMEBUFFER,
-            GL_COLOR_ATTACHMENT1,
-            GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,
-            &depth_attachment_type);
-    }
-    if (enabled && depth_attachment_type != GL_NONE) {
-        const GLenum color_and_depth[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2};
-        glDrawBuffers(3, color_and_depth);
-    } else {
-        const GLenum color_only[] = {GL_COLOR_ATTACHMENT0};
-        glDrawBuffers(1, color_only);
-    }
+    static constexpr GLenum outputs[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2};
+    glDrawBuffers(wanted, outputs);
+    g_draw_buffer_count = wanted;
 }
+
+#ifdef __EMSCRIPTEN__
+// WebGL2 renders to half floats only with EXT_color_buffer_float (all current
+// desktop browsers). With it the web target matches native: HDR scene color,
+// then the Reinhard + sRGB resolve. Without it colors stay 8-bit, untonemapped.
+bool web_hdr_targets() {
+    static const bool supported =
+        emscripten_webgl_enable_extension(emscripten_webgl_get_current_context(), "EXT_color_buffer_float");
+    return supported;
+}
+#endif
 
 RenderTexture2D load_game_render_texture(int width, int height) {
 #ifdef __EMSCRIPTEN__
@@ -144,6 +150,12 @@ RenderTexture2D load_game_render_texture(int width, int height) {
     if (target.id == 0U) return target;
 
     glBindFramebuffer(GL_FRAMEBUFFER, target.id);
+    if (web_hdr_targets()) {
+        rlUnloadTexture(target.texture.id);
+        target.texture = {rlLoadTexture(nullptr, width, height, PIXELFORMAT_UNCOMPRESSED_R16G16B16A16, 1),
+            width, height, 1, PIXELFORMAT_UNCOMPRESSED_R16G16B16A16};
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.texture.id, 0);
+    }
     if (target.depth.id != 0U) {
         glDeleteRenderbuffers(1, &target.depth.id);
     }
@@ -225,7 +237,8 @@ RenderTexture2D load_game_render_texture(int width, int height) {
 }
 
 void begin_game_texture_mode(RenderTexture2D target) {
-    reset_game_render_depth_output_cache();
+    g_draw_buffer_count = 1;
+    g_target_has_mrt = game_render_resources().contains(target.id);
     BeginTextureMode(target);
     rlDrawRenderBatchActive();
 #ifdef __EMSCRIPTEN__
@@ -264,7 +277,8 @@ void begin_game_texture_mode(RenderTexture2D target) {
 }
 
 void end_game_texture_mode() {
-    reset_game_render_depth_output_cache();
+    g_draw_buffer_count = 1;
+    g_target_has_mrt = false;
     rlDrawRenderBatchActive();
     const auto target = rlGetActiveFramebuffer();
     if (game_render_resources().contains(target)) {
@@ -310,6 +324,7 @@ void clear_game_render_packed_depth() {
     glClearBufferfv(GL_COLOR, 2, no_light);
     const GLenum color_only[] = {GL_COLOR_ATTACHMENT0};
     glDrawBuffers(1, color_only);
+    g_draw_buffer_count = 1;
 }
 
 void clear_game_render_shadow_factor() {
@@ -368,37 +383,9 @@ vec3 sceneColor(vec2 uv) {
     // ambient light and reflections instead of darkening the final image.
     return max(texture(texture0, uv).rgb - texture(directLight, uv).rgb * (1.0-texture(shadowFactor, uv).r), vec3(0.0));
 }
-vec3 fxaa(vec2 uv) {
-    vec2 inverseResolution=1.0/resolution;
-    vec3 rgbNW=sceneColor(uv+vec2(-1.0,-1.0)*inverseResolution);
-    vec3 rgbNE=sceneColor(uv+vec2( 1.0,-1.0)*inverseResolution);
-    vec3 rgbSW=sceneColor(uv+vec2(-1.0, 1.0)*inverseResolution);
-    vec3 rgbSE=sceneColor(uv+vec2( 1.0, 1.0)*inverseResolution);
-    vec3 rgbM =sceneColor(uv);
-    vec3 luma=vec3(0.299,0.587,0.114);
-    float lumaNW=dot(rgbNW,luma);
-    float lumaNE=dot(rgbNE,luma);
-    float lumaSW=dot(rgbSW,luma);
-    float lumaSE=dot(rgbSE,luma);
-    float lumaM=dot(rgbM,luma);
-    float lumaMin=min(lumaM,min(min(lumaNW,lumaNE),min(lumaSW,lumaSE)));
-    float lumaMax=max(lumaM,max(max(lumaNW,lumaNE),max(lumaSW,lumaSE)));
-    vec2 direction=vec2(-((lumaNW+lumaNE)-(lumaSW+lumaSE)),
-                         (lumaNW+lumaSW)-(lumaNE+lumaSE));
-    float reduce=max((lumaNW+lumaNE+lumaSW+lumaSE)*0.03125,0.0078125);
-    float inverseDirection=1.0/(min(abs(direction.x),abs(direction.y))+reduce);
-    direction=clamp(direction*inverseDirection,vec2(-8.0),vec2(8.0))*inverseResolution;
-    vec3 resultA=0.5*(
-        sceneColor(uv+direction*(1.0/3.0-0.5))+
-        sceneColor(uv+direction*(2.0/3.0-0.5)));
-    vec3 resultB=resultA*0.5+0.25*(
-        sceneColor(uv+direction*-0.5)+
-        sceneColor(uv+direction* 0.5));
-    float lumaB=dot(resultB,luma);
-    return (lumaB<lumaMin || lumaB>lumaMax) ? resultA : resultB;
-}
 void main() {
-    vec3 color=fxaa(fragTexCoord);
+    // hdr_composite.frag: Reinhard then sRGB, no anti-aliasing pass.
+    vec3 color=sceneColor(fragTexCoord);
     if (applyTonemap==1) {
         color=color/(color+vec3(1.0));
         color=convertToSrgb(color);
@@ -431,7 +418,7 @@ void resolve_game_render_texture(RenderTexture2D target) {
     SetShaderValue(shader, tonemap.resolution_loc, &resolution.x, SHADER_UNIFORM_VEC2);
     const int apply_tonemap =
 #ifdef __EMSCRIPTEN__
-        0;
+        web_hdr_targets() ? 1 : 0;
 #else
         1;
 #endif
@@ -559,7 +546,8 @@ void start_async_render_buffer_rebuild(EditorProject& project) {
                 progress->current = building.name;
             }
             const auto begin = Clock::now();
-            auto city_buffer = build_city_building_full_render_buffer(building.data, blocks, templates);
+            auto city_buffer = build_city_building_full_render_buffer(building.data, blocks, templates, BuildingLod::Far);
+            bake_shadow_volume(city_buffer);
             const auto end = Clock::now();
             const auto ms = std::chrono::duration<double, std::milli>(end - begin).count();
             const auto expanded_vertex_count = city_buffer.triangles.size() * 3U;
@@ -626,7 +614,8 @@ void build_next_browser_render_buffer(EditorProject& project) {
     project.building_render_buffers[index] = build_city_building_full_render_buffer(
         project.buildings[index].data,
         block_meshes(project),
-        buildblock_templates(project));
+        buildblock_templates(project),
+        BuildingLod::Far);
     project.pending_gpu_upload_indices.push_back(index);
     ++project.render_build_progress->completed;
     if (project.render_build_progress->completed >= project.buildings.size()) {
@@ -667,6 +656,7 @@ void upload_next_pending_building(EditorProject& project) {
         return;
     }
     project.building_gpu_models[index] = upload_building_render_model(project.building_render_buffers[index], project.buildings[index].data, project);
+    release_shadow_volume(project.building_render_buffers[index]);
     const auto end = Clock::now();
     const auto ms = std::chrono::duration<double, std::milli>(end - begin).count();
     const auto name = index < project.buildings.size() ? project.buildings[index].name : std::to_string(index);
@@ -674,9 +664,9 @@ void upload_next_pending_building(EditorProject& project) {
     append_render_log(
         project,
         "gpu upload " + name +
-        ": " + std::to_string(model.chunks.size()) + " chunks, " +
-        std::to_string(model.uploaded_vertices) + " verts, " +
-        std::to_string(model.uploaded_indices) + " indices, " +
+        ": " + std::to_string(model.mesh.parts.size()) + " parts, " +
+        std::to_string(model.mesh.vertex_count) + " verts, " +
+        std::to_string(model.mesh.index_count) + " indices, " +
         format_bytes(model.uploaded_bytes) + ", " +
         format_ms(ms));
     ++project.pending_gpu_upload_index;
@@ -702,7 +692,13 @@ void service_render_rebuild(EditorProject& project) {
     }
 
 #ifdef __EMSCRIPTEN__
-    build_next_browser_render_buffer(project);
+    // No worker threads here: build and upload buildings until ~12 ms of this
+    // frame is spent, so loading is bound by work rather than frame pacing.
+    const auto budget_end = std::chrono::steady_clock::now() + std::chrono::milliseconds{12};
+    do {
+        build_next_browser_render_buffer(project);
+        upload_next_pending_building(project);
+    } while (project.render_build_in_progress && std::chrono::steady_clock::now() < budget_end);
 #else
     drain_render_build_progress(project);
 
@@ -745,18 +741,6 @@ Vector3 to_raylib(Vec3 value) {
 // glow without needing a framebuffer bloom pass (which would mean a shader over
 // the whole scene and a fragile cross-platform GL path). Drawn for the selected
 // building, road, and piece so selection feedback is consistent everywhere.
-void draw_selection_glow_box(Vector3 center, Vector3 size, Color tint) {
-    const auto pulse = 0.5F + 0.5F * static_cast<float>(std::sin(GetTime() * 4.0));
-    const auto inner = Color{tint.r, tint.g, tint.b, static_cast<unsigned char>(235)};
-    const auto outer = Color{tint.r, tint.g, tint.b, static_cast<unsigned char>(60 + 70 * pulse)};
-    // Two concentric boxes: a crisp inner edge plus a softer, larger pulsing halo.
-    DrawCubeWiresV(center, size, inner);
-    const auto halo = Vector3{size.x + 1.4F + pulse, size.y + 1.4F + pulse, size.z + 1.4F + pulse};
-    DrawCubeWiresV(center, halo, outer);
-    if (g_gfx_debug_stats != nullptr) {
-        g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::WireOverlay, 0U, 48U, 24U);
-    }
-}
 
 Vector3 scaled(Vec3f value, Vec3 origin, float scale) {
     return {
@@ -881,6 +865,63 @@ const Texture2D& generated_game_landscape_color_texture() {
     return texture;
 }
 
+// The game's texture slot 0 ("concrete"), which curbs, sidewalks and legacy
+// district pieces with face texture 0 use. No file backs it:
+// Texture_GenerateProceduralNoise(0) @99730 fills 128x128 RGBA with a
+// hashed value noise n() (cosine-interpolated, ~[-1,1]) summed at four
+// frequencies, R = G = 168 + 2*sum, B = 167 + 1.75*sum, alpha 0x20, and
+// _settexture gives it a flat material map (0x60, 0xc0, 0).
+// ponytail: our hash differs from the game's, so the speckle pattern is not
+// pixel-identical; the colour, range and frequencies are.
+const Texture2D& game_slot0_texture(bool material) {
+    static const std::array<Texture2D, 2> textures = [] {
+        constexpr int size = 128;
+        const auto hash = [](int x, int y) {
+            auto h = static_cast<std::uint32_t>(x + y * 57);
+            h = (h << 13U) ^ h;
+            h = h * (h * h * 15731U + 789221U) + 1376312589U;
+            return 1.0F - static_cast<float>(h & 0x7fffffffU) / 1073741824.0F;
+        };
+        const auto noise = [&](float x, float y) {
+            const int ix = static_cast<int>(std::floor(x));
+            const int iy = static_cast<int>(std::floor(y));
+            const auto fx = (1.0F - std::cos((x - ix) * PI)) * 0.5F;
+            const auto fy = (1.0F - std::cos((y - iy) * PI)) * 0.5F;
+            const auto a = hash(ix & 127, iy & 127) + (hash((ix + 1) & 127, iy & 127) - hash(ix & 127, iy & 127)) * fx;
+            const auto b = hash(ix & 127, (iy + 1) & 127) + (hash((ix + 1) & 127, (iy + 1) & 127) - hash(ix & 127, (iy + 1) & 127)) * fx;
+            return a + (b - a) * fy;
+        };
+        Image color = GenImageColor(size, size, BLANK);
+        auto* pixels = static_cast<Color*>(color.data);
+        for (int y = 0; y < size; ++y) {
+            for (int x = 0; x < size; ++x) {
+                const auto fx = static_cast<float>(x);
+                const auto fy = static_cast<float>(y);
+                const auto n1 = noise(fx * 0.5F, fy * 0.25F);
+                const auto n2 = noise(fx * 0.25F, fy * 0.125F);
+                const auto n3 = noise(fx, fy * 0.5F);
+                const auto n4 = noise(fx * 2.0F + 1235.0F, fy + 123.0F);
+                const auto grey = static_cast<unsigned char>(std::clamp(168.0F + 2.0F * (n1 + n2 + n3 + n4), 0.0F, 255.0F));
+                const auto blue = static_cast<unsigned char>(std::clamp(167.0F + 1.75F * (n1 + n2 + n3 + n4), 0.0F, 255.0F));
+                // Alpha stays opaque here: world.frag writes alpha 1 regardless.
+                pixels[y * size + x] = Color{grey, grey, blue, 0xff};
+            }
+        }
+        auto color_texture = LoadTextureFromImage(color);
+        UnloadImage(color);
+        Image material = GenImageColor(4, 4, Color{0x60, 0xc0, 0x00, 0xff});
+        auto material_texture = LoadTextureFromImage(material);
+        UnloadImage(material);
+        for (auto* t : {&color_texture, &material_texture}) {
+            GenTextureMipmaps(t);
+            SetTextureWrap(*t, TEXTURE_WRAP_REPEAT);
+            SetTextureFilter(*t, TEXTURE_FILTER_TRILINEAR);
+        }
+        return std::array<Texture2D, 2>{color_texture, material_texture};
+    }();
+    return textures[material ? 1 : 0];
+}
+
 std::string_view game_surface_texture_name(std::string_view name) {
     if (name == "city_road_asphalt") return "asphalt2";
     if (name == "city_curb_concrete") return "concrete";
@@ -917,6 +958,7 @@ const Texture2D* texture_for_buffer_material(const EditorProject& project, const
         if (const auto* detail = find_project_texture(project, "bc_grass01b")) return detail;
         return &generated_game_landscape_color_texture();
     }
+    if (buffer.material_names[material_id] == "city_curb_concrete") return &game_slot0_texture(false);
     return find_project_texture(project, game_surface_texture_name(buffer.material_names[material_id]));
 }
 
@@ -924,486 +966,255 @@ const Texture2D* material_texture_for_buffer_material(const EditorProject& proje
     if (material_id >= buffer.material_names.size()) {
         return nullptr;
     }
+    if (buffer.material_names[material_id] == "city_curb_concrete") return &game_slot0_texture(true);
     return find_project_material_texture(project, game_surface_texture_name(buffer.material_names[material_id]));
 }
 
-Shader game_surface_shader();
 Texture2D default_game_material_texture();
 
-GpuBuildingMeshChunk upload_mesh_chunk(
-    const BuildingRenderBuffer& buffer,
-    std::uint32_t first_triangle,
-    std::uint32_t triangle_count,
-    std::uint32_t material_id,
-    const Texture2D* texture,
-    const Texture2D* material_texture,
-    bool window_material = false
-) {
-    GpuBuildingMeshChunk chunk;
-    chunk.material_id = material_id;
-    chunk.window_material = window_material;
-
-    const auto clamped_end = std::min<std::uint32_t>(
-        first_triangle + triangle_count,
-        static_cast<std::uint32_t>(buffer.triangles.size()));
-    const auto clamped_count = clamped_end > first_triangle ? clamped_end - first_triangle : 0U;
-    if (clamped_count == 0U) {
-        return chunk;
-    }
-
-    auto upload_unindexed_chunk = [&]() {
-        GpuBuildingMeshChunk fallback;
-        fallback.material_id = material_id;
-        fallback.window_material = window_material;
-        fallback.mesh.vertexCount = static_cast<int>(clamped_count * 3U);
-        fallback.mesh.triangleCount = static_cast<int>(clamped_count);
-        fallback.mesh.vertices = static_cast<float*>(MemAlloc(static_cast<unsigned int>(fallback.mesh.vertexCount * 3 * sizeof(float))));
-        fallback.mesh.texcoords = static_cast<float*>(MemAlloc(static_cast<unsigned int>(fallback.mesh.vertexCount * 2 * sizeof(float))));
-        fallback.mesh.colors = static_cast<unsigned char*>(MemAlloc(static_cast<unsigned int>(fallback.mesh.vertexCount * 4 * sizeof(unsigned char))));
-        fallback.mesh.normals = static_cast<float*>(MemAlloc(static_cast<unsigned int>(fallback.mesh.vertexCount * 3 * sizeof(float))));
-        if (fallback.mesh.vertices == nullptr || fallback.mesh.texcoords == nullptr || fallback.mesh.colors == nullptr ||
-            fallback.mesh.normals == nullptr) {
-            if (fallback.mesh.vertices != nullptr) {
-                MemFree(fallback.mesh.vertices);
-            }
-            if (fallback.mesh.texcoords != nullptr) {
-                MemFree(fallback.mesh.texcoords);
-            }
-            if (fallback.mesh.colors != nullptr) {
-                MemFree(fallback.mesh.colors);
-            }
-            if (fallback.mesh.normals != nullptr) {
-                MemFree(fallback.mesh.normals);
-            }
-            fallback.mesh.vertices = nullptr;
-            fallback.mesh.texcoords = nullptr;
-            fallback.mesh.colors = nullptr;
-            fallback.mesh.normals = nullptr;
-            fallback.mesh.vertexCount = 0;
-            fallback.mesh.triangleCount = 0;
-            return fallback;
-        }
-
-        auto* out = fallback.mesh.vertices;
-        auto* out_uv = fallback.mesh.texcoords;
-        auto* out_color = fallback.mesh.colors;
-        auto* out_normal = fallback.mesh.normals;
-        for (auto triangle_index = first_triangle; triangle_index < clamped_end; ++triangle_index) {
-            const auto& triangle = buffer.triangles[triangle_index];
-            std::array<RenderBufferVertex, 3> tri_vertices{};
-            std::array<Vec3, 3> positions{};
-            for (std::size_t index = 0; index < triangle.indices.size(); ++index) {
-                tri_vertices[index] = triangle.indices[index] < buffer.vertices.size()
-                    ? buffer.vertices[triangle.indices[index]]
-                    : RenderBufferVertex{};
-                positions[index] = tri_vertices[index].position;
-            }
-            const Vector3 e1{
-                positions[1].x - positions[0].x,
-                positions[1].y - positions[0].y,
-                positions[1].z - positions[0].z,
-            };
-            const Vector3 e2{
-                positions[2].x - positions[0].x,
-                positions[2].y - positions[0].y,
-                positions[2].z - positions[0].z,
-            };
-            const Vector3 face_normal{
-                e1.y * e2.z - e1.z * e2.y,
-                e1.z * e2.x - e1.x * e2.z,
-                e1.x * e2.y - e1.y * e2.x,
-            };
-            const auto fn_len = std::sqrt(face_normal.x * face_normal.x + face_normal.y * face_normal.y + face_normal.z * face_normal.z);
-            const auto fn_inv = fn_len > 1e-6F ? 1.0F / fn_len : 0.0F;
-            const Vector3 unit_normal{face_normal.x * fn_inv, face_normal.y * fn_inv, face_normal.z * fn_inv};
-            for (const auto vertex_index : triangle.indices) {
-                const auto vertex = vertex_index < buffer.vertices.size()
-                    ? buffer.vertices[vertex_index]
-                    : RenderBufferVertex{};
-                const auto position = vertex.position;
-                *out++ = position.x;
-                *out++ = position.y;
-                *out++ = position.z;
-                *out_uv++ = vertex.u;
-                *out_uv++ = vertex.v;
-                *out_color++ = 255;
-                *out_color++ = 255;
-                *out_color++ = 255;
-                *out_color++ = 255;
-                *out_normal++ = unit_normal.x;
-                *out_normal++ = unit_normal.y;
-                *out_normal++ = unit_normal.z;
-            }
-        }
-
-        UploadMesh(&fallback.mesh, false);
-        fallback.material = LoadMaterialDefault();
-        fallback.material.shader = game_surface_shader();
-        fallback.material.maps[MATERIAL_MAP_DIFFUSE].color = native_material_color(material_id, false, window_material);
-        fallback.material.maps[MATERIAL_MAP_METALNESS].texture = material_texture != nullptr && material_texture->id != 0U
-            ? *material_texture
-            : default_game_material_texture();
-        if (texture != nullptr && texture->id != 0U) {
-            fallback.material.maps[MATERIAL_MAP_DIFFUSE].texture = *texture;
-            fallback.source_texture = *texture;
-            fallback.textured = true;
-        }
-        return fallback;
-    };
-
-    std::vector<float> vertices;
-    std::vector<float> texcoords;
-    std::vector<unsigned char> colors;
-    std::vector<unsigned short> indices;
-    std::vector<float> normals;
-    std::unordered_map<std::uint32_t, unsigned short> local_indices;
-    std::vector<Vector3> vertex_normals(buffer.vertices.size());
-    vertices.reserve(static_cast<std::size_t>(clamped_count) * 9U);
-    texcoords.reserve(static_cast<std::size_t>(clamped_count) * 6U);
-    colors.reserve(static_cast<std::size_t>(clamped_count) * 12U);
-    normals.reserve(static_cast<std::size_t>(clamped_count) * 9U);
-    indices.reserve(static_cast<std::size_t>(clamped_count) * 3U);
-    local_indices.reserve(static_cast<std::size_t>(clamped_count) * 3U);
-
-    for (auto triangle_index = first_triangle; triangle_index < clamped_end; ++triangle_index) {
-        const auto& triangle = buffer.triangles[triangle_index];
-        if (triangle.indices[0] >= buffer.vertices.size() ||
-            triangle.indices[1] >= buffer.vertices.size() ||
-            triangle.indices[2] >= buffer.vertices.size()) {
-            continue;
-        }
-        const auto a = buffer.vertices[triangle.indices[0]].position;
-        const auto b = buffer.vertices[triangle.indices[1]].position;
-        const auto c = buffer.vertices[triangle.indices[2]].position;
-        const Vector3 e1{b.x - a.x, b.y - a.y, b.z - a.z};
-        const Vector3 e2{c.x - a.x, c.y - a.y, c.z - a.z};
-        const Vector3 face_normal{
-            e1.y * e2.z - e1.z * e2.y,
-            e1.z * e2.x - e1.x * e2.z,
-            e1.x * e2.y - e1.y * e2.x,
-        };
-        for (const auto vertex_index : triangle.indices) {
-            auto& normal = vertex_normals[vertex_index];
-            normal.x += face_normal.x;
-            normal.y += face_normal.y;
-            normal.z += face_normal.z;
-        }
-    }
-
-    auto add_index = [&](std::uint32_t source_index) -> std::optional<unsigned short> {
-        if (const auto existing = local_indices.find(source_index); existing != local_indices.end()) {
-            return existing->second;
-        }
-        if (local_indices.size() > static_cast<std::size_t>(std::numeric_limits<unsigned short>::max())) {
-            return std::nullopt;
-        }
-
-        const auto local_index = static_cast<unsigned short>(local_indices.size());
-        const auto vertex = source_index < buffer.vertices.size()
-            ? buffer.vertices[source_index]
-            : RenderBufferVertex{};
-        const auto position = vertex.position;
-        vertices.push_back(position.x);
-        vertices.push_back(position.y);
-        vertices.push_back(position.z);
-        texcoords.push_back(vertex.u);
-        texcoords.push_back(vertex.v);
-        colors.push_back(255);
-        colors.push_back(255);
-        colors.push_back(255);
-        colors.push_back(255);
-        // Per-pixel lighting normal (smoothed). The lit shader recomputes the same
-        // model from this; the baked color above stays as a per-vertex fallback.
-        const auto raw_n = source_index < vertex_normals.size() ? vertex_normals[source_index] : Vector3{0.0F, 1.0F, 0.0F};
-        const auto nlen = std::sqrt(raw_n.x * raw_n.x + raw_n.y * raw_n.y + raw_n.z * raw_n.z);
-        const auto inv = nlen > 1e-6F ? 1.0F / nlen : 0.0F;
-        normals.push_back(raw_n.x * inv);
-        normals.push_back(raw_n.y * inv);
-        normals.push_back(raw_n.z * inv);
-        local_indices.emplace(source_index, local_index);
-        return local_index;
-    };
-
-    for (auto triangle_index = first_triangle; triangle_index < clamped_end; ++triangle_index) {
-        const auto& triangle = buffer.triangles[triangle_index];
-        for (const auto vertex_index : triangle.indices) {
-            const auto local_index = add_index(vertex_index);
-            if (!local_index.has_value()) {
-                return upload_unindexed_chunk();
-            }
-            indices.push_back(*local_index);
-        }
-    }
-
-    chunk.mesh.vertexCount = static_cast<int>(vertices.size() / 3U);
-    chunk.mesh.triangleCount = static_cast<int>(indices.size() / 3U);
-    chunk.mesh.vertices = static_cast<float*>(MemAlloc(static_cast<unsigned int>(vertices.size() * sizeof(float))));
-    chunk.mesh.texcoords = static_cast<float*>(MemAlloc(static_cast<unsigned int>(texcoords.size() * sizeof(float))));
-    chunk.mesh.colors = static_cast<unsigned char*>(MemAlloc(static_cast<unsigned int>(colors.size() * sizeof(unsigned char))));
-    chunk.mesh.normals = static_cast<float*>(MemAlloc(static_cast<unsigned int>(normals.size() * sizeof(float))));
-    chunk.mesh.indices = static_cast<unsigned short*>(MemAlloc(static_cast<unsigned int>(indices.size() * sizeof(unsigned short))));
-    if (chunk.mesh.vertices == nullptr || chunk.mesh.texcoords == nullptr || chunk.mesh.colors == nullptr ||
-        chunk.mesh.normals == nullptr || chunk.mesh.indices == nullptr) {
-        if (chunk.mesh.vertices != nullptr) {
-            MemFree(chunk.mesh.vertices);
-        }
-        if (chunk.mesh.texcoords != nullptr) {
-            MemFree(chunk.mesh.texcoords);
-        }
-        if (chunk.mesh.colors != nullptr) {
-            MemFree(chunk.mesh.colors);
-        }
-        if (chunk.mesh.normals != nullptr) {
-            MemFree(chunk.mesh.normals);
-        }
-        if (chunk.mesh.indices != nullptr) {
-            MemFree(chunk.mesh.indices);
-        }
-        chunk.mesh.vertices = nullptr;
-        chunk.mesh.texcoords = nullptr;
-        chunk.mesh.colors = nullptr;
-        chunk.mesh.normals = nullptr;
-        chunk.mesh.indices = nullptr;
-        chunk.mesh.vertexCount = 0;
-        chunk.mesh.triangleCount = 0;
-        return chunk;
-    }
-
-    std::ranges::copy(vertices, chunk.mesh.vertices);
-    std::ranges::copy(texcoords, chunk.mesh.texcoords);
-    std::ranges::copy(colors, chunk.mesh.colors);
-    std::ranges::copy(normals, chunk.mesh.normals);
-    std::ranges::copy(indices, chunk.mesh.indices);
-
-    UploadMesh(&chunk.mesh, false);
-    chunk.material = LoadMaterialDefault();
-    chunk.material.shader = game_surface_shader();
-    chunk.material.maps[MATERIAL_MAP_DIFFUSE].color = native_material_color(material_id, false, window_material);
-    chunk.material.maps[MATERIAL_MAP_METALNESS].texture = material_texture != nullptr && material_texture->id != 0U
-        ? *material_texture
-        : default_game_material_texture();
-    if (texture != nullptr && texture->id != 0U) {
-        chunk.material.maps[MATERIAL_MAP_DIFFUSE].texture = *texture;
-        chunk.source_texture = *texture;
-        chunk.textured = true;
-    }
-    return chunk;
+void GpuMesh::unload() {
+    if (ebo != 0U) glDeleteBuffers(1, &ebo);
+    if (vbo != 0U) glDeleteBuffers(1, &vbo);
+    if (vao != 0U) glDeleteVertexArrays(1, &vao);
+    vao = vbo = ebo = 0U;
+    vertex_count = index_count = 0U;
+    parts.clear();
 }
 
-// Uploads a whole city render buffer (roads/curbs or terrain) as GPU mesh chunks,
-// one per material run, with per-face directional lighting baked into vertex
-// colors. Replaces the per-triangle immediate-mode DrawTriangle3D path that was
-// submitting hundreds of thousands of tiny draw calls per frame.
+namespace {
+
+// Vertex attribute locations shared by every GpuMesh program. 3..6 are the
+// per-instance model matrix columns, read from the instance stream.
+constexpr GLuint kAttribPosition = 0;
+constexpr GLuint kAttribTexCoord = 1;
+constexpr GLuint kAttribNormal = 2;
+constexpr GLuint kAttribInstance = 3;
+
+struct GpuVertex {
+    float position[3];
+    float uv[3];  // u, v, road-marking overlay layer
+    float normal[3];
+};
+
+// Uploads interleaved vertices + 32-bit indices into a fresh VAO whose instance
+// attributes (divisor 1) are pointed at the instance stream per draw.
+GpuMesh upload_gpu_vertices(const std::vector<GpuVertex>& vertices, const std::vector<std::uint32_t>& indices) {
+    GpuMesh mesh;
+    if (vertices.empty() || indices.empty()) return mesh;
+    rlDrawRenderBatchActive();
+    glGenVertexArrays(1, &mesh.vao);
+    glBindVertexArray(mesh.vao);
+    glGenBuffers(1, &mesh.vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(GpuVertex)), vertices.data(), GL_STATIC_DRAW);
+    glEnableVertexAttribArray(kAttribPosition);
+    glVertexAttribPointer(kAttribPosition, 3, GL_FLOAT, GL_FALSE, sizeof(GpuVertex), reinterpret_cast<void*>(offsetof(GpuVertex, position)));
+    glEnableVertexAttribArray(kAttribTexCoord);
+    glVertexAttribPointer(kAttribTexCoord, 3, GL_FLOAT, GL_FALSE, sizeof(GpuVertex), reinterpret_cast<void*>(offsetof(GpuVertex, uv)));
+    glEnableVertexAttribArray(kAttribNormal);
+    glVertexAttribPointer(kAttribNormal, 3, GL_FLOAT, GL_FALSE, sizeof(GpuVertex), reinterpret_cast<void*>(offsetof(GpuVertex, normal)));
+    for (GLuint column = 0; column < 4; ++column) {
+        glEnableVertexAttribArray(kAttribInstance + column);
+        glVertexAttribDivisor(kAttribInstance + column, 1);
+    }
+    glGenBuffers(1, &mesh.ebo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(indices.size() * sizeof(std::uint32_t)), indices.data(), GL_STATIC_DRAW);
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    mesh.vertex_count = static_cast<std::uint32_t>(vertices.size());
+    mesh.index_count = static_cast<std::uint32_t>(indices.size());
+    return mesh;
+}
+
+// Shadow volume vertices: the shader reads only the normal's direction (a sign
+// test against the light) and the vertex kind, so they pack into 20 bytes
+// instead of GpuVertex's 36.
+struct ShadowVertex {
+    float position[3];
+    std::uint16_t normal[3];  // unit normal as half floats
+    std::uint8_t kind;
+    std::uint8_t pad;
+};
+static_assert(sizeof(ShadowVertex) == 20);
+
+// IEEE half from a float in [-1, 1]; magnitudes below the half range flush
+// to a signed zero.
+std::uint16_t half_from_unit_float(float value) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const auto sign = static_cast<std::uint16_t>((bits >> 16U) & 0x8000U);
+    const auto exponent = static_cast<std::int32_t>((bits >> 23U) & 0xffU) - 127 + 15;
+    if (exponent <= 0) return sign;
+    if (exponent >= 31) return static_cast<std::uint16_t>(sign | 0x7c00U);
+    auto mantissa = (bits & 0x7fffffU) + 0x1000U;  // round to nearest
+    auto half = static_cast<std::uint32_t>(exponent) << 10U;
+    if ((mantissa & 0x800000U) != 0U) { mantissa = 0; half += 1U << 10U; }
+    return static_cast<std::uint16_t>(sign | std::min<std::uint32_t>(half + (mantissa >> 13U), 0x7c00U));
+}
+
+GpuMesh upload_shadow_volume(const std::vector<float>& baked, const std::vector<std::uint32_t>& indices) {
+    GpuMesh mesh;
+    const auto count = baked.size() / 9U;
+    if (count == 0U || indices.empty()) return mesh;
+    std::vector<ShadowVertex> vertices(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto* v = &baked[i * 9U];  // position, kind, 0, 0, normal
+        auto& out = vertices[i];
+        std::copy(v, v + 3, out.position);
+        const auto length = std::sqrt(v[6] * v[6] + v[7] * v[7] + v[8] * v[8]);
+        const auto scale = length > 0.0F ? 1.0F / length : 0.0F;
+        for (std::size_t c = 0; c < 3; ++c) out.normal[c] = half_from_unit_float(v[6 + c] * scale);
+        out.kind = static_cast<std::uint8_t>(v[3]);
+        out.pad = 0;
+    }
+    rlDrawRenderBatchActive();
+    glGenVertexArrays(1, &mesh.vao);
+    glBindVertexArray(mesh.vao);
+    glGenBuffers(1, &mesh.vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(ShadowVertex)), vertices.data(), GL_STATIC_DRAW);
+    glEnableVertexAttribArray(kAttribPosition);
+    glVertexAttribPointer(kAttribPosition, 3, GL_FLOAT, GL_FALSE, sizeof(ShadowVertex), reinterpret_cast<void*>(offsetof(ShadowVertex, position)));
+    // The kind arrives as vertexTexCoord.x, the normal as vertexNormal.
+    glEnableVertexAttribArray(kAttribTexCoord);
+    glVertexAttribPointer(kAttribTexCoord, 1, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(ShadowVertex), reinterpret_cast<void*>(offsetof(ShadowVertex, kind)));
+    glEnableVertexAttribArray(kAttribNormal);
+    glVertexAttribPointer(kAttribNormal, 3, GL_HALF_FLOAT, GL_FALSE, sizeof(ShadowVertex), reinterpret_cast<void*>(offsetof(ShadowVertex, normal)));
+    for (GLuint column = 0; column < 4; ++column) {
+        glEnableVertexAttribArray(kAttribInstance + column);
+        glVertexAttribDivisor(kAttribInstance + column, 1);
+    }
+    glGenBuffers(1, &mesh.ebo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(indices.size() * sizeof(std::uint32_t)), indices.data(), GL_STATIC_DRAW);
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    mesh.vertex_count = static_cast<std::uint32_t>(count);
+    mesh.index_count = static_cast<std::uint32_t>(indices.size());
+    return mesh;
+}
+
+} // namespace
+
+// One VAO for the whole buffer, one part per material run. Normals are smoothed
+// per shared vertex; flat-shaded surfaces derive theirs in the shader instead.
+// flat_faces emits three unique vertices per triangle carrying the face normal,
+// for surfaces lit from the vertex normal that must keep hard edges.
+GpuMesh upload_gpu_mesh(const BuildingRenderBuffer& buffer, const std::function<void(GpuMeshPart&)>& describe_part, bool flat_faces = false) {
+    std::vector<GpuVertex> vertices(flat_faces ? 0U : buffer.vertices.size());
+    for (std::size_t i = 0; i < vertices.size(); ++i) {
+        const auto& v = buffer.vertices[i];
+        vertices[i] = {{v.position.x, v.position.y, v.position.z}, {v.u, v.v, v.layer}, {0.0F, 0.0F, 0.0F}};
+    }
+    std::vector<std::uint32_t> indices;
+    indices.reserve(buffer.triangles.size() * 3U);
+    std::vector<GpuMeshPart> parts;
+    for (const auto& run : buffer.material_runs) {
+        const auto end = std::min<std::size_t>(run.first_triangle + run.triangle_count, buffer.triangles.size());
+        GpuMeshPart part;
+        part.first_index = static_cast<std::uint32_t>(indices.size());
+        part.material_id = run.material;
+        part.window_material = run.city_window_surface;
+        for (std::size_t t = run.first_triangle; t < end; ++t) {
+            const auto& tri = buffer.triangles[t];
+            if (tri.indices[0] >= buffer.vertices.size() || tri.indices[1] >= buffer.vertices.size() || tri.indices[2] >= buffer.vertices.size()) continue;
+            const auto& a = buffer.vertices[tri.indices[0]].position;
+            const auto& b = buffer.vertices[tri.indices[1]].position;
+            const auto& c = buffer.vertices[tri.indices[2]].position;
+            const auto n = Vector3CrossProduct({b.x - a.x, b.y - a.y, b.z - a.z}, {c.x - a.x, c.y - a.y, c.z - a.z});
+            if (flat_faces) {
+                for (const auto index : tri.indices) {
+                    const auto& v = buffer.vertices[index];
+                    indices.push_back(static_cast<std::uint32_t>(vertices.size()));
+                    vertices.push_back({{v.position.x, v.position.y, v.position.z}, {v.u, v.v, v.layer}, {n.x, n.y, n.z}});
+                }
+                continue;
+            }
+            for (const auto index : tri.indices) {
+                auto& out = vertices[index].normal;
+                out[0] += n.x;
+                out[1] += n.y;
+                out[2] += n.z;
+                indices.push_back(index);
+            }
+        }
+        part.index_count = static_cast<std::uint32_t>(indices.size()) - part.first_index;
+        if (part.index_count == 0U) continue;
+        describe_part(part);
+        parts.push_back(part);
+    }
+    for (auto& v : vertices) {
+        const auto n = Vector3{v.normal[0], v.normal[1], v.normal[2]};
+        const auto unit = Vector3LengthSqr(n) > 1e-12F ? Vector3Normalize(n) : Vector3{0.0F, 1.0F, 0.0F};
+        v.normal[0] = unit.x;
+        v.normal[1] = unit.y;
+        v.normal[2] = unit.z;
+    }
+    auto mesh = upload_gpu_vertices(vertices, indices);
+    mesh.parts = std::move(parts);
+    return mesh;
+}
+
+// Shared by building, portal, and city models: the part's textures come from the
+// resolver, its fallback color from the native material palette.
+void describe_textured_part(GpuMeshPart& part, const Texture2D* texture, const Texture2D* material_texture) {
+    part.material_texture = material_texture != nullptr && material_texture->id != 0U
+        ? material_texture->id
+        : default_game_material_texture().id;
+    if (texture != nullptr && texture->id != 0U) {
+        part.texture = texture->id;
+        part.color = WHITE;
+    } else {
+        part.color = native_material_color(part.material_id, false, part.window_material);
+    }
+}
+
 GpuBuildingRenderModel upload_city_buffer_model(
     const BuildingRenderBuffer& buffer,
     const EditorProject& project,
-    bool smooth_normals,
+    bool flat_faces,
     const std::function<Color(std::uint32_t)>& color_for_material) {
     GpuBuildingRenderModel model;
-    model.wire_lines = buffer.wire_lines;
-    model.chunks.reserve(buffer.material_runs.size());
-
-    std::vector<Vector3> vertex_normals(buffer.vertices.size(), Vector3{});
-    if (smooth_normals) {
-        for (const auto& triangle : buffer.triangles) {
-            if (triangle.indices[0] >= buffer.vertices.size() ||
-                triangle.indices[1] >= buffer.vertices.size() ||
-                triangle.indices[2] >= buffer.vertices.size()) {
-                continue;
-            }
-            const auto& a = buffer.vertices[triangle.indices[0]].position;
-            const auto& b = buffer.vertices[triangle.indices[1]].position;
-            const auto& c = buffer.vertices[triangle.indices[2]].position;
-            const Vector3 face = Vector3CrossProduct(
-                {b.x-a.x, b.y-a.y, b.z-a.z},
-                {c.x-a.x, c.y-a.y, c.z-a.z});
-            for (const auto index : triangle.indices) {
-                vertex_normals[index] = Vector3Add(vertex_normals[index], face);
-            }
-        }
-        for (auto& normal : vertex_normals) {
-            normal = Vector3LengthSqr(normal) > 1e-12F ? Vector3Normalize(normal) : Vector3{0.0F, 1.0F, 0.0F};
-        }
-    }
-
-    for (const auto& run : buffer.material_runs) {
-        const auto clamped_end = std::min<std::uint32_t>(
-            run.first_triangle + run.triangle_count,
-            static_cast<std::uint32_t>(buffer.triangles.size()));
-        if (clamped_end <= run.first_triangle) {
-            continue;
-        }
-        const auto tri_count = clamped_end - run.first_triangle;
-
-        // Per-face (unindexed) so each triangle keeps its own flat normal and
-        // hard edges shade crisply; terrain reads fine flat-shaded at this scale.
-        GpuBuildingMeshChunk chunk;
-        chunk.material_id = run.material;
-        chunk.window_material = run.city_window_surface;
-        chunk.mesh.vertexCount = static_cast<int>(tri_count * 3U);
-        chunk.mesh.triangleCount = static_cast<int>(tri_count);
-        chunk.mesh.vertices = static_cast<float*>(MemAlloc(static_cast<unsigned int>(chunk.mesh.vertexCount * 3 * sizeof(float))));
-        chunk.mesh.texcoords = static_cast<float*>(MemAlloc(static_cast<unsigned int>(chunk.mesh.vertexCount * 2 * sizeof(float))));
-        chunk.mesh.colors = static_cast<unsigned char*>(MemAlloc(static_cast<unsigned int>(chunk.mesh.vertexCount * 4 * sizeof(unsigned char))));
-        chunk.mesh.normals = static_cast<float*>(MemAlloc(static_cast<unsigned int>(chunk.mesh.vertexCount * 3 * sizeof(float))));
-        if (chunk.mesh.vertices == nullptr || chunk.mesh.texcoords == nullptr || chunk.mesh.colors == nullptr || chunk.mesh.normals == nullptr) {
-            if (chunk.mesh.vertices != nullptr) { MemFree(chunk.mesh.vertices); }
-            if (chunk.mesh.texcoords != nullptr) { MemFree(chunk.mesh.texcoords); }
-            if (chunk.mesh.colors != nullptr) { MemFree(chunk.mesh.colors); }
-            if (chunk.mesh.normals != nullptr) { MemFree(chunk.mesh.normals); }
-            continue;
-        }
-
-        const auto base_color = color_for_material(run.material);
-        auto* out = chunk.mesh.vertices;
-        auto* out_uv = chunk.mesh.texcoords;
-        auto* out_col = chunk.mesh.colors;
-        auto* out_normal = chunk.mesh.normals;
-        for (auto triangle_index = run.first_triangle; triangle_index < clamped_end; ++triangle_index) {
-            const auto& triangle = buffer.triangles[triangle_index];
-            std::array<Vec3, 3> p{};
-            std::array<RenderBufferVertex, 3> v{};
-            for (int i = 0; i < 3; ++i) {
-                v[i] = triangle.indices[i] < buffer.vertices.size()
-                    ? buffer.vertices[triangle.indices[i]]
-                    : RenderBufferVertex{};
-                p[i] = v[i].position;
-            }
-            const Vector3 e1{p[1].x - p[0].x, p[1].y - p[0].y, p[1].z - p[0].z};
-            const Vector3 e2{p[2].x - p[0].x, p[2].y - p[0].y, p[2].z - p[0].z};
-            const Vector3 face_normal{
-                e1.y * e2.z - e1.z * e2.y,
-                e1.z * e2.x - e1.x * e2.z,
-                e1.x * e2.y - e1.y * e2.x,
-            };
-            const auto normal_length = std::sqrt(
-                face_normal.x * face_normal.x +
-                face_normal.y * face_normal.y +
-                face_normal.z * face_normal.z);
-            const auto normal_scale = normal_length > 1e-6F ? 1.0F / normal_length : 0.0F;
-            for (int i = 0; i < 3; ++i) {
-                *out++ = p[i].x;
-                *out++ = p[i].y;
-                *out++ = p[i].z;
-                *out_uv++ = v[i].u;
-                *out_uv++ = v[i].v;
-                *out_col++ = 255;
-                *out_col++ = 255;
-                *out_col++ = 255;
-                *out_col++ = 255;
-                const auto normal = smooth_normals && triangle.indices[i] < vertex_normals.size()
-                    ? vertex_normals[triangle.indices[i]]
-                    : Vector3{face_normal.x * normal_scale, face_normal.y * normal_scale, face_normal.z * normal_scale};
-                *out_normal++ = normal.x;
-                *out_normal++ = normal.y;
-                *out_normal++ = normal.z;
-            }
-        }
-
-        UploadMesh(&chunk.mesh, false);
-        chunk.material = LoadMaterialDefault();
-        chunk.material.shader = game_surface_shader();
-        chunk.material.maps[MATERIAL_MAP_DIFFUSE].color = base_color;
-        if (const auto* texture = texture_for_buffer_material(project, buffer, run.material);
-            texture != nullptr && texture->id != 0U) {
-            chunk.material.maps[MATERIAL_MAP_DIFFUSE].texture = *texture;
-            chunk.source_texture = *texture;
-            chunk.textured = true;
-        }
-        const auto* material_texture = material_texture_for_buffer_material(project, buffer, run.material);
-        chunk.material.maps[MATERIAL_MAP_METALNESS].texture = material_texture != nullptr && material_texture->id != 0U
-            ? *material_texture
-            : default_game_material_texture();
-        model.uploaded_vertices += static_cast<std::size_t>(chunk.mesh.vertexCount);
-        model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.vertexCount) * (3U * sizeof(float) + 2U * sizeof(float) + 4U);
-        model.chunks.push_back(std::move(chunk));
-    }
+    // No wire_lines: city surfaces never draw wires.
+    model.mesh = upload_gpu_mesh(buffer, [&](GpuMeshPart& part) {
+        describe_textured_part(part,
+            texture_for_buffer_material(project, buffer, part.material_id),
+            material_texture_for_buffer_material(project, buffer, part.material_id));
+        // City surfaces tint their texture with the material color (terrain
+        // uses it as the generated landscape color map).
+        part.color = color_for_material(part.material_id);
+    }, flat_faces);
+    model.uploaded_bytes = model.mesh.vertex_count * sizeof(GpuVertex) + model.mesh.index_count * sizeof(std::uint32_t);
     return model;
 }
 
-void cache_shadow_faces(GpuBuildingRenderModel& model, const BuildingRenderBuffer& buffer) {
-    // Cache opaque face adjacency once. Window triangles do not occlude, so
-    // their openings remain openings in the building shadow silhouette.
-    struct EdgeKey {
-        std::array<std::int32_t, 3> first{};
-        std::array<std::int32_t, 3> second{};
-        bool operator==(const EdgeKey&) const = default;
-    };
-    struct EdgeHash {
-        std::size_t operator()(const EdgeKey& edge) const {
-            std::size_t hash = 1469598103934665603ULL;
-            for (const auto value : {edge.first[0], edge.first[1], edge.first[2], edge.second[0], edge.second[1], edge.second[2]}) {
-                hash ^= static_cast<std::uint32_t>(value);
-                hash *= 1099511628211ULL;
-            }
-            return hash;
-        }
-    };
-    struct EdgeOwner { std::size_t face{}; std::size_t edge{}; };
-    const auto point_key = [](Vec3 point) {
-        return std::array<std::int32_t, 3>{
-            static_cast<std::int32_t>(std::lround(point.x * 1024.0F)),
-            static_cast<std::int32_t>(std::lround(point.y * 1024.0F)),
-            static_cast<std::int32_t>(std::lround(point.z * 1024.0F)),
-        };
-    };
-    std::unordered_map<EdgeKey, EdgeOwner, EdgeHash> open_edges;
-    model.shadow_faces.reserve(buffer.triangles.size());
-    for (const auto& triangle : buffer.triangles) {
-        if (triangle.city_window_surface ||
-            triangle.indices[0] >= buffer.vertices.size() ||
-            triangle.indices[1] >= buffer.vertices.size() ||
-            triangle.indices[2] >= buffer.vertices.size()) continue;
-        GpuBuildingRenderModel::ShadowFace face;
-        for (std::size_t vertex = 0; vertex < 3; ++vertex) {
-            face.vertices[vertex] = buffer.vertices[triangle.indices[vertex]].position;
-        }
-        const auto face_index = model.shadow_faces.size();
-        model.shadow_faces.push_back(face);
-        for (std::size_t edge = 0; edge < 3; ++edge) {
-            auto first = point_key(face.vertices[edge]);
-            auto second = point_key(face.vertices[(edge + 1U) % 3U]);
-            if (second < first) std::swap(first, second);
-            const EdgeKey key{first, second};
-            if (const auto owner = open_edges.find(key); owner != open_edges.end()) {
-                model.shadow_faces[face_index].adjacent[edge] = static_cast<std::int32_t>(owner->second.face);
-                model.shadow_faces[owner->second.face].adjacent[owner->second.edge] = static_cast<std::int32_t>(face_index);
-                open_edges.erase(owner);
-            } else {
-                open_edges.emplace(key, EdgeOwner{face_index, edge});
-            }
-        }
+void build_shadow_volume(GpuBuildingRenderModel& model, const BuildingRenderBuffer& buffer) {
+    // Workers bake the volume with the buffer (bake_shadow_volume); small
+    // buffers built on this thread are baked here.
+    const BuildingRenderBuffer* baked = &buffer;
+    BuildingRenderBuffer local;
+    if (buffer.shadow_indices.empty() && !buffer.triangles.empty()) {
+        local.vertices = buffer.vertices;
+        local.triangles = buffer.triangles;
+        bake_shadow_volume(local);
+        baked = &local;
     }
+    model.shadow_top = baked->shadow_top;
+    model.shadow_volume = upload_shadow_volume(baked->shadow_vertices, baked->shadow_indices);
+    if (!model.shadow_volume.empty()) model.shadow_volume.parts.push_back({0U, model.shadow_volume.index_count});
 }
 
 GpuBuildingRenderModel upload_building_render_model(const BuildingRenderBuffer& buffer, const SbbBuilding& building, const EditorProject& project) {
     GpuBuildingRenderModel model;
-    model.wire_lines = buffer.wire_lines;
-    cache_shadow_faces(model, buffer);
-    model.chunks.reserve(buffer.material_runs.size());
-    for (const auto& run : buffer.material_runs) {
-        auto chunk = upload_mesh_chunk(
-            buffer,
-            run.first_triangle,
-            run.triangle_count,
-            run.material,
-            texture_for_material(project, building, run.material),
-            material_texture_for_material(project, building, run.material),
-            run.city_window_surface);
-        if (chunk.mesh.vertexCount > 0) {
-            model.uploaded_vertices += static_cast<std::size_t>(chunk.mesh.vertexCount);
-            model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.vertexCount) * 3U * sizeof(float);
-            model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.vertexCount) * 2U * sizeof(float);
-            if (chunk.mesh.colors != nullptr) {
-                model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.vertexCount) * 4U * sizeof(unsigned char);
-            }
-            if (chunk.mesh.indices != nullptr) {
-                model.uploaded_indices += static_cast<std::size_t>(chunk.mesh.triangleCount) * 3U;
-                model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.triangleCount) * 3U * sizeof(unsigned short);
-            }
-            model.chunks.push_back(std::move(chunk));
-        }
-    }
+    // No wire_lines: building models are never drawn with wires.
+    build_shadow_volume(model, buffer);
+    model.mesh = upload_gpu_mesh(buffer, [&](GpuMeshPart& part) {
+        describe_textured_part(part,
+            texture_for_material(project, building, part.material_id),
+            material_texture_for_material(project, building, part.material_id));
+    });
+    model.uploaded_bytes = model.mesh.vertex_count * sizeof(GpuVertex) + model.mesh.index_count * sizeof(std::uint32_t);
     return model;
 }
 
@@ -1421,29 +1232,113 @@ Matrix building_transform_matrix(Vector3 origin, std::int32_t rotation) {
     };
 }
 
-// Flat mask shader used by the screen-space outline pass. It renders the selected
-// mesh into an offscreen alpha mask without changing the real scene color/depth.
+Matrix city_placement_matrix(const SbcBuilding& placement) {
+    const auto origin = native_city_building_render_origin(placement, 4.0F);
+    return building_transform_matrix({origin.x, origin.y, origin.z}, placement.rotation);
+}
+
+// Vertex stage shared by every GpuMesh program: per-instance model matrix at
+// attribute 3..6, one view-projection uniform per draw.
+#define MAPED_INSTANCED_VS MAPED_GLSL_VERSION R"glsl(
+layout(location=0) in vec3 vertexPosition;
+layout(location=1) in vec3 vertexTexCoord;
+layout(location=2) in vec3 vertexNormal;
+layout(location=3) in mat4 instanceTransform;
+uniform mat4 viewProjection;
+// Shadow volume caps reuse the render triangles; invariance keeps their
+// depth identical to the surface they lie on.
+invariant gl_Position;
+out vec3 fragTexCoord;
+out vec3 fragNormal;
+out vec3 fragPosition;
+void main() {
+    vec4 world = instanceTransform * vec4(vertexPosition, 1.0);
+    fragTexCoord = vertexTexCoord;
+    // Placements only rotate in quarter turns, so the upper 3x3 is orthonormal.
+    fragNormal = mat3(instanceTransform) * vertexNormal;
+    fragPosition = world.xyz;
+    gl_Position = viewProjection * world;
+}
+)glsl"
+
+// Flat mask shader used by the screen-space outline pass and the stencil shadow
+// volumes. It renders into an offscreen alpha mask (or with color writes off).
 struct MaskShader {
     Shader shader{};
+    int view_projection_loc{-1};
     bool loaded{false};
 };
 
 MaskShader& mask_shader() {
     static MaskShader cache;
     if (!cache.loaded) {
-        const char* vs =
+        const char* fs =
             MAPED_GLSL_VERSION
-            "in vec3 vertexPosition;\n"
-            "uniform mat4 mvp;\n"
-            "void main() { gl_Position = mvp * vec4(vertexPosition, 1.0); }\n";
+            "out vec4 finalColor;\n"
+            "void main() { finalColor = vec4(1.0); }\n";
+        cache.shader = LoadShaderFromMemory(MAPED_INSTANCED_VS, fs);
+        cache.view_projection_loc = GetShaderLocation(cache.shader, "viewProjection");
+        cache.loaded = true;
+    }
+    return cache;
+}
+
+// Stencil shadow volumes (see build_shadow_volume): uv.x is the vertex kind,
+// 0 edge end, 1 open edge far end, 2 front cap, 3 back cap; the normal is the
+// owning face's (inward, faces wind clockwise). A face is extruded when it is
+// turned away from the light, as RenderQueuedShadowVolumeAdjacencyPass does.
+struct ShadowVolumeShader {
+    Shader shader{};
+    int view_projection_loc{-1};
+    int light_direction_loc{-1};
+    int extrusion_loc{-1};
+    bool loaded{false};
+};
+
+ShadowVolumeShader& shadow_volume_shader() {
+    static ShadowVolumeShader cache;
+    if (!cache.loaded) {
+        const char* vs = MAPED_GLSL_VERSION R"glsl(
+layout(location=0) in vec3 vertexPosition;
+layout(location=1) in vec3 vertexTexCoord;
+layout(location=2) in vec3 vertexNormal;
+layout(location=3) in mat4 instanceTransform;
+uniform mat4 viewProjection;
+uniform vec3 lightDirection;
+uniform vec3 extrusion;
+invariant gl_Position;
+void main() {
+    int kind = int(vertexTexCoord.x + 0.5);
+    bool lit = dot(mat3(instanceTransform) * vertexNormal, lightDirection) < 0.0;
+    // Caps of lit faces collapse to a clipped point.
+    if (kind >= 2 && lit) {
+        gl_Position = vec4(0.0);
+        return;
+    }
+    vec4 world = instanceTransform * vec4(vertexPosition, 1.0);
+    if (kind == 1 || kind == 3 || (kind == 0 && lit)) world.xyz += extrusion;
+    gl_Position = viewProjection * world;
+}
+)glsl";
         const char* fs =
             MAPED_GLSL_VERSION
             "out vec4 finalColor;\n"
             "void main() { finalColor = vec4(1.0); }\n";
         cache.shader = LoadShaderFromMemory(vs, fs);
+        cache.view_projection_loc = GetShaderLocation(cache.shader, "viewProjection");
+        cache.light_direction_loc = GetShaderLocation(cache.shader, "lightDirection");
+        cache.extrusion_loc = GetShaderLocation(cache.shader, "extrusion");
         cache.loaded = true;
     }
     return cache;
+}
+
+// Sets the sun direction and extrusion vector for following ShadowVolume draws.
+void set_shadow_volume_light(Vector3 light, Vector3 extrusion) {
+    const auto& shader = shadow_volume_shader();
+    glUseProgram(shader.shader.id);
+    glUniform3f(shader.light_direction_loc, light.x, light.y, light.z);
+    glUniform3f(shader.extrusion_loc, extrusion.x, extrusion.y, extrusion.z);
 }
 
 // Sub Rosa's world shader reads color + material maps, lights them with its world
@@ -1451,16 +1346,20 @@ MaskShader& mask_shader() {
 // keeps that contract and evaluates the native atmosphere used by its backdrop.
 struct LitShader {
     Shader shader{};
+    int view_projection_loc{-1};
+    int color_loc{-1};
     int view_position_loc{-1};
     int window_surface_loc{-1};
+    int glass_alpha_loc{-1};
+    int model_surface_loc{-1};
+    int unlit_surface_loc{-1};
     int building_surface_loc{-1};
     int terrain_surface_loc{-1};
-    int atmosphere_world_position_loc{-1};
     int light_direction_loc{-1};
     int light_ambient_loc{-1};
     int light_diffuse_loc{-1};
-    int env_face_loc{-1};
-    int ground_color_loc{-1};
+    int environment_loc{-1};
+    int cubemap_pass_loc{-1};
     bool loaded{false};
 };
 
@@ -1494,101 +1393,32 @@ GameLightColors game_light_colors(Vector3 light) {
     return colors;
 }
 
-// Lit landscape below the horizon: landscape.frag with the generated grass
-// color (0x40,0x54,0x26) and a mid-grey detail texel, n = up.
-Vector3 game_ground_color(Vector3 light) {
-    const auto colors = game_light_colors(light);
-    const Vector3 grass_srgb{0x40/255.0F, 0x54/255.0F, 0x26/255.0F};
-    const auto to_linear = [](float c) {
-        return c < 0.04045F ? c/12.92F : std::pow((c + 0.055F)/1.055F, 2.4F);
-    };
-    float ground_scale = 0.25F + std::max(light.y, 0.0F)*0.75F;
-    ground_scale = (4.0F/3.0F)*(1.0F - 1.0F/(1.0F + 3.0F*ground_scale));
-    Vector3 ground{};
-    for (int i = 0; i < 3; ++i) {
-        const float base = to_linear((&grass_srgb.x)[i])*0.5F;
-        (&ground.x)[i] = base*(&colors.ambient.x)[i]*(0.375F + light.y*0.125F) +
-                         base*(&colors.diffuse.x)[i]*ground_scale*0.625F;
-    }
-    return ground;
-}
-
-// CPU twin of the shader skyColor() without the sun disc, used to average the
-// sky over each cube face the way the game's blurred landscape cubemap does.
-Vector3 analytic_sky_color(Vector3 direction, Vector3 light, Vector3 world_position) {
-    constexpr float atmo_x = 0.0502275936F;
-    constexpr float atmo_z = 6.4F;
-    constexpr float atmo_w = 637.1F;
-    const Vector3 wavelength{0.625F, 0.75F, 1.0F};
-    const auto ray_distance = [](Vector3 position, Vector3 dir, float radius) {
-        const float scale = Vector3DotProduct(position, dir);
-        const float b2 = Vector3DotProduct(position, position) - scale*scale;
-        return std::sqrt(std::max(0.0F, radius*radius - b2)) - scale;
-    };
-    const auto ray_distance2 = [](Vector3 position, Vector3 dir, float radius) {
-        const float scale = -Vector3DotProduct(position, dir);
-        if (scale < 0.0F) return 0.0F;
-        const float b2 = Vector3DotProduct(position, position) - scale*scale;
-        if (b2 > radius*radius) return 0.0F;
-        return scale - std::sqrt(std::max(0.0F, radius*radius - b2));
-    };
-    const auto view = Vector3Normalize(direction);
-    float view_length = ray_distance2(world_position, view, atmo_w);
-    if (view_length <= 0.0F) view_length = ray_distance(world_position, view, atmo_w + atmo_z);
-    float phase = Vector3DotProduct(view, light);
-    phase = 3.0F/(16.0F*PI)*(1.0F + phase*phase);
-    const Vector3 out_scatter = Vector3Scale(wavelength, atmo_x);
-    const Vector3 in_scatter = Vector3Scale(wavelength, phase*atmo_x);
-    Vector3 color{};
-    float dist = 1.0F - 0.125F;
-    for (int count = 0; count < 4; ++count) {
-        const auto ray_position = Vector3Add(world_position, Vector3Scale(view, view_length*dist));
-        const float ray_length = ray_distance(ray_position, light, atmo_w + atmo_z);
-        float h = 1.0F - (Vector3Length(ray_position) - atmo_w)/atmo_z;
-        h = std::clamp(h, 0.0F, 1.0F);
-        h *= h;
-        const float density = h*8.0F;
-        for (int i = 0; i < 3; ++i) {
-            const float rayleigh = (&in_scatter.x)[i]*density*8.0F*std::exp(-ray_length*density*0.25F*atmo_x*(&wavelength.x)[i]);
-            const float extinction = (&out_scatter.x)[i]*density*0.5F;
-            const float transmit = std::exp(-extinction*view_length*0.25F);
-            (&color.x)[i] = (&color.x)[i]*transmit + (1.0F - transmit)*(rayleigh/std::max(extinction, 1e-8F));
-        }
-        dist -= 0.25F;
-    }
-    return color;
-}
 
 LitShader& lit_shader() {
     static LitShader cache;
     if (!cache.loaded) {
-        const char* vs = MAPED_GLSL_VERSION R"glsl(
-in vec3 vertexPosition;
-in vec2 vertexTexCoord;
-in vec3 vertexNormal;
-uniform mat4 mvp;
-uniform mat4 matModel;
-uniform mat4 matNormal;
-out vec2 fragTexCoord;
-out vec3 fragNormal;
-out vec3 fragPosition;
-void main() {
-    fragTexCoord = vertexTexCoord;
-    fragNormal = normalize((matNormal * vec4(vertexNormal, 0.0)).xyz);
-    fragPosition = (matModel * vec4(vertexPosition, 1.0)).xyz;
-    gl_Position = mvp * vec4(vertexPosition, 1.0);
-}
-)glsl";
+        const char* vs = MAPED_INSTANCED_VS;
         const char* fs = MAPED_GLSL_VERSION R"glsl(
-in vec2 fragTexCoord;
+in vec3 fragTexCoord;
 in vec3 fragNormal;
 in vec3 fragPosition;
 uniform sampler2D texture0;
 uniform sampler2D texture1;
+// Road-marking overlay arrays (tex_atlas_color / tex_atlas_material): layer 0 is
+// clear, so every surface samples them and only marked road faces change.
+uniform highp sampler2DArray overlayColor;
+uniform highp sampler2DArray overlayMaterial;
 uniform vec4 colDiffuse;
 uniform vec3 viewPosition;
-uniform vec3 atmosphereWorldPosition;
 uniform int windowSurface;
+// > 0: this window part is near-LOD room glass (the game's glass shader).
+uniform float glassAlpha;
+// GenerateMapTextureFromVisibleSectors draws sectors with the image shader:
+// the base texture only, unlit.
+uniform int unlitSurface;
+// model.frag surfaces (street objects): texture alpha is the shine; 1 draws
+// the texel unlit, below 0.5 is dielectric roughness 0.5, else 0.5/0.125.
+uniform int modelSurface;
 uniform int buildingSurface;
 uniform int terrainSurface;
 uniform vec3 lightDirection;
@@ -1596,23 +1426,18 @@ uniform vec3 lightDirection;
 // frame; the world shader only reads lightdiffuse, the landscape shader both.
 uniform vec3 lightAmbient;
 uniform vec3 lightDiffuse;
-// Per-face averages of the game's blurred landscape cubemap (+x,-x,+y,-y,+z,-z)
-// and the lit ground color below the horizon. world.frag samples the cubemap
-// at lod 8 (one texel per face) for diffuse environment light.
-uniform vec3 envFace[6];
-uniform vec3 groundColor;
+// The blurred landscape cubemap (RenderLandscapeCubemapAndBlurCapture @93e60),
+// sampled with true world directions. cubemapPass is set while capturing it:
+// the landscape then uses the cubemap color map, grey over the city block.
+uniform samplerCube environment;
+uniform int cubemapPass;
 layout(location=0) out vec4 finalColor;
 layout(location=1) out vec4 packedDepth;
 layout(location=2) out vec4 directLight;
 const float PI = 3.1415926;
 vec3 envDiffuse(vec3 n) {
-    vec3 w = n*n;
-    return w.x*(n.x > 0.0 ? envFace[0] : envFace[1])
-         + w.y*(n.y > 0.0 ? envFace[2] : envFace[3])
-         + w.z*(n.z > 0.0 ? envFace[4] : envFace[5]);
+    return textureLod(environment, n, 8.0).rgb;
 }
-const vec4 ATMOSPHERE = vec4(0.0502275936, 0.0001, 6.4, 637.1);
-const vec3 WAVELENGTH = vec3(0.625, 0.75, 1.0);
 vec3 toLinear(vec3 color) {
     bvec3 cutoff = lessThan(color, vec3(0.04045));
     return mix(pow((color + vec3(0.055))/vec3(1.055), vec3(2.4)), color/vec3(12.92), cutoff);
@@ -1634,48 +1459,6 @@ float geometrySchlick(float roughness, float ndv, float ndl) {
     float k = roughness*roughness*0.5;
     return 0.25/((ndv*(1.0-k)+k)*(ndl*(1.0-k)+k));
 }
-float atmosphereRayDistance(vec3 position, vec3 direction, float radius) {
-    float scale = dot(position, direction);
-    float b2 = dot(position, position)-scale*scale;
-    return sqrt(max(0.0, radius*radius-b2))-scale;
-}
-float atmosphereRayDistance2(vec3 position, vec3 direction, float radius) {
-    float scale = -dot(position, direction);
-    if (scale < 0.0) return 0.0;
-    float b2 = dot(position, position)-scale*scale;
-    if (b2 > radius*radius) return 0.0;
-    return scale-sqrt(max(0.0, radius*radius-b2));
-}
-vec3 skyColor(vec3 direction) {
-    vec3 viewNormal = normalize(direction);
-    float viewLength = atmosphereRayDistance2(atmosphereWorldPosition, viewNormal, ATMOSPHERE.w);
-    if (viewLength <= 0.0) viewLength = atmosphereRayDistance(atmosphereWorldPosition, viewNormal, ATMOSPHERE.w+ATMOSPHERE.z);
-    float phase = dot(viewNormal, lightDirection);
-    phase = 3.0/(16.0*PI)*(1.0+phase*phase);
-    vec3 outScatter = WAVELENGTH*ATMOSPHERE.x;
-    vec3 inScatter = phase*WAVELENGTH*ATMOSPHERE.x;
-    vec3 color = vec3(0.0);
-    if (viewLength > 4.0) {
-        float sun = max(dot(viewNormal, lightDirection)-0.9998, 0.0)*262144.0;
-        color = vec3(min(sun, 16.0));
-    }
-    float inverseSamples = 0.25;
-    float dist = 1.0-inverseSamples*0.5;
-    for (int count = 0; count < 4; ++count) {
-        vec3 rayPosition = atmosphereWorldPosition+viewNormal*viewLength*dist;
-        float rayLength = atmosphereRayDistance(rayPosition, lightDirection, ATMOSPHERE.w+ATMOSPHERE.z);
-        float height = 1.0-(length(rayPosition)-ATMOSPHERE.w)/ATMOSPHERE.z;
-        height = clamp(height, 0.0, 1.0);
-        height *= height;
-        float density = height*8.0;
-        vec3 rayleigh = inScatter*density*8.0*exp(-rayLength*density*0.25*ATMOSPHERE.x*WAVELENGTH);
-        vec3 extinction = outScatter*density*0.5;
-        color *= exp(-extinction*viewLength*inverseSamples);
-        color += (1.0-exp(-extinction*viewLength*inverseSamples))*(rayleigh/max(extinction, vec3(1e-8)));
-        dist -= inverseSamples;
-    }
-    return color;
-}
 void main() {
     // The game uses mipmapped linear minification. Add a small distance-only
     // bias so sub-pixel facade and window texels converge on a stable mip
@@ -1683,18 +1466,36 @@ void main() {
     // moves. Near surfaces retain their full-resolution texture.
     float textureDistance = length(viewPosition-fragPosition);
     float mipBias = smoothstep(160.0, 900.0, textureDistance)*0.65;
-    vec4 textureSample = texture(texture0, fragTexCoord, mipBias);
+    // landscape.vert: tex_detail at (x/32, 1-z/32) in world units.
+    vec2 surfaceUv = terrainSurface == 1 ? vec2(fragPosition.x/32.0, 1.0-fragPosition.z/32.0) : fragTexCoord.xy;
+    vec4 textureSample = texture(texture0, surfaceUv, mipBias);
     vec4 sampled = textureSample * colDiffuse;
+    if (unlitSurface == 1) {
+        finalColor = vec4(sampled.rgb, 1.0);
+        directLight = vec4(0.0);
+        packedDepth = vec4(1.0);
+        return;
+    }
+    // world.frag: the overlay blends by its alpha over the sRGB color and over
+    // the linearized material (the overlay material itself is not linearized).
+    vec4 overlay = texture(overlayColor, fragTexCoord, mipBias);
+    sampled.rgb = mix(sampled.rgb, overlay.rgb, overlay.a);
     vec3 albedo = toLinear(sampled.rgb);
     // Native world.frag applies the same sRGB-to-linear conversion to the
     // material texture before reading its metallic and roughness channels.
-    vec3 material = toLinear(texture(texture1, fragTexCoord, mipBias).rgb);
+    vec3 material = toLinear(texture(texture1, fragTexCoord.xy, mipBias).rgb);
+    material = mix(material, texture(overlayMaterial, fragTexCoord, mipBias).rgb, overlay.a);
     float metallic = clamp(material.r, 0.0, 1.0);
     float roughness = clamp(material.g, 0.0, 1.0);
+    if (modelSurface == 1) {
+        metallic = textureSample.a < 0.5 ? 0.0 : 0.5;
+        roughness = textureSample.a < 0.5 ? 0.5 : 0.125;
+    }
+    // The derivative normal already faces the viewer. Vertex normals point
+    // inward (clockwise winding), so a back-facing survivor flips them.
     vec3 n = buildingSurface == 1
         ? normalize(cross(dFdx(fragPosition), dFdy(fragPosition)))
-        : normalize(fragNormal);
-    if (!gl_FrontFacing) n = -n;
+        : normalize(gl_FrontFacing ? fragNormal : -fragNormal);
     vec3 v = normalize(viewPosition-fragPosition);
     vec3 color;
     vec3 direct;
@@ -1702,7 +1503,12 @@ void main() {
         // landscape.frag: wrapped diffuse with rho=3, ambient keyed to the sun
         // height, and a detail-driven view shine. texture0 is tex_detail and
         // colDiffuse stands in for the generated tex_color landscape map.
-        vec3 base = toLinear(textureSample.rgb)*toLinear(colDiffuse.rgb);
+        // tex_color is flat (0x40,0x54,0x26); the cubemap copy is grey (0x54)
+        // over texels 0x100..0x1bf x 0x240..0x2ff, world x and z 0..3072.
+        vec3 landColor = colDiffuse.rgb;
+        if (cubemapPass == 1 && fragPosition.x >= 0.0 && fragPosition.x < 3072.0 &&
+            fragPosition.z >= 0.0 && fragPosition.z < 3072.0) landColor = vec3(84.0/255.0);
+        vec3 base = toLinear(textureSample.rgb)*toLinear(landColor);
         float ndl0 = dot(n, lightDirection);
         float scale = 0.25+max(ndl0, 0.0)*0.75;
         scale = (4.0/3.0)*(1.0-1.0/(1.0+3.0*scale));
@@ -1732,11 +1538,9 @@ void main() {
         // Diffuse environment: one cubemap texel per face (lod 8).
         diffuse += envDiffuse(n)*0.75;
         diffuse *= 1.5;
-        // Specular environment: lod roughness^2*8, so smooth surfaces see the
-        // sharp sky/ground and rough ones converge on the face average.
+        // Specular environment: lod roughness^2*8.
         vec3 r = reflect(-v, n);
-        vec3 sharp = r.y >= 0.0 ? skyColor(r) : groundColor;
-        vec3 reflected = mix(sharp, envDiffuse(r), clamp(roughness*roughness*8.0/6.0, 0.0, 1.0));
+        vec3 reflected = textureLod(environment, r, roughness*roughness*8.0).rgb;
         specular += reflected*0.75*fresnelFactor(mix(vec3(0.02), albedo, metallic), ndv)*(1.0-roughness*0.5);
         color = diffuse*mix(albedo, vec3(0.0), metallic)+specular;
         if (windowSurface == 1) {
@@ -1744,39 +1548,63 @@ void main() {
             // toward half the ambient blue at grazing angles.
             float scale = 1.0-abs(dot(-v, n));
             scale = 0.5+pow(scale, 2.5)*0.5;
-            vec3 reflection = sharp*scale+vec3((1.0-scale)*0.5*lightAmbient.b);
+            vec3 reflection = texture(environment, r).rgb*scale+vec3((1.0-scale)*0.5*lightAmbient.b);
             color = mix(color, reflection, textureSample.a);
             direct *= 1.0-textureSample.a;
         }
     }
-    finalColor = vec4(color, windowSurface == 1 ? 1.0 : sampled.a);
-    directLight = vec4(direct, windowSurface == 1 ? 1.0 : sampled.a);
+    if (modelSurface == 1 && textureSample.a >= 1.0) {
+        color = albedo;
+        direct = vec3(0.0);
+    }
+    float alpha = windowSurface == 1 || modelSurface == 1 ? 1.0 : sampled.a;
+    if (windowSurface == 1 && glassAlpha > 0.0) {
+        // subrosa.exe room-glass shader (vertex @0x2f9820, fragment @0x2f9a10),
+        // premultiplied: drawn with glBlendFunc(ONE, ONE_MINUS_SRC_ALPHA). The
+        // pane is wound out of its cell, so the front face is the outside.
+        float scale = clamp((textureDistance-32.0)*0.125*0.125*0.75, 0.0, 1.0);
+        float scale2 = min(0.5+pow(1.0-abs(dot(v, n)), 3.0)*0.5, 1.0);
+        scale *= 1.0-scale2;
+        color = gl_FrontFacing ? textureLod(environment, reflect(-v, n), 0.0).rgb : vec3(0.0625*0.5);
+        color = color*scale2+vec3(scale*lightAmbient.b*0.5);
+        alpha = scale2+scale;
+        if (!gl_FrontFacing) alpha *= 0.25;
+        direct = vec3(0.0);
+    }
+    finalColor = vec4(color, alpha);
+    directLight = vec4(direct, alpha);
     float fragmentDepth = length(viewPosition-fragPosition);
     vec3 encodedDepth = fract(vec3(fragmentDepth*0.0000152587890625, fragmentDepth*0.00390625, fragmentDepth));
     packedDepth = vec4(floor(encodedDepth*256.0)/255.0, 1.0);
 }
 )glsl";
         cache.shader = LoadShaderFromMemory(vs, fs);
-        cache.shader.locs[SHADER_LOC_MATRIX_MODEL] = GetShaderLocation(cache.shader, "matModel");
-        cache.shader.locs[SHADER_LOC_MATRIX_NORMAL] = GetShaderLocation(cache.shader, "matNormal");
-        cache.shader.locs[SHADER_LOC_MAP_METALNESS] = GetShaderLocation(cache.shader, "texture1");
+        cache.view_projection_loc = GetShaderLocation(cache.shader, "viewProjection");
+        cache.color_loc = GetShaderLocation(cache.shader, "colDiffuse");
+        const int diffuse_unit = 0;
+        const int material_unit = 1;
+        SetShaderValue(cache.shader, GetShaderLocation(cache.shader, "texture0"), &diffuse_unit, SHADER_UNIFORM_INT);
+        SetShaderValue(cache.shader, GetShaderLocation(cache.shader, "texture1"), &material_unit, SHADER_UNIFORM_INT);
+        const int overlay_color_unit = 2;
+        const int overlay_material_unit = 3;
+        SetShaderValue(cache.shader, GetShaderLocation(cache.shader, "overlayColor"), &overlay_color_unit, SHADER_UNIFORM_INT);
+        SetShaderValue(cache.shader, GetShaderLocation(cache.shader, "overlayMaterial"), &overlay_material_unit, SHADER_UNIFORM_INT);
         cache.view_position_loc = GetShaderLocation(cache.shader, "viewPosition");
         cache.window_surface_loc = GetShaderLocation(cache.shader, "windowSurface");
+        cache.glass_alpha_loc = GetShaderLocation(cache.shader, "glassAlpha");
+        cache.model_surface_loc = GetShaderLocation(cache.shader, "modelSurface");
+        cache.unlit_surface_loc = GetShaderLocation(cache.shader, "unlitSurface");
         cache.building_surface_loc = GetShaderLocation(cache.shader, "buildingSurface");
         cache.terrain_surface_loc = GetShaderLocation(cache.shader, "terrainSurface");
-        cache.atmosphere_world_position_loc = GetShaderLocation(cache.shader, "atmosphereWorldPosition");
         cache.light_direction_loc = GetShaderLocation(cache.shader, "lightDirection");
         cache.light_ambient_loc = GetShaderLocation(cache.shader, "lightAmbient");
         cache.light_diffuse_loc = GetShaderLocation(cache.shader, "lightDiffuse");
-        cache.env_face_loc = GetShaderLocation(cache.shader, "envFace");
-        cache.ground_color_loc = GetShaderLocation(cache.shader, "groundColor");
+        cache.cubemap_pass_loc = GetShaderLocation(cache.shader, "cubemapPass");
+        const int environment_unit = 4;
+        SetShaderValue(cache.shader, GetShaderLocation(cache.shader, "environment"), &environment_unit, SHADER_UNIFORM_INT);
         cache.loaded = true;
     }
     return cache;
-}
-
-Shader game_surface_shader() {
-    return lit_shader().shader;
 }
 
 Texture2D default_game_material_texture() {
@@ -1794,66 +1622,23 @@ Texture2D default_game_material_texture() {
     return texture;
 }
 
+// Light colors at `scale` (the cubemap capture draws the landscape at 0.5).
+void set_game_surface_light(float scale) {
+    auto& shader = lit_shader();
+    const auto light = Vector3Normalize(game_light_direction());
+    const auto colors = game_light_colors(light);
+    const auto ambient = Vector3Scale(colors.ambient, scale);
+    const auto diffuse = Vector3Scale(colors.diffuse, scale);
+    SetShaderValue(shader.shader, shader.light_direction_loc, &light.x, SHADER_UNIFORM_VEC3);
+    SetShaderValue(shader.shader, shader.light_ambient_loc, &ambient.x, SHADER_UNIFORM_VEC3);
+    SetShaderValue(shader.shader, shader.light_diffuse_loc, &diffuse.x, SHADER_UNIFORM_VEC3);
+}
+
 void set_game_surface_camera(Vector3 position) {
     auto& shader = lit_shader();
     if (shader.shader.id != 0U && shader.view_position_loc >= 0) {
         SetShaderValue(shader.shader, shader.view_position_loc, &position.x, SHADER_UNIFORM_VEC3);
-        const Vector3 atmosphere_position{
-            position.x*0.0001F,
-            position.y*0.0001F+637.1F,
-            position.z*0.0001F,
-        };
-        SetShaderValue(shader.shader, shader.atmosphere_world_position_loc, &atmosphere_position.x, SHADER_UNIFORM_VEC3);
-        const auto light = Vector3Normalize(game_light_direction());
-        SetShaderValue(shader.shader, shader.light_direction_loc, &light.x, SHADER_UNIFORM_VEC3);
-        const auto colors = game_light_colors(light);
-        SetShaderValue(shader.shader, shader.light_ambient_loc, &colors.ambient.x, SHADER_UNIFORM_VEC3);
-        SetShaderValue(shader.shader, shader.light_diffuse_loc, &colors.diffuse.x, SHADER_UNIFORM_VEC3);
-
-        const Vector3 ground = game_ground_color(light);
-        SetShaderValue(shader.shader, shader.ground_color_loc, &ground.x, SHADER_UNIFORM_VEC3);
-
-        // Cube-face averages of sky (upper hemisphere) and ground (lower), the
-        // lod-8 cubemap texel world.frag reads. Cached on the light direction;
-        // the 0.0001-scaled camera offset is negligible at this blur level.
-        static Vector3 cached_light{0.0F, 0.0F, 0.0F};
-        static std::array<Vector3, 6> faces{};
-        static Vector3 cached_ground{};
-        if (Vector3LengthSqr(Vector3Subtract(cached_light, light)) > 1e-8F ||
-            Vector3LengthSqr(Vector3Subtract(cached_ground, ground)) > 1e-10F) {
-            cached_light = light;
-            cached_ground = ground;
-            const Vector3 origin{0.0F, 637.1F, 0.0F};
-            constexpr int grid = 6;
-            for (int face = 0; face < 6; ++face) {
-                Vector3 sum{};
-                for (int u = 0; u < grid; ++u) {
-                    for (int w = 0; w < grid; ++w) {
-                        const float a = (static_cast<float>(u) + 0.5F)/grid*2.0F - 1.0F;
-                        const float b = (static_cast<float>(w) + 0.5F)/grid*2.0F - 1.0F;
-                        const float sign = (face & 1) != 0 ? -1.0F : 1.0F;
-                        Vector3 dir{};
-                        switch (face >> 1) {
-                            case 0: dir = {sign, a, b}; break;
-                            case 1: dir = {a, sign, b}; break;
-                            default: dir = {a, b, sign}; break;
-                        }
-                        dir = Vector3Normalize(dir);
-                        sum = Vector3Add(sum, dir.y >= 0.0F ? analytic_sky_color(dir, light, origin) : ground);
-                    }
-                }
-                faces[static_cast<std::size_t>(face)] = Vector3Scale(sum, 1.0F/(grid*grid));
-            }
-        }
-        SetShaderValueV(shader.shader, shader.env_face_loc, faces.data(), SHADER_UNIFORM_VEC3, 6);
-    }
-}
-
-void set_game_surface_terrain(bool enabled) {
-    auto& shader = lit_shader();
-    const int value = enabled ? 1 : 0;
-    if (shader.shader.id != 0U && shader.terrain_surface_loc >= 0) {
-        SetShaderValue(shader.shader, shader.terrain_surface_loc, &value, SHADER_UNIFORM_INT);
+        set_game_surface_light(1.0F);
     }
 }
 
@@ -1861,20 +1646,283 @@ void set_game_world_time(float hours) {
     g_world_time_hours = std::clamp(hours, 0.0F, 24.0F);
 }
 
-void set_game_surface_window(bool enabled) {
-    auto& shader = lit_shader();
-    const int value = enabled ? 1 : 0;
-    if (shader.shader.id != 0U && shader.window_surface_loc >= 0) {
-        SetShaderValue(shader.shader, shader.window_surface_loc, &value, SHADER_UNIFORM_INT);
+namespace {
+
+// Per-instance model matrices for every GpuMesh draw. Each push re-specifies
+// the whole buffer (glBufferData with data), so the driver hands out fresh
+// storage instead of waiting for earlier draws; a glBufferSubData into storage
+// still in flight stalled every draw on Apple's GL-on-Metal.
+GLuint instance_stream() {
+    static GLuint vbo = 0U;
+    if (vbo == 0U) glGenBuffers(1, &vbo);
+    return vbo;
+}
+
+GfxDebugDrawCategory category_for(GpuSurface surface) {
+    switch (surface) {
+        case GpuSurface::Terrain: return GfxDebugDrawCategory::Terrain;
+        case GpuSurface::Mask:
+        case GpuSurface::ShadowVolume: return GfxDebugDrawCategory::WireOverlay;
+        default: return GfxDebugDrawCategory::CityCells;
     }
 }
 
-void set_game_surface_building(bool enabled) {
-    auto& shader = lit_shader();
-    const int value = enabled ? 1 : 0;
-    if (shader.shader.id != 0U && shader.building_surface_loc >= 0) {
-        SetShaderValue(shader.shader, shader.building_surface_loc, &value, SHADER_UNIFORM_INT);
+} // namespace
+
+namespace {
+struct EnvironmentCubemap {
+    GLuint texture{};
+    GLuint framebuffer{};
+    GLuint depth{};
+    // WebGL: blurred levels render here and are copied into the cube, since a
+    // cube level outside [base, max] makes the framebuffer incomplete.
+    GLuint scratch{};
+    Vector3 camera{};
+    Vector3 light{};
+    const GpuMesh* terrain{};
+    std::uint32_t terrain_indices{};
+    bool valid{};
+    bool capturing{};
+};
+
+EnvironmentCubemap& environment_cubemap() {
+    static EnvironmentCubemap cubemap;
+    return cubemap;
+}
+
+} // namespace
+
+// The road-marking overlay arrays the world shader samples on units 4/5
+// (texture 1's slots itemModels[0x356/0x357]), generated per layer by
+// subrosa.exe @0x98ff0 (the function Ghidra names Texture_GenerateCubemapFace):
+// 128x128, 11 layers, with x/y the texel column/row.
+//   color: layers 1/2 a yellow (255,255,32) line on rows 5..10 / 117..122,
+//          6/7 the same on columns; 4/5 a white dash on rows 5..10 / 117..122
+//          over columns 32..95, 9/10 the same on columns 5..10 / 117..122 over
+//          rows 32..95; 3 white rows 16..31 and 96..111, 8 white columns 11..26
+//          and 91..106. Opaque only where marked; layer 0 is clear.
+//   material: (128, 130 + 2*cos(noise), 0) on marked layers, 0 on layer 0;
+//          the cosine term is not ported, only its mean.
+struct OverlayArrays {
+    GLuint color{};
+    GLuint material{};
+};
+
+const OverlayArrays& road_overlay_arrays() {
+    static const OverlayArrays arrays = [] {
+        constexpr int size = 128;
+        constexpr int layers = 11;
+        const auto in = [](int value, int from, int to) { return value >= from && value <= to; };
+        std::vector<std::uint8_t> color(static_cast<std::size_t>(size * size * layers) * 4U, 0U);
+        std::vector<std::uint8_t> material(color.size(), 0U);
+        for (int layer = 1; layer < layers; ++layer) {
+            const bool yellow = layer == 1 || layer == 2 || layer == 6 || layer == 7;
+            for (int y = 0; y < size; ++y) {
+                for (int x = 0; x < size; ++x) {
+                    bool marked = false;
+                    switch (layer) {
+                        case 1: marked = in(y, 5, 10); break;
+                        case 2: marked = in(y, 117, 122); break;
+                        case 6: marked = in(x, 5, 10); break;
+                        case 7: marked = in(x, 117, 122); break;
+                        case 4: marked = in(y, 5, 10) && in(x, 32, 95); break;
+                        case 5: marked = in(y, 117, 122) && in(x, 32, 95); break;
+                        case 9: marked = in(x, 5, 10) && in(y, 32, 95); break;
+                        case 10: marked = in(x, 117, 122) && in(y, 32, 95); break;
+                        case 3: marked = in(y, 16, 31) || in(y, 96, 111); break;
+                        case 8: marked = in(x, 11, 26) || in(x, 91, 106); break;
+                        default: break;
+                    }
+                    const auto texel = (static_cast<std::size_t>(layer * size + y) * size + static_cast<std::size_t>(x)) * 4U;
+                    color[texel + 0] = 255;
+                    color[texel + 1] = 255;
+                    color[texel + 2] = yellow ? 32 : 255;
+                    color[texel + 3] = marked ? 255 : 0;
+                    material[texel + 0] = 128;
+                    material[texel + 1] = 130;
+                }
+            }
+        }
+        OverlayArrays result;
+        rlDrawRenderBatchActive();
+        for (auto [id, pixels] : {std::pair{&result.color, &color}, std::pair{&result.material, &material}}) {
+            glGenTextures(1, id);
+            glBindTexture(GL_TEXTURE_2D_ARRAY, *id);
+            glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8, size, size, layers, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels->data());
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_REPEAT);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_REPEAT);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glGenerateMipmap(GL_TEXTURE_2D_ARRAY);
+        }
+        glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+        return result;
+    }();
+    return arrays;
+}
+
+void draw_gpu_mesh_instances(const GpuMesh& mesh, const std::vector<Matrix>& transforms, GpuSurface surface) {
+    draw_gpu_mesh_batch({{&mesh, transforms}}, surface);
+}
+
+void draw_gpu_mesh_batch(const std::vector<GpuMeshDraw>& draws, GpuSurface surface, GpuPartFilter filter) {
+    std::size_t total_instances = 0;
+    for (const auto& draw : draws) {
+        if (draw.mesh != nullptr && !draw.mesh->empty()) total_instances += draw.transforms.size();
     }
+    if (total_instances == 0U) return;
+    rlDrawRenderBatchActive();
+    const auto view_projection = MatrixToFloatV(MatrixMultiply(rlGetMatrixModelview(), rlGetMatrixProjection()));
+    const bool lit = surface != GpuSurface::Mask && surface != GpuSurface::ShadowVolume;
+    // Created on first use, which flushes raylib's batch and unbinds the
+    // program; do it before binding ours.
+    if (lit) road_overlay_arrays();
+    if (surface == GpuSurface::ShadowVolume) {
+        const auto& shader = shadow_volume_shader();
+        glUseProgram(shader.shader.id);
+        glUniformMatrix4fv(shader.view_projection_loc, 1, GL_FALSE, view_projection.v);
+    } else if (lit) {
+        const auto& shader = lit_shader();
+        glUseProgram(shader.shader.id);
+        glUniformMatrix4fv(shader.view_projection_loc, 1, GL_FALSE, view_projection.v);
+        glUniform1i(shader.building_surface_loc, surface == GpuSurface::Building ? 1 : 0);
+        glUniform1i(shader.terrain_surface_loc, surface == GpuSurface::Terrain ? 1 : 0);
+        glUniform1i(shader.model_surface_loc, surface == GpuSurface::Model ? 1 : 0);
+        glUniform1i(shader.unlit_surface_loc, surface == GpuSurface::Unlit ? 1 : 0);
+    } else {
+        const auto& shader = mask_shader();
+        glUseProgram(shader.shader.id);
+        glUniformMatrix4fv(shader.view_projection_loc, 1, GL_FALSE, view_projection.v);
+    }
+    // Every mesh's instances go up in one buffer; each mesh reads its slice.
+    thread_local std::vector<float16> columns;
+    columns.clear();
+    columns.reserve(total_instances);
+    for (const auto& draw : draws) {
+        if (draw.mesh == nullptr || draw.mesh->empty()) continue;
+        for (const auto& transform : draw.transforms) columns.push_back(MatrixToFloatV(transform));
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, instance_stream());
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(columns.size() * sizeof(float16)), columns.data(), GL_STREAM_DRAW);
+    // World geometry winds clockwise, as in the game, which draws it with
+    // glFrontFace(GL_CW) and back faces culled. Under raylib's counter-clockwise
+    // front face that is culling GL_FRONT; the lit shader flips normals on the
+    // (then always back-facing) survivors. Masks and shadow volumes stay two-sided.
+    const bool glass = filter == GpuPartFilter::Glass;
+    if (lit && !glass) {
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_FRONT);
+    } else {
+        glDisable(GL_CULL_FACE);
+    }
+    if (lit) glUniform1f(lit_shader().glass_alpha_loc, glass ? kRoomGlassAlpha : 0.0F);
+    const bool blend_was_on = glIsEnabled(GL_BLEND) == GL_TRUE;
+    if (glass) {
+        // Room glass (_block_addwindows) is see-through: blend over the room
+        // behind it and keep depth for later geometry unchanged.
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        glDepthMask(GL_FALSE);
+        // The shadow resolve subtracts direct light per pixel after this pass,
+        // so the pane must scale the direct light behind it by (1 - alpha)
+        // like the color; the packed depth stays the surface behind.
+        if (g_target_has_mrt) {
+            static constexpr GLenum glass_outputs[] = {GL_COLOR_ATTACHMENT0, GL_NONE, GL_COLOR_ATTACHMENT2};
+            glDrawBuffers(3, glass_outputs);
+        }
+    }
+    if (lit) {
+        // Unbound while capturing, so the cube is never sampled while written.
+        const auto& environment = environment_cubemap();
+        glActiveTexture(GL_TEXTURE4);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, environment.capturing ? 0U : environment.texture);
+        const auto& overlay = road_overlay_arrays();
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, overlay.color);
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, overlay.material);
+    }
+    const auto default_texture = rlGetTextureIdDefault();
+    // Parts only rebind what differs from the previous part.
+    GLuint bound_texture = ~0U;
+    GLuint bound_material = ~0U;
+    Color bound_color{0, 0, 0, 0};
+    int bound_window = -1;
+    bool color_set = false;
+    std::size_t first_instance = 0;
+    std::uint64_t triangles = 0, indices = 0, calls = 0;
+    for (const auto& draw : draws) {
+        if (draw.mesh == nullptr || draw.mesh->empty() || draw.transforms.empty()) continue;
+        const auto& mesh = *draw.mesh;
+        glBindVertexArray(mesh.vao);
+        for (GLuint column = 0; column < 4; ++column) {
+            glVertexAttribPointer(kAttribInstance + column, 4, GL_FLOAT, GL_FALSE, sizeof(float16),
+                reinterpret_cast<void*>(first_instance * sizeof(float16) + column * 4U * sizeof(float)));
+        }
+        const auto instances = static_cast<GLsizei>(draw.transforms.size());
+        for (const auto& part : mesh.parts) {
+            if ((filter == GpuPartFilter::Opaque && part.window_material) || (glass && !part.window_material)) continue;
+            if (lit) {
+                const auto& shader = lit_shader();
+                const auto material = part.material_texture != 0U ? part.material_texture : default_texture;
+                const auto texture = part.texture != 0U ? part.texture : default_texture;
+                if (material != bound_material) {
+                    glActiveTexture(GL_TEXTURE1);
+                    glBindTexture(GL_TEXTURE_2D, material);
+                    bound_material = material;
+                }
+                if (texture != bound_texture) {
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_2D, texture);
+                    bound_texture = texture;
+                }
+                if (!color_set || part.color.r != bound_color.r || part.color.g != bound_color.g ||
+                    part.color.b != bound_color.b || part.color.a != bound_color.a) {
+                    glUniform4f(shader.color_loc, part.color.r / 255.0F, part.color.g / 255.0F, part.color.b / 255.0F, part.color.a / 255.0F);
+                    bound_color = part.color;
+                    color_set = true;
+                }
+                const int window = part.window_material ? 1 : 0;
+                if (window != bound_window) {
+                    glUniform1i(shader.window_surface_loc, window);
+                    bound_window = window;
+                }
+            }
+            glDrawElementsInstanced(GL_TRIANGLES, static_cast<GLsizei>(part.index_count), GL_UNSIGNED_INT,
+                reinterpret_cast<void*>(static_cast<std::size_t>(part.first_index) * sizeof(std::uint32_t)), instances);
+        }
+        first_instance += draw.transforms.size();
+        triangles += static_cast<std::uint64_t>(mesh.index_count / 3U) * draw.transforms.size();
+        indices += static_cast<std::uint64_t>(mesh.index_count) * draw.transforms.size();
+        calls += mesh.parts.size();
+    }
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    if (lit) {
+        glActiveTexture(GL_TEXTURE4);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+    }
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    if (glass) {
+        glDepthMask(GL_TRUE);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        if (g_target_has_mrt) {
+            static constexpr GLenum outputs[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2};
+            glDrawBuffers(g_draw_buffer_count, outputs);
+        }
+        if (!blend_was_on) glDisable(GL_BLEND);
+    }
+    if (lit) glUniform1f(lit_shader().glass_alpha_loc, 0.0F);
+    glCullFace(GL_BACK);
+    glEnable(GL_CULL_FACE);
+    if (g_gfx_debug_stats != nullptr) g_gfx_debug_stats->add_draw(category_for(surface), triangles, indices, calls);
 }
 
 struct SkyShader {
@@ -1883,7 +1931,6 @@ struct SkyShader {
     int world_position_loc{-1};
     int depth_texture_loc{-1};
     int inverse_resolution_loc{-1};
-    int ground_color_loc{-1};
     int mvp_loc{-1};
     unsigned int vao{0};
     unsigned int vbo{0};
@@ -1911,7 +1958,6 @@ out vec4 finalColor;
 in vec3 lightvec;
 in vec3 viewvec;
 uniform vec3 worldPosition;
-uniform vec3 groundColor;
 uniform sampler2D depthTexture;
 uniform vec2 inverseResolution;
 const vec4 ATMOSPHERE = vec4(0.0502275936, 0.0001, 6.4, 637.1);
@@ -1971,11 +2017,6 @@ void main() {
         distance *= ATMOSPHERE.y;
     }
     finalColor = rayleighScattering(viewNormal*distance, viewNormal, lightNormal);
-    // The game always has landscape under the horizon; without terrain loaded
-    // show the lit ground color instead of the black inside of the atmosphere.
-    if (skyPixel && viewNormal.y < 0.0) {
-        finalColor.rgb = mix(finalColor.rgb, groundColor, clamp(-viewNormal.y*8.0, 0.0, 1.0));
-    }
 }
 )glsl";
         cache.shader = LoadShaderFromMemory(vs, fs);
@@ -1983,7 +2024,6 @@ void main() {
         cache.world_position_loc = GetShaderLocation(cache.shader, "worldPosition");
         cache.depth_texture_loc = GetShaderLocation(cache.shader, "depthTexture");
         cache.inverse_resolution_loc = GetShaderLocation(cache.shader, "inverseResolution");
-        cache.ground_color_loc = GetShaderLocation(cache.shader, "groundColor");
         cache.mvp_loc = GetShaderLocation(cache.shader, "modelviewprojectionmatrix");
         glGenVertexArrays(1, &cache.vao);
         glGenBuffers(1, &cache.vbo);
@@ -2001,37 +2041,17 @@ void main() {
     return cache;
 }
 
-void draw_game_sky(const Camera3D& camera, Vector2 viewport_size, Texture2D depth_texture) {
-    if (viewport_size.x <= 0.0F || viewport_size.y <= 0.0F) {
-        return;
-    }
-    if (depth_texture.id == 0U) {
-        return;
-    }
+// Draws the atmosphere over a full-screen quad whose corners look along `rays`
+// (bottom-left, bottom-right, top-right, top-left). depth_texture holds the
+// packed scene distance; a white texel means open sky.
+void draw_sky_rays(const std::array<Vector3, 4>& rays, Vector3 camera_position, Vector2 inverse_resolution,
+                   GLuint depth_texture) {
     auto& sky = sky_shader();
-    const auto forward = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
-    const auto right = Vector3Normalize(Vector3CrossProduct(forward, camera.up));
-    const auto up = Vector3Normalize(Vector3CrossProduct(right, forward));
-    const float aspect = viewport_size.x / viewport_size.y;
-    const float vertical_fov = std::tan(camera.fovy * DEG2RAD * 0.5F);
-    const float horizontal_fov = vertical_fov*aspect;
-    // Native reset-time daylight: counter 0x244140 converted to the world-light
-    // angle, rotating normalized (0, 1, 0.5) around (0, 1/sqrt(5), -2/sqrt(5)).
     const Vector3 light_direction = game_light_direction();
     const Vector3 world_position{
-        camera.position.x*0.0001F,
-        camera.position.y*0.0001F+637.1F,
-        camera.position.z*0.0001F,
-    };
-    const Vector2 inverse_resolution{1.0F/viewport_size.x, 1.0F/viewport_size.y};
-    const auto ray = [&](float horizontal, float vertical) {
-        return Vector3Add(forward, Vector3Add(Vector3Scale(right, horizontal), Vector3Scale(up, vertical)));
-    };
-    const Vector3 rays[] = {
-        ray(-horizontal_fov, -vertical_fov),
-        ray( horizontal_fov, -vertical_fov),
-        ray( horizontal_fov,  vertical_fov),
-        ray(-horizontal_fov,  vertical_fov),
+        camera_position.x*0.0001F,
+        camera_position.y*0.0001F+637.1F,
+        camera_position.z*0.0001F,
     };
     const float vertices[] = {
         -1.0F, -1.0F, 0.0F, rays[0].x, rays[0].y, rays[0].z,
@@ -2045,6 +2065,46 @@ void draw_game_sky(const Camera3D& camera, Vector2 viewport_size, Texture2D dept
         0.0F, 0.0F, 1.0F, 0.0F,
         0.0F, 0.0F, 0.0F, 1.0F,
     };
+    glUseProgram(sky.shader.id);
+    glUniform3fv(sky.light_direction_loc, 1, &light_direction.x);
+    glUniform3fv(sky.world_position_loc, 1, &world_position.x);
+    glUniform2fv(sky.inverse_resolution_loc, 1, &inverse_resolution.x);
+    glUniformMatrix4fv(sky.mvp_loc, 1, GL_FALSE, identity);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, depth_texture);
+    glUniform1i(sky.depth_texture_loc, 0);
+    glBindVertexArray(sky.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, sky.vbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertices), vertices);
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(rlGetShaderIdDefault());
+}
+
+void draw_game_sky(const Camera3D& camera, Vector2 viewport_size, Texture2D depth_texture) {
+    if (viewport_size.x <= 0.0F || viewport_size.y <= 0.0F) {
+        return;
+    }
+    if (depth_texture.id == 0U) {
+        return;
+    }
+    const auto forward = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+    const auto right = Vector3Normalize(Vector3CrossProduct(forward, camera.up));
+    const auto up = Vector3Normalize(Vector3CrossProduct(right, forward));
+    const float aspect = viewport_size.x / viewport_size.y;
+    const float vertical_fov = std::tan(camera.fovy * DEG2RAD * 0.5F);
+    const float horizontal_fov = vertical_fov*aspect;
+    const auto ray = [&](float horizontal, float vertical) {
+        return Vector3Add(forward, Vector3Add(Vector3Scale(right, horizontal), Vector3Scale(up, vertical)));
+    };
+    const std::array<Vector3, 4> rays{
+        ray(-horizontal_fov, -vertical_fov),
+        ray( horizontal_fov, -vertical_fov),
+        ray( horizontal_fov,  vertical_fov),
+        ray(-horizontal_fov,  vertical_fov),
+    };
     const unsigned int framebuffer = rlGetActiveFramebuffer();
     rlDrawRenderBatchActive();
     glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
@@ -2055,26 +2115,10 @@ void draw_game_sky(const Camera3D& camera, Vector2 viewport_size, Texture2D dept
     glDepthMask(GL_FALSE);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
+    // RenderSky @122690: GL_ONE, GL_SRC_ALPHA over the lit scene.
     glEnable(GL_BLEND);
     glBlendFunc(GL_ONE, GL_SRC_ALPHA);
-    glUseProgram(sky.shader.id);
-    glUniform3fv(sky.light_direction_loc, 1, &light_direction.x);
-    glUniform3fv(sky.world_position_loc, 1, &world_position.x);
-    glUniform2fv(sky.inverse_resolution_loc, 1, &inverse_resolution.x);
-    const auto ground = game_ground_color(Vector3Normalize(light_direction));
-    glUniform3fv(sky.ground_color_loc, 1, &ground.x);
-    glUniformMatrix4fv(sky.mvp_loc, 1, GL_FALSE, identity);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, depth_texture.id);
-    glUniform1i(sky.depth_texture_loc, 0);
-    glBindVertexArray(sky.vao);
-    glBindBuffer(GL_ARRAY_BUFFER, sky.vbo);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertices), vertices);
-    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glBindVertexArray(0);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glUseProgram(rlGetShaderIdDefault());
+    draw_sky_rays(rays, camera.position, {1.0F/viewport_size.x, 1.0F/viewport_size.y}, depth_texture.id);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_DEPTH_TEST);
     glDepthMask(GL_TRUE);
@@ -2085,6 +2129,274 @@ void draw_game_sky(const Camera3D& camera, Vector2 viewport_size, Texture2D dept
     const GLenum color_only_after_sky[] = {GL_COLOR_ATTACHMENT0};
     glDrawBuffers(1, color_only_after_sky);
     rlEnableFramebuffer(framebuffer);
+}
+
+namespace {
+
+// RenderLandscapeCubemapAndBlurCapture @93e60: a 512 cube around the camera.
+// Each face is cleared to 0.125 grey, filled with the atmosphere
+// (_renderframeatmospherecubemap @122ca0, every texel treated as open sky),
+// then the landscape is drawn at half light with the grey-city color map.
+// _blurcubemap @1b6a0 then fills levels 1..9 (256 down to 1), each blurred from
+// the level above with the stock cubemap blur shader.
+constexpr int kEnvironmentSize = 512;
+constexpr int kEnvironmentLevels = 10;
+
+// Direction through NDC (x, y) of a cube face, faces +X -X +Y -Y +Z -Z, in the
+// GL cube-map convention (so the capture samples back with true directions).
+Vector3 cube_face_direction(int face, float x, float y) {
+    switch (face) {
+        case 0: return {1.0F, -y, -x};
+        case 1: return {-1.0F, -y, x};
+        case 2: return {x, 1.0F, y};
+        case 3: return {x, -1.0F, -y};
+        case 4: return {x, -y, 1.0F};
+        default: return {-x, -y, -1.0F};
+    }
+}
+
+struct CubemapBlurShader {
+    Shader shader{};
+    int lod_loc{-1};
+    GLuint vao{};
+    GLuint vbo{};
+};
+
+CubemapBlurShader& cubemap_blur_shader() {
+    static CubemapBlurShader cache = [] {
+        CubemapBlurShader value;
+        // Stock cubemap_blur shaders, minus the game's y/z axis flip (this cube
+        // is captured with GL cube-map directions).
+        value.shader = LoadShaderFromMemory(MAPED_GLSL_VERSION R"glsl(
+layout(location=0) in vec3 position_in;
+layout(location=1) in vec3 viewvec_in;
+layout(location=2) in vec3 upvec_in;
+out vec3 viewvec;
+out vec3 upvec;
+void main() {
+    viewvec = viewvec_in;
+    upvec = upvec_in;
+    gl_Position = vec4(position_in, 1.0);
+}
+)glsl", MAPED_GLSL_VERSION R"glsl(
+uniform samplerCube tex_color;
+uniform float texlod;
+in vec3 viewvec;
+in vec3 upvec;
+out vec4 fragcolor;
+#define PI 3.1415926
+void main() {
+    float maxangle = PI*0.03125;
+    vec3 frontnormal = normalize(viewvec);
+    vec3 rightnormal = normalize(cross(frontnormal, upvec));
+    vec3 upnormal = normalize(cross(rightnormal, frontnormal));
+    vec3 accum = vec3(0.0);
+    float total = 0.0;
+    const int numofsamples = 2;
+    for (int county = -numofsamples; county <= numofsamples; county++) {
+        float siny = sin(float(county)*maxangle/float(numofsamples));
+        for (int countx = -numofsamples; countx <= numofsamples; countx++) {
+            float sinx = sin(float(countx)*maxangle/float(numofsamples));
+            vec3 sampledir = frontnormal+upnormal*siny+rightnormal*sinx;
+            float opacity = cos(float(county)*PI*0.375/float(numofsamples))*cos(float(countx)*PI*0.375/float(numofsamples));
+            accum += textureLod(tex_color, sampledir, texlod).rgb*opacity;
+            total += opacity;
+        }
+    }
+    fragcolor = vec4(accum/total, 1.0);
+}
+)glsl");
+        value.lod_loc = GetShaderLocation(value.shader, "texlod");
+        glGenVertexArrays(1, &value.vao);
+        glGenBuffers(1, &value.vbo);
+        glBindVertexArray(value.vao);
+        glBindBuffer(GL_ARRAY_BUFFER, value.vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 36, nullptr, GL_DYNAMIC_DRAW);
+        for (GLuint attribute = 0; attribute < 3; ++attribute) {
+            glEnableVertexAttribArray(attribute);
+            glVertexAttribPointer(attribute, 3, GL_FLOAT, GL_FALSE, sizeof(float) * 9,
+                reinterpret_cast<void*>(attribute * 3U * sizeof(float)));
+        }
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        return value;
+    }();
+    return cache;
+}
+
+void create_environment_cubemap(EnvironmentCubemap& cubemap) {
+    glGenTextures(1, &cubemap.texture);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, cubemap.texture);
+#ifdef __EMSCRIPTEN__
+    // Half floats need EXT_color_buffer_float (web_hdr_targets); else 8-bit.
+    const GLenum internal_format = web_hdr_targets() ? GL_RGBA16F : GL_RGBA8;
+    const GLenum type = web_hdr_targets() ? GL_HALF_FLOAT : GL_UNSIGNED_BYTE;
+#else
+    constexpr GLenum internal_format = GL_RGBA16F;
+    constexpr GLenum type = GL_HALF_FLOAT;
+#endif
+    for (int level = 0; level < kEnvironmentLevels; ++level) {
+        const int size = std::max(1, kEnvironmentSize >> level);
+        for (int face = 0; face < 6; ++face) {
+            glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + static_cast<GLenum>(face), level, internal_format,
+                size, size, 0, GL_RGBA, type, nullptr);
+        }
+    }
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_BASE_LEVEL, 0);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, kEnvironmentLevels - 1);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+    glGenFramebuffers(1, &cubemap.framebuffer);
+    glGenRenderbuffers(1, &cubemap.depth);
+    glBindRenderbuffer(GL_RENDERBUFFER, cubemap.depth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, kEnvironmentSize, kEnvironmentSize);
+#ifdef __EMSCRIPTEN__
+    glGenRenderbuffers(1, &cubemap.scratch);
+    glBindRenderbuffer(GL_RENDERBUFFER, cubemap.scratch);
+    glRenderbufferStorage(GL_RENDERBUFFER, internal_format, kEnvironmentSize / 2, kEnvironmentSize / 2);
+#endif
+    glBindRenderbuffer(GL_RENDERBUFFER, 0);
+}
+
+} // namespace
+
+void update_environment_cubemap(const GpuMesh* terrain, Vector3 camera_position) {
+    auto& cubemap = environment_cubemap();
+    const auto light = Vector3Normalize(game_light_direction());
+    const auto terrain_indices = terrain != nullptr ? terrain->index_count : 0U;
+    // ponytail: recaptured only when the sun, the terrain, or the camera (by more
+    // than 16 units) changes; the game recaptures more eagerly.
+    if (cubemap.valid && Vector3Distance(cubemap.camera, camera_position) < 16.0F &&
+        Vector3LengthSqr(Vector3Subtract(cubemap.light, light)) < 1e-10F &&
+        cubemap.terrain == terrain && cubemap.terrain_indices == terrain_indices) {
+        return;
+    }
+    rlDrawRenderBatchActive();
+    if (cubemap.texture == 0U) create_environment_cubemap(cubemap);
+    cubemap.camera = camera_position;
+    cubemap.light = light;
+    cubemap.terrain = terrain;
+    cubemap.terrain_indices = terrain_indices;
+    cubemap.valid = true;
+    cubemap.capturing = true;
+
+    GLint previous_framebuffer = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous_framebuffer);
+    GLint previous_viewport[4]{};
+    glGetIntegerv(GL_VIEWPORT, previous_viewport);
+    const auto previous_modelview = rlGetMatrixModelview();
+    const auto previous_projection = rlGetMatrixProjection();
+
+    glBindFramebuffer(GL_FRAMEBUFFER, cubemap.framebuffer);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, cubemap.depth);
+    const GLenum color_only[] = {GL_COLOR_ATTACHMENT0};
+    glDrawBuffers(1, color_only);
+    glViewport(0, 0, kEnvironmentSize, kEnvironmentSize);
+    const auto projection = MatrixPerspective(PI * 0.5, 1.0, 1.0, 20000.0);
+    auto& lit = lit_shader();
+    for (int face = 0; face < 6; ++face) {
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X + static_cast<GLenum>(face),
+            cubemap.texture, 0);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glDepthMask(GL_TRUE);
+        glClearColor(0.125F, 0.125F, 0.125F, 0.0F);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        // Atmosphere: blending off, every texel open sky (white packed depth).
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_BLEND);
+        draw_sky_rays({
+            cube_face_direction(face, -1.0F, -1.0F), cube_face_direction(face, 1.0F, -1.0F),
+            cube_face_direction(face, 1.0F, 1.0F), cube_face_direction(face, -1.0F, 1.0F),
+        }, camera_position, {1.0F, 1.0F}, rlGetTextureIdDefault());
+        glEnable(GL_DEPTH_TEST);
+        glDepthMask(GL_TRUE);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        if (terrain != nullptr && !terrain->empty()) {
+            // View rows: face right, face up, minus forward.
+            const auto forward = cube_face_direction(face, 0.0F, 0.0F);
+            const auto right = Vector3Subtract(cube_face_direction(face, 1.0F, 0.0F), forward);
+            const auto up = Vector3Subtract(cube_face_direction(face, 0.0F, 1.0F), forward);
+            const Matrix view{
+                right.x, right.y, right.z, -Vector3DotProduct(right, camera_position),
+                up.x, up.y, up.z, -Vector3DotProduct(up, camera_position),
+                -forward.x, -forward.y, -forward.z, Vector3DotProduct(forward, camera_position),
+                0.0F, 0.0F, 0.0F, 1.0F,
+            };
+            rlSetMatrixModelview(view);
+            rlSetMatrixProjection(projection);
+            SetShaderValue(lit.shader, lit.view_position_loc, &camera_position.x, SHADER_UNIFORM_VEC3);
+            const int on = 1;
+            SetShaderValue(lit.shader, lit.cubemap_pass_loc, &on, SHADER_UNIFORM_INT);
+            set_game_surface_light(0.5F);
+            draw_gpu_mesh_instances(*terrain, {MatrixIdentity()}, GpuSurface::Terrain);
+            const int off = 0;
+            SetShaderValue(lit.shader, lit.cubemap_pass_loc, &off, SHADER_UNIFORM_INT);
+            set_game_surface_light(1.0F);
+        }
+    }
+
+    auto& blur = cubemap_blur_shader();
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 0);
+    glUseProgram(blur.shader.id);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, cubemap.texture);
+    glBindVertexArray(blur.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, blur.vbo);
+    for (int level = 1; level < kEnvironmentLevels; ++level) {
+        // Sample only the level above while writing this one.
+        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_BASE_LEVEL, level - 1);
+        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, level - 1);
+        glUniform1f(blur.lod_loc, static_cast<float>(level - 1));
+        const int size = std::max(1, kEnvironmentSize >> level);
+        glViewport(0, 0, size, size);
+        for (int face = 0; face < 6; ++face) {
+#ifdef __EMSCRIPTEN__
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, cubemap.scratch);
+#else
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                GL_TEXTURE_CUBE_MAP_POSITIVE_X + static_cast<GLenum>(face), cubemap.texture, level);
+#endif
+            const auto up = Vector3Subtract(cube_face_direction(face, 0.0F, 1.0F), cube_face_direction(face, 0.0F, 0.0F));
+            float vertices[36]{};
+            const std::array<std::array<float, 2>, 4> corners{{{-1, -1}, {1, -1}, {1, 1}, {-1, 1}}};
+            for (std::size_t i = 0; i < 4; ++i) {
+                const auto dir = cube_face_direction(face, corners[i][0], corners[i][1]);
+                const float v[9]{corners[i][0], corners[i][1], 0.0F, dir.x, dir.y, dir.z, up.x, up.y, up.z};
+                std::copy(std::begin(v), std::end(v), vertices + i * 9U);
+            }
+            glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertices), vertices);
+            glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+#ifdef __EMSCRIPTEN__
+            glCopyTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + static_cast<GLenum>(face), level, 0, 0, 0, 0, size, size);
+#endif
+        }
+    }
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_BASE_LEVEL, 0);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, kEnvironmentLevels - 1);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+    glUseProgram(rlGetShaderIdDefault());
+
+    glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previous_framebuffer));
+    glViewport(previous_viewport[0], previous_viewport[1], previous_viewport[2], previous_viewport[3]);
+    rlSetMatrixModelview(previous_modelview);
+    rlSetMatrixProjection(previous_projection);
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_CULL_FACE);
+    cubemap.capturing = false;
 }
 
 struct MaskOutlineShader {
@@ -2127,31 +2439,7 @@ MaskOutlineShader& mask_outline_shader() {
 }
 
 void draw_city_building_mask(GpuBuildingRenderModel& model, const SbcBuilding& placement) {
-    auto& mask = mask_shader();
-    if (mask.shader.id == 0) {
-        return;
-    }
-    constexpr auto unit_size = 4.0F;
-    const auto render_origin = native_city_building_render_origin(placement, unit_size);
-    const auto origin = Vector3{render_origin.x, render_origin.y, render_origin.z};
-    const auto transform = building_transform_matrix(origin, placement.rotation);
-
-    rlDisableBackfaceCulling();
-    for (auto& chunk : model.chunks) {
-        if (chunk.mesh.vertexCount <= 0 || chunk.material.maps == nullptr) {
-            continue;
-        }
-        const auto saved = chunk.material.shader;
-        chunk.material.shader = mask.shader;
-        DrawMesh(chunk.mesh, chunk.material, transform);
-        chunk.material.shader = saved;
-        if (g_gfx_debug_stats != nullptr) {
-            g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::WireOverlay,
-                static_cast<std::uint64_t>(std::max(chunk.mesh.triangleCount, 0)),
-                static_cast<std::uint64_t>(std::max(chunk.mesh.vertexCount, 0)), 1U);
-        }
-    }
-    rlEnableBackfaceCulling();
+    draw_gpu_mesh_instances(model.mesh, {city_placement_matrix(placement)}, GpuSurface::Mask);
 }
 
 // Fills the footprint of one road into the active mask target as solid geometry,
@@ -2203,14 +2491,136 @@ void draw_city_road_mask(const EditorProject& project, const MapScene& scene, st
 
 // Fills one building cell (a cube at its anchored centre) into the active mask
 // target, so the cell gets the same silhouette-outline hover/selection look.
-void draw_building_cell_mask(const SbbBuilding& building, const SbbCell& cell) {
-    constexpr auto unit_size = 4.0F;
-    const Vector3 center{
-        (static_cast<float>(cell.x) - static_cast<float>(building.anchor_x) + 0.5F) * unit_size,
-        (static_cast<float>(cell.y) - static_cast<float>(building.anchor_y) + 0.5F) * unit_size,
-        (static_cast<float>(cell.z) - static_cast<float>(building.anchor_z) + 0.5F) * unit_size,
+namespace {
+
+// Triangles of `buffer` whose centroid satisfies `inside`, flattened to three
+// vertices each. Cached per highlight key until the buffer changes, so a hover
+// outline does not rescan a city-sized mesh every frame.
+const std::vector<Vector3>& mask_triangles(std::uint64_t key, const BuildingRenderBuffer& buffer,
+                                           const std::function<bool(Vec3)>& inside) {
+    struct Entry {
+        std::uint64_t key{};
+        const RenderBufferVertex* vertices{};
+        std::size_t triangle_count{};
+        std::vector<Vector3> points;
     };
-    DrawCubeV(center, {unit_size, unit_size, unit_size}, WHITE);
+    static std::array<Entry, 8> entries;
+    static std::size_t next = 0;
+    for (auto& entry : entries) {
+        if (entry.key == key && entry.vertices == buffer.vertices.data() && entry.triangle_count == buffer.triangles.size()) {
+            return entry.points;
+        }
+    }
+    auto& entry = entries[next++ % entries.size()];
+    entry = {key, buffer.vertices.data(), buffer.triangles.size(), {}};
+    for (const auto& tri : buffer.triangles) {
+        const auto& a = buffer.vertices[tri.indices[0]].position;
+        const auto& b = buffer.vertices[tri.indices[1]].position;
+        const auto& c = buffer.vertices[tri.indices[2]].position;
+        if (!inside({(a.x + b.x + c.x) / 3.0F, (a.y + b.y + c.y) / 3.0F, (a.z + b.z + c.z) / 3.0F})) continue;
+        entry.points.insert(entry.points.end(), {Vector3{a.x, a.y, a.z}, Vector3{b.x, b.y, b.z}, Vector3{c.x, c.y, c.z}});
+    }
+    return entry.points;
+}
+
+// Fills cached mask triangles, both windings, lifted by `offset`. The batch is
+// flushed before culling comes back on, since DrawTriangle3D draws later.
+bool draw_mask_triangles(const std::vector<Vector3>& points, Vector3 offset) {
+    if (points.empty()) return false;
+    rlDrawRenderBatchActive();
+    rlDisableBackfaceCulling();
+    for (std::size_t i = 0; i + 2 < points.size(); i += 3) {
+        const auto a = Vector3Add(points[i], offset);
+        const auto b = Vector3Add(points[i + 1], offset);
+        const auto c = Vector3Add(points[i + 2], offset);
+        DrawTriangle3D(a, b, c, WHITE);
+        DrawTriangle3D(c, b, a, WHITE);
+    }
+    rlDrawRenderBatchActive();
+    rlEnableBackfaceCulling();
+    return true;
+}
+
+bool inside_cell_box(Vec3 p, float x0, float y0, float z0) {
+    constexpr float unit = 4.0F;
+    constexpr float eps = 0.01F;
+    return p.x >= x0 - eps && p.x <= x0 + unit + eps && p.y >= y0 - eps && p.y <= y0 + unit + eps &&
+        p.z >= z0 - eps && p.z <= z0 + unit + eps;
+}
+
+std::uint64_t mask_key(std::uint64_t kind, std::int64_t a, std::int64_t b = 0, std::int64_t c = 0) {
+    return kind << 60U ^ (static_cast<std::uint64_t>(a) & 0xfffffU) << 40U ^ (static_cast<std::uint64_t>(b) & 0xfffffU) << 20U ^
+        (static_cast<std::uint64_t>(c) & 0xfffffU);
+}
+
+} // namespace
+
+// One building cell's rendered faces (the edit-view mesh, anchored coords) into
+// the active mask, so the outline follows the block's real shape; an empty
+// cell falls back to its cube.
+void draw_building_cell_mask(const BuildingRenderBuffer& buffer, const SbbBuilding& building, const SbbCell& cell) {
+    constexpr auto unit_size = 4.0F;
+    const auto x0 = (static_cast<float>(cell.x) - static_cast<float>(building.anchor_x)) * unit_size;
+    const auto y0 = (static_cast<float>(cell.y) - static_cast<float>(building.anchor_y)) * unit_size;
+    const auto z0 = (static_cast<float>(cell.z) - static_cast<float>(building.anchor_z)) * unit_size;
+    const auto& points = mask_triangles(mask_key(1, cell.x, cell.y, cell.z), buffer,
+        [&](Vec3 p) { return inside_cell_box(p, x0, y0, z0); });
+    if (!draw_mask_triangles(points, {})) {
+        DrawCubeV({x0 + unit_size * 0.5F, y0 + unit_size * 0.5F, z0 + unit_size * 0.5F}, {unit_size, unit_size, unit_size}, WHITE);
+    }
+}
+
+// Tints the rendered triangles of one cell face (paint / hover target), both
+// windings, drawn over the lit mesh.
+void draw_building_face_highlight(const BuildingRenderBuffer& buffer, std::size_t cell, std::uint32_t slot) {
+    rlDrawRenderBatchActive();
+    rlDisableBackfaceCulling();
+    rlDisableDepthMask();
+    constexpr Color tint{255, 200, 60, 110};
+    for (const auto& tri : buffer.triangles) {
+        if (tri.cell != cell || tri.slot != slot) continue;
+        const auto v = [&](int i) { const auto& p = buffer.vertices[tri.indices[i]].position; return Vector3{p.x, p.y, p.z}; };
+        DrawTriangle3D(v(0), v(1), v(2), tint);
+        DrawTriangle3D(v(2), v(1), v(0), tint);
+    }
+    rlDrawRenderBatchActive();
+    rlEnableDepthMask();
+    rlEnableBackfaceCulling();
+}
+
+// One piece voxel's rendered faces into the active mask. Piece geometry sits in
+// world space and is drawn 0.25 above its cell (draw_city_piece_voxels).
+void draw_city_piece_mask(const EditorProject& project, CityGridPoint cell) {
+    constexpr auto unit_size = 4.0F;
+    const auto x0 = static_cast<float>(cell.x) * unit_size;
+    const auto y0 = static_cast<float>(cell.y) * unit_size;
+    const auto z0 = static_cast<float>(cell.z) * unit_size;
+    const auto& points = mask_triangles(mask_key(2, cell.x, cell.y, cell.z), project.portal_render_buffer,
+        [&](Vec3 p) { return inside_cell_box(p, x0, y0, z0); });
+    if (!draw_mask_triangles(points, {0.0F, 0.25F, 0.0F})) {
+        DrawCubeV({x0 + unit_size * 0.5F, y0 + 0.25F + unit_size * 0.5F, z0 + unit_size * 0.5F}, {unit_size, unit_size, unit_size}, WHITE);
+    }
+}
+
+// A road junction's road and curb tiles (those it placed) into the active mask.
+void draw_city_intersection_mask(const MapScene& scene, std::size_t intersection) {
+    std::unordered_set<std::uint64_t> cells;
+    const auto cell_key = [](std::int32_t x, std::int32_t y, std::int32_t z) {
+        return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 42U) ^
+            (static_cast<std::uint64_t>(static_cast<std::uint32_t>(y) & 0x1fffffU) << 21U) ^
+            static_cast<std::uint64_t>(static_cast<std::uint32_t>(z) & 0x1fffffU);
+    };
+    const auto& points = mask_triangles(mask_key(3, static_cast<std::int64_t>(intersection)), scene.city_tile_buffer, [&](Vec3 p) {
+        if (cells.empty()) {
+            for (const auto& tile : scene.city_tiles) {
+                if (tile.intersection_index == static_cast<std::int32_t>(intersection)) cells.insert(cell_key(tile.x, tile.y, tile.z));
+            }
+        }
+        // Tile cells span y*4+0.25 .. y*4+4.25.
+        return cells.contains(cell_key(static_cast<std::int32_t>(std::floor(p.x / 4.0F)),
+            static_cast<std::int32_t>(std::floor((p.y - 0.25F) / 4.0F)), static_cast<std::int32_t>(std::floor(p.z / 4.0F))));
+    });
+    draw_mask_triangles(points, {});
 }
 
 void draw_outline_from_mask(RenderTexture2D& mask, Vector2 viewport_size, Color tint) {
@@ -2249,39 +2659,21 @@ void draw_gpu_building_model(
     GpuBuildingRenderModel& model,
     Vector3 origin,
     std::int32_t rotation,
-    bool selected,
     bool draw_wires,
-    GfxDebugDrawCategory category = GfxDebugDrawCategory::CityCells
+    GpuSurface surface = GpuSurface::Building,
+    bool room_glass = false
 ) {
-    const auto transform = building_transform_matrix(origin, rotation);
+    const std::vector<Matrix> transform{building_transform_matrix(origin, rotation)};
     set_game_render_depth_output(true);
-    rlDisableBackfaceCulling();
-    for (auto& chunk : model.chunks) {
-        if (chunk.material.maps == nullptr || chunk.mesh.vertexCount <= 0) {
-            continue;
-        }
-        chunk.material.maps[MATERIAL_MAP_DIFFUSE].texture = chunk.source_texture;
-        chunk.material.maps[MATERIAL_MAP_DIFFUSE].color = chunk.textured
-            ? (selected ? Color{255, 236, 170, 255} : WHITE)
-            : native_material_color(chunk.material_id, selected, chunk.window_material);
-        set_game_surface_window(chunk.window_material);
-        set_game_surface_building(true);
-        DrawMesh(chunk.mesh, chunk.material, transform);
-        if (g_gfx_debug_stats != nullptr) {
-            g_gfx_debug_stats->add_draw(
-                category,
-                static_cast<std::uint64_t>(std::max(chunk.mesh.triangleCount, 0)),
-                static_cast<std::uint64_t>(std::max(chunk.mesh.vertexCount, 0)),
-                1U);
-        }
-    }
-    rlEnableBackfaceCulling();
+    // Near-LOD meshes: their window parts are room glass, drawn see-through last.
+    draw_gpu_mesh_batch({{&model.mesh, transform}}, surface, room_glass ? GpuPartFilter::Opaque : GpuPartFilter::All);
     set_game_render_depth_output(false);
+    if (room_glass) draw_gpu_mesh_batch({{&model.mesh, transform}}, surface, GpuPartFilter::Glass);
 
     if (!draw_wires) {
         return;
     }
-    const auto wire = selected ? Color{255, 240, 150, 255} : Color{40, 45, 50, 255};
+    const auto wire = Color{40, 45, 50, 255};
     for (const auto& line : model.wire_lines) {
         DrawLine3D(transform_buffer_vertex(line.from, origin, rotation), transform_buffer_vertex(line.to, origin, rotation), wire);
     }
@@ -2294,6 +2686,120 @@ void draw_gpu_building_model(
     }
 }
 
+namespace {
+
+// View the work grids size their lines for (set_grid_view).
+struct GridView {
+    Vector3 position{};
+    float pixels_per_radian{800.0F};
+};
+GridView g_grid_view;
+
+struct GridLineStyle {
+    Color color;
+    float pixels;  // on-screen width
+};
+
+// A flat work grid: every line is a quad lying in the plane, as wide on screen
+// at any distance, split per cell so its width and fade follow the view.
+// Drawn twice: normally where nothing covers it, and faint behind geometry so
+// it still reads through walls without swamping them.
+struct WorkGrid {
+    float y{};
+    float unit{4.0F};
+    std::int32_t x0{}, x1{}, z0{}, z1{};  // cell range, lines at x0..x1 and z0..z1
+    Vector2 fade_center{};
+    float fade_radius{};  // 0 = no fade
+    std::function<GridLineStyle(bool along_x, std::int32_t line)> style;
+};
+
+void emit_grid_quad(Vector3 a, Vector3 b, Vector3 side, Color ca, Color cb) {
+    rlColor4ub(ca.r, ca.g, ca.b, ca.a); rlVertex3f(a.x - side.x, a.y, a.z - side.z);
+    rlColor4ub(cb.r, cb.g, cb.b, cb.a); rlVertex3f(b.x - side.x, b.y, b.z - side.z);
+    rlColor4ub(cb.r, cb.g, cb.b, cb.a); rlVertex3f(b.x + side.x, b.y, b.z + side.z);
+    rlColor4ub(ca.r, ca.g, ca.b, ca.a); rlVertex3f(a.x - side.x, a.y, a.z - side.z);
+    rlColor4ub(cb.r, cb.g, cb.b, cb.a); rlVertex3f(b.x + side.x, b.y, b.z + side.z);
+    rlColor4ub(ca.r, ca.g, ca.b, ca.a); rlVertex3f(a.x + side.x, a.y, a.z + side.z);
+}
+
+float grid_fade(const WorkGrid& grid, float x, float z) {
+    if (grid.fade_radius <= 0.0F) return 1.0F;
+    const auto d = std::hypot(x - grid.fade_center.x, z - grid.fade_center.y) / grid.fade_radius;
+    return std::clamp((1.0F - d) / 0.4F, 0.0F, 1.0F);
+}
+
+void emit_work_grid(const WorkGrid& grid, float alpha_scale) {
+    rlBegin(RL_TRIANGLES);
+    const auto half_width = [&](Vector3 p, float pixels) {
+        const auto distance = std::max(0.5F, Vector3Distance(p, g_grid_view.position));
+        return 0.5F * pixels * distance / g_grid_view.pixels_per_radian;
+    };
+    const auto faded = [&](Color c, float x, float z) {
+        return Color{c.r, c.g, c.b, static_cast<unsigned char>(static_cast<float>(c.a) * alpha_scale * grid_fade(grid, x, z))};
+    };
+    for (int pass = 0; pass < 2; ++pass) {
+        const bool along_x = pass == 0;  // lines of constant z run along x
+        const auto first = along_x ? grid.z0 : grid.x0;
+        const auto last = along_x ? grid.z1 : grid.x1;
+        for (auto line = first; line <= last; ++line) {
+            const auto style = grid.style(along_x, line);
+            if (style.color.a == 0) continue;
+            const auto fixed = static_cast<float>(line) * grid.unit;
+            const auto begin = along_x ? grid.x0 : grid.z0;
+            const auto end = along_x ? grid.x1 : grid.z1;
+            for (auto step = begin; step < end; ++step) {
+                const auto s0 = static_cast<float>(step) * grid.unit;
+                const auto s1 = s0 + grid.unit;
+                const Vector3 a = along_x ? Vector3{s0, grid.y, fixed} : Vector3{fixed, grid.y, s0};
+                const Vector3 b = along_x ? Vector3{s1, grid.y, fixed} : Vector3{fixed, grid.y, s1};
+                const auto w = half_width(Vector3Lerp(a, b, 0.5F), style.pixels);
+                const Vector3 side = along_x ? Vector3{0.0F, 0.0F, w} : Vector3{w, 0.0F, 0.0F};
+                const auto ca = faded(style.color, a.x, a.z);
+                const auto cb = faded(style.color, b.x, b.z);
+                if (ca.a == 0 && cb.a == 0) continue;
+                emit_grid_quad(a, b, side, ca, cb);
+            }
+        }
+    }
+    rlEnd();
+}
+
+// Draws the grid over the scene without writing depth: in front of geometry at
+// full strength, behind it at a fifth.
+void draw_work_grid(const WorkGrid& grid, const std::function<void(float)>& extras = {}) {
+    rlDrawRenderBatchActive();
+    rlDisableBackfaceCulling();
+    rlDisableDepthMask();
+    rlEnableDepthTest();
+    emit_work_grid(grid, 1.0F);
+    if (extras) extras(1.0F);
+    rlDrawRenderBatchActive();
+    glDepthFunc(GL_GREATER);
+    emit_work_grid(grid, 0.2F);
+    if (extras) extras(0.2F);
+    rlDrawRenderBatchActive();
+    glDepthFunc(GL_LEQUAL);
+    rlEnableDepthMask();
+    rlEnableBackfaceCulling();
+}
+
+std::int32_t floor_mod(std::int32_t value, std::int32_t m) {
+    return ((value % m) + m) % m;
+}
+
+constexpr Color kGridMinor{205, 218, 232, 46};
+constexpr Color kGridMajor{120, 180, 255, 120};
+constexpr Color kGridAxisX{238, 88, 82, 215};
+constexpr Color kGridAxisZ{82, 150, 245, 215};
+
+} // namespace
+
+void set_grid_view(const Camera3D& camera, float viewport_height) {
+    g_grid_view.position = camera.position;
+    const auto half_fov = std::tan(camera.fovy * DEG2RAD * 0.5F);
+    g_grid_view.pixels_per_radian = viewport_height * 0.5F / std::max(half_fov, 1e-3F);
+}
+
 void draw_sbb_scene_for_app(
     const SbbBuilding& building,
     GpuBuildingRenderModel& model,
@@ -2303,64 +2809,47 @@ void draw_sbb_scene_for_app(
     constexpr std::uint32_t grid_cells = 64;
     const auto floor = std::min(guide_floor, building.size_z > 0U ? building.size_z - 1U : 0U);
     const auto grid_y = (static_cast<float>(floor) - static_cast<float>(building.anchor_y)) * unit_size + 0.02F;
-    const auto grid_min_x = -static_cast<float>(building.anchor_x) * unit_size;
-    const auto grid_min_z = -static_cast<float>(building.anchor_z) * unit_size;
-    const auto grid_max_x = (static_cast<float>(grid_cells) - static_cast<float>(building.anchor_x)) * unit_size;
-    const auto grid_max_z = (static_cast<float>(grid_cells) - static_cast<float>(building.anchor_z)) * unit_size;
 
-    const Vector3 anchor_offset{
-        -static_cast<float>(building.anchor_x) * unit_size,
-        -static_cast<float>(building.anchor_y) * unit_size,
-        -static_cast<float>(building.anchor_z) * unit_size,
+    // The runtime building mesh is anchor-relative, like the picker. It is the
+    // game's near LOD (rooms, doorways, glass), as seen standing beside it.
+    draw_gpu_building_model(model, {}, 0, false, GpuSurface::Building, true);
+
+    // editor.exe's fixed 64-cell work grid (65 lines per axis) at the guide
+    // floor. Every fourth line groups blocks; the anchor's lines are the X (red)
+    // and Z (blue) axes; the authored footprint is outlined in amber.
+    WorkGrid grid;
+    grid.unit = unit_size;
+    grid.y = grid_y;
+    grid.x0 = -static_cast<std::int32_t>(building.anchor_x);
+    grid.x1 = static_cast<std::int32_t>(grid_cells) - static_cast<std::int32_t>(building.anchor_x);
+    grid.z0 = -static_cast<std::int32_t>(building.anchor_z);
+    grid.z1 = static_cast<std::int32_t>(grid_cells) - static_cast<std::int32_t>(building.anchor_z);
+    // Fade the far rows so the distant lines do not crowd into a solid sheet.
+    grid.fade_center = {(static_cast<float>(building.size_x) * 0.5F - static_cast<float>(building.anchor_x)) * unit_size,
+                        (static_cast<float>(building.size_y) * 0.5F - static_cast<float>(building.anchor_z)) * unit_size};
+    grid.fade_radius = (std::max(building.size_x, building.size_y) * 0.5F + 20.0F) * unit_size;
+    grid.style = [](bool along_x, std::int32_t line) {
+        if (line == 0) return GridLineStyle{along_x ? kGridAxisX : kGridAxisZ, 2.4F};
+        if (floor_mod(line, 4) == 0) return GridLineStyle{kGridMajor, 1.6F};
+        return GridLineStyle{kGridMinor, 1.0F};
     };
-    draw_gpu_building_model(model, anchor_offset, 0, false, true, GfxDebugDrawCategory::CityCells);
-    rlDrawRenderBatchActive();
-    rlDisableDepthTest();
-    rlDisableDepthMask();
-
-    // editor.exe draws a fixed 64-cell work grid with 65 lines in each axis.
-    // Every fourth line is stronger so block-sized groups remain legible.
-    for (std::uint32_t index = 0; index <= grid_cells; ++index) {
-        const auto color = index % 4U == 0U
-            ? Color{105, 125, 140, 180}
-            : Color{70, 82, 92, 120};
-        const auto x = (static_cast<float>(index) - static_cast<float>(building.anchor_x)) * unit_size;
-        const auto z = (static_cast<float>(index) - static_cast<float>(building.anchor_z)) * unit_size;
-        DrawLine3D({x, grid_y, grid_min_z}, {x, grid_y, grid_max_z}, color);
-        DrawLine3D({grid_min_x, grid_y, z}, {grid_max_x, grid_y, z}, color);
-        if (index % 4U == 0U) {
-            DrawCylinderEx({x, grid_y, grid_min_z}, {x, grid_y, grid_max_z},
-                unit_size * 0.025F, unit_size * 0.025F, 4, color);
-            DrawCylinderEx({grid_min_x, grid_y, z}, {grid_max_x, grid_y, z},
-                unit_size * 0.025F, unit_size * 0.025F, 4, color);
-        }
-    }
-
-    // Show the authored footprint in the same anchor-relative coordinates as
-    // the mesh and picker.
-    const auto bound_max_x = (static_cast<float>(building.size_x) - static_cast<float>(building.anchor_x)) * unit_size;
-    const auto bound_max_z = (static_cast<float>(building.size_y) - static_cast<float>(building.anchor_z)) * unit_size;
-    const auto bound_color = Color{220, 74, 72, 230};
-    DrawLine3D({grid_min_x, grid_y, grid_min_z}, {bound_max_x, grid_y, grid_min_z}, bound_color);
-    DrawLine3D({bound_max_x, grid_y, grid_min_z}, {bound_max_x, grid_y, bound_max_z}, bound_color);
-    DrawLine3D({bound_max_x, grid_y, bound_max_z}, {grid_min_x, grid_y, bound_max_z}, bound_color);
-    DrawLine3D({grid_min_x, grid_y, bound_max_z}, {grid_min_x, grid_y, grid_min_z}, bound_color);
-    // The tool preview mesh is built in un-anchored cell space (cell.x*unit), but
-    // the picker and selection box live in anchored space ((cell.x-anchor)*unit).
-    // Translate the model by -anchor*unit so geometry, selection, and clicks all
-    // share one origin (fixes the constant anchor offset between them).
-    rlDrawRenderBatchActive();
-    rlEnableDepthMask();
-    rlEnableDepthTest();
-
-    if (selected != nullptr) {
-        const auto center = Vector3{
-            (static_cast<float>(selected->x) - static_cast<float>(building.anchor_x) + 0.5F) * unit_size,
-            (static_cast<float>(selected->y) - static_cast<float>(building.anchor_y) + 0.5F) * unit_size,
-            (static_cast<float>(selected->z) - static_cast<float>(building.anchor_z) + 0.5F) * unit_size,
+    const auto size_x = static_cast<std::int32_t>(building.size_x);
+    const auto size_z = static_cast<std::int32_t>(building.size_y);
+    draw_work_grid(grid, [&](float alpha_scale) {
+        WorkGrid footprint;
+        footprint.unit = unit_size;
+        footprint.y = grid_y + 0.01F;
+        footprint.x0 = grid.x0; footprint.x1 = grid.x0 + size_x;
+        footprint.z0 = grid.z0; footprint.z1 = grid.z0 + size_z;
+        footprint.style = [&](bool along_x, std::int32_t line) {
+            const bool edge = along_x ? (line == footprint.z0 || line == footprint.z1) : (line == footprint.x0 || line == footprint.x1);
+            return GridLineStyle{edge ? Color{240, 170, 60, 235} : Color{0, 0, 0, 0}, 2.6F};
         };
-        draw_selection_glow_box(center, {unit_size, unit_size, unit_size}, Color{255, 225, 90, 255});
-    }
+        emit_work_grid(footprint, alpha_scale);
+    });
+
+    // The selected cell is outlined from its real faces (draw_building_cell_mask).
+    (void)selected;
 }
 
 void invalidate_building_thumbnail(EditorProject& project, std::size_t index) {
@@ -2385,7 +2874,7 @@ void rebuild_single_building_render(EditorProject& project, std::size_t index) {
     const auto blocks = block_meshes(project);
     const auto templates = buildblock_templates(project);
     project.building_render_buffers[index] =
-        build_city_building_full_render_buffer(project.buildings[index].data, blocks, templates);
+        build_city_building_full_render_buffer(project.buildings[index].data, blocks, templates, BuildingLod::Far);
     project.building_gpu_models[index] =
         upload_building_render_model(project.building_render_buffers[index], project.buildings[index].data, project);
 }
@@ -2414,12 +2903,12 @@ const RenderTexture2D* building_thumbnail(EditorProject& project, std::size_t in
     // fresh CPU build for buildings whose render model is not ready yet.
     GpuBuildingRenderModel local_model;
     GpuBuildingRenderModel* model_ptr = nullptr;
-    if (index < project.building_gpu_models.size() && !project.building_gpu_models[index].chunks.empty()) {
+    if (index < project.building_gpu_models.size() && !project.building_gpu_models[index].empty()) {
         model_ptr = &project.building_gpu_models[index];
     } else {
         const auto& blocks = block_meshes(project);
         const auto& templates = buildblock_templates(project);
-        const auto buffer = build_native_building_tool_preview_render_buffer(building, blocks, templates, std::nullopt);
+        const auto buffer = build_native_building_render_buffer(building, blocks, templates);
         local_model = upload_building_render_model(buffer, building, project);
         model_ptr = &local_model;
     }
@@ -2448,17 +2937,13 @@ const RenderTexture2D* building_thumbnail(EditorProject& project, std::size_t in
     cam.fovy = 45.0F;
     cam.projection = CAMERA_PERSPECTIVE;
 
-    const Vector3 anchor_offset{
-        -static_cast<float>(building.anchor_x) * unit_size,
-        -static_cast<float>(building.anchor_y) * unit_size,
-        -static_cast<float>(building.anchor_z) * unit_size,
-    };
     begin_game_texture_mode(target);
     ClearBackground(Color{32, 36, 41, 255});
     BeginMode3D(cam);
     set_game_surface_camera(cam.position);
     rlEnableDepthTest();
-    draw_gpu_building_model(model, anchor_offset, 0, false, false, GfxDebugDrawCategory::CityCells);
+    // Building meshes are anchor-relative, like the picker and the city.
+    draw_gpu_building_model(model, {}, 0, false);
     // A subtle ground plane gives the building a sense of scale/orientation.
     DrawGrid(static_cast<int>(std::max(building.size_x, building.size_y)) + 2, unit_size);
     EndMode3D();
@@ -2466,9 +2951,6 @@ const RenderTexture2D* building_thumbnail(EditorProject& project, std::size_t in
     GenTextureMipmaps(&target.texture);
     SetTextureFilter(target.texture, TEXTURE_FILTER_BILINEAR);
 
-    if (model_ptr == &local_model) {
-        unload_city_render_model(local_model);
-    }
     project.building_thumbnail_ready[index] = true;
     return &target;
 }
@@ -2547,10 +3029,14 @@ const LoadedAsset<SbbBuilding>* find_building_asset(const EditorProject& project
 
 const std::vector<std::optional<std::size_t>>& resolve_placement_asset_indices(EditorProject& project) {
     const auto building_count = project.city ? project.city->data.buildings.size() : 0U;
-    const auto fingerprint = project.city ? city_scene_fingerprint(project.city->data) : 0U;
-    // ponytail: fingerprint already walks every placement's name/transform for
-    // the scene-rebuild check above, so reusing it here to detect renames is
-    // cheap and avoids threading a dirty flag through every mutation site.
+    // Placements resolve by name, so the key is the placement names: any edit,
+    // undo, or template swap that renames or reorders placements changes it.
+    std::uint64_t fingerprint = 1469598103934665603ULL;
+    if (project.city) {
+        for (const auto& placement : project.city->data.buildings) {
+            fingerprint = (fingerprint ^ std::hash<std::string>{}(placement.name)) * 1099511628211ULL;
+        }
+    }
     if (!project.placement_assets_dirty &&
         project.placement_asset_indices.size() == building_count &&
         project.placement_asset_indices_building_count == project.buildings.size() &&
@@ -2573,248 +3059,82 @@ const std::vector<std::optional<std::size_t>>& resolve_placement_asset_indices(E
     return project.placement_asset_indices;
 }
 
-void draw_city_building_model(
-    const SbbBuilding& template_file,
-    GpuBuildingRenderModel& model,
-    const SbcBuilding& placement,
-    bool selected,
-    bool use_lod,
-    bool hovered) {
-    constexpr auto unit_size = 4.0F;
-    (void)hovered;
-    const auto render_origin = native_city_building_render_origin(placement, unit_size);
-    const auto origin = Vector3{render_origin.x, render_origin.y, render_origin.z};
-    // Solid neutral grey: a see-through blue box read as a hover/ghost highlight.
-    const auto fill = selected ? Color{235, 194, 82, 255} : Color{118, 122, 128, 255};
-    const auto wire = selected ? Color{255, 240, 150, 255} : Color{40, 44, 50, 255};
-
-    if (use_lod) {
-        const float min_x = -static_cast<float>(template_file.anchor_x) * unit_size;
-        const float max_x = (static_cast<float>(template_file.size_x) - static_cast<float>(template_file.anchor_x)) * unit_size;
-        const float min_y = -static_cast<float>(template_file.anchor_y) * unit_size;
-        const float max_y = (static_cast<float>(template_file.size_z) - static_cast<float>(template_file.anchor_y)) * unit_size;
-        const float min_z = -static_cast<float>(template_file.anchor_z) * unit_size;
-        const float max_z = (static_cast<float>(template_file.size_y) - static_cast<float>(template_file.anchor_z)) * unit_size;
-
-        const std::array<Vector3, 8> corners{
-            Vector3{min_x, min_y, min_z},
-            Vector3{max_x, min_y, min_z},
-            Vector3{max_x, max_y, min_z},
-            Vector3{min_x, max_y, min_z},
-            Vector3{min_x, min_y, max_z},
-            Vector3{max_x, min_y, max_z},
-            Vector3{max_x, max_y, max_z},
-            Vector3{min_x, max_y, max_z},
-        };
-
-        std::array<Vector3, 8> world_corners;
-        for (std::size_t i = 0; i < 8; ++i) {
-            world_corners[i] = city_transform(origin, corners[i], placement.rotation);
+const GpuMesh* building_near_mesh(EditorProject& project, std::size_t asset_index, int& build_budget) {
+    if (asset_index >= project.buildings.size() || asset_index >= project.building_gpu_models.size()) return nullptr;
+    const auto far_vao = project.building_gpu_models[asset_index].mesh.vao;
+    if (auto found = project.building_near_models.find(asset_index); found != project.building_near_models.end()) {
+        if (found->second.far_vao == far_vao) {
+            found->second.last_used = GetTime();
+            return &found->second.mesh;
         }
-
-        // Draw rotated cube faces
-        // Front face
-        DrawTriangle3D(world_corners[0], world_corners[1], world_corners[2], fill);
-        DrawTriangle3D(world_corners[0], world_corners[2], world_corners[3], fill);
-        // Back face
-        DrawTriangle3D(world_corners[5], world_corners[4], world_corners[7], fill);
-        DrawTriangle3D(world_corners[5], world_corners[7], world_corners[6], fill);
-        // Left face
-        DrawTriangle3D(world_corners[4], world_corners[0], world_corners[3], fill);
-        DrawTriangle3D(world_corners[4], world_corners[3], world_corners[7], fill);
-        // Right face
-        DrawTriangle3D(world_corners[1], world_corners[5], world_corners[6], fill);
-        DrawTriangle3D(world_corners[1], world_corners[6], world_corners[2], fill);
-        // Top face
-        DrawTriangle3D(world_corners[3], world_corners[2], world_corners[6], fill);
-        DrawTriangle3D(world_corners[3], world_corners[6], world_corners[7], fill);
-        // Bottom face
-        DrawTriangle3D(world_corners[4], world_corners[5], world_corners[1], fill);
-        DrawTriangle3D(world_corners[4], world_corners[1], world_corners[0], fill);
-        if (g_gfx_debug_stats != nullptr) {
-            g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::CityCells, 12U, 36U, 12U);
-        }
-
-        // Wireframe edges
-        DrawLine3D(world_corners[0], world_corners[1], wire);
-        DrawLine3D(world_corners[1], world_corners[2], wire);
-        DrawLine3D(world_corners[2], world_corners[3], wire);
-        DrawLine3D(world_corners[3], world_corners[0], wire);
-
-        DrawLine3D(world_corners[4], world_corners[5], wire);
-        DrawLine3D(world_corners[5], world_corners[6], wire);
-        DrawLine3D(world_corners[6], world_corners[7], wire);
-        DrawLine3D(world_corners[7], world_corners[4], wire);
-
-        DrawLine3D(world_corners[0], world_corners[4], wire);
-        DrawLine3D(world_corners[1], world_corners[5], wire);
-        DrawLine3D(world_corners[2], world_corners[6], wire);
-        DrawLine3D(world_corners[3], world_corners[7], wire);
-        if (g_gfx_debug_stats != nullptr) {
-            g_gfx_debug_stats->add_draw(GfxDebugDrawCategory::WireOverlay, 0U, 24U, 12U);
-        }
-    } else {
-        draw_gpu_building_model(model, origin, placement.rotation, false, false, GfxDebugDrawCategory::CityCells);
+        project.building_near_models.erase(found);
     }
-
-    if (selected && use_lod) {
-        // The far LOD has no mesh to shell; fall back to a glow box on the bounds.
-        const auto sx = static_cast<float>(std::max(1U, template_file.size_x)) * unit_size;
-        const auto sy = static_cast<float>(std::max(1U, template_file.size_z)) * unit_size;
-        const auto sz = static_cast<float>(std::max(1U, template_file.size_y)) * unit_size;
-        const Vector3 local_center{
-            (static_cast<float>(template_file.size_x) * 0.5F - static_cast<float>(template_file.anchor_x)) * unit_size,
-            (static_cast<float>(template_file.size_z) * 0.5F - static_cast<float>(template_file.anchor_y)) * unit_size,
-            (static_cast<float>(template_file.size_y) * 0.5F - static_cast<float>(template_file.anchor_z)) * unit_size,
-        };
-        const auto center = city_transform(origin, local_center, placement.rotation);
-        const auto rotated = (placement.rotation & 1) != 0;
-        const auto box = Vector3{rotated ? sz : sx, sy, rotated ? sx : sz};
-        draw_selection_glow_box(center, box, Color{255, 225, 90, 255});
-    }
+    if (build_budget <= 0) return nullptr;
+    --build_budget;
+    const auto& building = project.buildings[asset_index].data;
+    const auto buffer = build_city_building_full_render_buffer(building, block_meshes(project), buildblock_templates(project), BuildingLod::Near);
+    EditorProject::NearBuildingModel model;
+    model.mesh = upload_gpu_mesh(buffer, [&](GpuMeshPart& part) {
+        describe_textured_part(part,
+            texture_for_material(project, building, part.material_id),
+            material_texture_for_material(project, building, part.material_id));
+    });
+    model.last_used = GetTime();
+    model.far_vao = far_vao;
+    return &project.building_near_models.insert_or_assign(asset_index, std::move(model)).first->second.mesh;
 }
 
-void draw_city_building_models(EditorProject& project, const SbcBuilding* selected_building, const Camera3D& camera) {
+void evict_building_near_models(EditorProject& project) {
+    const auto now = GetTime();
+    std::erase_if(project.building_near_models, [now](const auto& entry) { return now - entry.second.last_used > 5.0; });
+}
+
+void refresh_placement_override_models(EditorProject& project) {
     if (!project.city) {
+        project.placement_override_models.clear();
         return;
     }
-    constexpr auto unit_size = 4.0F;
+    // Wait for the template models to finish loading; overrides copy them.
+    if (project.render_build_in_progress || !project.pending_gpu_upload_indices.empty()) return;
+    const auto& asset_indices = resolve_placement_asset_indices(project);
+    std::uint64_t fingerprint = 1469598103934665603ULL;
+    const auto mix = [&](std::uint64_t v) { fingerprint = (fingerprint ^ v) * 1099511628211ULL; };
     for (const auto& placement : project.city->data.buildings) {
-        const auto* asset = find_building_asset(project, placement.name);
-        if (asset == nullptr) {
-            continue;
-        }
-        const auto asset_index = static_cast<std::size_t>(asset - project.buildings.data());
-        if (asset_index >= project.building_gpu_models.size()) {
-            continue;
-        }
+        mix(std::hash<std::string>{}(placement.name));
+        mix(static_cast<std::uint32_t>(placement.x));
+        mix(static_cast<std::uint32_t>(placement.y));
+        mix(static_cast<std::uint32_t>(placement.z));
+        mix(static_cast<std::uint32_t>(placement.rotation));
+    }
+    // A re-uploaded template model gets a new vao.
+    for (const auto& model : project.building_gpu_models) mix(model.mesh.vao);
+    if (fingerprint == project.placement_override_fingerprint) return;
+    project.placement_override_fingerprint = fingerprint;
+    project.placement_override_models.clear();
 
-        const auto render_origin = native_city_building_render_origin(placement, unit_size);
-        const auto origin = Vector3{render_origin.x, render_origin.y, render_origin.z};
-        const float dx = camera.position.x - origin.x;
-        const float dy = camera.position.y - origin.y;
-        const float dz = camera.position.z - origin.z;
-        const float dist = std::sqrt(dx*dx + dy*dy + dz*dz);
-        const bool use_lod = (selected_building != &placement) && (dist > 150.0F);
-
-        draw_city_building_model(
-            asset->data,
-            project.building_gpu_models[asset_index],
-            placement,
-            selected_building == &placement,
-            use_lod,
-            false);
+    std::vector<const SbbBuilding*> buildings(asset_indices.size());
+    for (std::size_t i = 0; i < asset_indices.size(); ++i) {
+        if (asset_indices[i].has_value()) buildings[i] = &project.buildings[*asset_indices[i]].data;
+    }
+    const auto overwritten = overwritten_building_cells(project.city->data, buildings);
+    for (std::size_t i = 0; i < overwritten.size(); ++i) {
+        if (overwritten[i].empty()) continue;
+        auto building = *buildings[i];
+        for (const auto c : overwritten[i]) building.cells[c].occupied = false;
+        const auto buffer = build_city_building_full_render_buffer(building, block_meshes(project), buildblock_templates(project), BuildingLod::Far);
+        project.placement_override_models.emplace(i, upload_building_render_model(buffer, building, project));
+        const auto& p = project.city->data.buildings[i];
+        append_render_log(project, "placement " + std::to_string(i) + " " + p.name + " at " + std::to_string(p.x) + "," +
+            std::to_string(p.y) + "," + std::to_string(p.z) + ": " + std::to_string(overwritten[i].size()) +
+            " cells overwritten by later placements");
     }
 }
 
-const std::vector<Vec3>& cached_shadow_volume_vertices(
-    const GpuBuildingRenderModel& model,
-    std::int32_t rotation,
-    Vector3 light,
-    Vector3 extrusion) {
-    const Vec3 light_value{light.x, light.y, light.z};
-    const auto light_delta = Vector3Subtract(
-        Vector3{model.shadow_volume_light.x, model.shadow_volume_light.y, model.shadow_volume_light.z},
-        light);
-    if (!model.shadow_volume_light_valid || Vector3LengthSqr(light_delta) > 1e-10F ||
-        Vector3LengthSqr(Vector3Subtract(extrusion, {model.shadow_volume_extrusion.x, model.shadow_volume_extrusion.y, model.shadow_volume_extrusion.z})) > 1e-10F) {
-        model.shadow_volume_light = light_value;
-        model.shadow_volume_extrusion = {extrusion.x, extrusion.y, extrusion.z};
-        model.shadow_volume_light_valid = true;
-        model.shadow_volume_valid.fill(false);
-        model.shadow_volume_mesh_uploaded.fill(false);
-        for (auto& vertices : model.shadow_volume_vertices) vertices.clear();
-    }
-
-    const auto rotation_index = static_cast<std::size_t>(rotation & 3);
-    auto& vertices = model.shadow_volume_vertices[rotation_index];
-    if (model.shadow_volume_valid[rotation_index]) return vertices;
-
-    std::vector<std::uint8_t> faces_light(model.shadow_faces.size(), 0U);
-    const auto append_triangle = [&vertices](Vector3 a, Vector3 b, Vector3 c) {
-        vertices.push_back({a.x, a.y, a.z});
-        vertices.push_back({b.x, b.y, b.z});
-        vertices.push_back({c.x, c.y, c.z});
-    };
-    vertices.reserve(model.shadow_faces.size() * 6U);
-    for (std::size_t face_index = 0; face_index < model.shadow_faces.size(); ++face_index) {
-        const auto& face = model.shadow_faces[face_index];
-        std::array<Vector3, 3> p{};
-        std::array<Vector3, 3> q{};
-        for (std::size_t index = 0; index < 3; ++index) {
-            const auto& local = face.vertices[index];
-            p[index] = city_transform(Vector3{}, {local.x, local.y, local.z}, rotation);
-            q[index] = Vector3Add(p[index], extrusion);
-        }
-        const auto normal = Vector3CrossProduct(Vector3Subtract(p[1], p[0]), Vector3Subtract(p[2], p[0]));
-        if (Vector3DotProduct(normal, light) < 0.0F) continue;
-        faces_light[face_index] = 1U;
-        append_triangle(p[0], p[1], p[2]);
-        append_triangle(q[0], q[2], q[1]);
-        for (std::size_t edge = 0; edge < 3; ++edge) {
-            const auto next = (edge + 1U) % 3U;
-            const auto adjacent = face.adjacent[edge];
-            if (adjacent >= 0 && static_cast<std::size_t>(adjacent) < faces_light.size()) continue;
-            append_triangle(p[next], p[edge], q[next]);
-            append_triangle(q[next], p[edge], q[edge]);
-        }
-    }
-    for (std::size_t face_index = 0; face_index < model.shadow_faces.size(); ++face_index) {
-        if (!faces_light[face_index]) continue;
-        const auto& face = model.shadow_faces[face_index];
-        for (std::size_t edge = 0; edge < 3; ++edge) {
-            const auto adjacent = face.adjacent[edge];
-            if (adjacent < 0 || static_cast<std::size_t>(adjacent) >= faces_light.size() || faces_light[adjacent]) continue;
-            const auto next = (edge + 1U) % 3U;
-            const auto& local_from = face.vertices[edge];
-            const auto& local_to = face.vertices[next];
-            const auto from = city_transform(Vector3{}, {local_from.x, local_from.y, local_from.z}, rotation);
-            const auto to = city_transform(Vector3{}, {local_to.x, local_to.y, local_to.z}, rotation);
-            const auto far_from = Vector3Add(from, extrusion);
-            const auto far_to = Vector3Add(to, extrusion);
-            append_triangle(to, from, far_to);
-            append_triangle(far_to, from, far_from);
-        }
-    }
-    model.shadow_volume_valid[rotation_index] = true;
-    return vertices;
-}
-
-// GPU-mesh counterpart of cached_shadow_volume_vertices(): same cache key
-// (light + extrusion + rotation), but uploads the vertex list into a Mesh
-// once instead of resubmitting it through rlVertex3f every frame.
-const Mesh& cached_shadow_volume_mesh(
-    const GpuBuildingRenderModel& model,
-    std::int32_t rotation,
-    Vector3 light,
-    Vector3 extrusion) {
-    const auto& vertices = cached_shadow_volume_vertices(model, rotation, light, extrusion);
-    const auto rotation_index = static_cast<std::size_t>(rotation & 3);
-    auto& mesh = model.shadow_volume_meshes[rotation_index];
-    if (model.shadow_volume_mesh_uploaded[rotation_index]) {
-        return mesh;
-    }
-    if (mesh.vaoId != 0U || mesh.vboId != nullptr) {
-        UnloadMesh(mesh);
-    }
-    mesh = {};
-    mesh.vertexCount = static_cast<int>(vertices.size());
-    mesh.triangleCount = static_cast<int>(vertices.size() / 3U);
-    if (!vertices.empty()) {
-        mesh.vertices = static_cast<float*>(MemAlloc(static_cast<unsigned int>(vertices.size() * 3U * sizeof(float))));
-        for (std::size_t i = 0; i < vertices.size(); ++i) {
-            mesh.vertices[i * 3U + 0U] = vertices[i].x;
-            mesh.vertices[i * 3U + 1U] = vertices[i].y;
-            mesh.vertices[i * 3U + 2U] = vertices[i].z;
-        }
-        UploadMesh(&mesh, false);
-    }
-    model.shadow_volume_mesh_uploaded[rotation_index] = true;
-    return mesh;
-}
+void draw_street_object_shadow_volumes(const MapScene& scene, const Camera3D& camera, float max_distance, Vector3 light);
 
 void draw_city_shadow_volumes(EditorProject& project, const Camera3D& camera, float max_distance) {
     if (!project.city) return;
+    refresh_placement_override_models(project);
     const auto& placement_asset_indices = resolve_placement_asset_indices(project);
 
     rlDrawRenderBatchActive();
@@ -2826,48 +3146,51 @@ void draw_city_shadow_volumes(EditorProject& project, const Camera3D& camera, fl
     glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
     glDepthMask(GL_FALSE);
     glEnable(GL_DEPTH_TEST);
-    glDisable(GL_CULL_FACE);
     glStencilOpSeparate(GL_FRONT, GL_KEEP, GL_DECR_WRAP, GL_KEEP);
     glStencilOpSeparate(GL_BACK, GL_KEEP, GL_INCR_WRAP, GL_KEEP);
 
     const auto light = Vector3Normalize(game_light_direction());
-
-    // Color writes are masked off (glColorMask above) so the material's shader
-    // only needs to exist and take a position; reuse the outline mask shader
-    // rather than defining a dedicated one.
-    Material mask_material = LoadMaterialDefault();
-    mask_material.shader = mask_shader().shader;
-
+    const auto sector_extrusion = [&](std::size_t sector) {
+        return Vector3Scale(light, -static_cast<float>(sector + 1U) * 32.0F / std::max(light.y, 0.125F));
+    };
+    // Group placements by (asset, top sector): each group is one instanced draw
+    // of the asset's volume with that sector's extrusion.
+    std::unordered_map<std::size_t, std::vector<Matrix>> groups;
     for (std::size_t placement_index = 0; placement_index < project.city->data.buildings.size(); ++placement_index) {
         const auto& placement = project.city->data.buildings[placement_index];
         if (!placement_asset_indices[placement_index].has_value()) continue;
         const auto asset_index = *placement_asset_indices[placement_index];
         if (asset_index >= project.building_gpu_models.size()) continue;
-        const auto* asset = &project.buildings[asset_index];
-        const auto& model = project.building_gpu_models[asset_index];
-        const auto origin_value = native_city_building_render_origin(placement, 4.0F);
-        const Vector3 origin{origin_value.x, origin_value.y, origin_value.z};
-        const auto camera_delta = Vector3Subtract(origin, camera.position);
+        const auto origin = native_city_building_render_origin(placement, 4.0F);
+        const auto camera_delta = Vector3Subtract({origin.x, origin.y, origin.z}, camera.position);
         if (max_distance > 0.0F && Vector3LengthSqr(camera_delta) > max_distance * max_distance) continue;
-
-        const float length = static_cast<float>(asset->data.size_z + 1U) * 8.0F / std::max(light.y, 0.125F);
-        const auto extrusion = Vector3Scale(light, -length);
-        const auto& mesh = cached_shadow_volume_mesh(model, placement.rotation, light, extrusion);
-        if (mesh.vertexCount > 0) {
-            DrawMesh(mesh, mask_material, MatrixTranslate(origin.x, origin.y, origin.z));
+        // Sectors extrude (sector y + 1) * 32 / max(light.y, 0.125): far enough
+        // to reach the ground from the sector's absolute height. A placement
+        // extrudes by its top sector.
+        const auto& building = project.buildings[asset_index].data;
+        const auto top_cell = placement.y + static_cast<std::int32_t>(building.size_z) - static_cast<std::int32_t>(building.anchor_y);
+        const auto top_sector = static_cast<std::size_t>(std::max(0, top_cell) / 8);
+        if (const auto found = project.placement_override_models.find(placement_index); found != project.placement_override_models.end()) {
+            set_shadow_volume_light(light, sector_extrusion(std::min<std::size_t>(top_sector, 63U)));
+            draw_gpu_mesh_instances(found->second.shadow_volume, {city_placement_matrix(placement)}, GpuSurface::ShadowVolume);
+            continue;
         }
+        groups[asset_index * 64U + std::min<std::size_t>(top_sector, 63U)].push_back(city_placement_matrix(placement));
     }
+    for (const auto& [key, transforms] : groups) {
+        set_shadow_volume_light(light, sector_extrusion(key % 64U));
+        draw_gpu_mesh_instances(project.building_gpu_models[key / 64U].shadow_volume, transforms, GpuSurface::ShadowVolume);
+    }
+    // Road and curb tiles are world sectors too; one volume at the highest sector.
+    set_shadow_volume_light(light, sector_extrusion(static_cast<std::size_t>(project.city_tile_gpu_model.shadow_top / 32.0F)));
+    draw_gpu_mesh_instances(project.city_tile_gpu_model.shadow_volume, {MatrixIdentity()}, GpuSurface::ShadowVolume);
     // Native queued district meshes use a 32-unit extrusion (0x2787d4).
     // Vertices are already world-space, so no translation is needed.
-    const auto& pieces_mesh = cached_shadow_volume_mesh(project.portal_gpu_model, 0, light, Vector3Scale(light, -32.0F));
-    if (pieces_mesh.vertexCount > 0) {
-        DrawMesh(pieces_mesh, mask_material, MatrixIdentity());
-    }
-    rlDrawRenderBatchActive();
-    MemFree(mask_material.maps);
+    set_shadow_volume_light(light, Vector3Scale(light, -32.0F));
+    draw_gpu_mesh_instances(project.portal_gpu_model.shadow_volume, {MatrixIdentity()}, GpuSurface::ShadowVolume);
+    draw_street_object_shadow_volumes(project.city_scene_cache, camera, max_distance, light);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDepthMask(GL_TRUE);
-    glEnable(GL_CULL_FACE);
     glDisable(GL_STENCIL_TEST);
 }
 
@@ -2923,31 +3246,13 @@ void composite_city_shadows(Vector2 viewport_size) {
 GpuBuildingRenderModel upload_portal_render_model(const BuildingRenderBuffer& buffer, const EditorProject& project, bool textured) {
     GpuBuildingRenderModel model;
     model.wire_lines = buffer.wire_lines;
-    cache_shadow_faces(model, buffer);
-    model.chunks.reserve(buffer.material_runs.size());
-    for (const auto& run : buffer.material_runs) {
-        const auto* texture = textured ? texture_for_buffer_material(project, buffer, run.material) : nullptr;
-        auto chunk = upload_mesh_chunk(
-            buffer,
-            run.first_triangle,
-            run.triangle_count,
-            run.material,
-            texture,
-            material_texture_for_buffer_material(project, buffer, run.material));
-        if (chunk.mesh.vertexCount > 0) {
-            model.uploaded_vertices += static_cast<std::size_t>(chunk.mesh.vertexCount);
-            model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.vertexCount) * 3U * sizeof(float);
-            model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.vertexCount) * 2U * sizeof(float);
-            if (chunk.mesh.colors != nullptr) {
-                model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.vertexCount) * 4U * sizeof(unsigned char);
-            }
-            if (chunk.mesh.indices != nullptr) {
-                model.uploaded_indices += static_cast<std::size_t>(chunk.mesh.triangleCount) * 3U;
-                model.uploaded_bytes += static_cast<std::size_t>(chunk.mesh.triangleCount) * 3U * sizeof(unsigned short);
-            }
-            model.chunks.push_back(std::move(chunk));
-        }
-    }
+    build_shadow_volume(model, buffer);
+    model.mesh = upload_gpu_mesh(buffer, [&](GpuMeshPart& part) {
+        describe_textured_part(part,
+            textured ? texture_for_buffer_material(project, buffer, part.material_id) : nullptr,
+            material_texture_for_buffer_material(project, buffer, part.material_id));
+    });
+    model.uploaded_bytes = model.mesh.vertex_count * sizeof(GpuVertex) + model.mesh.index_count * sizeof(std::uint32_t);
     return model;
 }
 
@@ -2966,8 +3271,9 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
             project.portal_preview_render_textured != textured ||
             project.portal_preview_index != selected_portal) {
             MAPED_PROFILE_BLOCK("portal_render_model rebuild selected portal preview");
-            project.portal_preview_render_buffer = build_native_portal_render_buffer(project.city->data, blocks, selected_portal, bb_templates, tex_names);
+            project.portal_preview_render_buffer = build_native_portal_render_buffer(project.city->data, blocks, selected_portal, bb_templates, tex_names, resolve_placement_buildings(project));
             project.portal_preview_gpu_model = upload_portal_render_model(project.portal_preview_render_buffer, project, textured);
+            release_shadow_volume(project.portal_preview_render_buffer);
             MAPED_PROFILE_END_BLOCK;
             project.portal_preview_index = selected_portal;
             project.portal_preview_render_textured = textured;
@@ -2989,20 +3295,31 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
         // rebuild inline.
         project.portal_render_dirty = false;
         project.portal_render_textured = textured;
-        project.portal_render_buffer = build_native_portal_render_buffer(project.city->data, blocks, std::nullopt, bb_templates, tex_names);
+        project.portal_render_buffer = build_native_portal_render_buffer(project.city->data, blocks, std::nullopt, bb_templates, tex_names, resolve_placement_buildings(project));
         project.portal_gpu_model = upload_portal_render_model(project.portal_render_buffer, project, textured);
+        release_shadow_volume(project.portal_render_buffer);
 #else
         const auto map = project.city->data;
         const auto blocks_copy = blocks;
         const auto bb_copy = bb_templates;
         const auto tex_copy = tex_names;
+        // The worker owns copies of the placed buildings.
+        std::vector<std::optional<SbbBuilding>> buildings_copy;
+        for (const auto* building : resolve_placement_buildings(project)) {
+            buildings_copy.push_back(building == nullptr ? std::nullopt : std::optional<SbbBuilding>{*building});
+        }
         project.portal_rebuild_in_progress = true;
         project.portal_render_dirty = false;
         project.portal_render_textured = textured;
-        project.portal_rebuild_future = std::async(std::launch::async, [map, blocks_copy, bb_copy, tex_copy]() {
+        project.portal_rebuild_future = std::async(std::launch::async, [map, blocks_copy, bb_copy, tex_copy,
+                                                                        buildings_copy = std::move(buildings_copy)]() {
             MAPED_PROFILE_THREAD("Portal render rebuild");
             MAPED_PROFILE_BLOCK("build async portal render buffer");
-            return build_native_portal_render_buffer(map, blocks_copy, std::nullopt, bb_copy, tex_copy);
+            std::vector<const SbbBuilding*> buildings;
+            for (const auto& building : buildings_copy) buildings.push_back(building ? &*building : nullptr);
+            auto buffer = build_native_portal_render_buffer(map, blocks_copy, std::nullopt, bb_copy, tex_copy, buildings);
+            bake_shadow_volume(buffer);
+            return buffer;
         });
 #endif
         MAPED_PROFILE_END_BLOCK;
@@ -3014,6 +3331,7 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
         project.portal_rebuild_future.reset();
         project.portal_rebuild_in_progress = false;
         project.portal_gpu_model = upload_portal_render_model(project.portal_render_buffer, project, textured);
+        release_shadow_volume(project.portal_render_buffer);
         MAPED_PROFILE_END_BLOCK;
     }
     return project.portal_gpu_model;
@@ -3022,24 +3340,29 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
 GpuBuildingRenderModel& building_tool_floor_preview_model(
     EditorProject& project,
     std::size_t building_index,
-    std::optional<std::uint32_t> floor
+    std::optional<std::uint32_t> floor,
+    bool roofs
 ) {
     if (project.building_floor_preview_dirty ||
         project.building_floor_preview_building != building_index ||
-        project.building_floor_preview_floor != floor) {
+        project.building_floor_preview_floor != floor ||
+        project.building_floor_preview_roofs != roofs) {
         const auto& blocks = block_meshes(project);
         const auto& templates = buildblock_templates(project);
-        project.building_floor_preview_render_buffer = build_native_building_tool_preview_render_buffer(
+        project.building_floor_preview_render_buffer = select_building_lod(build_native_building_render_buffer(
             project.buildings[building_index].data,
             blocks,
             templates,
-            floor);
+            floor,
+            roofs), BuildingLod::Near);
         project.building_floor_preview_gpu_model = upload_building_render_model(
             project.building_floor_preview_render_buffer,
             project.buildings[building_index].data,
             project);
+        release_shadow_volume(project.building_floor_preview_render_buffer);
         project.building_floor_preview_building = building_index;
         project.building_floor_preview_floor = floor;
+        project.building_floor_preview_roofs = roofs;
         project.building_floor_preview_dirty = false;
     }
     return project.building_floor_preview_gpu_model;
@@ -3057,161 +3380,89 @@ void draw_city_piece_voxels(
     auto& model = portal_render_model(project, textured, isolate_selected ? selected_portal : std::nullopt);
     // Native world cells sit 0.25 above their level; without the lift the piece
     // ground cells are coplanar with their stamped terrain plots and z-fight.
-    draw_gpu_building_model(model, {0.0F, 0.25F, 0.0F}, 0, false, draw_wires, GfxDebugDrawCategory::Pieces);
+    draw_gpu_building_model(model, {0.0F, 0.25F, 0.0F}, 0, draw_wires);
 
-    // Per-voxel selection/hover glow is drawn by the caller (draw_city_piece_glow)
-    // now that pieces are selected one block at a time, not by the whole portal.
+    // Per-voxel selection/hover is outlined by the caller (draw_city_piece_mask).
 }
 
 // Glow box over a single piece voxel (one world grid cell), so pieces highlight
 // individually instead of as the whole 8x8x8 portal they are stored in.
-void draw_city_piece_glow(CityGridPoint cell, Color color) {
-    constexpr auto unit_size = 4.0F;
-    const Vector3 center{
-        (static_cast<float>(cell.x) + 0.5F) * unit_size,
-        (static_cast<float>(cell.y) + 0.5F) * unit_size,
-        (static_cast<float>(cell.z) + 0.5F) * unit_size,
-    };
-    draw_selection_glow_box(center, {unit_size, unit_size, unit_size}, color);
-}
 
+// Untextured fallback colors for the road textures (asphalt2 / concrete).
 Color city_tile_material_color(const BuildingRenderBuffer& buffer, std::uint32_t material) {
-    if (material < buffer.material_names.size()) {
-        const auto& name = buffer.material_names[material];
-        if (name == "city_road_line_yellow") return Color{226, 190, 72, 255};
-        if (name == "city_road_line_white") return Color{224, 229, 226, 255};
-        if (name == "city_curb_concrete") {
-            return {150, 154, 151, 255};
-        }
-        if (name == "city_road_asphalt") {
-            return {43, 47, 50, 255};
-        }
+    if (material < buffer.material_names.size() && buffer.material_names[material] == "city_curb_concrete") {
+        return {150, 154, 151, 255};
     }
-    return {88, 96, 104, 255};
+    return {43, 47, 50, 255};
 }
 
 Color terrain_material_color(const BuildingRenderBuffer&, std::uint32_t) {
     return Color{0x40, 0x54, 0x26, 0xff};
 }
 
-// Draws pre-uploaded GPU chunks with an identity transform. One DrawMesh per
-// material run instead of one immediate-mode call per triangle.
-void draw_uploaded_city_model(GpuBuildingRenderModel& model, GfxDebugDrawCategory category, bool terrain = false) {
-    const auto transform = MatrixIdentity();
+// Road tiles are lit from their per-face vertex normals; terrain from smoothed
+// ones with the landscape shading. Both are world-space, drawn once.
+void draw_uploaded_city_model(GpuBuildingRenderModel& model, bool terrain = false) {
     set_game_render_depth_output(true);
-    rlDisableBackfaceCulling();
-    set_game_surface_window(false);
-    set_game_surface_building(false);
-    set_game_surface_terrain(terrain);
-    for (auto& chunk : model.chunks) {
-        if (chunk.material.maps == nullptr || chunk.mesh.vertexCount <= 0) {
-            continue;
-        }
-        DrawMesh(chunk.mesh, chunk.material, transform);
-        if (g_gfx_debug_stats != nullptr) {
-            g_gfx_debug_stats->add_draw(
-                category,
-                static_cast<std::uint64_t>(std::max(chunk.mesh.triangleCount, 0)),
-                static_cast<std::uint64_t>(std::max(chunk.mesh.vertexCount, 0)),
-                1U);
-        }
-    }
-    rlEnableBackfaceCulling();
-    set_game_surface_terrain(false);
+    draw_gpu_mesh_instances(model.mesh, {MatrixIdentity()}, terrain ? GpuSurface::Terrain : GpuSurface::World);
     set_game_render_depth_output(false);
 }
 
-// Frees the GPU meshes/materials a city model owns before it is replaced, so the
-// per-edit re-upload doesn't leak VRAM. (Buffers are MemAlloc'd by UploadMesh.)
 void unload_city_render_model(GpuBuildingRenderModel& model) {
-    // GpuBuildingMeshChunk owns its mesh/material via RAII: its destructor calls
-    // UnloadMesh and MemFree(material.maps) (and intentionally leaves the shared
-    // project texture alone). Clearing the vector runs those destructors. A manual
-    // UnloadMesh here would leave each mesh's stale vbo/vertex pointers in place,
-    // so the chunk destructor would then UnloadMesh the same buffers a second time
-    // and abort with a double free.
-    model.chunks.clear();
-    model.wire_lines.clear();
-    model.unload_shadow_volume_meshes();
-    model.shadow_volume_valid.fill(false);
-    model.shadow_volume_light_valid = false;
-    model.uploaded_vertices = 0;
-    model.uploaded_indices = 0;
-    model.uploaded_bytes = 0;
+    model = GpuBuildingRenderModel{};
 }
 
 GpuBuildingRenderModel upload_city_tile_model(const BuildingRenderBuffer& buffer, const EditorProject& project) {
-    return upload_city_buffer_model(buffer, project, false, [&buffer](std::uint32_t material) {
+    // The game draws road textures untinted; the color only stands in for a
+    // texture the map folder lacks.
+    auto model = upload_city_buffer_model(buffer, project, true, [&buffer](std::uint32_t material) {
         return city_tile_material_color(buffer, material);
     });
+    build_shadow_volume(model, buffer);
+    for (auto& part : model.mesh.parts) {
+        if (part.texture != 0U) part.color = WHITE;
+    }
+    return model;
+}
+
+// The landscape detail map (_landscape_generatetexture @d4360, tex_detail):
+// 1024x1024 grey noise, texel (x, y) from n = y*57 + x, n ^= n << 13,
+// v = ((n*n*15731 + 789221)^2 - 0x2df722f3) & 0x7fffffff (the game squares
+// where the textbook hash multiplies by n), grey = int(16 - v * 2^-26 + 192).
+// Its alpha (a cosine pattern) is unused by the landscape shader.
+Texture2D landscape_detail_texture() {
+    static const Texture2D texture = [] {
+        constexpr int size = 1024;
+        Image image = GenImageColor(size, size, WHITE);
+        auto* pixels = static_cast<Color*>(image.data);
+        for (int y = 0; y < size; ++y) {
+            for (int x = 0; x < size; ++x) {
+                auto n = static_cast<std::uint32_t>(y * 57 + x);
+                n ^= n << 13U;
+                auto h = n * n * 15731U + 789221U;
+                h = (h * h - 0x2df722f3U) & 0x7fffffffU;
+                const auto grey = static_cast<unsigned char>(
+                    static_cast<int>(16.0F - static_cast<float>(h) * 1.4901161e-08F + 192.0F));
+                pixels[y * size + x] = Color{grey, grey, grey, 255};
+            }
+        }
+        auto loaded = LoadTextureFromImage(image);
+        UnloadImage(image);
+        GenTextureMipmaps(&loaded);
+        SetTextureWrap(loaded, TEXTURE_WRAP_REPEAT);
+        SetTextureFilter(loaded, TEXTURE_FILTER_TRILINEAR);
+        return loaded;
+    }();
+    return texture;
 }
 
 GpuBuildingRenderModel upload_city_terrain_model(const BuildingRenderBuffer& buffer, const EditorProject& project) {
-    return upload_city_buffer_model(buffer, project, true, [&buffer](std::uint32_t material) {
+    auto model = upload_city_buffer_model(buffer, project, false, [&buffer](std::uint32_t material) {
         return terrain_material_color(buffer, material);
     });
-}
-
-void draw_city_road_markings(const MapScene& scene) {
-    constexpr float line_width = 0.26F;
-    const auto center_color = Color{226, 190, 72, 230};
-    const auto edge_color = Color{224, 229, 226, 210};
-    std::uint64_t triangles = 0U;
-
-    rlDisableBackfaceCulling();
-    for (const auto& road : scene.roads) {
-        const auto dx = road.to.x - road.from.x;
-        const auto dz = road.to.z - road.from.z;
-        const auto length = std::sqrt(dx * dx + dz * dz);
-        if (length <= scene.unit_size) {
-            continue;
-        }
-        const Vector3 direction{dx / length, 0.0F, dz / length};
-        const Vector3 perpendicular{-direction.z, 0.0F, direction.x};
-        const auto trim = std::min(road.width * 0.5F, length * 0.22F);
-        const auto start = trim;
-        const auto end = length - trim;
-        if (end <= start) {
-            continue;
-        }
-
-        const auto point = [&](float distance, float offset) {
-            const auto t = distance / length;
-            return Vector3{
-                road.from.x + direction.x * distance + perpendicular.x * offset,
-                road.from.y + (road.to.y - road.from.y) * t + 0.10F,
-                road.from.z + direction.z * distance + perpendicular.z * offset,
-            };
-        };
-        const auto stripe = [&](float from, float to, float offset, float width, Color color) {
-            const auto a = point(from, offset - width * 0.5F);
-            const auto b = point(from, offset + width * 0.5F);
-            const auto c = point(to, offset + width * 0.5F);
-            const auto d = point(to, offset - width * 0.5F);
-            DrawTriangle3D(a, b, c, color);
-            DrawTriangle3D(a, c, d, color);
-            triangles += 2U;
-        };
-
-        const auto edge_offset = std::max(scene.unit_size * 0.75F, road.width * 0.5F - scene.unit_size * 0.22F);
-        stripe(start, end, -edge_offset, line_width, edge_color);
-        stripe(start, end, edge_offset, line_width, edge_color);
-
-        const auto dash = scene.unit_size * 1.45F;
-        const auto gap = scene.unit_size * 0.65F;
-        for (auto distance = start; distance < end; distance += dash + gap) {
-            stripe(distance, std::min(distance + dash, end), 0.0F, line_width * 1.35F, center_color);
-        }
-    }
-    rlEnableBackfaceCulling();
-
-    if (g_gfx_debug_stats != nullptr && triangles > 0U) {
-        g_gfx_debug_stats->add_draw(
-            GfxDebugDrawCategory::RoadsCurbs,
-            triangles,
-            triangles * 3U,
-            triangles / 2U);
-    }
+    // Landscape: generated detail map times the flat generated color map.
+    for (auto& part : model.mesh.parts) part.texture = landscape_detail_texture().id;
+    return model;
 }
 
 void draw_city_scene(
@@ -3231,13 +3482,13 @@ void draw_city_scene(
 
     if (render_terrain) {
         GfxDebugMaybeTimer timer{GfxDebugTimingPhase::TerrainDraw};
-        draw_uploaded_city_model(project.terrain_gpu_model, GfxDebugDrawCategory::Terrain, true);
+        draw_uploaded_city_model(project.terrain_gpu_model, true);
     }
 
     {
         GfxDebugMaybeTimer timer{GfxDebugTimingPhase::CityRoadDraw};
         if (render_roads) {
-            draw_uploaded_city_model(project.city_tile_gpu_model, GfxDebugDrawCategory::RoadsCurbs);
+            draw_uploaded_city_model(project.city_tile_gpu_model);
         }
     }
 
@@ -3316,165 +3567,278 @@ void draw_city_editor_overlay(const EditorProject&, const MapScene& scene) {
     }
 }
 
-// Builds the traffic-light pole as ONE reusable model (post + arm + signal-head
-// boxes, the game's 3-box shape), oriented along -Z so a Y-rotation can aim the
-// arm. Built once and instanced per pole via DrawModelEx, instead of re-emitting
-// cylinders/cubes per pole every frame.
-Model build_traffic_light_pole_model(float unit_size) {
-    (void)unit_size;
-    // Native street-object type 1 geometry (World_InitResourcePoolsAndCatalogs
-    // @13dcd0, BuildBlock_GenerateCubeVerticesFaces boxes, world units, centered
-    // boxes), expressed relative to the pole's ground point: a 6-tall post, a
-    // 10-long arm across the street at the post top, and two signal heads at 6
-    // and 10 units out — one over each lane. The arm extends along local -Z.
-    struct BoxSpec {
-        Vector3 center;
-        Vector3 size;
-        bool lens;
-    };
-    const std::array<BoxSpec, 6> boxes{{
-        {{0.0F, 3.0F, 0.0F}, {0.375F, 6.0F, 0.375F}, false},   // post
-        {{0.0F, 6.0F, -5.0F}, {0.25F, 0.25F, 10.0F}, false},   // arm
-        {{0.0F, 6.0F, -6.0F}, {0.3125F, 1.0F, 0.5F}, false},   // head over lane 1
-        {{0.0F, 6.0F, -10.0F}, {0.3125F, 1.0F, 0.5F}, false},  // head over lane 2
-        // Signal lenses (editor stand-in for the game's red default state
-        // texture): a thin band through each head, proud on the +/-x faces the
-        // signal textures occupy.
-        {{0.0F, 6.3F, -6.0F}, {0.36F, 0.26F, 0.3F}, true},
-        {{0.0F, 6.3F, -10.0F}, {0.36F, 0.26F, 0.3F}, true},
+// Street objects (World_InitResourcePoolsAndCatalogs @13dcd0): each type is a
+// set of centred boxes (BuildBlock_GenerateCubeVerticesFaces @3fb90) that
+// GeneratedModel_BuildFromStaticTableSet675f @5b840 turns straight into the
+// render model. Every face samples texel (0,0) except the -X face of the last two
+// boxes of types 1 and 4, which map the whole texture. Type 1 is the traffic
+// light (post, arm, two signal heads; arm along local -Z), type 4 the street
+// sign drawn with the light's transform. Box centres are relative to the post
+// centre, 3 above the pole's ground point.
+struct StreetObjectBox {
+    Vector3 center;
+    Vector3 size;
+    bool textured;  // -X face carries the full texture
+};
+constexpr std::array<StreetObjectBox, 4> kTrafficLightBoxes{{
+    {{0.0F, 0.0F, 0.0F}, {0.375F, 6.0F, 0.375F}, false},
+    {{0.0F, 3.0F, -5.0F}, {0.25F, 0.25F, 10.0F}, false},
+    {{0.0F, 3.0F, -6.0F}, {0.3125F, 1.0F, 0.5F}, true},
+    {{0.0F, 3.0F, -10.0F}, {0.3125F, 1.0F, 0.5F}, true},
+}};
+constexpr std::array<StreetObjectBox, 1> kStreetSignBoxes{{
+    {{0.0F, 2.625F, -8.0F}, {0.0625F, 0.5F, 2.0F}, true},
+}};
+
+template <std::size_t N>
+BuildingRenderBuffer build_street_object_buffer(const std::array<StreetObjectBox, N>& boxes) {
+    // Cube corners DAT_002b34f0 and face corners DAT_002b3660 (face 2 is -X,
+    // corners 4,7,3,0), centred on the box.
+    static constexpr std::array<Vector3, 8> corners{{
+        {0, 0, 0}, {1, 0, 0}, {1, 0, 1}, {0, 0, 1}, {0, 1, 0}, {1, 1, 0}, {1, 1, 1}, {0, 1, 1},
     }};
-
-    Model model{};
-    model.transform = MatrixIdentity();
-    model.meshCount = static_cast<int>(boxes.size());
-    model.materialCount = 2;
-    model.meshes = static_cast<Mesh*>(MemAlloc(static_cast<unsigned int>(boxes.size() * sizeof(Mesh))));
-    model.meshMaterial = reinterpret_cast<int*>(MemAlloc(static_cast<unsigned int>(boxes.size() * sizeof(int))));
-    model.materials = static_cast<Material*>(MemAlloc(2 * sizeof(Material)));
-    model.materials[0] = LoadMaterialDefault();
-    model.materials[0].shader = game_surface_shader();
-    model.materials[0].maps[MATERIAL_MAP_DIFFUSE].color = Color{40, 43, 45, 255};
-    model.materials[0].maps[MATERIAL_MAP_METALNESS].texture = default_game_material_texture();
-    model.materials[1] = LoadMaterialDefault();
-    model.materials[1].shader = game_surface_shader();
-    model.materials[1].maps[MATERIAL_MAP_DIFFUSE].color = Color{205, 48, 38, 255};
-    model.materials[1].maps[MATERIAL_MAP_METALNESS].texture = default_game_material_texture();
-
-    for (std::size_t index = 0; index < boxes.size(); ++index) {
-        const auto& box = boxes[index];
-        Mesh mesh = GenMeshCube(box.size.x, box.size.y, box.size.z);
-        UploadMesh(&mesh, false);
-        for (int i = 0; i < mesh.vertexCount; ++i) {
-            mesh.vertices[i * 3 + 0] += box.center.x;
-            mesh.vertices[i * 3 + 1] += box.center.y;
-            mesh.vertices[i * 3 + 2] += box.center.z;
+    static constexpr std::array<std::array<std::uint32_t, 4>, 6> faces{{
+        {3, 2, 1, 0}, {7, 6, 2, 3}, {4, 7, 3, 0}, {5, 4, 0, 1}, {6, 5, 1, 2}, {4, 5, 6, 7},
+    }};
+    static constexpr std::array<std::array<float, 2>, 4> face_uv{{{0, 1}, {1, 1}, {1, 0}, {0, 0}}};
+    BuildingRenderBuffer buffer;
+    for (const auto& box : boxes) {
+        for (std::size_t face = 0; face < faces.size(); ++face) {
+            const auto base = static_cast<std::uint32_t>(buffer.vertices.size());
+            for (std::size_t i = 0; i < 4; ++i) {
+                const auto& c = corners[faces[face][i]];
+                const bool mapped = box.textured && face == 2;
+                buffer.vertices.push_back({{
+                    box.center.x + (c.x - 0.5F) * box.size.x,
+                    box.center.y + (c.y - 0.5F) * box.size.y + 3.0F,
+                    box.center.z + (c.z - 0.5F) * box.size.z,
+                }, mapped ? face_uv[i][0] : 0.0F, mapped ? face_uv[i][1] : 0.0F});
+            }
+            buffer.triangles.push_back({{base, base + 1U, base + 2U}, 0U, false});
+            buffer.triangles.push_back({{base, base + 2U, base + 3U}, 0U, false});
         }
-        UpdateMeshBuffer(mesh, 0, mesh.vertices, mesh.vertexCount * 3 * static_cast<int>(sizeof(float)), 0);
-        model.meshes[index] = mesh;
-        model.meshMaterial[index] = box.lens ? 1 : 0;
+    }
+    buffer.material_runs.push_back({0U, 0U, static_cast<std::uint32_t>(buffer.triangles.size()), false});
+    return buffer;
+}
+
+// A street object's render mesh plus its shadow-volume faces pre-rotated for the
+// four pole directions (arm toward -Z, +X, +Z, -X), which placements then share
+// by translation. Models cast 64-unit volumes (RenderQueuedModelWithAdjacency
+// GeometryPass @124fe0, DAT_00278814).
+struct StreetObjectModel {
+    GpuMesh mesh;
+    std::array<GpuBuildingRenderModel, 4> shadow;
+};
+
+float street_object_yaw(Vec3 arm_direction) {
+    // The arm points along -Z; raylib's +Y yaw is right-handed, so X is negated
+    // to aim it along arm_direction (the building handedness flip).
+    return std::atan2(-arm_direction.x, -arm_direction.z);
+}
+
+std::size_t street_object_direction(Vec3 arm_direction) {
+    if (arm_direction.x > 0.5F) return 1U;
+    if (arm_direction.z > 0.5F) return 2U;
+    if (arm_direction.x < -0.5F) return 3U;
+    return 0U;
+}
+
+template <std::size_t N>
+StreetObjectModel build_street_object_model(const std::array<StreetObjectBox, N>& boxes) {
+    auto buffer = build_street_object_buffer(boxes);
+    StreetObjectModel model;
+    model.mesh = upload_gpu_mesh(buffer, [](GpuMeshPart& part) {
+        part.material_texture = default_game_material_texture().id;
+    }, true);
+    constexpr std::array<Vec3, 4> arms{{{0, 0, -1}, {1, 0, 0}, {0, 0, 1}, {-1, 0, 0}}};
+    for (std::size_t direction = 0; direction < arms.size(); ++direction) {
+        auto rotated = buffer;
+        const auto rotation = MatrixRotateY(street_object_yaw(arms[direction]));
+        for (auto& vertex : rotated.vertices) {
+            const auto p = Vector3Transform({vertex.position.x, vertex.position.y, vertex.position.z}, rotation);
+            vertex.position = {p.x, p.y, p.z};
+        }
+        build_shadow_volume(model.shadow[direction], rotated);
     }
     return model;
 }
 
-// Bakes every pole's boxes of one material into world-space meshes, split so
-// each stays under raylib's 16-bit index limit.
-std::vector<Mesh> merge_traffic_light_poles(const Model& pole_model, const std::vector<CityTrafficLightPole>& poles, int material) {
-    constexpr int kMaxVertices = 60000;
-    std::vector<Mesh> merged;
-    std::vector<float> positions, normals, texcoords;
-    std::vector<unsigned short> indices;
-    const auto flush = [&] {
-        if (positions.empty()) return;
-        Mesh mesh{};
-        mesh.vertexCount = static_cast<int>(positions.size() / 3);
-        mesh.triangleCount = static_cast<int>(indices.size() / 3);
-        mesh.vertices = static_cast<float*>(MemAlloc(static_cast<unsigned int>(positions.size() * sizeof(float))));
-        mesh.normals = static_cast<float*>(MemAlloc(static_cast<unsigned int>(normals.size() * sizeof(float))));
-        mesh.texcoords = static_cast<float*>(MemAlloc(static_cast<unsigned int>(texcoords.size() * sizeof(float))));
-        mesh.indices = static_cast<unsigned short*>(MemAlloc(static_cast<unsigned int>(indices.size() * sizeof(unsigned short))));
-        std::copy(positions.begin(), positions.end(), mesh.vertices);
-        std::copy(normals.begin(), normals.end(), mesh.normals);
-        std::copy(texcoords.begin(), texcoords.end(), mesh.texcoords);
-        std::copy(indices.begin(), indices.end(), mesh.indices);
-        UploadMesh(&mesh, false);
-        merged.push_back(mesh);
-        positions.clear(); normals.clear(); texcoords.clear(); indices.clear();
-    };
-    for (const auto& pole : poles) {
-        // Same transform DrawModelEx applied per pole: the arm points along -Z,
-        // and raylib's +Y yaw is right-handed, so X is negated to aim it along
-        // arm_direction (the same handedness flip as the building rotations).
-        const auto yaw = std::atan2(-pole.arm_direction.x, -pole.arm_direction.z);
-        const auto rotation = MatrixRotateY(yaw);
-        const auto transform = MatrixMultiply(rotation, MatrixTranslate(pole.base.x, pole.base.y, pole.base.z));
-        for (int m = 0; m < pole_model.meshCount; ++m) {
-            if (pole_model.meshMaterial[m] != material) continue;
-            const auto& box = pole_model.meshes[m];
-            if (static_cast<int>(positions.size() / 3) + box.vertexCount > kMaxVertices) flush();
-            const auto base_index = static_cast<unsigned short>(positions.size() / 3);
-            for (int v = 0; v < box.vertexCount; ++v) {
-                const auto p = Vector3Transform({box.vertices[v * 3], box.vertices[v * 3 + 1], box.vertices[v * 3 + 2]}, transform);
-                const auto n = Vector3Transform({box.normals[v * 3], box.normals[v * 3 + 1], box.normals[v * 3 + 2]}, rotation);
-                positions.insert(positions.end(), {p.x, p.y, p.z});
-                normals.insert(normals.end(), {n.x, n.y, n.z});
-                texcoords.insert(texcoords.end(), {box.texcoords[v * 2], box.texcoords[v * 2 + 1]});
-            }
-            for (int i = 0; i < box.triangleCount * 3; ++i) {
-                indices.push_back(static_cast<unsigned short>(base_index + box.indices[i]));
-            }
-        }
-    }
-    flush();
-    return merged;
+StreetObjectModel& traffic_light_model() {
+    static StreetObjectModel model = build_street_object_model(kTrafficLightBoxes);
+    return model;
 }
 
-void draw_city_traffic_light_poles(const MapScene& scene) {
-    static float cached_unit = -1.0F;
-    static Model pole_model{};
-    if (cached_unit != scene.unit_size) {
-        if (cached_unit > 0.0F) {
-            UnloadModel(pole_model);
-        }
-        pole_model = build_traffic_light_pole_model(scene.unit_size);
-        cached_unit = scene.unit_size;
-    }
+StreetObjectModel& street_sign_model() {
+    static StreetObjectModel model = build_street_object_model(kStreetSignBoxes);
+    return model;
+}
 
-    // Every pole shares one model, so bake them all into a few meshes (one
-    // draw per chunk and material) instead of a draw per box per pole. Rebake
-    // when the pole set changes.
-    static std::array<std::vector<Mesh>, 2> merged;
-    static std::size_t merged_key = 0;
-    std::size_t key = scene.traffic_light_poles.size();
+void draw_street_object_shadow_volumes(const MapScene& scene, const Camera3D& camera, float max_distance, Vector3 light) {
+    std::array<std::vector<Matrix>, 4> by_direction;
     for (const auto& pole : scene.traffic_light_poles) {
-        key = key * 31U + std::hash<float>{}(pole.base.x) + std::hash<float>{}(pole.base.y) * 7U +
-            std::hash<float>{}(pole.base.z) * 13U + std::hash<float>{}(pole.arm_direction.x) * 17U +
-            std::hash<float>{}(pole.arm_direction.z) * 19U;
-    }
-    if (key != merged_key) {
-        for (auto& chunks : merged) {
-            for (auto& mesh : chunks) UnloadMesh(mesh);
-            chunks.clear();
+        if (max_distance > 0.0F &&
+            Vector3DistanceSqr({pole.base.x, pole.base.y, pole.base.z}, camera.position) > max_distance * max_distance) {
+            continue;
         }
-        for (int material = 0; material < 2; ++material) {
-            merged[static_cast<std::size_t>(material)] = merge_traffic_light_poles(pole_model, scene.traffic_light_poles, material);
-        }
-        merged_key = key;
+        by_direction[street_object_direction(pole.arm_direction)].push_back(MatrixTranslate(pole.base.x, pole.base.y, pole.base.z));
     }
+    set_shadow_volume_light(light, Vector3Scale(light, -64.0F));
+    for (std::size_t direction = 0; direction < by_direction.size(); ++direction) {
+        if (by_direction[direction].empty()) continue;
+        for (auto* model : {&traffic_light_model(), &street_sign_model()}) {
+            draw_gpu_mesh_instances(model->shadow[direction].shadow_volume, by_direction[direction], GpuSurface::ShadowVolume);
+        }
+    }
+}
 
-    set_game_surface_window(false);
-    set_game_surface_building(false);
-    set_game_render_depth_output(true);
-    for (int material = 0; material < 2; ++material) {
-        for (const auto& mesh : merged[static_cast<std::size_t>(material)]) {
-            DrawMesh(mesh, pole_model.materials[material], MatrixIdentity());
-            if (g_gfx_debug_stats != nullptr) {
-                g_gfx_debug_stats->add_draw(
-                    GfxDebugDrawCategory::TrafficLightPoles,
-                    static_cast<std::uint64_t>(mesh.triangleCount),
-                    static_cast<std::uint64_t>(mesh.vertexCount),
-                    1U);
+// The red signal state (_generatetexture @9a8cc, texture DAT_43ebf074): 128x128
+// dark grey (32,32,32) with alpha 32 (a lit surface), and the lamp at columns
+// 40..87, rows 84..107 in red (255,32,32) with alpha 255 (drawn unlit). Rows run
+// bottom-up in v, so the lamp sits in the upper half of the head. The yellow and
+// green states move the lamp to rows 52..75 / 20..43; the editor shows the
+// map-load state.
+Texture2D traffic_light_signal_texture() {
+    static const Texture2D texture = [] {
+        Image image = GenImageColor(128, 128, Color{32, 32, 32, 32});
+        auto* pixels = static_cast<Color*>(image.data);
+        for (int y = 84; y <= 107; ++y) {
+            for (int x = 40; x <= 87; ++x) pixels[y * 128 + x] = Color{255, 32, 32, 255};
+        }
+        auto loaded = LoadTextureFromImage(image);
+        UnloadImage(image);
+        GenTextureMipmaps(&loaded);
+        SetTextureFilter(loaded, TEXTURE_FILTER_TRILINEAR);
+        return loaded;
+    }();
+    return texture;
+}
+
+// Street-name label (RenderStreetLabelTexture @9da10): 256x64, cleared to
+// (0, 0.25, 0, 0), the name drawn white in font 4 ("overpass", a 16x16 atlas of
+// 64px cells with CSV widths) at size 52, centred on (128, 32); alpha stays 0 so
+// the sign is lit. The font lives in the game install (<game>/font), two levels
+// above a map folder; without it the label falls back to raylib's font.
+struct GameFont {
+    Image atlas{};
+    std::array<float, 256> width{};  // advance per unit size: (base - 0.5) / cell height
+    int cell{64};
+};
+
+// raw_widths: font flag 1 (fixedsys) keeps the CSV widths as they are; the
+// other fonts subtract half a pixel (Font_LoadAtlasMetricsAndCursorTexture).
+std::optional<GameFont> load_game_font(const std::filesystem::path& map_root, const char* name, bool raw_widths = false) {
+    for (const auto& dir : {map_root.parent_path().parent_path() / "font", map_root.parent_path() / "font"}) {
+        std::ifstream csv(dir / (std::string(name) + ".csv"));
+        if (!csv) continue;
+        GameFont font;
+        std::array<int, 256> base{};
+        float cell_height = 64.0F;
+        std::string line;
+        while (std::getline(csv, line)) {
+            int index = 0;
+            int value = 0;
+            if (std::sscanf(line.c_str(), "Char %d Base Width,%d", &index, &value) == 2 && index >= 0 && index < 256) {
+                base[static_cast<std::size_t>(index)] = value;
+            } else if (std::sscanf(line.c_str(), "Cell Height,%d", &value) == 1) {
+                cell_height = static_cast<float>(value);
+                font.cell = value;
             }
         }
+        for (std::size_t c = 0; c < 256; ++c) font.width[c] = (static_cast<float>(base[c]) - (raw_widths ? 0.0F : 0.5F)) / cell_height;
+        font.atlas = LoadImage((dir / (std::string(name) + ".png")).string().c_str());
+        if (font.atlas.data == nullptr) continue;
+        ImageFormat(&font.atlas, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+        return font;
+    }
+    return std::nullopt;
+}
+
+Texture2D render_street_label(const char* text, const GameFont* font) {
+    constexpr int width = 256;
+    constexpr int height = 64;
+    constexpr float size = 52.0F;
+    // Glyph coverage in top-down screen space, composited over the green below.
+    Image glyphs = GenImageColor(width, height, BLANK);
+    if (font != nullptr) {
+        float total = 0.0F;
+        for (const char* c = text; *c != '\0'; ++c) total += size * font->width[static_cast<unsigned char>(*c)];
+        float x = width * 0.5F - total * 0.5F;
+        const float y = height * 0.5F - size * 0.5F;
+        const auto* atlas = static_cast<const Color*>(font->atlas.data);
+        auto* out = static_cast<Color*>(glyphs.data);
+        for (const char* c = text; *c != '\0'; ++c) {
+            const auto code = static_cast<unsigned char>(*c);
+            const float glyph_width = size * font->width[code];
+            const int cell_x = (code & 15) * font->cell;
+            const int cell_y = (code >> 4) * font->cell;
+            for (int py = static_cast<int>(y); py < static_cast<int>(y + size) && py < height; ++py) {
+                for (int px = static_cast<int>(x); px < static_cast<int>(x + glyph_width) && px < width; ++px) {
+                    if (px < 0 || py < 0) continue;
+                    const int sx = cell_x + static_cast<int>((static_cast<float>(px) + 0.5F - x) / size * static_cast<float>(font->cell));
+                    const int sy = cell_y + static_cast<int>((static_cast<float>(py) + 0.5F - y) / size * static_cast<float>(font->cell));
+                    if (sx < 0 || sy < 0 || sx >= font->atlas.width || sy >= font->atlas.height) continue;
+                    const auto texel = atlas[sy * font->atlas.width + sx];
+                    auto& dst = out[py * width + px];
+                    dst.a = std::max(dst.a, texel.a);
+                }
+            }
+            x += glyph_width;
+        }
+    } else {
+        ImageDrawTextEx(&glyphs, GetFontDefault(), text, {8.0F, 16.0F}, 32.0F, 2.0F, WHITE);
+    }
+    Image label = GenImageColor(width, height, Color{0, 64, 0, 0});
+    auto* dst = static_cast<Color*>(label.data);
+    const auto* src = static_cast<const Color*>(glyphs.data);
+    for (int i = 0; i < width * height; ++i) {
+        const float a = static_cast<float>(src[i].a) / 255.0F;
+        dst[i].r = static_cast<unsigned char>(255.0F * a);
+        dst[i].g = static_cast<unsigned char>(64.0F + (255.0F - 64.0F) * a);
+        dst[i].b = static_cast<unsigned char>(255.0F * a);
+    }
+    UnloadImage(glyphs);
+    // The label was drawn with y down into a framebuffer, so v runs bottom-up.
+    ImageFlipVertical(&label);
+    auto texture = LoadTextureFromImage(label);
+    UnloadImage(label);
+    GenTextureMipmaps(&texture);
+    SetTextureFilter(texture, TEXTURE_FILTER_TRILINEAR);
+    return texture;
+}
+
+// Every light is an instance of one model; signs are grouped by street name.
+void draw_city_traffic_light_poles(const EditorProject& project, const MapScene& scene) {
+    auto& light = traffic_light_model().mesh;
+    auto& sign = street_sign_model().mesh;
+    static std::filesystem::path label_root;
+    static std::array<Texture2D, native_street_names.size()> labels{};
+    if (label_root != project.root) {
+        label_root = project.root;
+        auto font = load_game_font(project.root, "overpass");
+        for (std::size_t i = 0; i < labels.size(); ++i) {
+            if (labels[i].id != 0U) UnloadTexture(labels[i]);
+            labels[i] = render_street_label(native_street_names[i], font ? &*font : nullptr);
+        }
+        if (font) UnloadImage(font->atlas);
+    }
+    light.parts.front().texture = traffic_light_signal_texture().id;
+
+    static std::vector<Matrix> transforms;
+    static std::array<std::vector<Matrix>, native_street_names.size()> by_name;
+    transforms.clear();
+    for (auto& group : by_name) group.clear();
+    for (const auto& pole : scene.traffic_light_poles) {
+        const auto transform = MatrixMultiply(MatrixRotateY(street_object_yaw(pole.arm_direction)),
+            MatrixTranslate(pole.base.x, pole.base.y, pole.base.z));
+        transforms.push_back(transform);
+        by_name[static_cast<std::size_t>(std::clamp(pole.sign_name, 0, static_cast<int>(by_name.size()) - 1))].push_back(transform);
+    }
+    set_game_render_depth_output(true);
+    draw_gpu_mesh_instances(light, transforms, GpuSurface::Model);
+    for (std::size_t i = 0; i < by_name.size(); ++i) {
+        sign.parts.front().texture = labels[i].id;
+        draw_gpu_mesh_instances(sign, by_name[i], GpuSurface::Model);
     }
     set_game_render_depth_output(false);
 }
@@ -3495,147 +3859,51 @@ void draw_city_cursor(CityGridPoint point, float unit_size, CityTool tool) {
     DrawSphere(position, unit_size * 0.22F, color);
 }
 
-void draw_city_edit_grid(CityGridPoint center, const MapScene& scene) {
+// Placement grid for the city tools, around the cursor. `center` is the cell
+// (piece, building) or grid point (road node) the tool will use; the plane
+// sits on world cells' floor at level*4 + 0.25, where roads, pieces, and
+// buildings rest. Lines every 8 cells mark district sectors; the lines through
+// the cursor are its X (red) and Z (blue) axes; `cell_fill` tints the cell.
+void draw_city_edit_grid(CityGridPoint center, const MapScene& scene, Color accent, bool cell_fill) {
     const auto unit = scene.unit_size > 0.0F ? scene.unit_size : 4.0F;
-    constexpr std::int32_t half_cells = 20;
-    // Flat plane fixed at the hovered cell's height, not terrain-following: a
-    // single working plane is easier to read and to place against. Depth test is
-    // disabled below so it overlays the scene ("goes through everything") instead
-    // of being clipped by terrain/buildings.
-    const float plane_y = static_cast<float>(center.y) * unit + unit * 0.02F;
-    const float min_x = static_cast<float>(center.x - half_cells) * unit;
-    const float max_x = static_cast<float>(center.x + half_cells) * unit;
-    const float min_z = static_cast<float>(center.z - half_cells) * unit;
-    const float max_z = static_cast<float>(center.z + half_cells) * unit;
-
-    // Modelled on raylib's DrawGrid: one rlBegin(RL_LINES) batch with raw
-    // rlVertex3f/rlColor4ub instead of N DrawLine3D calls. Major lines get
-    // world-space width below; GL line width is unreliable on core profiles.
-    const auto is_major = [](std::int32_t coord) { return coord % 10 == 0; };
-    const auto set_color = [](bool axis, bool major) {
-        if (axis) {
-            rlColor4ub(210, 225, 245, 220);
-        } else if (major) {
-            rlColor4ub(170, 195, 220, 180);
-        } else {
-            rlColor4ub(120, 140, 160, 90);
-        }
+    constexpr std::int32_t half_cells = 24;
+    WorkGrid grid;
+    grid.unit = unit;
+    grid.y = static_cast<float>(center.y) * unit + 0.25F + 0.03F;
+    grid.x0 = center.x - half_cells;
+    grid.x1 = center.x + half_cells;
+    grid.z0 = center.z - half_cells;
+    grid.z1 = center.z + half_cells;
+    grid.fade_center = {(static_cast<float>(center.x) + (cell_fill ? 0.5F : 0.0F)) * unit,
+        (static_cast<float>(center.z) + (cell_fill ? 0.5F : 0.0F)) * unit};
+    grid.fade_radius = static_cast<float>(half_cells) * unit;
+    grid.style = [&](bool along_x, std::int32_t line) {
+        const auto cursor_line = along_x ? center.z : center.x;
+        if (!cell_fill && line == cursor_line) return GridLineStyle{along_x ? kGridAxisX : kGridAxisZ, 2.4F};
+        if (floor_mod(line, 8) == 0) return GridLineStyle{kGridMajor, 1.8F};
+        return GridLineStyle{kGridMinor, 1.1F};
     };
-
-    // Overlay: draw on top of everything, depth-write off so it never occludes.
-    rlDrawRenderBatchActive();
-    rlDisableDepthTest();
-    rlDisableDepthMask();
-    rlBegin(RL_LINES);
-    for (std::int32_t gx = center.x - half_cells; gx <= center.x + half_cells; ++gx) {
-        const bool axis = gx == center.x;
-        const bool major = axis || is_major(gx);
-        set_color(axis, major);
-        const float wx = static_cast<float>(gx) * unit;
-        rlVertex3f(wx, plane_y, min_z);
-        rlVertex3f(wx, plane_y, max_z);
-    }
-    for (std::int32_t gz = center.z - half_cells; gz <= center.z + half_cells; ++gz) {
-        const bool axis = gz == center.z;
-        const bool major = axis || is_major(gz);
-        set_color(axis, major);
-        const float wz = static_cast<float>(gz) * unit;
-        rlVertex3f(min_x, plane_y, wz);
-        rlVertex3f(max_x, plane_y, wz);
-    }
-    rlEnd();
-    rlDrawRenderBatchActive();
-    for (std::int32_t gx = center.x - half_cells; gx <= center.x + half_cells; ++gx) {
-        if (!is_major(gx) && gx != center.x) continue;
-        const float x = static_cast<float>(gx) * unit;
-        DrawCylinderEx({x, plane_y, min_z}, {x, plane_y, max_z}, unit * 0.025F,
-            unit * 0.025F, 4, Color{170, 195, 220, 180});
-    }
-    for (std::int32_t gz = center.z - half_cells; gz <= center.z + half_cells; ++gz) {
-        if (!is_major(gz) && gz != center.z) continue;
-        const float z = static_cast<float>(gz) * unit;
-        DrawCylinderEx({min_x, plane_y, z}, {max_x, plane_y, z}, unit * 0.025F,
-            unit * 0.025F, 4, Color{170, 195, 220, 180});
-    }
-    rlEnableDepthMask();
-    rlEnableDepthTest();
+    draw_work_grid(grid, [&](float alpha_scale) {
+        if (!cell_fill) return;
+        // The target cell: a tinted tile with a crisp accent border.
+        const auto x0 = static_cast<float>(center.x) * unit;
+        const auto z0 = static_cast<float>(center.z) * unit;
+        const Vector3 c{x0 + unit * 0.5F, grid.y, z0 + unit * 0.5F};
+        const Color fill{accent.r, accent.g, accent.b, static_cast<unsigned char>(60.0F * alpha_scale)};
+        DrawTriangle3D({x0, grid.y, z0}, {x0, grid.y, z0 + unit}, {x0 + unit, grid.y, z0 + unit}, fill);
+        DrawTriangle3D({x0, grid.y, z0}, {x0 + unit, grid.y, z0 + unit}, {x0 + unit, grid.y, z0}, fill);
+        (void)c;
+        WorkGrid border;
+        border.unit = unit;
+        border.y = grid.y + 0.01F;
+        border.x0 = center.x; border.x1 = center.x + 1;
+        border.z0 = center.z; border.z1 = center.z + 1;
+        border.style = [&](bool, std::int32_t) {
+            return GridLineStyle{Color{accent.r, accent.g, accent.b, 235}, 2.6F};
+        };
+        emit_work_grid(border, alpha_scale);
+    });
 }
-
-void draw_city_road_selection(const EditorProject& project, const EditorUi& ui, const MapScene& scene) {
-    if (!project.city) {
-        return;
-    }
-    const auto& map = project.city->data;
-    const auto unit = scene.unit_size > 0.0F ? scene.unit_size : 4.0F;
-    const auto lift = unit * 0.6F;
-    const auto node_world = [&](std::size_t node_index) {
-        const auto& n = map.intersections[node_index];
-        const auto y = scene.terrain.has_value()
-            ? terrain_height_at(*scene.terrain, static_cast<float>(n.x) * unit, static_cast<float>(n.z) * unit)
-            : static_cast<float>(n.y) * unit;
-        return Vector3{static_cast<float>(n.x) * unit, y + lift, static_cast<float>(n.z) * unit};
-    };
-    // Same pulsing glow box buildings use, so node and road selection read the
-    // same way. A node is one box; a road is a chain of boxes stepped along the
-    // segment (covering its full length and drawn width) so the whole road glows.
-    const auto glow_node = [&](std::size_t node_index, Color color) {
-        if (node_index >= map.intersections.size()) {
-            return;
-        }
-        const auto pos = node_world(node_index);
-        draw_selection_glow_box(pos, {unit, unit, unit}, color);
-    };
-    const auto glow_road = [&](std::size_t street_index, Color color) {
-        if (street_index >= map.streets.size()) {
-            return;
-        }
-        const auto& s = map.streets[street_index];
-        if (s.from_intersection < 0 || s.to_intersection < 0 ||
-            static_cast<std::size_t>(s.from_intersection) >= map.intersections.size() ||
-            static_cast<std::size_t>(s.to_intersection) >= map.intersections.size()) {
-            return;
-        }
-        const auto a = node_world(static_cast<std::size_t>(s.from_intersection));
-        const auto b = node_world(static_cast<std::size_t>(s.to_intersection));
-        // A translucent glowing strip over the road footprint plus a pulsing
-        // border - one clean highlighted ribbon along the road, the road analogue
-        // of the building's glow box (not a noisy stack of cubes).
-        const auto half_w = std::max(static_cast<float>(std::max(s.left_width, s.right_width)), 1.0F) * unit * 0.5F;
-        const auto len = std::sqrt((b.x - a.x) * (b.x - a.x) + (b.z - a.z) * (b.z - a.z));
-        if (len < 0.001F) {
-            return;
-        }
-        // Unit perpendicular in the ground plane.
-        const auto px = -(b.z - a.z) / len * half_w;
-        const auto pz = (b.x - a.x) / len * half_w;
-        const Vector3 a0{a.x + px, a.y, a.z + pz};
-        const Vector3 a1{a.x - px, a.y, a.z - pz};
-        const Vector3 b0{b.x + px, b.y, b.z + pz};
-        const Vector3 b1{b.x - px, b.y, b.z - pz};
-        const auto pulse = 0.5F + 0.5F * static_cast<float>(std::sin(GetTime() * 4.0));
-        const Color fill{color.r, color.g, color.b, static_cast<unsigned char>(70 + 60 * pulse)};
-        rlDisableBackfaceCulling();
-        DrawTriangle3D(a0, a1, b1, fill);
-        DrawTriangle3D(a0, b1, b0, fill);
-        rlEnableBackfaceCulling();
-        const Color edge{color.r, color.g, color.b, 255};
-        DrawLine3D(a0, b0, edge);
-        DrawLine3D(a1, b1, edge);
-    };
-
-    // Roads get the silhouette outline (composited after the 3D pass, like
-    // buildings), so here we only glow the nodes - the outline shader cannot
-    // trace the thin node markers as cleanly as a glow box does.
-    (void)glow_road;
-    if (!map.intersections.empty()) {
-        glow_node(std::min(ui.selected_city_intersection, map.intersections.size() - 1U), Color{120, 210, 255, 255});
-    }
-    if (ui.hover_city_intersection.has_value()) {
-        glow_node(*ui.hover_city_intersection, Color{200, 240, 255, 255});
-    }
-}
-
-
 
 void draw_city_block_preview(EditorProject& project, const SbcCityBlock& city_block, const std::vector<NamedBlockMesh>& meshes, std::size_t city_block_index, std::size_t selected_layer, std::size_t selected_slot) {
     DrawGrid(24, 4.0F);
@@ -3717,8 +3985,287 @@ void draw_buildblock_preview_3d(const BuildblockPreviewScene& scene) {
     }
 }
 
+// The map image (GenerateMapTextureFromVisibleSectors @124300): 512x512 of the
+// world sectors (road and curb tiles, buildings, pieces, not the landscape) drawn
+// unlit from straight above on black, orthographic half-extent 1024 around
+// (1920, 1920), so one pixel per cell over world x and z 896..2944, +x right and
+// +z down. The round map (isMapAutoGenerated) keeps its map.png instead.
+// Bumped whenever city_map_image reloads or re-renders its image.
+std::uint64_t g_map_image_revision = 0;
+
+const Texture2D* city_map_image(EditorProject& project) {
+    static RenderTexture2D target{};
+    static Texture2D loaded_png{};
+    static std::filesystem::path png_root;
+    static std::uint64_t rendered_key = 0;
+    if (project.root.filename() == "round") {
+        if (png_root != project.root) {
+            if (loaded_png.id != 0U) UnloadTexture(loaded_png);
+            loaded_png = {};
+            png_root = project.root;
+            const auto path = project.root / "map.png";
+            if (std::filesystem::exists(path)) loaded_png = LoadTexture(path.string().c_str());
+            ++g_map_image_revision;
+        }
+        return loaded_png.id != 0U ? &loaded_png : nullptr;
+    }
+    if (!project.city || !project.city_scene_gpu_valid) return target.id != 0U ? &target.texture : nullptr;
+    std::uint64_t key = project.city_scene_cache_fingerprint ^ (project.city_tile_gpu_model.mesh.index_count * 0x9e3779b97f4a7c15ULL) ^
+        (project.portal_gpu_model.mesh.index_count * 0xc2b2ae3d27d4eb4fULL);
+    for (const auto& model : project.building_gpu_models) key = key * 31U + model.mesh.index_count;
+    if (target.id != 0U && key == rendered_key) return &target.texture;
+    rendered_key = key;
+    ++g_map_image_revision;
+    if (target.id == 0U) target = LoadRenderTexture(512, 512);
+
+    Camera3D camera{};
+    camera.position = {1920.0F, 1024.0F, 1920.0F};
+    camera.target = {1920.0F, 0.0F, 1920.0F};
+    camera.up = {0.0F, 0.0F, -1.0F};
+    camera.fovy = 2048.0F;
+    camera.projection = CAMERA_ORTHOGRAPHIC;
+    const auto near_plane = rlGetCullDistanceNear();
+    const auto far_plane = rlGetCullDistanceFar();
+    rlSetClipPlanes(0.01, 2048.0);
+    BeginTextureMode(target);
+    ClearBackground(BLACK);
+    BeginMode3D(camera);
+    draw_gpu_mesh_instances(project.city_tile_gpu_model.mesh, {MatrixIdentity()}, GpuSurface::Unlit);
+    draw_gpu_mesh_instances(project.portal_gpu_model.mesh, {MatrixTranslate(0.0F, 0.25F, 0.0F)}, GpuSurface::Unlit);
+    const auto& placement_assets = resolve_placement_asset_indices(project);
+    std::vector<std::vector<Matrix>> by_asset(project.building_gpu_models.size());
+    for (std::size_t i = 0; i < project.city->data.buildings.size(); ++i) {
+        if (!placement_assets[i].has_value() || *placement_assets[i] >= by_asset.size()) continue;
+        by_asset[*placement_assets[i]].push_back(city_placement_matrix(project.city->data.buildings[i]));
+    }
+    for (std::size_t asset = 0; asset < by_asset.size(); ++asset) {
+        draw_gpu_mesh_instances(project.building_gpu_models[asset].mesh, by_asset[asset], GpuSurface::Unlit);
+    }
+    EndMode3D();
+    EndTextureMode();
+    rlSetClipPlanes(near_plane, far_plane);
+    return &target.texture;
+}
+
+// Game fonts in load order (Program_InitializeAndRunClient @1330): index,
+// file, and load flags (1 = nearest filtering and raw widths, 2 = lowercase
+// drawn with the uppercase glyphs).
+struct GameFontInfo {
+    const char* name;
+    int flags;
+};
+constexpr std::array<GameFontInfo, 5> kGameFonts{{
+    {"vcr", 0}, {"osd-white", 2}, {"rockwell", 0}, {"fixedsys", 1}, {"overpass", 0},
+}};
+
+std::vector<MapFontChoice> map_font_choices(const EditorProject& project) {
+    std::vector<MapFontChoice> choices;
+    for (const auto& info : kGameFonts) {
+        for (const auto& dir : {project.root.parent_path().parent_path() / "font", project.root.parent_path() / "font"}) {
+            if (std::filesystem::exists(dir / (std::string(info.name) + ".csv")) &&
+                std::filesystem::exists(dir / (std::string(info.name) + ".png"))) {
+                choices.push_back({std::string("game:") + info.name, std::string(info.name) + " (game)"});
+                break;
+            }
+        }
+    }
+    std::vector<std::filesystem::path> dirs;
+#if defined(__APPLE__)
+    dirs = {"/System/Library/Fonts", "/System/Library/Fonts/Supplemental", "/Library/Fonts"};
+    if (const char* home = std::getenv("HOME")) dirs.push_back(std::filesystem::path(home) / "Library/Fonts");
+#elif defined(_WIN32)
+    dirs = {"C:/Windows/Fonts"};
+#elif !defined(__EMSCRIPTEN__)
+    dirs = {"/usr/share/fonts", "/usr/local/share/fonts"};
+    if (const char* home = std::getenv("HOME")) dirs.push_back(std::filesystem::path(home) / ".local/share/fonts");
+#endif
+    std::vector<MapFontChoice> system;
+    for (const auto& dir : dirs) {
+        std::error_code ec;
+        for (auto it = std::filesystem::recursive_directory_iterator(dir, ec); !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+            auto ext = it->path().extension().string();
+            std::ranges::transform(ext, ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (it->is_regular_file(ec) && (ext == ".ttf" || ext == ".otf")) {
+                system.push_back({"file:" + it->path().string(), it->path().stem().string()});
+            }
+        }
+    }
+    std::ranges::sort(system, {}, &MapFontChoice::label);
+    choices.insert(choices.end(), system.begin(), system.end());
+    return choices;
+}
+
+namespace {
+
+// One loaded label font: a game atlas font or a system TrueType font rasterized
+// at the label's pixel size.
+struct MapLabelFont {
+    std::string key;
+    int pixel_size{};
+    std::optional<GameFont> game;
+    Texture2D game_texture{};
+    int game_flags{};
+    Font system{};
+
+    void unload() {
+        if (game_texture.id != 0U) UnloadTexture(game_texture);
+        if (game) UnloadImage(game->atlas);
+        if (system.texture.id != 0U) UnloadFont(system);
+        *this = {};
+    }
+};
+
+void load_map_label_font(MapLabelFont& font, const EditorProject& project, const std::string& key, int pixel_size) {
+    const bool is_game = key.starts_with("game:");
+    if (font.key == key && (is_game || font.pixel_size == pixel_size)) return;
+    font.unload();
+    font.key = key;
+    font.pixel_size = pixel_size;
+    if (is_game) {
+        const auto name = key.substr(5);
+        const auto info = std::ranges::find_if(kGameFonts, [&](const GameFontInfo& f) { return name == f.name; });
+        font.game_flags = info != kGameFonts.end() ? info->flags : 0;
+        font.game = load_game_font(project.root, name.c_str(), (font.game_flags & 1) != 0);
+        if (font.game) {
+            font.game_texture = LoadTextureFromImage(font.game->atlas);
+            SetTextureFilter(font.game_texture, (font.game_flags & 1) != 0 ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
+        }
+    } else if (key.starts_with("file:")) {
+        font.system = LoadFontEx(key.substr(5).c_str(), std::max(8, pixel_size), nullptr, 0);
+        SetTextureFilter(font.system.texture, TEXTURE_FILTER_BILINEAR);
+    }
+}
+
+// Draws `text` centred on (x, y) at `size` map units, as renderText flags 5.
+void draw_map_label(const MapLabelFont& font, const char* text, float x, float y, float size) {
+    if (font.game) {
+        const auto glyph = [&](unsigned char c) {
+            // Flag 2 fonts reuse the uppercase glyph rows for a..z.
+            return (font.game_flags & 2) != 0 && c >= 'a' && c <= 'z' ? static_cast<unsigned char>(c - 32) : c;
+        };
+        float advance = 0.0F;
+        for (const char* c = text; *c != '\0'; ++c) advance += size * font.game->width[glyph(static_cast<unsigned char>(*c))];
+        float pen = x - advance * 0.5F;
+        const float top = y - size * 0.5F;
+        // _cs_drawtextstring: a size x size cell per glyph, clipped to its
+        // advance width, sampled from the 16x16 atlas.
+        rlSetTexture(font.game_texture.id);
+        rlBegin(RL_QUADS);
+        rlColor4ub(255, 255, 255, 255);
+        for (const char* c = text; *c != '\0'; ++c) {
+            const auto code = glyph(static_cast<unsigned char>(*c));
+            const float w = font.game->width[code];
+            const float u0 = static_cast<float>(code & 15U) / 16.0F;
+            const float v0 = static_cast<float>(code >> 4U) / 16.0F;
+            const float u1 = u0 + w / 16.0F;
+            const float v1 = v0 + 1.0F / 16.0F;
+            rlTexCoord2f(u0, v0); rlVertex2f(pen, top);
+            rlTexCoord2f(u0, v1); rlVertex2f(pen, top + size);
+            rlTexCoord2f(u1, v1); rlVertex2f(pen + w * size, top + size);
+            rlTexCoord2f(u1, v0); rlVertex2f(pen + w * size, top);
+            pen += w * size;
+        }
+        rlEnd();
+        rlSetTexture(0);
+        return;
+    }
+    const Font& face = font.system.texture.id != 0U ? font.system : GetFontDefault();
+    const float spacing = font.system.texture.id != 0U ? 0.0F : size * 0.1F;
+    const auto measured = MeasureTextEx(face, text, size, spacing);
+    DrawTextEx(face, text, {x - measured.x * 0.5F, y - size * 0.5F}, size, spacing, WHITE);
+}
+
+// Draws the map screen into `target` (square, pixels wide).
+void compose_map_menu(RenderTexture2D target, const Texture2D& image, EditorProject& project, const MapMenuOptions& options, MapLabelFont& font) {
+    const auto pixels = target.texture.width;
+    const bool auto_generated = project.root.filename() == "round";
+    const float center = auto_generated ? 128.0F : 120.0F;
+    const float half = static_cast<float>(pixels) * 0.5F;
+    constexpr float size = 6.0F;
+    if (!auto_generated && options.street_labels) {
+        load_map_label_font(font, project, options.font, static_cast<int>(std::lround(size * half / 128.0F)));
+    }
+    BeginTextureMode(target);
+    ClearBackground(BLACK);
+    BeginMode2D(Camera2D{{half, half}, {center, center}, 0.0F, half / 128.0F});
+    // Rendered images are stored bottom-up; round's map.png is a plain image.
+    const auto height = static_cast<float>(image.height);
+    DrawTexturePro(image, {0.0F, 0.0F, static_cast<float>(image.width), auto_generated ? height : -height},
+        {0.0F, 0.0F, 256.0F, 256.0F}, {}, 0.0F, Fade(WHITE, 0.75F));
+    if (!auto_generated && options.street_labels) {
+        for (const auto& label : project.city_scene_cache.map_labels) {
+            const char* text = native_street_names[static_cast<std::size_t>(
+                std::clamp(label.name, 0, static_cast<int>(native_street_names.size()) - 1))];
+            draw_map_label(font, text, label.x, label.y, size);
+        }
+    }
+    EndMode2D();
+    EndTextureMode();
+}
+
+MapLabelFont& map_label_font() {
+    static MapLabelFont font;
+    return font;
+}
+
+} // namespace
+
+// The map screen as DrawMapMenu @88130 draws it into its 512x512 viewport (in
+// 1024x768 virtual units, so at the screen's own pixel density), at `pixels`: an
+// orthographic view of map space, half-extent 128 around (120, 120), or
+// (128, 128) when isMapAutoGenerated, with y running down. The map image fills
+// (0, 0)-(256, 256) at alpha 0.75. On city maps each street label follows in
+// font 2 ("rockwell", set by RenderWorld before the HUD) at size 6, white, with
+// renderText flags 5: x back by half the advance width, y back by half the
+// size. Label anchors are (world - 896) * 0.125 (see build_map_scene).
+const Texture2D* map_menu_texture(EditorProject& project, int pixels, const MapMenuOptions& options) {
+    const auto* image = city_map_image(project);
+    if (image == nullptr) return nullptr;
+    static RenderTexture2D target{};
+    static std::uint64_t composed_key = 0;
+    pixels = std::clamp(pixels, 64, 4096);
+    std::uint64_t key = g_map_image_revision * 0x9e3779b97f4a7c15ULL;
+    key = key * 31U + static_cast<std::uint64_t>(pixels);
+    key = key * 31U + (options.street_labels ? 1U : 0U);
+    key = key * 31U + std::hash<std::string>{}(options.font);
+    key = key * 31U + std::hash<std::string>{}(project.root.string());
+    for (const auto& label : project.city_scene_cache.map_labels) {
+        key = key * 31U + static_cast<std::uint64_t>(label.name);
+        key = key * 31U + static_cast<std::uint64_t>(std::lround(label.x * 8.0F));
+        key = key * 31U + static_cast<std::uint64_t>(std::lround(label.y * 8.0F));
+    }
+    if (target.id != 0U && key == composed_key) return &target.texture;
+    composed_key = key;
+    if (target.id != 0U && target.texture.width != pixels) {
+        UnloadRenderTexture(target);
+        target = {};
+    }
+    if (target.id == 0U) {
+        target = LoadRenderTexture(pixels, pixels);
+        SetTextureFilter(target.texture, TEXTURE_FILTER_BILINEAR);
+    }
+    compose_map_menu(target, *image, project, options, map_label_font());
+    return &target.texture;
+}
+
+std::vector<std::uint8_t> map_menu_png(EditorProject& project, int pixels, const MapMenuOptions& options) {
+    const auto* image = city_map_image(project);
+    if (image == nullptr) return {};
+    auto target = LoadRenderTexture(pixels, pixels);
+    compose_map_menu(target, *image, project, options, map_label_font());
+    auto shot = LoadImageFromTexture(target.texture);
+    UnloadRenderTexture(target);
+    ImageFlipVertical(&shot);
+    int size = 0;
+    auto* bytes = ExportImageToMemory(shot, ".png", &size);
+    UnloadImage(shot);
+    std::vector<std::uint8_t> png(bytes, bytes + std::max(0, size));
+    MemFree(bytes);
+    return png;
+}
+
 void draw_gpu_building_model_public(GpuBuildingRenderModel& model, Vector3 origin, std::int32_t rotation) {
-    draw_gpu_building_model(model, origin, rotation, false, false, GfxDebugDrawCategory::CityCells);
+    draw_gpu_building_model(model, origin, rotation, false);
 }
 
 } // namespace map_editor::app_internal

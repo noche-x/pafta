@@ -1,6 +1,7 @@
 #pragma once
 
 #include "formats.hpp"
+#include "scene.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -87,5 +88,25 @@ private:
     std::size_t selected_word_index_{};
     bool dirty_{};
 };
+
+// Free-fly keys held this frame.
+struct FlyInput {
+    bool forward{};
+    bool back{};
+    bool left{};
+    bool right{};
+    bool up{};
+    bool down{};
+    bool slow{};  // Shift
+    bool fast{};  // Z: speeds up, or with Shift slows further
+};
+
+// Speed multiplier: Shift 1/4, Z 4x, Shift+Z 1/16.
+float fly_speed_multiplier(bool slow, bool fast);
+
+// One frame of fly movement: W/S along the full view direction (pitch
+// included), A/D along its level right, Space/Ctrl straight up/down. Combined
+// keys are normalized so diagonals are not faster.
+Vec3 fly_camera_step(Vec3 forward, const FlyInput& input, float speed, float seconds);
 
 } // namespace map_editor

@@ -527,3 +527,27 @@ High-value asks for the lead:
 - Native overwrite/merge rules inside `World_SetTileBlockAndResolveNeighborLinks` are not decoded here.
 - Corner helper object coordinates and visible purpose are not decoded here.
 - Bezier/curved road mesh behavior is not covered because the requested decompile file was absent.
+
+## Resolved 2026-09-25 (subrosa.exe.THIS_ONE, Ghidra)
+
+The open items above are resolved and implemented in `scene.cpp`
+(`place_native_street_tiles`, `build_city_tile_render_buffer`),
+`buildblock_catalog.cpp`, and `render_gpu.cpp` (`road_overlay_arrays`).
+
+- `DAT_0500a748` = `DAT_0500a70c[15]` = catalog id 15, the curb plate with all four skirts.
+- Grade tables: from `DAT_0500aa14`, row `4n + edge` holds 16 ids (int offset `n*64 + edge*16`), n = 4..12; `ba14` is the next `0x1000` bytes. Bases `aa14/aa54/aa90/aad0` are +0/+16/+31/+47 ints, so uphill reads edge 0 (street along X) or 1 (along Z) at step `runPos`, downhill edge 2 or 3 at step `n-1-runPos`. Unassigned entries are 0.
+- Grade geometry (`Buildblock_InitTemplateMeshCatalog @10110`): edge 0 rises along +X, 1 along +Z, 2 falls along +X, 3 falls along +Z. `aa` = one linear patch from `k/n` to `(k+1)/n`, UV (x, z), material slot 0. `ba` = a 1/16-thick slab with top `k/n+1/16 .. (k+1)/n+1/16`, faces 1..5, material slot 0.
+- The X branch mirrors branch 0 exactly (codes `0x46/0x47/0x4a/0x49`, tables `aa54/aad0/ba54/bad0`). End caps: for each lane row `[c-L, c+R)`, a solid cell with `face[5] = 0x4801` (`0x4301` on the X branch) at the first along cell when A has `ext_along_pos > 0` and a cross extent, and at `B.pos - ext_along_neg - 1` on B's level likewise. Extents are the pre-expansion values.
+- Face codes (`BuildCellRenderGeometryAndAdjacency @c555`): bit 14 set means texture = low byte and overlay layer = `(code >> 8) & 0x1f`; a negative code means default texture 3 with overlay `code & 0x3ff`. Texture 1 is `asphalt2.png`, texture 0 `concrete`. Solid-cell faces use tangent/bitangent tables `DAT_002b35a0/35f0`; UV = sector-local position · 0.25 (`DAT_64cffce4`). Block quads take `face[quad material]`.
+- Road markings are not a file: `@0x98ff0` (named `Texture_GenerateCubemapFace`) fills an 11-layer 128x128 array (units 4/5, `tex_atlas_color/material`). Layers: 1/2 yellow rows 5..10 / 117..122; 6/7 yellow columns; 4/5 white dashes (rows, columns 32..95); 9/10 dashes on columns; 3 white rows 16..31 and 96..111; 8 white columns 11..26 and 91..106. `world.frag` mixes it by alpha over color and material.
+- The corner table `DAT_002b34f0` is bottom ring then top ring, each (0,0) (1,0) (1,1) (0,1) in x,z; face 0 is the bottom and face 5 the top.
+
+## Traffic lights and street signs (2026-09-25)
+
+Implemented in `scene.cpp` (`build_city_traffic_light_poles`, street name index) and `render_gpu.cpp` (`draw_city_traffic_light_poles`).
+
+- Objects: `_area_interior_setobject` codes `(intersection << 12) | dir` with type `code & 0x7f` (1 = light), quarter turn `(code >> 10) & 3`, placed at the corner cell centre plus the type offset `(0, 3.25, -1)` rotated (`_area_interior_buildsectormodel @13120`).
+- Model: `GeneratedModel_BuildFromStaticTableSet675f @5b840` renders the type's collision boxes (`BuildBlock_GenerateCubeVerticesFaces @3fb90`, centred cubes). Type 1: post (0,0,0) 0.375x6x0.375, arm (0,3,-5) 0.25x0.25x10, heads (0,3,-6) and (0,3,-10) 0.3125x1x0.5. Type 4 (sign, drawn with the light's transform): (0,2.625,-8) 0.0625x0.5x2. All faces use UV (0,0) except the -X face of the last two boxes of types 1 and 4: (0,1) (1,1) (1,0) (0,0) on corners 4,7,3,0.
+- Signal textures (`_generatetexture @9a8cc`): 128x128 (32,32,32,a=32); lamp columns 40..87 at rows 84..107 red (255,32,32), 52..75 yellow (255,255,32), 20..43 green (32,255,32), a=255. `model.frag` draws alpha 1 unlit and alpha < 0.5 as dielectric roughness 0.5. The state per direction is `StreetIntersection` +0x54 + dir*4 (runtime); the editor shows state 0 (red).
+- Sign texture (`RenderStreetLabelTexture @9da10`): 256x64 cleared to (0, 0.25, 0, 0), street name in font 4 = `font/overpass` at size 52 centred on (128, 32), colour mask keeps alpha 0. Glyph advance = size * (base width - 0.5) / cell height. The street is the pole's neighbour at `unk0[7 + ((dir + 1) & 3)]` (south, west, north, east at +0x1c..+0x28), else `(dir - 1) & 3`, else street 0, with `dir = (rotation - 2) & 3`.
+- Street names (`MapConnector_AddStreetSegment @38e0`): along X, `(A.gz - 256) / 32` = 0..8 names First..Ninth Street; along Z, `(A.gx - 256) / 56` = 0..7 names Abrash, Bunten, Carmack, David, Eugene, Flinn, Garriott, Holland Ave. Otherwise the field keeps 0.

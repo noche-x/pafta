@@ -60,6 +60,18 @@ An invalid range yields an empty payload but leaves the directory metadata in
 the parsed entry. A truncated directory stops parsing at the last complete
 `0x40` record.
 
+## How the game finds it
+
+`World_LoadMapAndInitializeTerrain` (`@56980`) changes into `data/<map>` and
+`Csx_OpenAndIndexAssetArchive` (`@1979d0`) opens the fixed name `test.csx`,
+rejecting it unless the first word is `0xc5f17e01`. No other archive is read,
+so the editor saves the archive as `test.csx` next to `city2.sbc` (the only map
+name the game loads) and, when a folder holds `test.csx`, loads only that one.
+
+Buildblock templates never come from the archive: `BuildblockTemplate_LoadFromSbl`
+(`@27200`) reads loose `buildblock/<name>.sbl` files (header 1). The editor
+writes buildblocks there, not into the archive.
+
 ## Writer behavior
 
 `build_csx` recalculates all payload offsets, payload sizes, directory offset,

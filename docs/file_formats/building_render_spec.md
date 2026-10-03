@@ -342,6 +342,100 @@ the inset profile; window records are consumed by the separate opening/mask
 path. This distinction is why a full opaque window box is not a safe parity
 fix.
 
+## Game buildblock walls and windows (subrosa.exe, verified)
+
+The game keeps an exterior and an interior world. `InstantiateSbbVolumeIntoWorldAndMetadata
+@23ac0` writes a building cell's exterior block word (solid `0x40000000`) to the exterior
+world, and for interior block `0xffff` a procedural room (`_block_createbuildblock @1a990`,
+key packed from the four side codes, floor/ceiling bits and cell type) to the interior world
+(`_area_interior_createblock`). The interior world is not drawn from outside.
+
+Exterior: solid cells emit a face per bit of their world word; `World_SetTileBlockAndResolveNeighborLinks
+@f830` clears only the bits shared with solid neighbours, so side codes never cut holes in the
+shell. `_generatematerialwindowtexture @9a1a1` instead builds one texture-array layer per
+(wall texture, buildblock, layer): the wall texture, then alpha 1 over the layer's **bounds**
+rectangle. Window and door records are not read. `array_world.frag` uses the alpha as window
+shine, so from outside the whole bounds is a reflective opening, door layers included.
+
+Rooms: code 1 is a plain wall (`_block_addbasicsurface`). Codes 3..15 go through
+`BuildBlock_AddBeams @1a1c0`: the bounds is the opening, framed by up to four boxes
+(`_block_addbeam @19940`) 1/16 deep from the cell edge whose opening-facing faces take slot 6;
+the outer face is emitted only for portal type 0. Beam records are boxes: type 0 flush and 1/16
+deep, type 1 from -1/16 with depth 3/16, type 2 from -1/16 with depth 5/16, other types mullions
+1/64 deep at 1/128 (slot 7). `_block_addwindows @1a590` records a glass quad per window record
+at depth 1/64 (1/256 for portal type 1), only when the portal type is 0 or the side is north/east.
+The x origin mirrors as `1 - (x + width)` except for portal type 1 on the south/west sides.
+Door layers (portal type 1, bounds, no windows) are therefore open doorways inside and a
+reflective rectangle outside.
+
+LOD (`_render_buildsectorlist @11cc30`): a sector whose centre is in view and within 192 units
+(squared 36864) is near. Near sectors build and draw the interior world and skip every exterior
+face whose texture is the window-array texture (`DAT_64cff7e4`, flag `+0x10`), which
+`BuildCellRenderGeometryAndAdjacency` assigns to buildblock-coded faces. So up close the rooms,
+open doorways and see-through glass replace the reflective shell; plain walls and roofs remain.
+The editor chooses per placement (nearest bounds distance < 192) and draws room glass blended.
+
+Side codes (`Sbb_BuildBuildingConnectivityMetadata @29120`), shared by shell and rooms: north is
+the cell's own `+0x0c`, west its own `+0x10`, east the `(x+1)` cell's `+0x10`, south the `(z+1)`
+cell's `+0x0c`. A missing neighbour gives code 0.
+
+Room glass (RenderWorld, after the water pass): the alpha-quad list is drawn far to near with
+blend `(ONE, ONE_MINUS_SRC_ALPHA)`, depth writes off and culling off, using the glass program
+(vertex `@0x2f9820`, fragment `@0x2f9a10`). With `n` the quad normal and `v` toward the camera:
+`scale2 = min(0.5 + 0.5*(1-|v.n|)^3, 1)`, `scale = clamp((dist-32)*0.75/64, 0, 1) * (1-scale2)`.
+Front faces take the cubemap reflection, back faces `0.03125` grey; `rgb = c*scale2 +
+scale*ambient.b*0.5`, `a = scale2 + scale` (times 0.25 on back faces). The editor emits one quad
+per pane, wound out of its cell, so the front face is the outside. The editor resolves shadows
+after this pass by subtracting direct light, so the pane blends into the direct-light target too
+(scaling it by 1 - alpha) and leaves the packed depth of the surface behind.
+
+Legacy district faces (`World_LoadMapAndInitializeTerrain @56980`) pass `(texture != 0)`, so only
+texture 0 and 1 are used: 1 is `asphalt2.png`/`asphalt2_material.png`, 0 is the procedural
+128x128 grey noise (`Texture_GenerateProceduralNoise @99730`, material `0x60,0xc0,0`), not the
+CSX "concrete" texture. CSX textures start at index 4.
+
+Sun (`Game_RunFixedStep`): `angle = pi + t*2pi/5616000` when the game type is 4 (World),
+otherwise `pi + t*2pi/5184000`, with `t` the clock that `DrawGameInfo` shows as hour `t/216000`
+(`_resetgame` starts it at `0x244140`, 11:00). The server sends `sunTime` and the type; the client
+reads the type as 4 bits, so World-based modes with `type = 4 + 16` (Ultimate, rosaworld) run
+the 26-hour World sun against the 24-hour clock. RenderWorld rotates `normalize(0,1,0.5)` about
+`(0,0.447,-0.894)` with `Math_Vec3RotateAroundAxis @7b4d0`, which turns by `-angle` (raylib's
+rotation is the opposite sense). The editor uses the World cycle.
+
+v10 district cells (`World_LoadMapAndInitializeTerrain` legacy loop) are placed before the
+buildings; `InstantiateSbbVolumeIntoWorldAndMetadata` then writes every building cell with an
+exterior block word over the world cell, so district cells under a building are gone and the
+building's solids hide neighbouring district faces. Later-format city blocks are placed after
+the buildings.
+
+v12 cannot express v10 district cells exactly: `RemapCityBuildingDataLayersToLoadedMaterials
+@e6960` resolves each layer name against the texture name table (last match wins; slot 0 is
+"concrete", slots 1-3 are unnamed, CSX names start at 4), so the asphalt2 slot that every
+nonzero legacy grid entry uses has no name. The editor therefore keeps a map with legacy
+district cells at its version (saving it with `rebuild_sbc_layout`) and promotes only on an
+explicit piece edit.
+
+Shadows (`RenderQueuedShadowVolumeAdjacencyPass`): only exterior-world sectors cast, and the
+geometry shader extrudes only triangles turned away from the sun. Rooms are in the interior
+world and never cast; the inside of a closed shell is lit unless another away-facing face
+(an overhang, another building) covers it.
+
+Room key details (`InstantiateSbbVolumeIntoWorldAndMetadata`): an open side becomes code 2 when a
+neighbour's wall ends at that side's starting corner (north: the west cell's north wall or the
+north cell's west wall; the other sides by rotation), and code 2 adds two full-height 1/16 strips
+filling the corner notch. The ceiling bit is derived in `Sbb_BuildBuildingConnectivityMetadata
+@29120`: set on the top layer or when the cell above has no exterior block, no interior block, or
+its own floor. Room wall slots rotate with the side (`_block_addbeam`): 0..7 index the interior
+set, 8..15 the exterior set; N/E/S/W walls use interior 1/2/3/4, outer faces exterior 3/4/1/2,
+frames 6, mullions 7.
+
+Placement along a wall: `_block_addwindows` rotates its wall frame `(x, z) -> (1 - z, x)` per side,
+so it runs backwards on south and west walls; the exterior mask follows the face tangents (south
++x, west +z, north -x, east -z). Net, in world terms: type-0 rectangles are mirrored
+(`1 - (x + width)`) on north and east walls only, outside and inside alike; type-1 room
+rectangles are mirrored on every wall. Solid cells emit their bottom face unless a solid cell is
+below (`World_SetTileBlockAndResolveNeighborLinks @f830`), so overhangs show their underside.
+
 ## Editor preview versus world rendering
 
 The editor preview uses a dedicated GLSL 3.30 shader initialized by

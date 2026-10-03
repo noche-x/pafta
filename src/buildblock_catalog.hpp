@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -38,5 +39,16 @@ struct BuildblockCatalogEntry {
 // matching Buildblock_InitTemplateMeshCatalog. CSX buildblocks are appended by the
 // caller (they carry their own SBL geometry).
 std::vector<BuildblockCatalogEntry> build_native_builtin_catalog();
+
+// The street grade lookup tables as they sit in memory from DAT_0500aa14: ints
+// [0, 1024) are the lane-surface table (aa14), [1024, 2048) the side-curb table
+// (ba14). Entries the catalog never assigns stay 0, as in the zeroed globals.
+// MapConnector_PlaceStreetSegmentTilesAndSlopes indexes them from four bases:
+// aa14 (+0), aa54 (+16), aa90 (+31), aad0 (+47), and the same for ba.
+std::array<std::int32_t, 2048> native_grade_slot_table();
+
+// DAT_0500a70c[15]: the curb block (top plate with all four skirts) that
+// streets and intersection perimeters place one level above the road.
+inline constexpr std::uint32_t native_curb_block_id = 15U;
 
 } // namespace map_editor

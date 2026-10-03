@@ -61,10 +61,6 @@ Vector3 rotate_around_axis(Vector3 value, Vector3 axis, float radians) {
         scale(axis, dot(axis, value) * (1.0F - c)));
 }
 
-Vector3 horizontal_forward(Vector3 forward) {
-    return normalize_or({forward.x, 0.0F, forward.z}, {0.0F, 0.0F, -1.0F});
-}
-
 } // namespace
 
 Camera3D default_camera() {
@@ -80,7 +76,22 @@ float adjust_camera_fly_speed(float current_speed, float wheel_delta) {
     return std::clamp(speed, kMinFlySpeed, kMaxFlySpeed);
 }
 
-void update_free_fly_camera(Camera3D& camera, float fly_speed) {
+FlyInput read_fly_input() {
+    // WASD follows the view (W climbs when looking up), Space/Ctrl lift and
+    // sink, Shift slows, Z speeds up (Shift+Z slows further).
+    return {
+        IsKeyDown(KEY_W),
+        IsKeyDown(KEY_S),
+        IsKeyDown(KEY_A),
+        IsKeyDown(KEY_D),
+        IsKeyDown(KEY_SPACE),
+        IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL),
+        IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT),
+        IsKeyDown(KEY_Z),
+    };
+}
+
+void update_free_fly_camera(Camera3D& camera, float fly_speed, const FlyInput& input) {
     auto forward = normalize_or(subtract(camera.target, camera.position), {0.0F, 0.0F, -1.0F});
     const auto mouse_delta = GetMouseDelta();
     if (mouse_delta.x != 0.0F || mouse_delta.y != 0.0F) {
@@ -95,35 +106,9 @@ void update_free_fly_camera(Camera3D& camera, float fly_speed) {
         forward = normalize_or(rotate_around_axis(forward, right, target_pitch - current_pitch), forward);
     }
 
-    const auto forward_xz = horizontal_forward(forward);
-    const auto right_xz = normalize_or(cross(forward_xz, kWorldUp), {1.0F, 0.0F, 0.0F});
-    Vector3 movement{0.0F, 0.0F, 0.0F};
-    if (IsKeyDown(KEY_W)) {
-        movement = add(movement, forward_xz);
-    }
-    if (IsKeyDown(KEY_S)) {
-        movement = subtract(movement, forward_xz);
-    }
-    if (IsKeyDown(KEY_D)) {
-        movement = add(movement, right_xz);
-    }
-    if (IsKeyDown(KEY_A)) {
-        movement = subtract(movement, right_xz);
-    }
-    if (IsKeyDown(KEY_SPACE) || IsKeyDown(KEY_E)) {
-        movement = add(movement, kWorldUp);
-    }
-    if (IsKeyDown(KEY_Q)) {
-        movement = subtract(movement, kWorldUp);
-    }
-
-    const auto movement_len = length(movement);
-    if (movement_len > std::numeric_limits<float>::epsilon()) {
-        const auto boost = (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) ? 3.0F : 1.0F;
-        const auto step = adjust_camera_fly_speed(fly_speed, 0.0F) * boost * GetFrameTime();
-        const auto delta = scale(movement, step / movement_len);
-        camera.position = add(camera.position, delta);
-    }
+    const auto delta = fly_camera_step({forward.x, forward.y, forward.z}, input,
+        adjust_camera_fly_speed(fly_speed, 0.0F), GetFrameTime());
+    camera.position = add(camera.position, Vector3{delta.x, delta.y, delta.z});
 
     camera.up = kWorldUp;
     camera.target = add(camera.position, forward);
@@ -375,30 +360,6 @@ bool select_building_cell_by_index(const SbbBuilding& building, EditorUi& ui, st
     return false;
 }
 
-template <typename Building>
-std::optional<std::size_t> pick_building_cell_index_if_available(
-    const Building& building,
-    const Vec3& ray_origin,
-    const Vec3& ray_dir,
-    float unit_size,
-    std::optional<std::uint32_t> floor) {
-    if constexpr (requires { pick_building_cell(building, ray_origin, ray_dir, unit_size, floor); }) {
-        const auto pick = pick_building_cell(building, ray_origin, ray_dir, unit_size, floor);
-        if (pick.has_value()) {
-            return pick->cell_index;
-        }
-    } else {
-        (void)building;
-        (void)ray_origin;
-        (void)ray_dir;
-        (void)unit_size;
-        (void)floor;
-        // TODO(Agent A): This compiles before scene.hpp exposes pick_building_cell.
-        // Once Agent A declares it, the ADL guarded call above starts driving selection.
-    }
-    return std::nullopt;
-}
-
 bool select_building_cell_from_viewport(
     EditorProject& project,
     EditorUi& ui,
@@ -422,16 +383,18 @@ bool select_building_cell_from_viewport(
     const auto ray_dir = Vec3{ray.direction.x, ray.direction.y, ray.direction.z};
     constexpr auto unit_size = 4.0F;
 
-    const auto picked = pick_building_cell_index_if_available(building, ray_origin, ray_dir, unit_size, floor);
+    // The block whose rendered face is under the cursor, not the cell the ray
+    // starts in: the edit view's mesh carries each face's cell.
+    (void)unit_size;
+    (void)floor;
+    const auto picked = pick_building_face(project.building_floor_preview_render_buffer, ray_origin, ray_dir);
     if (!picked.has_value()) {
-        status = floor.has_value()
-            ? "no selectable cell on visible floor"
-            : "building cell picker unavailable until scene.hpp exposes pick_building_cell";
+        status = "nothing under the cursor";
         return false;
     }
 
-    if (!select_building_cell_by_index(building, ui, *picked)) {
-        status = "picker hit cell " + std::to_string(*picked) + " but it is not selectable";
+    if (!select_building_cell_by_index(building, ui, picked->cell_index)) {
+        status = "picker hit cell " + std::to_string(picked->cell_index) + " but it is not selectable";
         return false;
     }
     const auto occupied = occupied_cell_indices(building);

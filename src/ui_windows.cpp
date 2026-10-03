@@ -368,7 +368,9 @@ void reset_shortcuts(EditorUi& ui) {
 }
 
 bool action_pressed(const EditorUi& ui, EditorAction action) {
-    if (ui.capturing_shortcut.has_value()) return false;
+    // While flying (right mouse held, cursor captured) the keys steer the
+    // camera: Ctrl+S or Ctrl+Z must not save or undo mid-flight.
+    if (ui.capturing_shortcut.has_value() || IsCursorHidden()) return false;
     const auto& binding = ui.shortcuts[index_of(action)];
     if (binding.key == 0) return false;
     if (!IsKeyPressed(binding.key)) return false;
@@ -443,12 +445,26 @@ void load_preferences(EditorUi& ui) {
             ui.render_sky = value == "1";
         } else if (key == "render.shadow_distance") {
             ui.shadow_distance = std::clamp(std::strtof(value.c_str(), nullptr), 64.0F, 2000.0F);
-        } else if (key == "render.quality") {
-            ui.render_quality = std::clamp(std::atoi(value.c_str()), 0, 2);
         } else if (key == "render.terrain") {
             ui.render_terrain = std::atoi(value.c_str()) != 0;
+        } else if (key == "render.near_lod") {
+            ui.near_lod = value == "1";
+        } else if (key == "render.scale") {
+            ui.render_scale = std::clamp(std::strtof(value.c_str(), nullptr), 0.5F, 1.0F);
+        } else if (key == "render.building_distance") {
+            ui.building_distance = std::clamp(std::strtof(value.c_str(), nullptr), 0.0F, 4000.0F);
+        } else if (key == "render.half_textures") {
+            ui.half_textures = value == "1";
         } else if (key == "render.world_time") {
             ui.world_time_hours = std::clamp(std::strtof(value.c_str(), nullptr), 0.0F, 24.0F);
+        } else if (key == "view.coordinates") {
+            ui.show_coordinates = value == "1";
+        } else if (key == "map.street_labels") {
+            ui.map_menu.street_labels = value == "1";
+        } else if (key == "map.font") {
+            ui.map_menu.font = value;
+        } else if (key == "map.export_size") {
+            ui.map_export_size = std::clamp(std::atoi(value.c_str()), 64, 4096);
         } else if (key == "camera.fly_speed") {
             ui.camera_fly_speed = std::clamp(std::strtof(value.c_str(), nullptr), 2.0F, 512.0F);
         }
@@ -492,10 +508,17 @@ void save_preferences(const EditorUi& ui) {
     out << "render.shadows=" << (ui.render_shadows ? 1 : 0) << '\n';
     out << "render.sky=" << (ui.render_sky ? 1 : 0) << '\n';
     out << "render.shadow_distance=" << ui.shadow_distance << '\n';
-    out << "render.quality=" << ui.render_quality << '\n';
     out << "render.terrain=" << (ui.render_terrain ? 1 : 0) << '\n';
+    out << "render.near_lod=" << (ui.near_lod ? 1 : 0) << '\n';
+    out << "render.scale=" << ui.render_scale << '\n';
+    out << "render.building_distance=" << ui.building_distance << '\n';
+    out << "render.half_textures=" << (ui.half_textures ? 1 : 0) << '\n';
     out << "render.world_time=" << ui.world_time_hours << '\n';
     out << "camera.fly_speed=" << ui.camera_fly_speed << '\n';
+    out << "view.coordinates=" << (ui.show_coordinates ? 1 : 0) << '\n';
+    out << "map.street_labels=" << (ui.map_menu.street_labels ? 1 : 0) << '\n';
+    out << "map.font=" << ui.map_menu.font << '\n';
+    out << "map.export_size=" << ui.map_export_size << '\n';
     for (std::size_t i = 0; i < kShortcutInfos.size(); ++i) {
         const auto& s = ui.shortcuts[i];
         out << "shortcut." << kShortcutInfos[i].name << '=' << s.key << ',' << (s.ctrl ? 1 : 0) << ','
@@ -710,8 +733,10 @@ void draw_shortcuts_table(EditorUi& ui, bool editable) {
             {"Orbit camera", "Alt + left drag"},
             {"Pan camera", "Middle drag"},
             {"Zoom toward cursor", "Mouse wheel"},
-            {"Fly camera", "Hold right mouse + WASD"},
-            {"Fly up / down / faster", "E or Space / Q / Shift"},
+            {"Fly camera (along view)", "Hold right mouse + WASD"},
+            {"Fly up / down", "Space / Ctrl"},
+            {"Fly slower / faster / slowest", "Shift / Z / Shift+Z"},
+            {"Fly speed", "Mouse wheel while flying"},
             {"Road left width", "[  ]"},
             {"Road right width", ";  '"},
             {"Cancel drag / end road", "Esc"},
@@ -741,14 +766,19 @@ void draw_shortcuts_table(EditorUi& ui, bool editable) {
     }
 }
 
+// The world clock that places the sun (set_game_world_time), shown as hh:mm.
+bool draw_world_time_slider(EditorUi& ui) {
+    const auto minutes = static_cast<int>(std::lround(ui.world_time_hours * 60.0F)) % (24 * 60);
+    char label[16];
+    std::snprintf(label, sizeof(label), "%02d:%02d", minutes / 60, minutes % 60);
+    field_label("Time of day");
+    return ImGui::SliderFloat("##world_time", &ui.world_time_hours, 0.0F, 24.0F, label);
+}
+
 void draw_preferences_contents(EditorUi& ui) {
     bool changed = false;
     ImGui::SeparatorText("Rendering");
-    const char* quality_items[] = {"Low", "Balanced", "High"};
-    field_label("Quality");
-    if (ImGui::Combo("##quality", &ui.render_quality, quality_items, 3)) {
-        changed = true;
-    }
+    changed |= draw_world_time_slider(ui);
     changed |= ImGui::Checkbox("Draw terrain", &ui.render_terrain);
     changed |= ImGui::Checkbox("Shadows", &ui.render_shadows);
     ImGui::SameLine();
@@ -757,6 +787,28 @@ void draw_preferences_contents(EditorUi& ui) {
     field_label("Shadow range");
     changed |= ImGui::SliderFloat("##shadow_distance", &ui.shadow_distance, 64.0F, 2000.0F, "%.0f");
     ImGui::EndDisabled();
+
+    ImGui::SeparatorText("Performance");
+    changed |= ImGui::Checkbox("Interiors up close (game LOD)", &ui.near_lod);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Like the game: within 192 units buildings show their rooms through open doors and\n"
+                          "see-through windows; farther away the reflective shell. Off: always the shell (cheaper).");
+    }
+    field_label("Render scale");
+    changed |= ImGui::SliderFloat("##render_scale", &ui.render_scale, 0.5F, 1.0F, "%.2fx");
+    field_label("Building distance");
+    changed |= ImGui::SliderFloat("##building_distance", &ui.building_distance, 0.0F, 4000.0F,
+        ui.building_distance <= 0.0F ? "unlimited" : "%.0f");
+    changed |= ImGui::Checkbox("Half-resolution textures", &ui.half_textures);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Quarters texture memory. Takes effect the next time a map loads.");
+    if (ImGui::Button("Low-end preset")) {
+        ui.near_lod = false;
+        ui.render_scale = 0.75F;
+        ui.building_distance = 900.0F;
+        ui.render_shadows = false;
+        ui.half_textures = true;
+        changed = true;
+    }
 
     ImGui::SeparatorText("Camera");
     field_label("Fly speed");
@@ -879,7 +931,7 @@ void draw_building_browser_window(EditorProject& project, EditorUi& ui) {
                 -static_cast<float>(asset.data.anchor_z) * 4.0F,
             };
             const bool ready = ui.browser_building < project.building_gpu_models.size() &&
-                !project.building_gpu_models[ui.browser_building].chunks.empty();
+                !project.building_gpu_models[ui.browser_building].empty();
             draw_preview_view(ui.building_preview, "bb", ImVec2(side, side), center, radius, [&] {
                 if (ready) {
                     draw_gpu_building_model_public(project.building_gpu_models[ui.browser_building], anchor_offset, 0);
@@ -1044,6 +1096,116 @@ void draw_buildblock_window(EditorProject& project, EditorUi& ui, std::string& s
         draw_buildblock_face_canvas(project, ui);
     }
     ImGui::EndChild();
+    ImGui::End();
+}
+
+// The in-game map screen as DrawMapMenu draws it (map_menu_texture), with the
+// street/avenue names toggle, their font, and a PNG export.
+void draw_map_image_window(EditorProject& project, EditorUi& ui) {
+    if (!ui.show_map_image_window) return;
+    place_floating_window(ui, 2, ImVec2(560.0F, 640.0F));
+    if (!ImGui::Begin(ICON_FA_MAP " Map image###MapImage", &ui.show_map_image_window)) {
+        ImGui::End();
+        return;
+    }
+    const bool auto_generated = project.root.filename() == "round";
+    bool changed = false;
+    // The game prints no names on auto-generated maps (DrawMapMenu).
+    ImGui::BeginDisabled(auto_generated);
+    changed |= ImGui::Checkbox("Street names", &ui.map_menu.street_labels);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!ui.map_menu.street_labels);
+    static std::vector<MapFontChoice> choices;
+    static std::filesystem::path choices_root;
+    if (choices_root != project.root) {
+        choices = map_font_choices(project);
+        choices_root = project.root;
+    }
+    const auto current = std::ranges::find(choices, ui.map_menu.font, &MapFontChoice::key);
+    const std::string preview = current != choices.end() ? current->label
+        : ui.map_menu.font.starts_with("game:") ? ui.map_menu.font.substr(5) + " (missing)" : "Default";
+    ImGui::SetNextItemWidth(220.0F);
+    if (ImGui::BeginCombo("##map_font", preview.c_str(), ImGuiComboFlags_HeightLarge)) {
+        static char filter[64] = "";
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        ImGui::SetNextItemWidth(-1.0F);
+        ImGui::InputTextWithHint("##font_filter", "Search fonts", filter, sizeof(filter));
+        const auto lower = [](std::string text) {
+            std::ranges::transform(text, text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return text;
+        };
+        const auto needle = lower(filter);
+        for (const auto& choice : choices) {
+            if (!needle.empty() && lower(choice.label).find(needle) == std::string::npos) continue;
+            if (ImGui::Selectable(choice.label.c_str(), choice.key == ui.map_menu.font)) {
+                ui.map_menu.font = choice.key;
+                changed = true;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    static constexpr int sizes[] = {512, 1024, 2048, 4096};
+    ImGui::SetNextItemWidth(90.0F);
+    if (ImGui::BeginCombo("##map_export_size", (std::to_string(ui.map_export_size) + " px").c_str())) {
+        for (const auto size : sizes) {
+            if (ImGui::Selectable((std::to_string(size) + " px").c_str(), size == ui.map_export_size)) {
+                ui.map_export_size = size;
+                changed = true;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(ICON_FA_FILE_EXPORT " Export PNG")) ui.map_export_requested = true;
+    if (changed) save_preferences(ui);
+
+    const auto avail = ImGui::GetContentRegionAvail();
+    const float side = std::max(64.0F, std::min(avail.x, avail.y));
+    const auto* image = map_menu_texture(project,
+        static_cast<int>(std::lround(side * ImGui::GetIO().DisplayFramebufferScale.x)), ui.map_menu);
+    if (image == nullptr) {
+        ImGui::TextDisabled(auto_generated ? "This map has no map.png." : "The city is still being built.");
+        ImGui::End();
+        return;
+    }
+    // Render textures are stored bottom-up.
+    const auto origin = ImGui::GetCursorScreenPos();
+    ImGui::Image(ImTextureID(image->id), ImVec2(side, side), ImVec2(0.0F, 1.0F), ImVec2(1.0F, 0.0F));
+
+    // Map units to world, as DrawMapMenu places things: map = (world - legend)
+    // * scale, over a view of half-extent 128 around map (120, 120), or (128,
+    // 128) with legend (960, 896) and scale 0.25 on auto-generated maps.
+    const float center = auto_generated ? 128.0F : 120.0F;
+    const float scale = auto_generated ? 0.25F : 0.125F;
+    const ImVec2 legend = auto_generated ? ImVec2(960.0F, 896.0F) : ImVec2(896.0F, 896.0F);
+    const auto to_screen = [&](float world_x, float world_z) {
+        return ImVec2(origin.x + ((world_x - legend.x) * scale - center + 128.0F) / 256.0F * side,
+                      origin.y + ((world_z - legend.y) * scale - center + 128.0F) / 256.0F * side);
+    };
+    // The editor camera: a dot with a heading tick, like the game's chevron.
+    auto* draw = ImGui::GetWindowDrawList();
+    const auto camera = to_screen(ui.view_camera_position.x, ui.view_camera_position.z);
+    const Vector2 heading{ui.view_camera_target.x - ui.view_camera_position.x, ui.view_camera_target.z - ui.view_camera_position.z};
+    const auto heading_length = std::hypot(heading.x, heading.y);
+    if (heading_length > 1e-3F) {
+        const ImVec2 tip{camera.x + heading.x / heading_length * 12.0F, camera.y + heading.y / heading_length * 12.0F};
+        draw->AddLine(camera, tip, IM_COL32(255, 215, 90, 255), 2.5F);
+    }
+    draw->AddCircleFilled(camera, 5.0F, IM_COL32(255, 215, 90, 255));
+    draw->AddCircle(camera, 5.0F, IM_COL32(20, 20, 20, 255), 0, 1.5F);
+
+    if (ImGui::IsItemHovered()) {
+        const auto mouse = ImGui::GetMousePos();
+        const auto map_x = center - 128.0F + (mouse.x - origin.x) / side * 256.0F;
+        const auto map_z = center - 128.0F + (mouse.y - origin.y) / side * 256.0F;
+        const auto world_x = map_x / scale + legend.x;
+        const auto world_z = map_z / scale + legend.y;
+        ImGui::SetTooltip("X %.1f  Z %.1f\ncell %d, %d", world_x, world_z,
+            static_cast<int>(std::floor(world_x / 4.0F)), static_cast<int>(std::floor(world_z / 4.0F)));
+    }
     ImGui::End();
 }
 

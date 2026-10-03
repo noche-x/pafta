@@ -4,8 +4,11 @@
 #include "profiler.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
+#include <tuple>
 #include <limits>
+#include <span>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -73,6 +76,27 @@ std::optional<PortalRect> portal_rect_for_side(
         return portal_rect(1.0F - (x + width), width, y, height);
     }
     return portal_rect(x, width, y, height);
+}
+
+// Where subrosa.exe puts a layer rectangle on a building wall, as u along the
+// wall (N/S walls: +x, E/W walls: +z) in cell fractions.
+// Outside (the far LOD) the rectangle is drawn into the wall texture unmirrored
+// (_generatematerialwindowtexture) and the face UVs follow the face tangent
+// (DAT_002b35a0: south +x, west +z, north -x, east -z), so it comes out
+// mirrored on north and east walls only.
+std::optional<PortalRect> building_exterior_rect(PortalSide side, float x, float width, float y, float height) {
+    if (side == PortalSide::North || side == PortalSide::East) return portal_rect(1.0F - (x + width), width, y, height);
+    return portal_rect(x, width, y, height);
+}
+// Inside (the room, BuildBlock_AddBeams / _block_addwindows) x is mirrored as
+// 1 - (x + width) except for portal type 1 on the south/west sides, in a wall
+// frame that _block_addwindows rotates (x,z) -> (1 - z, x) per side, which runs
+// backwards on south and west walls. Net: mirrored on north and east walls,
+// and on every wall for portal type 1. Type 0 therefore lines up with the
+// exterior rectangle, as in the game.
+std::optional<PortalRect> building_room_rect(const SblLayer& layer, PortalSide side, float x, float width, float y, float height) {
+    if (layer.portal_type == 1U) return portal_rect(1.0F - (x + width), width, y, height);
+    return building_exterior_rect(side, x, width, y, height);
 }
 
 PortalRect unit_portal_rect() {
@@ -355,7 +379,7 @@ bool cell_has_exterior_surface(const SbbCell* cell) {
     return cell != nullptr && is_solid_building_cell(*cell);
 }
 
-PortalSideCodes native_edge_side_codes(const SbbCell& cell, const SbbCell* east) {
+PortalSideCodes native_edge_side_codes(const SbbCell& cell, const SbbCell* east, const SbbCell* south) {
     // BuildBuildingBlockRenderBuffers_1400799d0.c:136-141 fills edgeFlags for
     // faces 1..4; lines 177-180 consume edgeFlags[face-1] as layer index+3.
     // Native face -> C++ side mapping from lines 149-152:
@@ -364,7 +388,9 @@ PortalSideCodes native_edge_side_codes(const SbbCell& cell, const SbbCell* east)
     return {
         cell.exterior_portal_face(), // face 3 / North: BuildingCell +0x0c.
         cell.interior_portal_face(), // face 2 / West: BuildingCell +0x10.
-        cell.exterior_portal_face(), // face 1 / South: BuildingCell +0x0c.
+        // face 1 / South: the south neighbour's +0x0c (Sbb_BuildBuildingConnectivityMetadata
+        // @29120 reads the record one z row on), not this cell's.
+        south == nullptr ? 0U : south->exterior_portal_face(),
         east == nullptr ? 0U : east->interior_portal_face(), // face 4 / East: east-neighbor +0x10.
     };
 }
@@ -720,6 +746,12 @@ std::uint32_t material_for_piece_face(const SbbCell& cell, std::uint32_t slot, b
         return material_for_cell_slot(cell, slot < 8U ? slot + 8U : slot < 16U ? slot - 8U : 0U);
     }
     return material_for_cell_slot(cell, std::min(slot, 7U));
+}
+
+// The cell.shorts slot material_for_piece_face reads for a piece face.
+std::uint32_t piece_face_slot(std::uint32_t slot, bool interior) {
+    if (interior) return slot < 8U ? slot + 8U : slot < 16U ? slot - 8U : 0U;
+    return std::min(slot, 7U);
 }
 
 std::array<Vec3, 4> native_preview_cube_face_vertices(const SbbCell& cell, std::uint32_t face, float unit_size) {
@@ -1095,12 +1127,18 @@ std::optional<PortalSide> portal_side_for_building_face(BuildingFaceSide side) {
     }
 }
 
+// Sbb_BuildBuildingConnectivityMetadata @29120: face 1 (+Z) reads the cell at
+// z+1's +0x0c, face 2 (-X) this cell's +0x10, face 3 (-Z) this cell's +0x0c,
+// face 4 (+X) the cell at x+1's +0x10. Each side code sits on the wall between
+// two cells, shared by both.
 std::uint32_t city_buildblock_side_code_for_face(
     const SbbCell& cell,
     const SbbCell* east,
+    const SbbCell* south,
     BuildingFaceSide side) {
     switch (side) {
         case BuildingFaceSide::South:
+            return south == nullptr ? 0U : south->exterior_portal_face();
         case BuildingFaceSide::North:
             return cell.exterior_portal_face();
         case BuildingFaceSide::West:
@@ -1120,22 +1158,6 @@ const SblLayer* buildblock_layer_for_side_code(const SblTemplate* template_file,
     }
     const auto layer_index = static_cast<std::size_t>(side_code - 3U);
     return layer_index < template_file->layers.size() ? &template_file->layers[layer_index] : nullptr;
-}
-
-std::vector<PortalRect> city_buildblock_window_rects(const SblLayer& layer, PortalSide side) {
-    const auto bounds = portal_rect_for_side(layer, side, layer.bounds[0], layer.bounds[1], layer.bounds[2], layer.bounds[3]);
-    if (!bounds.has_value()) {
-        return {};
-    }
-
-    std::vector<PortalRect> rects;
-    for (const auto& window : layer.windows) {
-        const auto rect = portal_rect_for_side(layer, side, window.x, window.width, window.y, window.height);
-        if (rect.has_value() && rects_intersect(*bounds, *rect)) {
-            rects.push_back(*rect);
-        }
-    }
-    return rects;
 }
 
 std::vector<PortalRect> subtract_city_window_rects(const std::vector<PortalRect>& windows) {
@@ -1184,8 +1206,9 @@ void add_native_solid_cell_faces(
     float cx,
     float cy,
     float cz,
-    const std::array<SolidCellFaceCheck, 5>& native_sides,
+    std::span<const SolidCellFaceCheck> native_sides,
     const SbbCell* east,
+    const SbbCell* south,
     const SblTemplate* template_file,
     MaterialSelector select_material,
     CellTopSlope top_slope = {}) {
@@ -1201,18 +1224,24 @@ void add_native_solid_cell_faces(
         // interiorBlock == 0xffff). An interior piece owns that side's
         // geometry and must not inherit the exterior window mask.
         if (portal_side.has_value() && cell.interior_block() == 0xffffU) {
-            const auto side_code = city_buildblock_side_code_for_face(cell, east, side.side);
+            const auto side_code = city_buildblock_side_code_for_face(cell, east, south, side.side);
             if (const auto* layer = buildblock_layer_for_side_code(template_file, side_code)) {
-                // FUN_140051c60 emits the window rectangles. The game then builds
-                // a per-signature texture-array layer from the wall texture and
-                // writes the window mask into its alpha channel. Keep the wall
-                // material on these separate quads so the shader sees the same
-                // base color instead of an unrelated replacement texture.
-                window_rects = city_buildblock_window_rects(*layer, *portal_side);
+                // _generatematerialwindowtexture @9a1a1 builds one texture-array
+                // layer per (wall texture, buildblock, layer): the wall texture,
+                // then alpha 1 over the layer's BOUNDS rectangle; the window and
+                // door records are not read. array_world.frag uses that alpha as
+                // shine, so from outside the whole bounds is a reflective opening,
+                // door layers (bounds, no windows) included. Keep the wall
+                // material on these quads so the shader sees the same base color.
+                if (const auto bounds = building_exterior_rect(
+                        *portal_side, layer->bounds[0], layer->bounds[1], layer->bounds[2], layer->bounds[3])) {
+                    window_rects.push_back(*bounds);
+                }
             }
         }
 
         const auto wall_material = select_material(side.side);
+        const auto first_triangle = buffer.triangles.size();
         const auto wall_rects = window_rects.empty()
             ? std::vector<PortalRect>{unit_portal_rect()}
             : subtract_city_window_rects(window_rects);
@@ -1242,6 +1271,9 @@ void add_native_solid_cell_faces(
                 true,
                 top_slope);
         }
+        if (!window_rects.empty()) {
+            for (auto t = first_triangle; t < buffer.triangles.size(); ++t) buffer.triangles[t].far_only = true;
+        }
     }
 }
 
@@ -1263,7 +1295,8 @@ void add_native_city_block_solid_cell(
     BuildingRenderBuffer& buffer,
     VertexIndexMap& vertex_indices,
     Vec3 origin,
-    MaterialSelector select_material) {
+    MaterialSelector select_material,
+    std::array<bool, 5> covered = {}) {
     const auto cell = native_city_block_solid_cell();
     const auto half = buffer.unit_size * 0.5F;
     const auto cx = origin.x + half;
@@ -1271,12 +1304,14 @@ void add_native_city_block_solid_cell(
     const auto cz = origin.z + half;
     // BuildBuildingBlockRenderBuffers emits native faces 1..5 for solid cells;
     // face 0/down stays absent here, matching the existing building solid path.
+    // A side covered by a solid neighbour is not emitted (exposed-face mask).
+    const auto neighbor = [&](std::size_t i) { return covered[i] ? &cell : nullptr; };
     const std::array<SolidCellFaceCheck, 5> exposed_sides{{
-        {BuildingFaceSide::South, nullptr},
-        {BuildingFaceSide::West, nullptr},
-        {BuildingFaceSide::North, nullptr},
-        {BuildingFaceSide::East, nullptr},
-        {BuildingFaceSide::Up, nullptr},
+        {BuildingFaceSide::South, neighbor(0)},
+        {BuildingFaceSide::West, neighbor(1)},
+        {BuildingFaceSide::North, neighbor(2)},
+        {BuildingFaceSide::East, neighbor(3)},
+        {BuildingFaceSide::Up, neighbor(4)},
     }};
 
     add_native_solid_cell_faces(
@@ -1287,6 +1322,7 @@ void add_native_city_block_solid_cell(
         cy,
         cz,
         exposed_sides,
+        nullptr,
         nullptr,
         nullptr,
         select_material);
@@ -1425,51 +1461,45 @@ struct CityTileKeyHash {
 };
 
 struct CityTileValue {
+    std::uint32_t block{};
+    std::array<std::uint16_t, 8> faces{};
     CityTileKind kind{};
-    // World Y of the walkable top surface at the cell center. For roads this is
-    // the drivable asphalt plane (native level * 4.0 + 4.25); for curbs it is the
-    // concrete plate top (road surface + 0.25).
-    float top_y{};
-    // World-Y gradient of the top surface, per +1 cell along each axis. Drives
-    // the tilted top so a sloping street reads as a continuous grade.
+    float base_y{};
     float slope_x{};
     float slope_z{};
-    // SbcMap::streets index that laid this tile (-1 for intersection tiles, which
-    // belong to no single street). Lets clicks on the real asphalt resolve to a
-    // road.
     std::int32_t street_index{-1};
+    std::int32_t intersection_index{-1};
 };
 
 using CityTileMap = std::unordered_map<CityTileKey, CityTileValue, CityTileKeyHash>;
 
-bool city_tile_kind_overrides(CityTileKind incoming, CityTileKind current) {
-    return incoming == CityTileKind::Road && current == CityTileKind::Curb;
-}
+constexpr std::uint32_t kNativeSolidBlock = 0x40000000U;
+constexpr std::uint32_t kNativeMeshBlock = 0x80000000U;
+using NativeFaceArray = std::array<std::uint16_t, 8>;
+constexpr NativeFaceArray kFacesZero{};
+constexpr NativeFaceArray kFacesOne{1, 1, 1, 1, 1, 1, 1, 1};
 
+// World_SetTileBlockAndResolveNeighborLinks @f830 overwrites the cell, so the
+// last placement wins. The street owner is editor metadata for picking: an
+// intersection fill keeps the street that paved the cell first.
 void set_city_tile(
     CityTileMap& tiles,
     std::int32_t x,
     std::int32_t y,
     std::int32_t z,
+    std::uint32_t block,
+    const NativeFaceArray& faces,
     CityTileKind kind,
-    float top_y,
+    std::int32_t street_index = -1,
     float slope_x = 0.0F,
     float slope_z = 0.0F,
-    std::int32_t street_index = -1) {
-    const CityTileKey key{x, y, z};
-    const auto [match, inserted] = tiles.emplace(key, CityTileValue{kind, top_y, slope_x, slope_z, street_index});
-    if (!inserted) {
-        if (city_tile_kind_overrides(kind, match->second.kind)) {
-            match->second.kind = kind;
-            match->second.top_y = top_y;
-            match->second.slope_x = slope_x;
-            match->second.slope_z = slope_z;
-            match->second.street_index = street_index;
-        } else if (match->second.street_index < 0 && street_index >= 0) {
-            // Adopt a street owner if this tile didn't have one yet.
-            match->second.street_index = street_index;
-        }
-    }
+    float top_center = std::numeric_limits<float>::quiet_NaN()) {
+    auto& tile = tiles[CityTileKey{x, y, z}];
+    const auto owner = street_index >= 0 ? street_index : tile.street_index;
+    // Cell y spans y*4+0.25 .. y*4+4.25; sloped tiles report the grade at the
+    // cell centre for the road outline and picking.
+    const auto base_y = std::isnan(top_center) ? static_cast<float>(y) * 4.0F + 0.25F : top_center - 4.0F;
+    tile = {block, faces, kind, base_y, slope_x, slope_z, owner};
 }
 
 // -----------------------------------------------------------------------------
@@ -1503,6 +1533,11 @@ struct NativeCityStreet {
     std::int32_t left_width{};   // native unk1[1] (startOffset)
     std::int32_t right_width{};  // native unk1[2] (endOffset)
     std::int32_t source_index{-1}; // index into SbcMap::streets this came from
+    // Generated name (MapConnector_AddStreetSegment @38e0): from the start
+    // intersection, (gz - 256) / 32 names First..Ninth Street along X and
+    // (gx - 256) / 56 names Abrash..Holland Ave along Z. Out-of-range positions
+    // keep the zeroed field, which reads as First Street.
+    std::int32_t name_index{};
 };
 
 struct NativeCityGraph {
@@ -1547,6 +1582,13 @@ NativeCityGraph build_native_city_graph(const SbcMap& map) {
         native.source_index = static_cast<std::int32_t>(street_src);
         native.left_width = std::max(0, ordered_street.left_width);
         native.right_width = std::max(0, ordered_street.right_width);
+        if (orientation == 0) {
+            const auto row = (graph.intersections[a].gz - 256) / 32;
+            native.name_index = row >= 0 && row <= 8 ? row : 0;
+        } else {
+            const auto column = (graph.intersections[a].gx - 256) / 56;
+            native.name_index = column >= 0 && column <= 7 ? 9 + column : 0;
+        }
         const auto street_index = static_cast<std::int32_t>(graph.streets.size());
         auto& from = graph.intersections[a];
         auto& to = graph.intersections[b];
@@ -1595,13 +1637,23 @@ void expand_native_city_extents(NativeCityGraph& graph) {
 // for the terrain patch when all four of its corners are stamped > 0.
 struct CityCornerStampMap {
     std::unordered_map<std::uint64_t, float> heights;
+    // Land-use mask (g_landUseMaskBits): cells whose bit a stamp cleared. The
+    // landscape shader discards terrain there (landscape.frag, land_usemask).
+    // Only cells inside the intersections' bounding box are cleared.
+    std::unordered_set<std::uint64_t> masked;
+    std::int32_t mask_min_x{}, mask_max_x{-1}, mask_min_z{}, mask_max_z{-1};
+    // isMapAutoGenerated: UpdateMapTopHeightAndClearOccupancyBit does nothing.
+    bool disabled{};
 
     static std::uint64_t key(std::int32_t gx, std::int32_t gz) {
         return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(gx)) << 32U) |
             static_cast<std::uint64_t>(static_cast<std::uint32_t>(gz));
     }
 
+    // UpdateMapTopHeightAndClearOccupancyBit @3fa40.
     void stamp(std::int32_t gx, std::int32_t gz, float height) {
+        if (disabled || static_cast<std::uint32_t>(gx) >= 0xfffU || static_cast<std::uint32_t>(gz) >= 0xfffU) return;
+        if (gx >= mask_min_x && gx <= mask_max_x && gz >= mask_min_z && gz <= mask_max_z) masked.insert(key(gx, gz));
         const std::array<std::pair<std::int32_t, std::int32_t>, 4> corners{{
             {gx, gz}, {gx + 1, gz}, {gx, gz + 1}, {gx + 1, gz + 1},
         }};
@@ -1658,7 +1710,8 @@ void stamp_city_building_footprints(
         const auto& placement = map.buildings[index];
         const auto height = static_cast<float>(placement.y) * 4.0F;
         for (const auto& cell : building->cells) {
-            if (!cell.occupied || cell.y != building->anchor_y) {
+            // The anchor layer's placed cells (those with an exterior block word).
+            if (cell.exterior_block() == 0U || cell.y != building->anchor_y) {
                 continue;
             }
             const Vec3 local{
@@ -1675,17 +1728,96 @@ void stamp_city_building_footprints(
     }
 }
 
+// Later world writes replace street cells. Streets are placed first; district
+// cells (ApplyAllCityDistrictCellsToWorld @20000) then overwrite their cell, and
+// InstantiateSbbVolumeIntoWorldAndMetadata @23ac0 deletes the block in every
+// occupied cell of the building volume before writing the building's own.
+void remove_replaced_city_tiles(
+    std::vector<CityTileCell>& tiles,
+    const SbcMap& map,
+    const std::vector<const SbbBuilding*>& placement_buildings) {
+    std::unordered_set<CityTileKey, CityTileKeyHash> replaced;
+    for (const auto& portal : map.portals) {
+        const auto& voxels = portal.voxel_blocks();
+        const auto count = std::min<std::size_t>(voxels.size(), 0x200);
+        for (std::size_t i = 0; i < count; ++i) {
+            if (voxels[i] == 0U) continue;
+            replaced.insert({portal.fields[1] * 8 + static_cast<std::int32_t>(i & 7U),
+                portal.fields[2] * 8 + static_cast<std::int32_t>((i >> 6U) & 7U),
+                portal.fields[3] * 8 + static_cast<std::int32_t>((i >> 3U) & 7U)});
+        }
+    }
+    for (std::size_t index = 0; index < map.buildings.size() && index < placement_buildings.size(); ++index) {
+        const auto* building = placement_buildings[index];
+        if (building == nullptr) continue;
+        const auto& placement = map.buildings[index];
+        for (const auto& cell : building->cells) {
+            // Only cells with an exterior block word are deleted and rewritten.
+            if (cell.exterior_block() == 0U) continue;
+            const Vec3 local{
+                (static_cast<float>(cell.x) - static_cast<float>(building->anchor_x) + 0.5F) * 4.0F,
+                0.0F,
+                (static_cast<float>(cell.z) - static_cast<float>(building->anchor_z) + 0.5F) * 4.0F,
+            };
+            const auto world = native_city_building_transform_point(placement, local, 4.0F);
+            replaced.insert({static_cast<std::int32_t>(std::floor(world.x / 4.0F)),
+                placement.y + static_cast<std::int32_t>(cell.y) - static_cast<std::int32_t>(building->anchor_y),
+                static_cast<std::int32_t>(std::floor(world.z / 4.0F))});
+        }
+    }
+    if (replaced.empty()) return;
+    std::erase_if(tiles, [&](const CityTileCell& tile) { return replaced.contains({tile.x, tile.y, tile.z}); });
+}
+
+} // namespace
+
+// Per placement, the cells a later placement overwrites. The game deletes the
+// world cell under every building cell with an exterior block word before it
+// writes its own (InstantiateSbbVolumeIntoWorldAndMetadata @23ac0), so where
+// placements overlap the later one wins.
+std::vector<std::vector<std::size_t>> overwritten_building_cells(
+    const SbcMap& map,
+    const std::vector<const SbbBuilding*>& placement_buildings) {
+    std::vector<std::vector<std::size_t>> overwritten(map.buildings.size());
+    std::unordered_set<CityTileKey, CityTileKeyHash> claimed;
+    for (std::size_t index = std::min(map.buildings.size(), placement_buildings.size()); index-- > 0;) {
+        const auto* building = placement_buildings[index];
+        if (building == nullptr) continue;
+        const auto& placement = map.buildings[index];
+        for (std::size_t c = 0; c < building->cells.size(); ++c) {
+            const auto& cell = building->cells[c];
+            if (!cell.occupied || cell.exterior_block() == 0U) continue;
+            const Vec3 local{
+                (static_cast<float>(cell.x) - static_cast<float>(building->anchor_x) + 0.5F) * 4.0F,
+                0.0F,
+                (static_cast<float>(cell.z) - static_cast<float>(building->anchor_z) + 0.5F) * 4.0F,
+            };
+            const auto world = native_city_building_transform_point(placement, local, 4.0F);
+            const CityTileKey key{static_cast<std::int32_t>(std::floor(world.x / 4.0F)),
+                placement.y + static_cast<std::int32_t>(cell.y) - static_cast<std::int32_t>(building->anchor_y),
+                static_cast<std::int32_t>(std::floor(world.z / 4.0F))};
+            if (!claimed.insert(key).second) overwritten[index].push_back(c);
+        }
+    }
+    return overwritten;
+}
+
+namespace {
+
 // Street tile placement (MapConnector_PlaceStreetSegmentTilesAndSlopes @20580).
-// Lane cells are solid asphalt tiles at the current integer height level; curbs
-// are block-mesh plates one level above. The slope is a centered integer
-// run-length region between the two intersection footprints; the editor renders
-// it as a continuous tilted top (equivalent to the game's pre-baked 1/16-step
-// tilted block meshes per Buildblock_InitTemplateMeshCatalog @10110).
+// Lanes are solid cells at the current level with the lane marking code in face
+// slot 5 (the top). Inside the centered run-length slope region they become
+// grade blocks from the aa14 table, with the code also in slot 0 (the grade
+// quad's material). Curbs are the curb block one level up, and grade side
+// blocks from the ba14 table at the lane level inside the slope region.
+// Branch 0 (orientation 0) walks +X with lanes offset in Z and uses table edges
+// 0 (up) / 2 (down); branch 1 walks +Z with lanes in X and edges 1 / 3.
 void place_native_street_tiles(
     CityTileMap& tiles,
     CityCornerStampMap& stamps,
     const NativeCityGraph& graph,
     const NativeCityStreet& street) {
+    static const auto grade_slots = native_grade_slot_table();
     if (street.a < 0 || street.b < 0) {
         return;
     }
@@ -1696,71 +1828,89 @@ void place_native_street_tiles(
     const auto start = along_x ? from.gx + from.ext_x_pos : from.gz + from.ext_z_pos;
     const auto seg_len = (along_x ? to.gx - to.ext_x_neg : to.gz - to.ext_z_neg) - start;
     const auto center = along_x ? from.gz : from.gx;
-    if (seg_len <= 0) {
-        return;
-    }
 
     const auto delta = to.level - from.level;
     const auto abs_delta = std::abs(delta);
+    // ponytail: the game divides by zero when a street is shorter than its climb;
+    // clamp the run length to 1 instead of reproducing the crash.
     const auto run_len = abs_delta > 0 ? std::max(1, seg_len / abs_delta) : 6;
     const auto half = (abs_delta * run_len) >> 1;
     const auto slope_start = (seg_len >> 1) - half;
     const auto slope_end = (seg_len >> 1) + half;
 
-    const auto from_top = native_road_surface_y(from.level);
-    const auto to_top = native_road_surface_y(to.level);
-    const auto slope_span = std::max(1, slope_end - slope_start);
-    const auto rise_per_cell = slope_end > slope_start
-        ? (to_top - from_top) / static_cast<float>(slope_span)
-        : 0.0F;
-    const auto top_at = [&](std::int32_t along) {
-        if (along < slope_start || slope_end <= slope_start) {
-            return from_top;
-        }
-        if (along >= slope_end) {
-            return to_top;
-        }
-        return from_top + (to_top - from_top) *
-            ((static_cast<float>(along - slope_start) + 0.5F) / static_cast<float>(slope_span));
+    // Uphill reads edge 0/1 at n*64+runPos; downhill reads the table 31/47 ints
+    // past its base at n*65-runPos (edge 2/3, steps reversed). Out-of-table reads
+    // resolve to id 0, like the zeroed globals the game would read.
+    const auto grade_block = [&](bool side, std::int32_t run_pos) {
+        const auto base = (side ? 1024 : 0) + (along_x ? 0 : 16) + (delta > 0 ? 0 : 31);
+        const auto index = base + (delta > 0 ? run_len * 64 + run_pos : run_len * 65 - run_pos);
+        const auto id = index >= 0 && index < static_cast<std::int32_t>(grade_slots.size())
+            ? grade_slots[static_cast<std::size_t>(index)]
+            : 0;
+        return kNativeMeshBlock | static_cast<std::uint32_t>(id);
     };
-
-    auto place = [&](std::int32_t along_coord, std::int32_t cross_coord, std::int32_t level,
-                     CityTileKind kind, float top_y, float grade) {
+    const auto place = [&](std::int32_t along_coord, std::int32_t cross_coord, std::int32_t level, std::uint32_t block,
+                           const NativeFaceArray& faces, CityTileKind kind, float grade = 0.0F,
+                           float top_center = std::numeric_limits<float>::quiet_NaN()) {
         const auto x = along_x ? along_coord : cross_coord;
         const auto z = along_x ? cross_coord : along_coord;
-        const auto slope_x = along_x ? grade : 0.0F;
-        const auto slope_z = along_x ? 0.0F : grade;
-        set_city_tile(tiles, x, level, z, kind, top_y, slope_x, slope_z, street.source_index);
+        set_city_tile(tiles, x, level, z, block, faces, kind, street.source_index,
+            along_x ? grade : 0.0F, along_x ? 0.0F : grade, top_center);
     };
+
+    const std::uint16_t center_code = along_x ? 0x4101 : 0x4601;
+    const std::uint16_t left_code = along_x ? 0x4201 : 0x4701;
+    const std::uint16_t neg_code = along_x ? 0x4501 : 0x4a01;
+    const std::uint16_t pos_code = along_x ? 0x4401 : 0x4901;
+    const auto curb = kNativeMeshBlock | native_curb_block_id;
+    const auto left_curb = center - street.left_width - 1;
+    const auto right_curb = center + street.right_width;
 
     auto height = from.level;
     auto run_pos = 0;
+    auto last_faces = kFacesOne;
     for (auto along = 0; along < seg_len; ++along) {
         const auto in_slope = slope_start <= along && along < slope_end;
         if (in_slope && delta > 0 && run_pos % run_len == 0) {
             height += 1;
         }
-
         const auto coord = start + along;
-        const auto left_curb = center - street.left_width - 1;
-        const auto right_curb = center + street.right_width;
-        const auto lane_top = in_slope ? top_at(along) : native_road_surface_y(height);
-        const auto grade = in_slope ? rise_per_cell : 0.0F;
+        // Grade of this cell's sloped surface, for the outline and picking.
+        const auto step = 4.0F / static_cast<float>(run_len);
+        const auto grade = in_slope ? (delta > 0 ? step : -step) : 0.0F;
+        const auto k = delta > 0 ? run_pos : run_len - 1 - run_pos;
+        const auto top_center = static_cast<float>(height) * 4.0F + 0.25F + (static_cast<float>(k) + 0.5F) * step;
 
-        // Curbs: flat plates at height+1 outside the slope region (and at the
-        // segment end caps); inside the slope they follow the ramp.
         if (along == 0 || along == seg_len - 1 || !in_slope) {
-            const auto curb_top = native_road_surface_y(height) + 0.25F;
-            place(coord, left_curb, height + 1, CityTileKind::Curb, curb_top, 0.0F);
-            place(coord, right_curb, height + 1, CityTileKind::Curb, curb_top, 0.0F);
+            place(coord, left_curb, height + 1, curb, kFacesZero, CityTileKind::Curb);
+            place(coord, right_curb, height + 1, curb, kFacesZero, CityTileKind::Curb);
         } else {
-            place(coord, left_curb, height + 1, CityTileKind::Curb, lane_top + 0.25F, grade);
-            place(coord, right_curb, height + 1, CityTileKind::Curb, lane_top + 0.25F, grade);
+            const auto side = grade_block(true, run_pos);
+            place(coord, left_curb, height, side, kFacesZero, CityTileKind::Curb, grade, top_center + 0.25F);
+            place(coord, right_curb, height, side, kFacesZero, CityTileKind::Curb, grade, top_center + 0.25F);
         }
 
+        auto faces = kFacesOne;
         for (auto offset = -street.left_width; offset < street.right_width; ++offset) {
-            place(coord, center + offset, height, CityTileKind::Road, lane_top, grade);
+            std::uint16_t code = 1;
+            if (offset == -1) {
+                code = left_code;
+            } else if (offset == 0) {
+                code = center_code;
+            } else if (offset < -1) {
+                code = street.left_width - 1 < -offset ? 1 : neg_code;
+            } else if (offset >= 1 && offset < street.right_width - 1) {
+                code = pos_code;
+            }
+            faces[5] = code;
+            if (!in_slope) {
+                place(coord, center + offset, height, kNativeSolidBlock, faces, CityTileKind::Road);
+            } else {
+                faces[0] = code;
+                place(coord, center + offset, height, grade_block(false, run_pos), faces, CityTileKind::Road, grade, top_center);
+            }
         }
+        last_faces = faces;
 
         // Terrain top stamp spans curb to curb (native ~leftWidth .. rightWidth).
         for (auto offset = -street.left_width - 1; offset <= street.right_width; ++offset) {
@@ -1776,25 +1926,44 @@ void place_native_street_tiles(
             run_pos = (run_pos + 1) % run_len;
         }
     }
+
+    // Stop lines: the lane rows touching each endpoint become solid cells with
+    // the end-cap code, when that endpoint has a cross street (extents measured
+    // before the +1 expansion). The rest of the face array is left over from the
+    // last lane written.
+    last_faces[5] = along_x ? 0x4801 : 0x4301;
+    const auto from_cap = along_x
+        ? from.ext_x_pos > 0 && (from.ext_z_pos > 0 || from.ext_z_neg > 0)
+        : from.ext_z_pos > 0 && (from.ext_x_pos > 0 || from.ext_x_neg > 0);
+    const auto to_cap = along_x
+        ? to.ext_x_neg > 0 && (to.ext_z_pos > 0 || to.ext_z_neg > 0)
+        : to.ext_z_neg > 0 && (to.ext_x_pos > 0 || to.ext_x_neg > 0);
+    for (auto cross = center - street.left_width; cross < center + street.right_width; ++cross) {
+        if (from_cap) {
+            place(start, cross, from.level, kNativeSolidBlock, last_faces, CityTileKind::Road);
+        }
+        if (to_cap) {
+            place(along_x ? to.gx - to.ext_x_neg - 1 : to.gz - to.ext_z_neg - 1, cross, to.level,
+                kNativeSolidBlock, last_faces, CityTileKind::Road);
+        }
+    }
 }
 
 // Intersection footprint + perimeter (MapConnector_PlaceIntersectionPerimeterTiles
 // @20130): solid asphalt fill over the asymmetric extents; missing-neighbor
-// sides get curb plate rows one level above, extended one tile past both ends.
-void place_native_intersection_tiles(
-    CityTileMap& tiles,
-    const NativeCityGraph& graph,
-    const NativeCityIntersection& intersection) {
-    const auto top = native_road_surface_y(intersection.level);
-    for (auto x = intersection.gx - intersection.ext_x_neg; x < intersection.gx + intersection.ext_x_pos; ++x) {
-        for (auto z = intersection.gz - intersection.ext_z_neg; z < intersection.gz + intersection.ext_z_pos; ++z) {
-            set_city_tile(tiles, x, intersection.level, z, CityTileKind::Road, top);
+// sides get curb rows one level above, extended one tile past both ends.
+void place_native_intersection_tiles(CityTileMap& tiles, const NativeCityIntersection& intersection, std::int32_t index) {
+    // Every tile this junction writes is tagged with it, for its outline.
+    const auto tag = [&](std::int32_t x, std::int32_t y, std::int32_t z) { tiles[CityTileKey{x, y, z}].intersection_index = index; };
+    for (auto z = intersection.gz - intersection.ext_z_neg; z < intersection.gz + intersection.ext_z_pos; ++z) {
+        for (auto x = intersection.gx - intersection.ext_x_neg; x < intersection.gx + intersection.ext_x_pos; ++x) {
+            set_city_tile(tiles, x, intersection.level, z, kNativeSolidBlock, kFacesOne, CityTileKind::Road);
+            tag(x, intersection.level, z);
         }
     }
 
-    (void)graph;
+    const auto curb = kNativeMeshBlock | native_curb_block_id;
     const auto curb_level = intersection.level + 1;
-    const auto curb_top = top + 0.25F;
     const auto z_row_begin = intersection.gz - intersection.ext_z_neg - 1;
     const auto z_row_end = intersection.gz + intersection.ext_z_pos;  // inclusive
     const auto x_row_begin = intersection.gx - intersection.ext_x_neg - 1;
@@ -1802,7 +1971,8 @@ void place_native_intersection_tiles(
     if (intersection.street_south < 0) {
         const auto x = intersection.gx + intersection.ext_x_pos;
         for (auto z = z_row_begin; z <= z_row_end; ++z) {
-            set_city_tile(tiles, x, curb_level, z, CityTileKind::Curb, curb_top);
+            set_city_tile(tiles, x, curb_level, z, curb, kFacesZero, CityTileKind::Curb);
+            tag(x, curb_level, z);
         }
     }
     if (intersection.street_north < 0) {
@@ -1810,19 +1980,22 @@ void place_native_intersection_tiles(
         // -x extent.
         const auto x = intersection.gx - intersection.ext_x_pos - 1;
         for (auto z = z_row_begin; z <= z_row_end; ++z) {
-            set_city_tile(tiles, x, curb_level, z, CityTileKind::Curb, curb_top);
+            set_city_tile(tiles, x, curb_level, z, curb, kFacesZero, CityTileKind::Curb);
+            tag(x, curb_level, z);
         }
     }
     if (intersection.street_west < 0) {
         const auto z = intersection.gz + intersection.ext_z_pos;
         for (auto x = x_row_begin; x <= x_row_end; ++x) {
-            set_city_tile(tiles, x, curb_level, z, CityTileKind::Curb, curb_top);
+            set_city_tile(tiles, x, curb_level, z, curb, kFacesZero, CityTileKind::Curb);
+            tag(x, curb_level, z);
         }
     }
     if (intersection.street_east < 0) {
         const auto z = intersection.gz - intersection.ext_z_neg - 1;
         for (auto x = x_row_begin; x <= x_row_end; ++x) {
-            set_city_tile(tiles, x, curb_level, z, CityTileKind::Curb, curb_top);
+            set_city_tile(tiles, x, curb_level, z, curb, kFacesZero, CityTileKind::Curb);
+            tag(x, curb_level, z);
         }
     }
 }
@@ -1871,7 +2044,7 @@ float terrain_noise_sample(float x, float z, float frequency_x, float frequency_
     return lerp(lerp(n00, n10, ux), lerp(n01, n11, ux), uz);
 }
 
-float native_like_city_terrain_height(float world_x, float world_z) {
+float native_like_city_terrain_height(float world_x, float world_z, bool city_map) {
     // Native runtime terrain samples use grid = world + 4096 at 1 sample per world
     // unit. The 2049^2 source heightfield is upsampled 8x by the game
     // (Terrain_RebuildLandTilesRoadPatchesAndChunkCaches @d12e0); the bilinear
@@ -1902,6 +2075,7 @@ float native_like_city_terrain_height(float world_x, float world_z) {
     // source samples at the boundary.
     const auto min1 = [](float value) { return std::min(value, 1.0F); };
     const auto shore = [&](float edge) { return (36.0F - edge * 24.0F) * edge * edge + 11.75F; };
+    if (!city_map) return height;
     if (gz <= 637.0F && gx < 768.0F) {
         const auto edge = clamp01(std::max(
             1.0F - min1((638.0F - gz) * 0.25F),
@@ -2215,230 +2389,334 @@ std::vector<CityTileCell> build_city_tile_cells(
     for (const auto& street : graph.streets) {
         place_native_street_tiles(tile_map, stamps, graph, street);
     }
-    for (const auto& intersection : graph.intersections) {
-        place_native_intersection_tiles(tile_map, graph, intersection);
+    for (std::size_t index = 0; index < graph.intersections.size(); ++index) {
+        place_native_intersection_tiles(tile_map, graph.intersections[index], static_cast<std::int32_t>(index));
     }
-    // District piece cells are no longer paved here: the v10 portal render path
-    // emits each district piece's own catalog mesh (g_buildblockTemplateCatalog[
-    // word & 0xffff]), so idx-0 plaza cells render their curb top-plate exactly as
-    // the binary does — there is no separate asphalt overlay in the native editor.
 
     std::vector<CityTileCell> tiles;
     tiles.reserve(tile_map.size());
     for (const auto& [key, value] : tile_map) {
-        // base_y is the bottom of the rendered solid: a full cell below the
-        // surface for road cells, the 0.25-thick concrete plate for curbs.
-        const auto base_y = value.kind == CityTileKind::Curb
-            ? value.top_y - 0.25F
-            : value.top_y - 4.0F;
-        tiles.push_back({key.x, key.y, key.z, base_y, value.slope_x, value.slope_z, value.kind, value.street_index});
+        tiles.push_back({key.x, key.y, key.z, value.base_y, value.slope_x, value.slope_z, value.kind, value.street_index,
+            value.block, value.faces, value.intersection_index});
     }
     std::ranges::sort(tiles, [](const CityTileCell& left, const CityTileCell& right) {
-        if (left.y != right.y) {
-            return left.y < right.y;
-        }
-        if (left.z != right.z) {
-            return left.z < right.z;
-        }
-        if (left.x != right.x) {
-            return left.x < right.x;
-        }
-        return static_cast<int>(left.kind) < static_cast<int>(right.kind);
+        return std::tie(left.y, left.z, left.x) < std::tie(right.y, right.z, right.x);
     });
     return tiles;
 }
 
-// Curb plate: the native curb block (Buildblock_InitTemplateMeshCatalog @10110,
-// template ids 0..15) is a 1/16-cell-high concrete plate with lips on its open
-// sides, placed one level above the road. Rendered as a thin slab whose top and
-// bottom both ride the street grade.
-void add_city_curb_slab(
-    BuildingRenderBuffer& buffer,
-    VertexIndexMap& vertex_indices,
-    const CityTileCell& tile,
-    std::uint32_t material,
-    float unit_size) {
-    constexpr auto thickness = 0.25F;
-    const auto x0 = static_cast<float>(tile.x) * unit_size;
-    const auto x1 = x0 + unit_size;
-    const auto z0 = static_cast<float>(tile.z) * unit_size;
-    const auto z1 = z0 + unit_size;
-    const auto cx = x0 + unit_size * 0.5F;
-    const auto cz = z0 + unit_size * 0.5F;
-    auto base_at = [&](float x, float z) {
-        return tile.base_y + tile.slope_x * ((x - cx) / unit_size) +
-            tile.slope_z * ((z - cz) / unit_size);
-    };
-    auto corner = [&](float x, float z, float lift) {
-        return Vec3{x, base_at(x, z) + lift, z};
-    };
-    const std::array<Vec2f, 4> uvs{{{0.0F, 0.0F}, {1.0F, 0.0F}, {1.0F, 1.0F}, {0.0F, 1.0F}}};
+// Face tables of BuildCellRenderGeometryAndAdjacency @c555, read from
+// subrosa.exe: cube corners DAT_002b34f0, face corners DAT_002b3660, and the
+// per-face tangent DAT_002b35a0 / bitangent DAT_002b35f0 that project UVs.
+// Faces: 0 -Y, 1 +Z, 2 -X, 3 -Z, 4 +X, 5 +Y.
+constexpr std::array<Vec3, 8> kNativeCubeCorner{{
+    {0, 0, 0}, {1, 0, 0}, {1, 0, 1}, {0, 0, 1}, {0, 1, 0}, {1, 1, 0}, {1, 1, 1}, {0, 1, 1},
+}};
+constexpr std::array<std::array<std::uint8_t, 4>, 6> kNativeFaceCorners{{
+    {3, 2, 1, 0}, {7, 6, 2, 3}, {4, 7, 3, 0}, {5, 4, 0, 1}, {6, 5, 1, 2}, {4, 5, 6, 7},
+}};
+constexpr std::array<Vec3, 6> kNativeFaceTangent{{
+    {-1, 0, 0}, {1, 0, 0}, {0, 0, 1}, {-1, 0, 0}, {0, 0, -1}, {1, 0, 0},
+}};
+constexpr std::array<Vec3, 6> kNativeFaceBitangent{{
+    {0, 0, -1}, {0, 1, 0}, {0, 1, 0}, {0, 1, 0}, {0, 1, 0}, {0, 0, 1},
+}};
+constexpr std::array<std::array<std::int32_t, 3>, 6> kNativeFaceNeighbor{{
+    {0, -1, 0}, {0, 0, 1}, {-1, 0, 0}, {0, 0, -1}, {1, 0, 0}, {0, 1, 0},
+}};
 
-    // Top plate.
-    add_quad(buffer, vertex_indices,
-        {corner(x0, z0, thickness), corner(x1, z0, thickness), corner(x1, z1, thickness), corner(x0, z1, thickness)},
-        uvs, material);
-    // Side lips.
-    add_quad(buffer, vertex_indices,
-        {corner(x0, z1, thickness), corner(x1, z1, thickness), corner(x1, z1, 0.0F), corner(x0, z1, 0.0F)},
-        uvs, material);
-    add_quad(buffer, vertex_indices,
-        {corner(x1, z0, thickness), corner(x0, z0, thickness), corner(x0, z0, 0.0F), corner(x1, z0, 0.0F)},
-        uvs, material);
-    add_quad(buffer, vertex_indices,
-        {corner(x0, z0, thickness), corner(x0, z1, thickness), corner(x0, z1, 0.0F), corner(x0, z0, 0.0F)},
-        uvs, material);
-    add_quad(buffer, vertex_indices,
-        {corner(x1, z1, thickness), corner(x1, z0, thickness), corner(x1, z0, 0.0F), corner(x1, z1, 0.0F)},
-        uvs, material);
+// A face code names a texture and a road-marking overlay layer: with bit 14 set
+// the low byte is the texture and bits 8..12 the overlay layer; a negative code
+// is the default texture (index 3) with overlay code & 0x3ff.
+struct NativeFaceTexture {
+    std::uint32_t texture{};
+    std::uint32_t overlay{};
+};
+
+NativeFaceTexture decode_native_face(std::uint16_t code) {
+    if ((code & 0x4000U) != 0U) {
+        return {code & 0xffU, (code >> 8U) & 0x1fU};
+    }
+    if ((code & 0x8000U) != 0U) {
+        return {3U, code & 0x3ffU};
+    }
+    return {code, 0U};
 }
 
-BuildingRenderBuffer build_city_tile_render_buffer(const std::vector<CityTileCell>& tiles, float unit_size) {
-    BuildingRenderBuffer buffer;
-    buffer.unit_size = unit_size;
-    if (tiles.empty()) {
-        return buffer;
-    }
+// Road cells only use texture 0 (concrete, curbs) and 1 (asphalt2, lanes).
+std::uint32_t city_tile_material(BuildingRenderBuffer& buffer, std::uint32_t texture) {
+    return material_id_for_name(buffer, texture == 0U ? "city_curb_concrete" : "city_road_asphalt");
+}
 
-    VertexIndexMap vertex_indices;
-    std::vector<SbbCell> cells;
-    cells.reserve(tiles.size());
-    std::unordered_map<CityTileKey, std::size_t, CityTileKeyHash> tile_indices;
-    tile_indices.reserve(tiles.size());
-    for (std::size_t index = 0; index < tiles.size(); ++index) {
-        const auto& tile = tiles[index];
-        auto cell = native_city_block_solid_cell();
-        cell.index = index;
-        cell.occupied = true;
-        cells.push_back(cell);
-        tile_indices.emplace(CityTileKey{tile.x, tile.y, tile.z}, index);
+void add_city_tile_quad(BuildingRenderBuffer& buffer, const std::array<Vec3, 4>& p, const std::array<Vec2f, 4>& uv,
+                        std::uint16_t code) {
+    const auto texture = decode_native_face(code);
+    const auto material = city_tile_material(buffer, texture.texture);
+    const auto first = static_cast<std::uint32_t>(buffer.vertices.size());
+    for (std::size_t i = 0; i < 4; ++i) {
+        buffer.vertices.push_back({p[i], uv[i].u, uv[i].v, static_cast<float>(texture.overlay)});
     }
+    buffer.triangles.push_back({{first, first + 1U, first + 2U}, material, false});
+    buffer.triangles.push_back({{first, first + 2U, first + 3U}, material, false});
+}
 
-    auto road_cell_at = [&](std::int32_t x, std::int32_t y, std::int32_t z) -> const SbbCell* {
-        const auto match = tile_indices.find(CityTileKey{x, y, z});
-        if (match == tile_indices.end() || tiles[match->second].kind != CityTileKind::Road) {
-            return nullptr;
+} // namespace
+
+void bake_shadow_volume(BuildingRenderBuffer& buffer) {
+    // Build the volume once from the face adjacency. RenderQueuedShadowVolumeAdjacencyPass @11c950
+    // extrudes every triangle of a sector, window panes included. The game's
+    // walls are whole cell quads (windows live in the texture alpha); ours are
+    // cut around window rects, which leaves T-junctions: a long edge facing
+    // several short ones never pairs, both sides emit coincident side quads,
+    // and their depth rounding leaks light as thin lines. So split every edge
+    // at the vertices lying on it, then pair each directed edge a->b with b->a.
+    using Key = std::array<std::int64_t, 3>;
+    const auto point_key = [](Vec3 point) {
+        return Key{std::llround(point.x * 1024.0), std::llround(point.y * 1024.0), std::llround(point.z * 1024.0)};
+    };
+    struct KeyHash {
+        std::size_t operator()(const Key& key) const {
+            return static_cast<std::size_t>((key[0] * 73856093) ^ (key[1] * 19349663) ^ (key[2] * 83492791));
         }
-        return &cells[match->second];
+    };
+    struct EdgeHash {
+        std::size_t operator()(const std::pair<Key, Key>& edge) const {
+            return KeyHash{}(edge.first) * 31U ^ KeyHash{}(edge.second);
+        }
     };
 
-    const auto road_material = material_id_for_name(buffer, "city_road_asphalt");
-    const auto curb_material = material_id_for_name(buffer, "city_curb_concrete");
-    for (std::size_t index = 0; index < tiles.size(); ++index) {
-        const auto& tile = tiles[index];
-        if (tile.kind == CityTileKind::Curb) {
-            add_city_curb_slab(buffer, vertex_indices, tile, curb_material, unit_size);
+    // Unique vertices, bucketed by 1-unit grid cell.
+    std::unordered_map<Key, Vec3, KeyHash> points;
+    std::unordered_map<Key, std::vector<Key>, KeyHash> grid;
+    const auto cell_of = [](const Key& key) { return Key{key[0] >> 10, key[1] >> 10, key[2] >> 10}; };
+    for (const auto& vertex : buffer.vertices) {
+        const auto key = point_key(vertex.position);
+        if (points.emplace(key, vertex.position).second) grid[cell_of(key)].push_back(key);
+    }
+    // Vertices strictly inside segment a-b, ordered from a.
+    std::vector<std::pair<std::int64_t, Key>> on_edge;
+    const auto split_points = [&](const Key& a, const Key& b) {
+        on_edge.clear();
+        const Key d{b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+        const auto length_sq = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+        if (length_sq == 0) return;
+        const auto lo = cell_of({std::min(a[0], b[0]), std::min(a[1], b[1]), std::min(a[2], b[2])});
+        const auto hi = cell_of({std::max(a[0], b[0]), std::max(a[1], b[1]), std::max(a[2], b[2])});
+        for (auto x = lo[0]; x <= hi[0]; ++x)
+        for (auto y = lo[1]; y <= hi[1]; ++y)
+        for (auto z = lo[2]; z <= hi[2]; ++z) {
+            const auto bucket = grid.find({x, y, z});
+            if (bucket == grid.end()) continue;
+            for (const auto& p : bucket->second) {
+                const Key v{p[0] - a[0], p[1] - a[1], p[2] - a[2]};
+                const auto t = v[0] * d[0] + v[1] * d[1] + v[2] * d[2];
+                if (t <= 0 || t >= length_sq) continue;
+                // Distance from the line, squared, within 2/1024 units.
+                const auto cx = static_cast<double>(v[1] * d[2] - v[2] * d[1]);
+                const auto cy = static_cast<double>(v[2] * d[0] - v[0] * d[2]);
+                const auto cz = static_cast<double>(v[0] * d[1] - v[1] * d[0]);
+                if (cx * cx + cy * cy + cz * cz > 4.0 * static_cast<double>(length_sq)) continue;
+                on_edge.emplace_back(t, p);
+            }
+        }
+        std::ranges::sort(on_edge);
+    };
+
+    // Split faces carry the render triangle they came from: caps use that
+    // triangle as drawn, so a cap depth-matches its surface exactly, and every
+    // piece of it shares its normal, so the pieces agree on facing.
+    struct Face {
+        std::array<Key, 3> keys{};
+        std::array<std::int32_t, 3> adjacent{{-1, -1, -1}};
+        std::size_t parent{};
+    };
+    std::vector<Face> faces;
+    faces.reserve(buffer.triangles.size());
+    std::vector<std::array<Vec3, 3>> parents;
+    parents.reserve(buffer.triangles.size());
+    std::unordered_map<std::pair<Key, Key>, std::pair<std::size_t, std::size_t>, EdgeHash> open_edges;
+    std::vector<Key> ring;
+    const auto add_face = [&](const std::array<Key, 3>& keys) {
+        const auto face_index = faces.size();
+        faces.push_back({keys, {{-1, -1, -1}}, parents.size() - 1U});
+        for (std::size_t edge = 0; edge < 3; ++edge) {
+            const auto& from = keys[edge];
+            const auto& to = keys[(edge + 1U) % 3U];
+            if (const auto owner = open_edges.find({to, from}); owner != open_edges.end()) {
+                faces[face_index].adjacent[edge] = static_cast<std::int32_t>(owner->second.first);
+                faces[owner->second.first].adjacent[owner->second.second] = static_cast<std::int32_t>(face_index);
+                open_edges.erase(owner);
+            } else {
+                open_edges.emplace(std::pair{from, to}, std::pair{face_index, edge});
+            }
+        }
+    };
+    for (const auto& triangle : buffer.triangles) {
+        if (triangle.interior) continue;
+        if (triangle.indices[0] >= buffer.vertices.size() ||
+            triangle.indices[1] >= buffer.vertices.size() ||
+            triangle.indices[2] >= buffer.vertices.size()) continue;
+        std::array<Key, 3> keys{};
+        auto& parent = parents.emplace_back();
+        for (std::size_t i = 0; i < 3; ++i) {
+            parent[i] = buffer.vertices[triangle.indices[i]].position;
+            keys[i] = point_key(parent[i]);
+        }
+        ring.clear();
+        for (std::size_t edge = 0; edge < 3; ++edge) {
+            ring.push_back(keys[edge]);
+            split_points(keys[edge], keys[(edge + 1U) % 3U]);
+            for (const auto& [t, p] : on_edge) ring.push_back(p);
+        }
+        if (ring.size() == 3) {
+            add_face(keys);
             continue;
         }
-
-        const auto& cell = cells[index];
-        const auto* west = road_cell_at(tile.x - 1, tile.y, tile.z);
-        const auto* east = road_cell_at(tile.x + 1, tile.y, tile.z);
-        const auto* north = road_cell_at(tile.x, tile.y, tile.z - 1);
-        const auto* south = road_cell_at(tile.x, tile.y, tile.z + 1);
-        const auto* up = road_cell_at(tile.x, tile.y + 1, tile.z);
-        const auto cx = (static_cast<float>(tile.x) + 0.5F) * unit_size;
-        const auto cy = tile.base_y + unit_size * 0.5F;
-        const auto cz = (static_cast<float>(tile.z) + 0.5F) * unit_size;
-
-        const std::array<SolidCellFaceCheck, 5> native_sides{{
-            {BuildingFaceSide::South, south},
-            {BuildingFaceSide::West, west},
-            {BuildingFaceSide::North, north},
-            {BuildingFaceSide::East, east},
-            {BuildingFaceSide::Up, up},
-        }};
-
-        add_native_solid_cell_faces(
-            buffer,
-            vertex_indices,
-            cell,
-            cx,
-            cy,
-            cz,
-            native_sides,
-            east,
-            nullptr,
-            [road_material](BuildingFaceSide) {
-                return road_material;
-            },
-            CellTopSlope{tile.slope_x, tile.slope_z});
+        // Fan the split polygon from its centroid so no fan triangle is
+        // degenerate (split points are collinear with their edge's corners).
+        Vec3 centroid{};
+        for (const auto& key : keys) {
+            const auto& p = points.at(key);
+            centroid = {centroid.x + p.x / 3.0F, centroid.y + p.y / 3.0F, centroid.z + p.z / 3.0F};
+        }
+        const auto center = point_key(centroid);
+        points.emplace(center, centroid);
+        for (std::size_t i = 0; i < ring.size(); ++i) add_face({center, ring[i], ring[(i + 1U) % ring.size()]});
     }
 
-    sort_triangles_into_native_material_runs(buffer);
-    return buffer;
+    // RenderQueuedShadowVolumeAdjacencyPass decides silhouettes per frame in a
+    // geometry shader: it extrudes the faces turned away from the light and
+    // emits a side where the neighbour faces the light or the edge is open.
+    // Without a geometry shader, bake every candidate: each face carries a
+    // front and a back cap, each edge a quad whose two ends carry their own
+    // face's normal (kind in uv.x). The shadow vertex shader keeps the caps of
+    // faces turned away, and extrudes an edge end when its face is lit, so only
+    // silhouette quads get area. An open edge's far end always extrudes.
+    // Faces wind clockwise (game order), so cross(p1 - p0, p2 - p0) points
+    // inward and a face is turned away when that normal meets the light.
+    enum : std::uint8_t { kEdge = 0, kOpenEdge = 1, kFrontCap = 2, kBackCap = 3 };
+    // Vertex layout matches the GPU mesh: position, uv (kind, 0, 0), normal.
+    auto& vertices = buffer.shadow_vertices;
+    vertices.clear();
+    vertices.reserve((parents.size() * 6U + faces.size() * 6U) * 9U);
+    std::uint32_t vertex_count = 0;
+    std::vector<Vec3> normals(parents.size());
+    const auto emit_at = [&](Vec3 p, Vec3 normal, std::uint8_t kind) {
+        vertices.insert(vertices.end(), {p.x, p.y, p.z, static_cast<float>(kind), 0.0F, 0.0F, normal.x, normal.y, normal.z});
+        ++vertex_count;
+    };
+    const auto emit = [&](const Key& key, Vec3 normal, std::uint8_t kind) { emit_at(points.at(key), normal, kind); };
+    auto& indices = buffer.shadow_indices;
+    indices.clear();
+    indices.reserve(parents.size() * 6U + faces.size() * 9U);
+    buffer.shadow_top = 0.0F;
+    for (std::size_t t = 0; t < parents.size(); ++t) {
+        const auto& [p0, p1, p2] = parents[t];
+        const Vec3 e1{p1.x - p0.x, p1.y - p0.y, p1.z - p0.z};
+        const Vec3 e2{p2.x - p0.x, p2.y - p0.y, p2.z - p0.z};
+        normals[t] = {e1.y * e2.z - e1.z * e2.y, e1.z * e2.x - e1.x * e2.z, e1.x * e2.y - e1.y * e2.x};
+        buffer.shadow_top = std::max({buffer.shadow_top, p0.y, p1.y, p2.y});
+        for (const auto i : {0, 1, 2}) {
+            indices.push_back(vertex_count);
+            emit_at(parents[t][i], normals[t], kFrontCap);
+        }
+        for (const auto i : {0, 2, 1}) {
+            indices.push_back(vertex_count);
+            emit_at(parents[t][i], normals[t], kBackCap);
+        }
+    }
+    for (std::size_t f = 0; f < faces.size(); ++f) {
+        const auto normal = normals[faces[f].parent];
+        for (std::size_t edge = 0; edge < 3; ++edge) {
+            const auto other = faces[f].adjacent[edge];
+            if (other >= 0 && static_cast<std::size_t>(other) < f) continue;
+            const auto& from = faces[f].keys[edge];
+            const auto& to = faces[f].keys[(edge + 1U) % 3U];
+            const auto other_normal = other >= 0 ? normals[faces[static_cast<std::size_t>(other)].parent] : Vec3{};
+            const auto far_kind = other >= 0 ? kEdge : kOpenEdge;
+            // (to, from, to'), (to', from, from') when this face is the dark one.
+            const auto first = vertex_count;
+            emit(to, normal, kEdge);
+            emit(from, normal, kEdge);
+            emit(to, other_normal, far_kind);
+            emit(from, other_normal, far_kind);
+            indices.insert(indices.end(), {first, first + 1U, first + 2U, first + 2U, first + 1U, first + 3U});
+        }
+    }
 }
 
-void add_city_road_markings(
-    BuildingRenderBuffer& buffer,
-    const std::vector<RenderRoad>& roads,
-    const std::vector<CityTileCell>& tiles) {
-    VertexIndexMap vertex_indices;
-    const auto center_material = material_id_for_name(buffer, "city_road_line_yellow");
-    const auto edge_material = material_id_for_name(buffer, "city_road_line_white");
-    constexpr float line_width = 0.26F;
-    constexpr float surface_offset = 0.06F;
-    const std::array<Vec2f, 4> uvs{{{0.0F, 0.0F}, {1.0F, 0.0F}, {1.0F, 1.0F}, {0.0F, 1.0F}}};
-    std::unordered_map<std::uint64_t, const CityTileCell*> road_tiles;
-    road_tiles.reserve(tiles.size());
-    const auto tile_key = [](std::int32_t x, std::int32_t z) {
-        return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 32U) |
-            static_cast<std::uint32_t>(z);
-    };
+namespace {
+
+// Road tiles as BuildCellRenderGeometryAndAdjacency builds them: solid cells
+// emit each face not covered by a solid neighbour, block cells instance their
+// catalog mesh, and every face takes its texture and overlay from the cell's
+// face array. Cell y spans y*4+0.25 .. y*4+4.25.
+BuildingRenderBuffer build_city_tile_render_buffer(const std::vector<CityTileCell>& tiles, float unit_size) {
+    static const auto catalog = build_native_builtin_catalog();
+    BuildingRenderBuffer buffer;
+    buffer.unit_size = unit_size;
+    std::unordered_set<CityTileKey, CityTileKeyHash> solids;
     for (const auto& tile : tiles) {
-        if (tile.kind == CityTileKind::Road) {
-            road_tiles[tile_key(tile.x, tile.z)] = &tile;
+        if ((tile.block & 0xe0000000U) == kNativeSolidBlock) {
+            solids.insert({tile.x, tile.y, tile.z});
         }
     }
-    for (const auto& road : roads) {
-        const auto dx = road.to.x-road.from.x;
-        const auto dz = road.to.z-road.from.z;
-        const auto length = std::sqrt(dx*dx+dz*dz);
-        if (length <= buffer.unit_size) continue;
-        const Vec3 direction{dx/length, 0.0F, dz/length};
-        const Vec3 perpendicular{-direction.z, 0.0F, direction.x};
-        const auto trim = std::min(road.width*0.5F, length*0.22F);
-        const auto point = [&](float distance, float offset) {
-            const auto t = distance/length;
-            Vec3 result{
-                road.from.x+direction.x*distance+perpendicular.x*offset,
-                road.from.y+(road.to.y-road.from.y)*t,
-                road.from.z+direction.z*distance+perpendicular.z*offset,
+    for (const auto& tile : tiles) {
+        const Vec3 origin{
+            static_cast<float>(tile.x) * unit_size,
+            static_cast<float>(tile.y) * unit_size + 0.25F,
+            static_cast<float>(tile.z) * unit_size,
+        };
+        if ((tile.block & 0xe0000000U) == kNativeSolidBlock) {
+            // UVs project the sector-local position (8-cell sectors) at 0.25 per
+            // world unit, one texture repeat per cell.
+            const Vec3 local{
+                static_cast<float>(tile.x & 7),
+                static_cast<float>(tile.y & 7),
+                static_cast<float>(tile.z & 7),
             };
-            const auto cell_x = static_cast<std::int32_t>(std::floor(result.x/buffer.unit_size));
-            const auto cell_z = static_cast<std::int32_t>(std::floor(result.z/buffer.unit_size));
-            if (const auto tile = road_tiles.find(tile_key(cell_x, cell_z)); tile != road_tiles.end()) {
-                const auto* surface = tile->second;
-                const auto center_x = (static_cast<float>(surface->x)+0.5F)*buffer.unit_size;
-                const auto center_z = (static_cast<float>(surface->z)+0.5F)*buffer.unit_size;
-                result.y = surface->base_y+buffer.unit_size+
-                    surface->slope_x*((result.x-center_x)/buffer.unit_size)+
-                    surface->slope_z*((result.z-center_z)/buffer.unit_size);
+            for (std::size_t face = 0; face < 6; ++face) {
+                const auto& n = kNativeFaceNeighbor[face];
+                if ((face == 0 && tile.y == 0) || solids.contains({tile.x + n[0], tile.y + n[1], tile.z + n[2]})) {
+                    continue;
+                }
+                std::array<Vec3, 4> p{};
+                std::array<Vec2f, 4> uv{};
+                for (std::size_t i = 0; i < 4; ++i) {
+                    const auto& c = kNativeCubeCorner[kNativeFaceCorners[face][i]];
+                    const Vec3 sector{(local.x + c.x) * unit_size, (local.y + c.y) * unit_size, (local.z + c.z) * unit_size};
+                    const auto& t = kNativeFaceTangent[face];
+                    const auto& b = kNativeFaceBitangent[face];
+                    uv[i] = {
+                        (t.x * sector.x + t.y * sector.y + t.z * sector.z) * 0.25F,
+                        (b.x * sector.x + b.y * sector.y + b.z * sector.z) * 0.25F,
+                    };
+                    p[i] = {origin.x + c.x * unit_size, origin.y + c.y * unit_size, origin.z + c.z * unit_size};
+                }
+                add_city_tile_quad(buffer, p, uv, tile.faces[face]);
             }
-            result.y += surface_offset;
-            return result;
-        };
-        const auto stripe = [&](float from, float to, float offset, float width, std::uint32_t material) {
-            // Follow the per-cell tilted road surface. A single long quad cuts
-            // through the game's slope tiles and loses markings on grades.
-            for (auto segment_from = from; segment_from < to; segment_from += buffer.unit_size) {
-                const auto segment_to = std::min(segment_from+buffer.unit_size, to);
-                add_quad(buffer, vertex_indices, {
-                    point(segment_from, offset-width*0.5F), point(segment_from, offset+width*0.5F),
-                    point(segment_to, offset+width*0.5F), point(segment_to, offset-width*0.5F),
-                }, uvs, material);
+            continue;
+        }
+        const auto id = tile.block & 0xffffU;
+        if (id >= catalog.size()) {
+            continue;
+        }
+        for (const auto& face : catalog[id].mesh.faces) {
+            if (face.vertices.size() < 4 || face.uvs.size() < 4) {
+                continue;
             }
-        };
-        const auto edge = std::max(buffer.unit_size*0.75F, road.width*0.5F-buffer.unit_size*0.22F);
-        stripe(trim, length-trim, -edge, line_width, edge_material);
-        stripe(trim, length-trim, edge, line_width, edge_material);
-        const auto dash = buffer.unit_size*1.45F;
-        const auto gap = buffer.unit_size*0.65F;
-        for (auto distance = trim; distance < length-trim; distance += dash+gap) {
-            stripe(distance, std::min(distance+dash, length-trim), 0.0F, line_width*1.35F, center_material);
+            std::array<Vec3, 4> p{};
+            std::array<Vec2f, 4> uv{};
+            for (std::size_t i = 0; i < 4; ++i) {
+                const auto& v = face.vertices[i];
+                p[i] = {origin.x + v.x * unit_size, origin.y + v.y * unit_size, origin.z + v.z * unit_size};
+                uv[i] = face.uvs[i];
+            }
+            add_city_tile_quad(buffer, p, uv, tile.faces[face.material & 7U]);
         }
     }
     sort_triangles_into_native_material_runs(buffer);
+    return buffer;
 }
 
 std::optional<CityTerrain> build_city_terrain(
@@ -2451,63 +2729,12 @@ std::optional<CityTerrain> build_city_terrain(
         return std::nullopt;
     }
 
-    // The game removes the terrain surface under road/curb tiles entirely — the
-    // drivable asphalt IS the ground there. Without this, the flat terrain plane
-    // (sitting at the same patched level as the road tops) z-fights the road on
-    // the lowest, flattest blocks. Build a covered-cell set so terrain quads
-    // fully under tiles are skipped.
-    // District piece cells are no longer paved (they render their own catalog
-    // mesh), so the carve below covers only street/curb tiles. District solid
-    // cells render their own cube, so carve terrain under them here too —
-    // otherwise the terrain mesh buries the flat asphalt slabs.
-    std::unordered_set<std::uint64_t> covered_cells;
-    covered_cells.reserve(tile_cells.size());
-    for (const auto& tile : tile_cells) {
-        covered_cells.insert(CityCornerStampMap::key(tile.x, tile.z));
-    }
-    // Only SINGLETON solid cells render (build_native_portal_render_buffer culls
-    // stacked foundation walls), so only carve terrain under singletons. Carving
-    // under the culled stacks would punch holes in the ground with nothing behind
-    // them. Match the render's cull: a solid with another solid directly above or
-    // below is part of a stack and is neither drawn nor carved.
-    std::unordered_set<std::uint64_t> solid_cell_coords;
-    const auto solid_key3 = [](std::int32_t x, std::int32_t y, std::int32_t z) {
-        return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 42) |
-               (static_cast<std::uint64_t>(static_cast<std::uint32_t>(y) & 0x1fffffU) << 21) |
-               static_cast<std::uint64_t>(static_cast<std::uint32_t>(z) & 0x1fffffU);
-    };
-    for (const auto& portal : map.portals) {
-        const auto& voxels = portal.voxel_blocks();
-        const auto block_count = std::min<std::size_t>(voxels.size(), 0x200);
-        for (std::size_t voxel_index = 0; voxel_index < block_count; ++voxel_index) {
-            if ((voxels[voxel_index] & 0xe0000000U) != 0x40000000U) {
-                continue;
-            }
-            const auto sx = portal.fields[1] * 8 + static_cast<std::int32_t>(voxel_index & 7U);
-            const auto sz = portal.fields[3] * 8 + static_cast<std::int32_t>((voxel_index >> 3U) & 7U);
-            const auto sy = portal.fields[2] * 8 + static_cast<std::int32_t>((voxel_index >> 6U) & 7U);
-            solid_cell_coords.insert(solid_key3(sx, sy, sz));
-        }
-    }
-    for (const auto& portal : map.portals) {
-        const auto& voxels = portal.voxel_blocks();
-        const auto block_count = std::min<std::size_t>(voxels.size(), 0x200);
-        for (std::size_t voxel_index = 0; voxel_index < block_count; ++voxel_index) {
-            if ((voxels[voxel_index] & 0xe0000000U) != 0x40000000U) {
-                continue;
-            }
-            const auto gx = portal.fields[1] * 8 + static_cast<std::int32_t>(voxel_index & 7U);
-            const auto gz = portal.fields[3] * 8 + static_cast<std::int32_t>((voxel_index >> 3U) & 7U);
-            const auto gy = portal.fields[2] * 8 + static_cast<std::int32_t>((voxel_index >> 6U) & 7U);
-            if (solid_cell_coords.contains(solid_key3(gx, gy + 1, gz)) ||
-                solid_cell_coords.contains(solid_key3(gx, gy - 1, gz))) {
-                continue;
-            }
-            covered_cells.insert(CityCornerStampMap::key(gx, gz));
-        }
-    }
+    // The landscape is discarded where the land-use mask bit is clear: every
+    // cell a street tile, district cell, or building anchor layer stamped
+    // (see CityCornerStampMap::stamp). Buildings and pieces stand on no terrain.
+    (void)tile_cells;
     auto cell_covered = [&](std::int32_t gx, std::int32_t gz) {
-        return covered_cells.contains(CityCornerStampMap::key(gx, gz));
+        return stamps.masked.contains(CityCornerStampMap::key(gx, gz));
     };
 
     auto min_x = std::numeric_limits<std::int32_t>::max();
@@ -2557,40 +2784,44 @@ std::optional<CityTerrain> build_city_terrain(
     };
 
     // Native 1-unit heightfield: base island field, then the hardcoded
-    // intersection block patches.
-#ifndef __EMSCRIPTEN__
+    // intersection block patches (which only write, never read, the field).
     CityHeightfield field;
     field.min_x = static_cast<std::int32_t>(terrain.min_x);
     field.min_z = static_cast<std::int32_t>(terrain.min_z);
     field.count_x = static_cast<std::int32_t>(terrain.max_x - terrain.min_x) + 1;
     field.count_z = static_cast<std::int32_t>(terrain.max_z - terrain.min_z) + 1;
+#ifdef __EMSCRIPTEN__
+    // A dense base field stalls WebAssembly for minutes on large maps. Store
+    // only the patches; unpatched samples fall back to the island height.
+    field.heights.assign(static_cast<std::size_t>(field.count_x) * static_cast<std::size_t>(field.count_z),
+        std::numeric_limits<float>::quiet_NaN());
+#else
     field.heights.resize(static_cast<std::size_t>(field.count_x) * static_cast<std::size_t>(field.count_z));
     for (auto z = 0; z < field.count_z; ++z) {
         for (auto x = 0; x < field.count_x; ++x) {
             field.heights[static_cast<std::size_t>(z) * static_cast<std::size_t>(field.count_x) +
                 static_cast<std::size_t>(x)] = native_like_city_terrain_height(
-                    static_cast<float>(field.min_x + x), static_cast<float>(field.min_z + z));
+                    static_cast<float>(field.min_x + x), static_cast<float>(field.min_z + z), !stamps.disabled);
         }
     }
+#endif
+    // Terrain_RebuildLandTilesRoadPatchesAndChunkCaches patches city maps only.
     for (const auto patch_index : native_city_terrain_patch_indices) {
+        if (stamps.disabled) break;
         apply_native_city_terrain_patch(field, expanded_graph, stamps, patch_index);
     }
-#endif
 
     const auto terrain_height = [&](float world_x, float world_z) {
-#ifdef __EMSCRIPTEN__
-        return native_like_city_terrain_height(world_x, world_z);
-#else
         if (world_x >= terrain.min_x && world_x <= terrain.max_x &&
             world_z >= terrain.min_z && world_z <= terrain.max_z) {
             const auto sample_x = std::clamp(
                 static_cast<std::int32_t>(world_x), field.min_x, field.min_x + field.count_x - 1);
             const auto sample_z = std::clamp(
                 static_cast<std::int32_t>(world_z), field.min_z, field.min_z + field.count_z - 1);
-            return field.get(sample_x, sample_z);
+            const auto height = field.get(sample_x, sample_z);
+            if (!std::isnan(height)) return height;
         }
-        return native_like_city_terrain_height(world_x, world_z);
-#endif
+        return native_like_city_terrain_height(world_x, world_z, !stamps.disabled);
     };
 
     terrain.sample_count_x = std::max(2, static_cast<std::int32_t>(std::ceil((terrain.max_x - terrain.min_x) / terrain.sample_spacing)) + 1);
@@ -2720,29 +2951,41 @@ std::vector<CityTrafficLightPole> build_city_traffic_light_poles(
         // (origin y 3.25, pole half-height 3) = 0.5 above the cell level — the
         // top of the curb plate.
         const auto base_y = native_road_surface_y(intersection.level) + 0.25F;
-        auto add_pole = [&](std::int32_t tile_x, std::int32_t tile_z, Vec3 arm) {
+        // The sign names the street crossing the arm (RenderModels @212e0): the
+        // neighbour one step clockwise in (south, west, north, east) from the
+        // pole's direction, else the one counter-clockwise, else street 0.
+        const std::array<std::int32_t, 4> neighbours{
+            intersection.street_south, intersection.street_west, intersection.street_north, intersection.street_east};
+        auto add_pole = [&](std::int32_t tile_x, std::int32_t tile_z, Vec3 arm, std::size_t direction) {
             const auto center_x = (static_cast<float>(tile_x) + 0.5F) * unit_size;
             const auto center_z = (static_cast<float>(tile_z) + 0.5F) * unit_size;
+            auto street = neighbours[(direction + 1U) & 3U];
+            if (street < 0) street = neighbours[(direction + 3U) & 3U];
+            if (street < 0) street = 0;
+            const auto name = static_cast<std::size_t>(street) < graph.streets.size()
+                ? graph.streets[static_cast<std::size_t>(street)].name_index
+                : 0;
             poles.push_back({
                 {center_x + arm.x, base_y, center_z + arm.z},
                 arm,
+                name,
             });
         };
         if (intersection.street_north >= 0) {
             add_pole(intersection.gx + intersection.ext_x_pos, intersection.gz + intersection.ext_z_pos,
-                {0.0F, 0.0F, -1.0F});
+                {0.0F, 0.0F, -1.0F}, 2U);
         }
         if (intersection.street_south >= 0) {
             add_pole(intersection.gx - intersection.ext_x_pos - 1, intersection.gz - intersection.ext_z_pos - 1,
-                {0.0F, 0.0F, 1.0F});
+                {0.0F, 0.0F, 1.0F}, 0U);
         }
         if (intersection.street_east >= 0) {
             add_pole(intersection.gx - intersection.ext_x_pos - 1, intersection.gz + intersection.ext_z_pos,
-                {1.0F, 0.0F, 0.0F});
+                {1.0F, 0.0F, 0.0F}, 3U);
         }
         if (intersection.street_west >= 0) {
             add_pole(intersection.gx + intersection.ext_x_pos, intersection.gz - intersection.ext_z_pos - 1,
-                {-1.0F, 0.0F, 0.0F});
+                {-1.0F, 0.0F, 0.0F}, 1U);
         }
     }
     return poles;
@@ -2832,7 +3075,8 @@ SbbScene build_sbb_scene(
         if (is_solid_building_cell(cell) && cell.interior_block() == 0xffffU && cell.cell_type() < building.block_names.size()) {
             if (const auto* template_file = find_buildblock_template(buildblock_templates, building.block_names[cell.cell_type()])) {
                 const auto* east = find_cell_at(building.cells, cell.x + 1U, cell.y, cell.z);
-                const auto side_codes = native_edge_side_codes(cell, east);
+                const auto* south = find_cell_at(building.cells, cell.x, cell.y, cell.z + 1U);
+                const auto side_codes = native_edge_side_codes(cell, east, south);
                 scene.portal_edges.push_back({
                     &cell,
                     {
@@ -2859,10 +3103,209 @@ SbbScene build_sbb_scene(
     return scene;
 }
 
+// The room inside a cell whose interior block is 0xffff. The game builds it
+// with _block_createbuildblock(0, key) @1a990 from the key
+// InstantiateSbbVolumeIntoWorldAndMetadata @23ac0 packs per cell: side codes
+// north (the cell's +0x0c word), east (the +x cell's +0x10), south (the +z
+// cell's +0x0c), west (the cell's +0x10); bit 16 floor and bit 17 ceiling from
+// the placed flag; the cell type picks the buildblock. Side code 1 is a plain
+// wall (_block_addbasicsurface @19140), 3..15 a wall with that buildblock
+// layer's windows. Walls stand 1/16 inside the cell edge; the floor
+// (_block_addbasicsurface2 @194b0) lies at 1/16, pulled in 1/16 from each side
+// that has a wall; the ceiling at 7/8. Surfaces use the interior texture set
+// (slots 8..15). Floors are two-sided: shipped rooms set only the floor bit, so
+// a room's ceiling is the floor above seen from below. Walls face inward only.
+// ponytail: code 2 (the curved corner patches) and the door-flag bits are not
+// generated yet; add them when a building needs them.
+void add_native_interior_room(
+    BuildingRenderBuffer& buffer,
+    VertexIndexMap& vertex_indices,
+    const SbbCell& cell,
+    const std::array<std::uint32_t, 4>& codes,
+    bool ceiling,
+    const SblTemplate* template_file,
+    float cx,
+    float cy,
+    float cz) {
+    const auto unit = buffer.unit_size;
+    const Vec3 base{cx - unit * 0.5F, cy - unit * 0.5F, cz - unit * 0.5F};
+    const auto at = [&](float x, float y, float z) { return Vec3{base.x + x * unit, base.y + y * unit, base.z + z * unit}; };
+    // Floors are two-sided (the floor above is this room's ceiling). Walls face
+    // only into the room: seen from outside they sit 1/16 behind the exterior
+    // wall and would depth-fight with it at a distance. A visible face's
+    // geometric normal points away from the viewer, so an inward wall's normal
+    // points away from the cell centre.
+    // Material slots as the room builder numbers them (_block_addbeam @19940):
+    // 0..7 index the cell's interior set, 8..15 its exterior set. Wall faces
+    // rotate with the side, so a room's N/E/S/W walls use interior 1/2/3/4 and
+    // their outer faces exterior 3/4/1/2 (the shell's N/E/S/W slots).
+    const auto shorts_index = [](std::uint32_t game_slot) { return game_slot < 8U ? game_slot + 8U : game_slot - 8U; };
+    const auto wall_slot = [](BuildingFaceSide side) -> std::uint32_t {
+        switch (side) {
+            case BuildingFaceSide::North: return 1U;
+            case BuildingFaceSide::East: return 2U;
+            case BuildingFaceSide::South: return 3U;
+            case BuildingFaceSide::West: return 4U;
+            default: return static_cast<std::uint32_t>(material_slot_for_cell_side(side));
+        }
+    };
+    const auto add_surface = [&](const std::array<Vec3, 4>& p, const std::array<Vec2f, 4>& uv, BuildingFaceSide side, bool both,
+                                 std::optional<std::uint32_t> slot_override = std::nullopt, bool glass = false) {
+        const auto game_slot = slot_override.value_or(wall_slot(side));
+        const auto material = material_for_cell_slot(cell, shorts_index(game_slot));
+        const auto first = buffer.triangles.size();
+        const std::array<Vec3, 4> reversed{p[3], p[2], p[1], p[0]};
+        const std::array<Vec2f, 4> reversed_uv{uv[3], uv[2], uv[1], uv[0]};
+        const auto keep = [&] {
+            if (both) return true;
+            const Vec3 e1{p[1].x - p[0].x, p[1].y - p[0].y, p[1].z - p[0].z};
+            const Vec3 e2{p[2].x - p[0].x, p[2].y - p[0].y, p[2].z - p[0].z};
+            const Vec3 normal{e1.y * e2.z - e1.z * e2.y, e1.z * e2.x - e1.x * e2.z, e1.x * e2.y - e1.y * e2.x};
+            const auto centre = at(0.5F, 0.5F, 0.5F);
+            const Vec3 out{(p[0].x + p[2].x) * 0.5F - centre.x, (p[0].y + p[2].y) * 0.5F - centre.y, (p[0].z + p[2].z) * 0.5F - centre.z};
+            return normal.x * out.x + normal.y * out.y + normal.z * out.z > 0.0F;
+        }();
+        if (both || keep) add_quad(buffer, vertex_indices, p, uv, material, glass);
+        if (both || !keep) add_quad(buffer, vertex_indices, reversed, reversed_uv, material, glass);
+        const auto slot = static_cast<std::uint8_t>(shorts_index(game_slot));
+        for (auto index = first; index < buffer.triangles.size(); ++index) {
+            buffer.triangles[index].interior = true;
+            buffer.triangles[index].cell = static_cast<std::uint32_t>(cell.index);
+            buffer.triangles[index].slot = slot;
+        }
+    };
+    constexpr float inset = 1.0F / 16.0F;
+    const auto walled = [&](std::size_t side) { return codes[side] != 0U && codes[side] != 2U; };
+    const auto flat = [&](float y, BuildingFaceSide side) {
+        const auto x0 = walled(3) ? inset : 0.0F;
+        const auto x1 = walled(1) ? 1.0F - inset : 1.0F;
+        const auto z0 = walled(0) ? inset : 0.0F;
+        const auto z1 = walled(2) ? 1.0F - inset : 1.0F;
+        add_surface({at(x0, y, z0), at(x1, y, z0), at(x1, y, z1), at(x0, y, z1)},
+            {Vec2f{x0, z0}, Vec2f{x1, z0}, Vec2f{x1, z1}, Vec2f{x0, z1}}, side, true);
+    };
+    if ((cell.placed_flag() & 1U) != 0U) flat(inset, BuildingFaceSide::Down);
+    if (ceiling) flat(7.0F / 8.0F, BuildingFaceSide::Up);
+
+    // Side walls, as _block_createbuildblock @1a990 builds them. Code 1 is a
+    // plain wall (_block_addbasicsurface). Codes 3..15 go through
+    // BuildBlock_AddBeams @1a1c0: the layer's BOUNDS is the opening, framed by
+    // up to four 1/16-deep boxes (left/right/bottom/top) whose opening-facing
+    // faces (jambs, sill, lintel) take interior slot 6; then every beam record
+    // is a box: type 0 flush with the wall (depth 1/16), types 1 and 2 stand
+    // out 1/16 each way (depth 3/16, 5/16), other types are thin mullions
+    // (1/64 deep at 1/128, slot 7). _block_addwindows @1a590 then adds a glass
+    // pane per window record, 1/64 in (1/256 for portal type 1), but only when
+    // the layer's portal type is 0 or the side is north/east. Door layers
+    // (portal type 1, bounds, no windows) are therefore open doorways.
+    // A pane is one quad, wound to face out of the cell: the game draws it
+    // unculled and shades its two sides differently (see the glass pass).
+    // Rooms belong to the near LOD only, where the shell's buildblock faces
+    // are not drawn, so the frame's outer face never meets the shell.
+    // u runs along the wall and v up it; d is the depth in from the cell edge.
+    const std::array<BuildingFaceSide, 4> faces{
+        BuildingFaceSide::North, BuildingFaceSide::East, BuildingFaceSide::South, BuildingFaceSide::West};
+    for (std::size_t side = 0; side < 4; ++side) {
+        const auto wall = [&](float u, float v, float d) {
+            switch (side) {
+                case 0: return at(u, v, d);
+                case 1: return at(1.0F - d, v, u);
+                case 2: return at(u, v, 1.0F - d);
+                default: return at(d, v, u);
+            }
+        };
+        // A wall-parallel quad at depth d over [u0,u1] x [v0,v1].
+        const auto facing = [&](float u0, float u1, float v0, float v1, float d) {
+            return std::array<Vec3, 4>{wall(u0, v1, d), wall(u1, v1, d), wall(u1, v0, d), wall(u0, v0, d)};
+        };
+        // Box over [u0,u1] x [v0,v1] x [d0,d1]; faces toward the room / edge use
+        // the wall slot, the four sides `edge_slot`.
+        const auto box = [&](float u0, float u1, float v0, float v1, float d0, float d1, std::uint32_t edge_slot) {
+            add_surface(facing(u0, u1, v0, v1, d1), quad_uvs(u0, u1 - u0, v0, v1 - v0), faces[side], true);
+            add_surface(facing(u0, u1, v0, v1, d0), quad_uvs(u0, u1 - u0, v0, v1 - v0), faces[side], true);
+            const auto along = quad_uvs(u0, u1 - u0, d0, d1 - d0);
+            const auto up = quad_uvs(v0, v1 - v0, d0, d1 - d0);
+            add_surface({wall(u0, v0, d0), wall(u1, v0, d0), wall(u1, v0, d1), wall(u0, v0, d1)}, along, faces[side], true, edge_slot);
+            add_surface({wall(u0, v1, d0), wall(u1, v1, d0), wall(u1, v1, d1), wall(u0, v1, d1)}, along, faces[side], true, edge_slot);
+            add_surface({wall(u0, v0, d0), wall(u0, v1, d0), wall(u0, v1, d1), wall(u0, v0, d1)}, up, faces[side], true, edge_slot);
+            add_surface({wall(u1, v0, d0), wall(u1, v1, d0), wall(u1, v1, d1), wall(u1, v0, d1)}, up, faces[side], true, edge_slot);
+        };
+        if (codes[side] == 1U) {
+            add_surface(facing(0.0F, 1.0F, 0.0F, 1.0F, inset), quad_uvs(0.0F, 1.0F, 0.0F, 1.0F), faces[side], false);
+            continue;
+        }
+        if (codes[side] == 2U) {
+            // Corner fill: two full-height 1/16 strips at the side's starting
+            // corner (NW, NE, SE, SW for N, E, S, W; the game's wall frame runs
+            // backwards on S/W), closing the notch where a neighbour's inset
+            // wall ends. The second strip takes the previous side's wall slot.
+            const bool reversed = side >= 2U;
+            const auto u0 = reversed ? 1.0F - inset : 0.0F;
+            const auto u1 = reversed ? 1.0F : inset;
+            const auto edge = reversed ? 1.0F - inset : inset;
+            add_surface(facing(u0, u1, 0.0F, 1.0F, inset), quad_uvs(u0, inset, 0.0F, 1.0F), faces[side], true);
+            add_surface({wall(edge, 1.0F, 0.0F), wall(edge, 1.0F, inset), wall(edge, 0.0F, inset), wall(edge, 0.0F, 0.0F)},
+                quad_uvs(0.0F, inset, 0.0F, 1.0F), faces[side], true, wall_slot(faces[(side + 3U) % 4U]));
+            continue;
+        }
+        const auto* layer = buildblock_layer_for_side_code(template_file, codes[side]);
+        const auto portal_side = portal_side_for_building_face(faces[side]);
+        if (layer == nullptr || !portal_side.has_value()) continue;
+        const auto rect_of = [&](float x, float width, float y, float height) {
+            return building_room_rect(*layer, *portal_side, x, width, y, height);
+        };
+        const auto opening = rect_of(layer->bounds[0], layer->bounds[1], layer->bounds[2], layer->bounds[3]);
+        // Frame: the wall minus the opening, facing the room at depth `inset`.
+        const auto frame = opening ? subtract_city_window_rects({*opening}) : std::vector<PortalRect>{unit_portal_rect()};
+        for (const auto& rect : frame) {
+            add_surface(facing(rect.x, rect.max_x, rect.y, rect.max_y, inset),
+                quad_uvs(rect.x, rect.width, rect.y, rect.height), faces[side], false);
+            // The outer face on the cell edge, for portal type 0 only. It shows
+            // in the near LOD, where the shell's window face is not drawn.
+            if (layer->portal_type == 0U) {
+                add_surface(facing(rect.x, rect.max_x, rect.y, rect.max_y, 0.0F),
+                    quad_uvs(rect.x, rect.width, rect.y, rect.height), faces[side], true,
+                    8U + static_cast<std::uint32_t>(material_slot_for_cell_side(faces[side])));
+            }
+        }
+        if (opening) {
+            constexpr std::uint32_t kFrameSlot = 6U;
+            const auto& o = *opening;
+            const auto along = quad_uvs(o.x, o.width, 0.0F, inset);
+            const auto up = quad_uvs(o.y, o.height, 0.0F, inset);
+            if (o.y > 0.0F) add_surface({wall(o.x, o.y, 0.0F), wall(o.max_x, o.y, 0.0F), wall(o.max_x, o.y, inset), wall(o.x, o.y, inset)}, along, faces[side], true, kFrameSlot);
+            if (o.max_y < 1.0F) add_surface({wall(o.x, o.max_y, 0.0F), wall(o.max_x, o.max_y, 0.0F), wall(o.max_x, o.max_y, inset), wall(o.x, o.max_y, inset)}, along, faces[side], true, kFrameSlot);
+            if (o.x > 0.0F) add_surface({wall(o.x, o.y, 0.0F), wall(o.x, o.max_y, 0.0F), wall(o.x, o.max_y, inset), wall(o.x, o.y, inset)}, up, faces[side], true, kFrameSlot);
+            if (o.max_x < 1.0F) add_surface({wall(o.max_x, o.y, 0.0F), wall(o.max_x, o.max_y, 0.0F), wall(o.max_x, o.max_y, inset), wall(o.max_x, o.y, inset)}, up, faces[side], true, kFrameSlot);
+        }
+        for (const auto& beam : layer->beams) {
+            const auto rect = rect_of(beam.x, beam.width, beam.y, beam.height);
+            if (!rect) continue;
+            float d0 = 0.0F, d1 = inset;
+            std::uint32_t slot = 6U;
+            if (beam.type == 1U) { d0 = -inset; d1 = -inset + 0.1875F; }
+            else if (beam.type == 2U) { d0 = -inset; d1 = -inset + 0.3125F; }
+            else if (beam.type != 0U) { d0 = 1.0F / 128.0F; d1 = d0 + 1.0F / 64.0F; slot = 7U; }
+            box(rect->x, rect->max_x, rect->y, rect->max_y, d0, d1, slot);
+        }
+        if (layer->portal_type == 0U || side < 2U) {
+            const auto depth = layer->portal_type == 1U ? 1.0F / 256.0F : 1.0F / 64.0F;
+            for (const auto& window : layer->windows) {
+                if (const auto rect = rect_of(window.x, window.width, window.y, window.height)) {
+                    add_surface(facing(rect->x, rect->max_x, rect->y, rect->max_y, depth),
+                        quad_uvs(rect->x, rect->width, rect->y, rect->height), faces[side], false, std::nullopt, true);
+                }
+            }
+        }
+    }
+}
+
 BuildingRenderBuffer build_native_building_render_buffer(
     const SbbBuilding& building,
     const std::vector<NamedBlockMesh>& block_meshes,
-    const std::vector<NamedBuildblockTemplate>& buildblock_templates) {
+    const std::vector<NamedBuildblockTemplate>& buildblock_templates,
+    std::optional<std::uint32_t> floor,
+    bool roofs) {
     MAPED_PROFILE_FUNCTION();
     BuildingRenderBuffer buffer;
     const auto unit_size = buffer.unit_size;
@@ -2870,7 +3313,7 @@ BuildingRenderBuffer build_native_building_render_buffer(
     vertex_indices.reserve(building.cells.size() * 4U);
     buffer.vertices.reserve(building.cells.size() * 4U);
     buffer.triangles.reserve(building.cells.size() * 6U);
-    const auto cell_index = build_cell_index(building.cells);
+    const auto cell_lookup = build_cell_index(building.cells);
 
     const auto piece_resolution_count = begins_with_native_builtin_block_meshes(block_meshes)
         ? std::max(building.piece_names.size(), block_meshes.size())
@@ -2905,9 +3348,23 @@ BuildingRenderBuffer build_native_building_render_buffer(
     };
 
     for (const auto& cell : building.cells) {
-        if (!cell.occupied) {
+        // A single-floor view drops the other floors, so the floor above no
+        // longer covers this floor's top faces.
+        if (!cell.occupied || (floor.has_value() && cell.y != *floor)) {
             continue;
         }
+        // Tag every face this cell emits with the cell and its texture slot:
+        // a selector call names the slot of the triangles emitted after it.
+        const auto cell_index = static_cast<std::uint32_t>(&cell - building.cells.data());
+        std::size_t tagged = buffer.triangles.size();
+        std::uint8_t pending_slot = 0xffU;
+        const auto tag = [&](std::uint32_t next_slot) {
+            for (; tagged < buffer.triangles.size(); ++tagged) {
+                buffer.triangles[tagged].cell = cell_index;
+                buffer.triangles[tagged].slot = pending_slot;
+            }
+            pending_slot = static_cast<std::uint8_t>(next_slot);
+        };
 
         const auto piece_payload = exterior_piece_payload(cell);
         if (piece_payload.has_value()) {
@@ -2920,7 +3377,8 @@ BuildingRenderBuffer build_native_building_render_buffer(
                     *mesh,
                     origin,
                     rotation,
-                    [&cell](BuildingRenderBuffer&, const SblBlockFace&, const NativeRotatedBlockFace& rotated_face) {
+                    [&](BuildingRenderBuffer&, const SblBlockFace&, const NativeRotatedBlockFace& rotated_face) {
+                        tag(piece_face_slot(rotated_face.material, false));
                         return material_for_piece_face(cell, rotated_face.material, false);
                     });
             }
@@ -2937,7 +3395,8 @@ BuildingRenderBuffer build_native_building_render_buffer(
                     *mesh,
                     origin,
                     rotation,
-                    [&cell](BuildingRenderBuffer&, const SblBlockFace&, const NativeRotatedBlockFace& rotated_face) {
+                    [&](BuildingRenderBuffer&, const SblBlockFace&, const NativeRotatedBlockFace& rotated_face) {
+                        tag(piece_face_slot(rotated_face.material, true));
                         return material_for_piece_face(cell, rotated_face.material, true);
                     });
             }
@@ -2947,27 +3406,74 @@ BuildingRenderBuffer build_native_building_render_buffer(
         const auto cy = (static_cast<float>(cell.y) - static_cast<float>(building.anchor_y) + 0.5F) * unit_size;
         const auto cz = (static_cast<float>(cell.z) - static_cast<float>(building.anchor_z) + 0.5F) * unit_size;
 
-        if (!cell_has_exterior_surface(&cell)) {
-            continue;
-        }
-
-        const auto* west = find_cell_at(cell_index, cell.x - 1U, cell.y, cell.z);
-        const auto* east = find_cell_at(cell_index, cell.x + 1U, cell.y, cell.z);
-        const auto* north = find_cell_at(cell_index, cell.x, cell.y, cell.z - 1U);
-        const auto* south = find_cell_at(cell_index, cell.x, cell.y, cell.z + 1U);
-        const auto* up = find_cell_at(cell_index, cell.x, cell.y + 1U, cell.z);
+        const auto* west = find_cell_at(cell_lookup, cell.x - 1U, cell.y, cell.z);
+        const auto* east = find_cell_at(cell_lookup, cell.x + 1U, cell.y, cell.z);
+        const auto* north = find_cell_at(cell_lookup, cell.x, cell.y, cell.z - 1U);
+        const auto* south = find_cell_at(cell_lookup, cell.x, cell.y, cell.z + 1U);
+        const auto* up = floor.has_value() ? nullptr : find_cell_at(cell_lookup, cell.x, cell.y + 1U, cell.z);
         const auto* template_file = cell.cell_type() < resolved_buildblock_templates.size()
             ? resolved_buildblock_templates[cell.cell_type()]
             : (buildblock_templates.empty() ? nullptr : &buildblock_templates.front().template_file);
 
-        // BuildBuildingBlockRenderBuffers_1400799d0.c:144-146 iterates native
-        // faces 1..5 only. Down/face 0 is intentionally absent here.
-        const std::array<SolidCellFaceCheck, 5> native_sides{{
+        if (cell.interior_block() == 0xffffU) {
+            tag(0xffU);
+            // InstantiateSbbVolumeIntoWorldAndMetadata @23ac0 packs the room
+            // key: side codes N (own +0x0c), E ((x+1) +0x10), S ((z+1) +0x0c),
+            // W (own +0x10), and turns an open side into code 2 (a corner fill)
+            // where a neighbour's wall ends at that side's starting corner.
+            // Sbb_BuildBuildingConnectivityMetadata @29120 derives the ceiling:
+            // top layer, or the cell above has no exterior or interior block,
+            // or has its own floor.
+            const auto code_at = [&](std::int64_t dx, std::int64_t dz, bool north_word) -> std::uint32_t {
+                if (static_cast<std::int64_t>(cell.x) + dx < 0 || static_cast<std::int64_t>(cell.z) + dz < 0) return 0U;
+                const auto* other = find_cell_at(cell_lookup, static_cast<std::uint32_t>(cell.x + dx), cell.y,
+                    static_cast<std::uint32_t>(cell.z + dz));
+                if (other == nullptr) return 0U;
+                return north_word ? other->exterior_portal_face() : other->interior_portal_face();
+            };
+            const auto wall_code = [](std::uint32_t code) { return code == 1U || (code >= 3U && code <= 15U); };
+            std::array<std::uint32_t, 4> codes{
+                cell.exterior_portal_face(),
+                code_at(1, 0, false),
+                code_at(0, 1, true),
+                cell.interior_portal_face(),
+            };
+            const auto [n, e, s, w] = codes;
+            if (n == 0U) {
+                if (w == 0U && (wall_code(code_at(-1, 0, true)) || wall_code(code_at(0, -1, false)))) codes[0] = 2U;
+                if (e == 0U && (wall_code(code_at(1, 0, true)) || wall_code(code_at(1, -1, false)))) codes[1] = 2U;
+            }
+            if (s == 0U) {
+                if (e == 0U && (wall_code(code_at(1, 1, true)) || wall_code(code_at(1, 1, false)))) codes[2] = 2U;
+                if (w == 0U && (wall_code(code_at(-1, 1, true)) || wall_code(code_at(0, 1, false)))) codes[3] = 2U;
+            }
+            const auto* above = floor.has_value() ? nullptr : find_cell_at(cell_lookup, cell.x, cell.y + 1U, cell.z);
+            const bool ceiling = above == nullptr || !above->occupied || above->exterior_block() == 0U ||
+                above->interior_block() == 0U || above->placed_flag() != 0U;
+            add_native_interior_room(buffer, vertex_indices, cell, codes, ceiling, template_file, cx, cy, cz);
+            // The room tags its own slots; the cell is its position here.
+            for (; tagged < buffer.triangles.size(); ++tagged) buffer.triangles[tagged].cell = cell_index;
+        }
+
+        if (!cell_has_exterior_surface(&cell)) {
+            tag(0xffU);
+            continue;
+        }
+        // Without roofs every upward face counts as covered.
+        static const auto roof_cover = native_city_block_solid_cell();
+        if (!roofs) up = &roof_cover;
+
+        // World_SetTileBlockAndResolveNeighborLinks @f830 gives a solid cell all
+        // six faces and clears only those against a solid neighbour (the bottom
+        // also at world y 0), so overhangs show their underside.
+        const auto* down = floor.has_value() || cell.y == 0U ? nullptr : find_cell_at(cell_lookup, cell.x, cell.y - 1U, cell.z);
+        const std::array<SolidCellFaceCheck, 6> native_sides{{
             {BuildingFaceSide::South, south},
             {BuildingFaceSide::West, west},
             {BuildingFaceSide::North, north},
             {BuildingFaceSide::East, east},
             {BuildingFaceSide::Up, up},
+            {BuildingFaceSide::Down, down},
         }};
 
         add_native_solid_cell_faces(
@@ -2979,10 +3485,13 @@ BuildingRenderBuffer build_native_building_render_buffer(
             cz,
             native_sides,
             east,
+            south,
             template_file,
-            [&cell](BuildingFaceSide side) {
+            [&](BuildingFaceSide side) {
+                tag(static_cast<std::uint32_t>(material_slot_for_cell_side(side)));
                 return material_for_cell_side(cell, side);
             });
+        tag(0xffU);
     }
 
     sort_triangles_into_native_material_runs(buffer);
@@ -3114,15 +3623,36 @@ BuildingRenderBuffer build_native_building_tool_preview_render_buffer(
 BuildingRenderBuffer build_city_building_full_render_buffer(
     const SbbBuilding& building,
     const std::vector<NamedBlockMesh>& block_meshes,
-    const std::vector<NamedBuildblockTemplate>& buildblock_templates) {
+    const std::vector<NamedBuildblockTemplate>& buildblock_templates,
+    BuildingLod lod) {
     // City placement uses the runtime building buffer, not the editor's
     // floor-tool preview. The preview interprets placed_flag bits as optional
     // floor/ceiling guides; using it in the city dropped exposed face 5 on
     // otherwise solid top cells and made roofs or top floors disappear.
-    return build_native_building_render_buffer(
-        building,
-        block_meshes,
-        buildblock_templates);
+    return select_building_lod(build_native_building_render_buffer(building, block_meshes, buildblock_templates), lod);
+}
+
+BuildingRenderBuffer select_building_lod(BuildingRenderBuffer buffer, BuildingLod lod) {
+    if (lod == BuildingLod::Both) return buffer;
+    const bool near = lod == BuildingLod::Near;
+    std::erase_if(buffer.triangles, [near](const RenderBufferTriangle& tri) { return near ? tri.far_only : tri.interior; });
+    // Keep only the vertices the remaining triangles use.
+    std::vector<std::uint32_t> remap(buffer.vertices.size(), 0xffffffffU);
+    std::vector<RenderBufferVertex> vertices;
+    for (auto& tri : buffer.triangles) {
+        for (auto& index : tri.indices) {
+            if (remap[index] == 0xffffffffU) {
+                remap[index] = static_cast<std::uint32_t>(vertices.size());
+                vertices.push_back(buffer.vertices[index]);
+            }
+            index = remap[index];
+        }
+    }
+    vertices.shrink_to_fit();
+    buffer.vertices = std::move(vertices);
+    buffer.triangles.shrink_to_fit();
+    sort_triangles_into_native_material_runs(buffer);
+    return buffer;
 }
 
 BuildingRenderBuffer build_native_portal_render_buffer(
@@ -3130,7 +3660,8 @@ BuildingRenderBuffer build_native_portal_render_buffer(
     const std::vector<NamedBlockMesh>& block_meshes,
     std::optional<std::size_t> selected_portal,
     [[maybe_unused]] const std::vector<NamedBuildblockTemplate>& buildblock_templates,
-    const std::vector<std::string>& texture_names) {
+    const std::vector<std::string>& texture_names,
+    const std::vector<const SbbBuilding*>& placement_buildings) {
     MAPED_PROFILE_FUNCTION();
     BuildingRenderBuffer buffer;
     VertexIndexMap vertex_indices;
@@ -3139,25 +3670,40 @@ BuildingRenderBuffer build_native_portal_render_buffer(
         return material_id_for_name(buffer, city_block_layer_slot_name(city_block, layer_index, slot));
     };
 
-    // v10 district SOLID (0x40000000) cells are buried world fill. The game never
-    // draws the vertical STACKS of them (foundation walls, up to 5 cells deep at
-    // Y=6..10) — they sit below the ground and the terrain hides them. The editor
-    // drew every cell as an opaque cube, so those buried stacks showed up as black
-    // walls in 3D (and were absent from the 2D preview — the tell). A SINGLE solid
-    // cell standing alone in its column is a real flat asphalt slab (the plaza /
-    // road-end pieces) and still renders. So: cull a solid that has another solid
-    // directly above or below it (i.e. it belongs to a stack); keep singletons.
-    // Precompute solid coordinates so the render loop can test vertical neighbors.
+    // Solid district cells, for the neighbour face test below.
     std::unordered_set<std::uint64_t> solid_cell_coords;
-    // Any occupied (non-empty) district cell, used to detect a solid buried under a
-    // piece (e.g. the Y=11 solid support directly below a Y=12 railing piece). The
-    // game culls the buried solid's faces against the piece/sidewalk above it; the
-    // editor must skip it too or it z-fights the sidewalk tile.
-    std::unordered_set<std::uint64_t> occupied_cell_coords;
     const auto solid_key = [](std::int32_t x, std::int32_t y, std::int32_t z) {
         return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 42) |
                (static_cast<std::uint64_t>(static_cast<std::uint32_t>(y) & 0x1fffffU) << 21) |
                static_cast<std::uint64_t>(static_cast<std::uint32_t>(z) & 0x1fffffU);
+    };
+    // World_LoadMapAndInitializeTerrain places v10 district cells before the
+    // buildings, and InstantiateSbbVolumeIntoWorldAndMetadata then writes every
+    // building cell with an exterior block word over the world cell. Those
+    // district cells are gone; the building's solids are neighbours for the
+    // face test. (Later-format city blocks are placed after the buildings.)
+    std::unordered_set<CityTileKey, CityTileKeyHash> building_cells;
+    for (std::size_t index = 0; map.city_blocks.empty() && index < map.buildings.size() && index < placement_buildings.size(); ++index) {
+        const auto* building = placement_buildings[index];
+        if (building == nullptr) continue;
+        const auto& placement = map.buildings[index];
+        for (const auto& cell : building->cells) {
+            if (cell.exterior_block() == 0U) continue;
+            const Vec3 local{
+                (static_cast<float>(cell.x) - static_cast<float>(building->anchor_x) + 0.5F) * 4.0F,
+                0.0F,
+                (static_cast<float>(cell.z) - static_cast<float>(building->anchor_z) + 0.5F) * 4.0F,
+            };
+            const auto world = native_city_building_transform_point(placement, local, 4.0F);
+            const CityTileKey key{static_cast<std::int32_t>(std::floor(world.x / 4.0F)),
+                placement.y + static_cast<std::int32_t>(cell.y) - static_cast<std::int32_t>(building->anchor_y),
+                static_cast<std::int32_t>(std::floor(world.z / 4.0F))};
+            building_cells.insert(key);
+            if ((cell.exterior_block() & 0xe0000000U) == 0x40000000U) solid_cell_coords.insert(solid_key(key.x, key.y, key.z));
+        }
+    }
+    const auto replaced_by_building = [&](std::int32_t x, std::int32_t y, std::int32_t z) {
+        return building_cells.contains({x, y, z});
     };
     for (const auto& portal : map.portals) {
         const auto& portal_voxels = portal.voxel_blocks();
@@ -3170,8 +3716,7 @@ BuildingRenderBuffer build_native_portal_render_buffer(
             const auto sx = portal.fields[1] * 8 + static_cast<std::int32_t>(vi & 7U);
             const auto sz = portal.fields[3] * 8 + static_cast<std::int32_t>((vi >> 3U) & 7U);
             const auto sy = portal.fields[2] * 8 + static_cast<std::int32_t>((vi >> 6U) & 7U);
-            occupied_cell_coords.insert(solid_key(sx, sy, sz));
-            if ((cell_word & 0xe0000000U) == 0x40000000U) {
+            if ((cell_word & 0xe0000000U) == 0x40000000U && !replaced_by_building(sx, sy, sz)) {
                 solid_cell_coords.insert(solid_key(sx, sy, sz));
             }
         }
@@ -3215,47 +3760,42 @@ BuildingRenderBuffer build_native_portal_render_buffer(
             //     out-of-range index render nothing, exactly as the native instancing
             //     loop does for empty catalog slots.
             if (map.city_blocks.empty()) {
+                if (replaced_by_building(portal.fields[1] * 8 + local_x, portal.fields[2] * 8 + local_y,
+                        portal.fields[3] * 8 + local_z)) {
+                    continue;
+                }
                 const auto cell_class = word & 0xe0000000U;
                 const auto grid_material = [&](std::size_t slot) {
                     const auto grid_base = voxel_index * 8U + std::min<std::size_t>(slot, 7U);
-                    auto tex_idx = grid_base < portal.textures.size()
+                    const auto tex_idx = grid_base < portal.textures.size()
                         ? static_cast<std::size_t>(portal.textures[grid_base])
                         : 0U;
-                    // An unset grid slot stores 0xffff; BuildCellRenderGeometryAndAdjacency
-                    // @0xc4c0 replaces such entries with the default texture rather than
-                    // leaving them unbound. Procedural pieces (railings/curbs) carry no
-                    // per-face texture, so every slot is unset -> fall back to texture 0
-                    // instead of an empty name (which renders black).
-                    if (tex_idx >= texture_names.size()) {
-                        tex_idx = 0U;
-                    }
-                    const auto name = tex_idx < texture_names.size() ? texture_names[tex_idx] : std::string{};
-                    return material_id_for_name(buffer, name);
+                    // World_LoadMapAndInitializeTerrain's legacy district loop hands
+                    // World_SetTileBlockAndResolveNeighborLinks each face as
+                    // (grid != 0), so these cells only ever use texture 0 ("concrete")
+                    // or texture 1, whose slot asphalt2.png loads into. The stored
+                    // index itself is never used.
+                    return material_id_for_name(buffer, tex_idx == 0U ? "city_curb_concrete" : "city_road_asphalt");
                 };
 
                 if (cell_class == 0x40000000U) {
-                    // Cull buried solids; keep singleton slabs (flat plaza/road-end
-                    // pieces). A solid is buried when:
-                    //  - another solid sits directly above OR below it (a vertical
-                    //    foundation-wall stack the game never draws), or
-                    //  - ANY district cell sits directly above it (e.g. the Y=11
-                    //    solid support under a Y=12 railing piece) — the game hides it
-                    //    behind the piece + sidewalk, so drawing it z-fights the tile.
+                    // World_SetTileBlockAndResolveNeighborLinks places every
+                    // district solid; BuildCellRenderGeometryAndAdjacency then
+                    // skips only the faces shared with a solid neighbour.
                     const auto cell_x = portal.fields[1] * 8 + local_x;
                     const auto cell_y = portal.fields[2] * 8 + local_y;
                     const auto cell_z = portal.fields[3] * 8 + local_z;
-                    if (solid_cell_coords.contains(solid_key(cell_x, cell_y + 1, cell_z)) ||
-                        solid_cell_coords.contains(solid_key(cell_x, cell_y - 1, cell_z)) ||
-                        occupied_cell_coords.contains(solid_key(cell_x, cell_y + 1, cell_z))) {
-                        continue;
-                    }
+                    const auto solid = [&](std::int32_t dx, std::int32_t dy, std::int32_t dz) {
+                        return solid_cell_coords.contains(solid_key(cell_x + dx, cell_y + dy, cell_z + dz));
+                    };
                     add_native_city_block_solid_cell(
                         buffer,
                         vertex_indices,
                         origin,
                         [&](BuildingFaceSide side) {
                             return grid_material(material_slot_for_cell_side(side));
-                        });
+                        },
+                        {solid(0, 0, 1), solid(-1, 0, 0), solid(0, 0, -1), solid(1, 0, 0), solid(0, 1, 0)});
                     continue;
                 }
 
@@ -3789,19 +4329,44 @@ Vec3 native_city_building_transform_point(const SbcBuilding& placement, Vec3 loc
     };
 }
 
+std::optional<BuildingFacePick> pick_building_face(const BuildingRenderBuffer& buffer, Vec3 origin, Vec3 direction) {
+    std::optional<BuildingFacePick> best;
+    for (const auto& tri : buffer.triangles) {
+        if (tri.cell == 0xffffffffU) continue;
+        const auto& a = buffer.vertices[tri.indices[0]].position;
+        const auto& b = buffer.vertices[tri.indices[1]].position;
+        const auto& c = buffer.vertices[tri.indices[2]].position;
+        // Moller-Trumbore, either side.
+        const Vec3 e1{b.x - a.x, b.y - a.y, b.z - a.z};
+        const Vec3 e2{c.x - a.x, c.y - a.y, c.z - a.z};
+        const Vec3 p{direction.y * e2.z - direction.z * e2.y, direction.z * e2.x - direction.x * e2.z, direction.x * e2.y - direction.y * e2.x};
+        const auto det = e1.x * p.x + e1.y * p.y + e1.z * p.z;
+        if (std::abs(det) < 1e-9F) continue;
+        const auto inv = 1.0F / det;
+        const Vec3 s{origin.x - a.x, origin.y - a.y, origin.z - a.z};
+        const auto u = (s.x * p.x + s.y * p.y + s.z * p.z) * inv;
+        if (u < 0.0F || u > 1.0F) continue;
+        const Vec3 q{s.y * e1.z - s.z * e1.y, s.z * e1.x - s.x * e1.z, s.x * e1.y - s.y * e1.x};
+        const auto v = (direction.x * q.x + direction.y * q.y + direction.z * q.z) * inv;
+        if (v < 0.0F || u + v > 1.0F) continue;
+        const auto t = (e2.x * q.x + e2.y * q.y + e2.z * q.z) * inv;
+        if (t <= 0.0F || (best && t >= best->t)) continue;
+        best = BuildingFacePick{tri.cell, tri.slot, {origin.x + direction.x * t, origin.y + direction.y * t, origin.z + direction.z * t}, t};
+    }
+    return best;
+}
+
 std::uint64_t city_scene_fingerprint(const SbcMap& map) {
-    // FNV-1a over the fields the city scene is built from: intersections (terrain
+    // Hash over the fields the city scene is built from: intersections (terrain
     // + tile grid + poles), streets (road tiles), and building placements. Anything
     // that changes the rendered city changes one of these, so a mismatch is the
     // signal to rebuild the cached MapScene.
     std::uint64_t hash = 1469598103934665603ULL;
+    // Word-at-a-time FNV variant: this runs every frame over every piece voxel,
+    // and only needs to detect change, not be a stable byte-wise FNV-1a.
     const auto mix = [&hash](std::int64_t value) {
-        auto bits = static_cast<std::uint64_t>(value);
-        for (int byte = 0; byte < 8; ++byte) {
-            hash ^= bits & 0xFFU;
-            hash *= 1099511628211ULL;
-            bits >>= 8;
-        }
+        hash ^= static_cast<std::uint64_t>(value);
+        hash *= 1099511628211ULL;
     };
     mix(static_cast<std::int64_t>(map.intersections.size()));
     for (const auto& it : map.intersections) {
@@ -3830,9 +4395,18 @@ std::uint64_t city_scene_fingerprint(const SbcMap& map) {
         mix(portal.fields[1]);
         mix(portal.fields[2]);
         mix(portal.fields[3]);
-        for (const auto word : portal.voxel_blocks()) {
-            mix(static_cast<std::int64_t>(word));
+        // Four independent lanes, so the multiplies don't wait on each other;
+        // every word still feeds one lane.
+        const auto& words = portal.voxel_blocks();
+        std::array<std::uint64_t, 4> lanes{hash, hash + 1U, hash + 2U, hash + 3U};
+        std::size_t i = 0;
+        for (; i + 4U <= words.size(); i += 4U) {
+            for (std::size_t lane = 0; lane < 4U; ++lane) {
+                lanes[lane] = (lanes[lane] ^ words[i + lane]) * 1099511628211ULL;
+            }
         }
+        for (; i < words.size(); ++i) lanes[0] = (lanes[0] ^ words[i]) * 1099511628211ULL;
+        for (const auto lane : lanes) mix(static_cast<std::int64_t>(lane));
     }
     return hash;
 }
@@ -3843,13 +4417,11 @@ std::uint64_t city_terrain_fingerprint(const SbcMap& map) {
     // footprints, and piece/portal cells (footprint stamping). Streets/road widths
     // are excluded, so road and street edits skip the expensive terrain re-upload.
     std::uint64_t hash = 1469598103934665603ULL;
+    // Word-at-a-time FNV variant: this runs every frame over every piece voxel,
+    // and only needs to detect change, not be a stable byte-wise FNV-1a.
     const auto mix = [&hash](std::int64_t value) {
-        auto bits = static_cast<std::uint64_t>(value);
-        for (int byte = 0; byte < 8; ++byte) {
-            hash ^= bits & 0xFFU;
-            hash *= 1099511628211ULL;
-            bits >>= 8;
-        }
+        hash ^= static_cast<std::uint64_t>(value);
+        hash *= 1099511628211ULL;
     };
     mix(static_cast<std::int64_t>(map.intersections.size()));
     for (const auto& it : map.intersections) {
@@ -3880,7 +4452,7 @@ MapScene build_map_scene(const SbcMap& map) {
     return build_map_scene(map, {});
 }
 
-MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*>& placement_buildings) {
+MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*>& placement_buildings, bool auto_generated) {
     MAPED_PROFILE_FUNCTION();
     MapScene scene;
     // Native build order (World_LoadMapAndInitializeTerrain @56980): street
@@ -3889,10 +4461,39 @@ MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*
     // expansion, then the terrain rebuild with its patches.
     auto graph = build_native_city_graph(map);
     CityCornerStampMap corner_stamps;
+    corner_stamps.disabled = auto_generated;
+    // The mask bounds are the raw intersection extents (0x35fd1444..0x35fd1458),
+    // gathered before any tile is placed.
+    if (!map.intersections.empty()) {
+        corner_stamps.mask_min_x = corner_stamps.mask_min_z = std::numeric_limits<std::int32_t>::max();
+        corner_stamps.mask_max_x = corner_stamps.mask_max_z = std::numeric_limits<std::int32_t>::lowest();
+        for (const auto& intersection : map.intersections) {
+            corner_stamps.mask_min_x = std::min(corner_stamps.mask_min_x, intersection.x);
+            corner_stamps.mask_max_x = std::max(corner_stamps.mask_max_x, intersection.x);
+            corner_stamps.mask_min_z = std::min(corner_stamps.mask_min_z, intersection.z);
+            corner_stamps.mask_max_z = std::max(corner_stamps.mask_max_z, intersection.z);
+        }
+    }
     scene.city_tiles = build_city_tile_cells(graph, corner_stamps);
+    remove_replaced_city_tiles(scene.city_tiles, map, placement_buildings);
     stamp_city_portal_cells(corner_stamps, map);
     stamp_city_building_footprints(corner_stamps, map, placement_buildings);
     scene.traffic_light_poles = build_city_traffic_light_poles(graph, scene.unit_size);
+    // Map labels (DrawMapMenu @88040): a street along X is named on its first
+    // segment (no street arriving at its start from -X); one along Z on the
+    // segment starting at gz 320..323, shifted 16 map units down on odd avenue
+    // columns. Placed at the segment midpoint, (world - 896) / 8.
+    for (const auto& street : graph.streets) {
+        const auto& a = graph.intersections[static_cast<std::size_t>(street.a)];
+        const auto& b = graph.intersections[static_cast<std::size_t>(street.b)];
+        const bool labelled = street.orientation == 0
+            ? a.street_north < 0
+            : static_cast<std::uint32_t>(a.gz - 320) < 4U;
+        if (!labelled) continue;
+        auto y = (static_cast<float>((a.gz + b.gz) * 2) - 896.0F) * 0.125F;
+        if (street.orientation == 1) y += static_cast<float>(((a.gx - 256) / 56) & 1) * 16.0F;
+        scene.map_labels.push_back({street.name_index, (static_cast<float>((a.gx + b.gx) * 2) - 896.0F) * 0.125F, y});
+    }
     expand_native_city_extents(graph);
     scene.terrain = build_city_terrain(map, graph, corner_stamps, scene.city_tiles, scene.unit_size);
     for (const auto& street : graph.streets) {
@@ -3963,7 +4564,20 @@ MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*
         });
     }
     scene.city_tile_buffer = build_city_tile_render_buffer(scene.city_tiles, scene.unit_size);
-    add_city_road_markings(scene.city_tile_buffer, scene.roads, scene.city_tiles);
+    bake_shadow_volume(scene.city_tile_buffer);
+    scene.city_tile_fingerprint = 1469598103934665603ULL;
+    for (const auto& tile : scene.city_tiles) {
+        for (const auto value : {static_cast<std::uint64_t>(static_cast<std::uint32_t>(tile.x)),
+                 static_cast<std::uint64_t>(static_cast<std::uint32_t>(tile.y)),
+                 static_cast<std::uint64_t>(static_cast<std::uint32_t>(tile.z)),
+                 static_cast<std::uint64_t>(tile.block),
+                 static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(tile.base_y)),
+                 static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(tile.slope_x)),
+                 static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(tile.slope_z))}) {
+            scene.city_tile_fingerprint = (scene.city_tile_fingerprint ^ value) * 1099511628211ULL;
+        }
+        for (const auto face : tile.faces) scene.city_tile_fingerprint = (scene.city_tile_fingerprint ^ face) * 1099511628211ULL;
+    }
 
     for (std::size_t intersection_index = 0; intersection_index < map.intersections.size(); ++intersection_index) {
         const auto& intersection = map.intersections[intersection_index];

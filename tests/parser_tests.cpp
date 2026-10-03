@@ -1,5 +1,6 @@
 #include "formats.hpp"
 #include "editor_state.hpp"
+#include "buildblock_catalog.hpp"
 #include "scene.hpp"
 
 #include <algorithm>
@@ -12,6 +13,7 @@
 #include <cassert>
 #include <cmath>
 #include <filesystem>
+#include <set>
 #include <string>
 #include <stdexcept>
 #include <vector>
@@ -690,7 +692,11 @@ void resolves_sbb_portal_edge_units() {
     const auto east = std::ranges::find_if(building.cells, [source](const map_editor::SbbCell& cell) {
         return cell.x == source->x + 1U && cell.y == source->y && cell.z == source->z;
     });
-    assert(first.side_codes.south == source->exterior_portal_face());
+    // Sbb_BuildBuildingConnectivityMetadata @29120: south is the (z+1) cell's w3.
+    const auto south = std::ranges::find_if(building.cells, [source](const map_editor::SbbCell& cell) {
+        return cell.x == source->x && cell.y == source->y && cell.z == source->z + 1U;
+    });
+    assert(first.side_codes.south == (south == building.cells.end() ? 0U : south->exterior_portal_face()));
     assert(first.side_codes.east == (east == building.cells.end() ? 0U : east->interior_portal_face()));
 }
 
@@ -742,7 +748,8 @@ void native_portal_edge_side_codes_follow_editor_edge_flags() {
 
     assert(scene.portal_edges.size() >= 1);
     const auto& edge = scene.portal_edges.front();
-    assert(edge.side_codes.south == 4U);
+    // South is the z+1 cell's w3 (@29120).
+    assert(edge.side_codes.south == 9U);
     assert(edge.side_codes.west == 5U);
     assert(edge.side_codes.north == 4U);
     assert(edge.side_codes.east == 6U);
@@ -782,7 +789,8 @@ void attaches_portal_wall_rects_to_scene_edges() {
 
     assert(scene.portal_edges.size() == 1);
     assert(scene.portal_edges[0].wall_rects.north.size() == 4);
-    assert(scene.portal_edges[0].wall_rects.south.size() == 4);
+    // No z+1 cell supplies a south code (@29120).
+    assert(scene.portal_edges[0].wall_rects.south.empty());
     assert(scene.portal_edges[0].wall_rects.west.empty());
     assert(close_to(scene.portal_edges[0].wall_rects.north[0].height, 0.25F));
 }
@@ -838,9 +846,11 @@ void native_building_render_buffer_indexes_shared_cell_corners_and_uvs() {
 
     const auto buffer = map_editor::build_native_building_render_buffer(building, {}, {});
 
-    assert(buffer.triangles.size() == 10U);
+    // Six shell faces: nothing solid touches the lone cell (the bottom
+    // included). Its room adds the derived ceiling.
+    assert(std::ranges::count_if(buffer.triangles, [](const map_editor::RenderBufferTriangle& t) { return !t.interior; }) == 12);
     assert(buffer.vertices.size() > 8U);
-    assert(buffer.vertices.size() <= 20U);
+    assert(buffer.vertices.size() <= 24U);
     for (const auto& triangle : buffer.triangles) {
         for (const auto index : triangle.indices) {
             assert(index < buffer.vertices.size());
@@ -848,31 +858,27 @@ void native_building_render_buffer_indexes_shared_cell_corners_and_uvs() {
     }
 }
 
-void native_building_render_buffer_never_emits_down_face() {
+void native_building_render_buffer_emits_down_face_only_over_open_cells() {
+    // World_SetTileBlockAndResolveNeighborLinks @f830: a solid cell keeps its
+    // bottom face unless a solid cell sits below, so overhangs show their
+    // underside and a cell resting on another does not.
     map_editor::SbbBuilding building{};
-    building.extent_x = 1;
-    building.extent_y = 1;
-    building.extent_z = 1;
-    building.cells.push_back({
-        0,
-        0,
-        0,
-        0,
-        {0x40000000U, 0xffffU, 0U, 0U, 0U, 0U},
-        0,
-        true,
-        {},
-    });
-
+    building.cells.push_back({0, 0, 0, 0, {0x40000000U, 0xffffU, 0U, 0U, 0U, 0U}, 0, true, {}});
+    building.cells.push_back({1, 1, 1, 0, {0x40000000U, 0xffffU, 0U, 0U, 0U, 0U}, 0, true, {}});
+    building.cells.push_back({2, 0, 1, 0, {0x40000000U, 0xffffU, 0U, 0U, 0U, 0U}, 0, true, {}});
     const auto buffer = map_editor::build_native_building_render_buffer(building, {}, {});
-
-    assert(buffer.triangles.size() == 10U);
-    for (const auto& triangle : buffer.triangles) {
-        const auto& a = buffer.vertices[triangle.indices[0]].position;
-        const auto& b = buffer.vertices[triangle.indices[1]].position;
-        const auto& c = buffer.vertices[triangle.indices[2]].position;
-        assert(!(close_to(a.y, 0.0F) && close_to(b.y, 0.0F) && close_to(c.y, 0.0F)));
-    }
+    const auto bottom_at = [&](float y, float x0, float x1) {
+        return std::ranges::count_if(buffer.triangles, [&](const map_editor::RenderBufferTriangle& triangle) {
+            const auto& a = buffer.vertices[triangle.indices[0]].position;
+            const auto& b = buffer.vertices[triangle.indices[1]].position;
+            const auto& c = buffer.vertices[triangle.indices[2]].position;
+            const auto cx = (a.x + b.x + c.x) / 3.0F;
+            return close_to(a.y, y) && close_to(b.y, y) && close_to(c.y, y) && cx > x0 && cx < x1;
+        });
+    };
+    assert(bottom_at(0.0F, 0.0F, 4.0F) == 2);  // ground cell
+    assert(bottom_at(4.0F, 4.0F, 8.0F) == 2);  // overhang at x 1, nothing below
+    assert(bottom_at(4.0F, 0.0F, 4.0F) == 0);  // resting on the ground cell
 }
 
 void native_building_render_buffer_uses_editor_face_order_and_uvs() {
@@ -981,7 +987,151 @@ void native_building_render_buffer_renders_interior_piece_with_interior_material
     assert(interior_run->triangle_count == 2U);
 }
 
-void native_city_building_render_buffer_keeps_plain_buildblock_walls_untextured() {
+// A 0xffff interior cell gets the _block_createbuildblock room: the floor at
+// 1/16 pulled in from walled sides, and each walled side 1/16 inside the edge,
+// all two-sided, in the interior texture set.
+void native_building_render_buffer_builds_interior_room() {
+    map_editor::SbbBuilding building{};
+    auto cell = map_editor::SbbCell{0, 0, 0, 0, {0x40000000U, 0xffffU, 0U, 1U, 0U, 1U}, 0, true, {}};
+    cell.shorts[8] = 21U;  // interior floor
+    cell.shorts[9] = 22U;  // interior north wall: _block_addbeam's slot 1 on side 0
+    building.cells.push_back(cell);
+    const auto buffer = map_editor::build_native_building_render_buffer(building, {}, {});
+    const auto count = [&](std::uint32_t material, auto predicate) {
+        return std::ranges::count_if(buffer.triangles, [&](const map_editor::RenderBufferTriangle& tri) {
+            return tri.material == material && predicate(tri);
+        });
+    };
+    const auto all_y = [&](float y) {
+        return [&buffer, y](const map_editor::RenderBufferTriangle& tri) {
+            return std::ranges::all_of(tri.indices, [&](std::uint32_t i) { return std::abs(buffer.vertices[i].position.y - y) < 1e-4F; });
+        };
+    };
+    const auto all_z = [&](float z) {
+        return [&buffer, z](const map_editor::RenderBufferTriangle& tri) {
+            return std::ranges::all_of(tri.indices, [&](std::uint32_t i) { return std::abs(buffer.vertices[i].position.z - z) < 1e-4F; });
+        };
+    };
+    // Cell spans 0..4 (anchor 0); floor at 4/16, wall at z = 4/16.
+    assert(count(21U, all_y(0.25F)) == 4);
+    // The floor is two-sided; the wall faces only into the room.
+    assert(count(22U, all_z(0.25F)) == 2);
+    // Visible faces wind so their geometric normal points away from the viewer:
+    // the kept north wall (z = 0.25) is seen from the room, so its normal is -z.
+    for (const auto& tri : buffer.triangles) {
+        if (tri.material != 22U) continue;
+        const auto& p0 = buffer.vertices[tri.indices[0]].position;
+        const auto& p1 = buffer.vertices[tri.indices[1]].position;
+        const auto& p2 = buffer.vertices[tri.indices[2]].position;
+        const auto normal_z = (p1.x - p0.x) * (p2.y - p0.y) - (p1.y - p0.y) * (p2.x - p0.x);
+        assert(normal_z < 0.0F);
+    }
+    // The floor stops at the north wall but runs to the open sides.
+    for (const auto& tri : buffer.triangles) {
+        if (tri.material != 21U) continue;
+        for (const auto i : tri.indices) {
+            const auto& p = buffer.vertices[i].position;
+            assert(p.z >= 0.25F - 1e-4F && p.x >= -1e-4F && p.x <= 4.0F + 1e-4F);
+        }
+    }
+}
+
+void native_building_rooms_follow_the_game_room_key() {
+    const auto room = [](std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint32_t w3, std::uint32_t w4, std::uint32_t placed) {
+        return map_editor::SbbCell{0, x, y, z, {0x40000000U, 0xffffU, 0U, w3, w4, placed}, 0, true, {}};
+    };
+    const auto interior_quads_at_y = [](const map_editor::BuildingRenderBuffer& buffer, float y) {
+        return std::ranges::count_if(buffer.triangles, [&](const map_editor::RenderBufferTriangle& t) {
+            return t.interior && std::ranges::all_of(t.indices, [&](std::uint32_t i) { return close_to(buffer.vertices[i].position.y, y); });
+        });
+    };
+    // Ceiling (Sbb_BuildBuildingConnectivityMetadata): at 7/8 under a room that
+    // has its own floor or on the top layer, none under a room without one.
+    {
+        map_editor::SbbBuilding building{};
+        building.cells = {room(0, 0, 0, 0, 0, 1), room(0, 1, 0, 0, 0, 1)};
+        building.cells[1].index = 1;
+        const auto buffer = map_editor::build_native_building_render_buffer(building, {}, {});
+        assert(interior_quads_at_y(buffer, 3.5F) == 4);  // lower room: upper has a floor
+        assert(interior_quads_at_y(buffer, 7.5F) == 4);  // upper room: top layer
+        building.cells[1].placed_flag() = 0U;
+        const auto open = map_editor::build_native_building_render_buffer(building, {}, {});
+        assert(interior_quads_at_y(open, 3.5F) == 0);
+    }
+    // South walls run the game's wall frame backwards: a type-0 opening at
+    // x 0.1..0.3 sits at x 0.1..0.3 (0.4..1.2 units), not mirrored.
+    {
+        map_editor::SblLayer layer{};
+        layer.bounds = {0.1F, 0.2F, 0.2F, 0.5F};
+        map_editor::SblTemplate bb{};
+        bb.version = 1;
+        bb.layers.resize(2);
+        bb.layers[1] = layer;
+        map_editor::SbbBuilding building{};
+        building.block_names = {"bb"};
+        building.cells = {room(0, 0, 0, 0, 0, 0), map_editor::SbbCell{1, 0, 0, 1, {0U, 0U, 0U, 4U, 0U, 0U}, 0, false, {}}};
+        const auto buffer = map_editor::build_native_building_render_buffer(building, {}, {map_editor::NamedBuildblockTemplate{"bb", bb}});
+        float lo = 9.0F, hi = -9.0F;
+        for (const auto& t : buffer.triangles) {
+            if (!t.interior || t.slot != 14U) continue;  // jambs
+            for (const auto i : t.indices) {
+                lo = std::min(lo, buffer.vertices[i].position.x);
+                hi = std::max(hi, buffer.vertices[i].position.x);
+            }
+        }
+        assert(close_to(lo, 0.4F) && close_to(hi, 1.2F));
+    }
+    // Corner fill (code 2): the west neighbour's north wall ends at this room's
+    // open NW corner, so the room fills the 1/16 notch there.
+    {
+        map_editor::SbbBuilding building{};
+        building.cells = {room(0, 0, 0, 1, 0, 0), room(1, 0, 0, 0, 0, 0)};
+        building.cells[1].index = 1;
+        const auto buffer = map_editor::build_native_building_render_buffer(building, {}, {});
+        assert(std::ranges::any_of(buffer.triangles, [&](const map_editor::RenderBufferTriangle& t) {
+            return t.interior && t.cell == 1U && std::ranges::all_of(t.indices, [&](std::uint32_t i) {
+                const auto& p = buffer.vertices[i].position;
+                return close_to(p.z, 0.25F) && p.x >= 4.0F - 1e-4F && p.x <= 4.25F + 1e-4F;
+            });
+        }));
+    }
+}
+
+void building_face_pick_returns_the_painted_slot_of_each_face() {
+    // Paint writes cell.shorts[pick.slot]; every tagged triangle must be drawn
+    // with that slot's material, and each side must pick its own slot.
+    map_editor::SbbBuilding building{};
+    auto cell = map_editor::SbbCell{0, 0, 0, 0, {0x40000000U, 0xffffU, 0U, 1U, 0U, 1U}, 0, true, {}};
+    for (std::uint32_t slot = 0; slot < 16U; ++slot) cell.shorts[slot] = static_cast<std::uint16_t>(100U + slot);
+    building.cells.push_back(cell);
+    const auto buffer = map_editor::build_native_building_render_buffer(building, {}, {});
+    std::size_t tagged = 0;
+    for (const auto& tri : buffer.triangles) {
+        if (tri.slot == 0xffU) continue;
+        ++tagged;
+        assert(tri.cell == 0U);
+        assert(tri.material == 100U + tri.slot);
+    }
+    assert(tagged > 0U);
+    const std::array<std::pair<map_editor::Vec3, map_editor::Vec3>, 5> rays{{
+        {{-10.0F, 2.0F, 2.0F}, {1.0F, 0.0F, 0.0F}},
+        {{14.0F, 2.0F, 2.0F}, {-1.0F, 0.0F, 0.0F}},
+        {{2.0F, 2.0F, -10.0F}, {0.0F, 0.0F, 1.0F}},
+        {{2.0F, 2.0F, 14.0F}, {0.0F, 0.0F, -1.0F}},
+        {{2.0F, 14.0F, 2.0F}, {0.0F, -1.0F, 0.0F}},
+    }};
+    std::set<std::uint32_t> slots;
+    for (const auto& [origin, direction] : rays) {
+        const auto pick = map_editor::pick_building_face(buffer, origin, direction);
+        assert(pick.has_value());
+        assert(pick->cell_index == 0U);
+        assert(pick->slot < 8U);
+        slots.insert(pick->slot);
+    }
+    assert(slots.size() == rays.size());
+}
+
+void native_building_buildblock_bounds_are_the_opening() {
     map_editor::SblLayer layer{};
     layer.index = 1;
     layer.portal_type = 0;
@@ -1019,15 +1169,35 @@ void native_city_building_render_buffer_keeps_plain_buildblock_walls_untextured(
         return run.material == 12U;
     });
     assert(frame_run != buffer.material_runs.end());
-    assert(frame_run->triangle_count == 2U);
-    assert(buffer.triangles.size() == 10U);
     assert(std::ranges::none_of(buffer.material_runs, [](const map_editor::RenderBufferMaterialRun& run) {
         return run.material == 0x100U;
     }));
-    assert(std::ranges::none_of(buffer.material_runs, [](const map_editor::RenderBufferMaterialRun& run) {
-        return run.city_window_surface;
-    }));
     assert(!buffer.wire_lines.empty());
+    // Bounds x 0.25..0.75, y 0.25..0.75 of the north (z = 0) wall; cell 0..4.
+    // _generatematerialwindowtexture: from outside the bounds is a reflective
+    // opening even though the layer has no window records.
+    const auto centroid = [&](const map_editor::RenderBufferTriangle& tri) {
+        map_editor::Vec3 c{};
+        for (const auto i : tri.indices) {
+            const auto& p = buffer.vertices[i].position;
+            c = {c.x + p.x / 3.0F, c.y + p.y / 3.0F, c.z + p.z / 3.0F};
+        }
+        return c;
+    };
+    const auto in_opening = [](const map_editor::Vec3& c) { return c.x > 1.0F && c.x < 3.0F && c.y > 1.0F && c.y < 3.0F; };
+    assert(std::ranges::any_of(buffer.triangles, [&](const map_editor::RenderBufferTriangle& tri) {
+        return tri.city_window_surface && !tri.interior && std::abs(centroid(tri).z) < 1e-4F && in_opening(centroid(tri));
+    }));
+    // BuildBlock_AddBeams: the room wall frames the bounds and leaves it open;
+    // the jambs (interior slot 6) run 1/16 deep from the cell edge.
+    assert(std::ranges::none_of(buffer.triangles, [&](const map_editor::RenderBufferTriangle& tri) {
+        const auto c = centroid(tri);
+        return tri.interior && !tri.city_window_surface && std::abs(c.z - 0.25F) < 1e-4F && in_opening(c);
+    }));
+    assert(std::ranges::any_of(buffer.triangles, [&](const map_editor::RenderBufferTriangle& tri) {
+        const auto c = centroid(tri);
+        return tri.interior && tri.slot == 14U && c.z > 0.0F && c.z < 0.25F;
+    }));
 }
 
 void native_building_tool_preview_uses_frame_faces_for_buildblock_opening() {
@@ -1687,6 +1857,103 @@ void city_terrain_inside_patch_conforms_to_piece_cells() {
     assert(map_editor::city_scene_fingerprint(map) != without);
 }
 
+void city_district_cell_replaces_the_street_tile_in_its_cell() {
+    // Later world writes replace street cells (ApplyAllCityDistrictCellsToWorld,
+    // InstantiateSbbVolumeIntoWorldAndMetadata): a piece in a road tile's cell
+    // removes that tile.
+    auto map = native_patch_block_map({5, 5, 5, 5});
+    const auto before = map_editor::build_map_scene(map);
+    assert(!before.city_tiles.empty());
+    const auto tile = before.city_tiles.front();
+    map_editor::SbcPortal portal;
+    portal.index = 0;
+    portal.fields = {0, tile.x / 8, tile.y / 8, tile.z / 8};
+    portal.blocks.assign(512, 0U);
+    portal.blocks[static_cast<std::size_t>((tile.y % 8) * 64 + (tile.z % 8) * 8 + (tile.x % 8))] = 1U;
+    map.portals.push_back(portal);
+    const auto after = map_editor::build_map_scene(map);
+    const auto same = [&](const map_editor::CityTileCell& other) {
+        return other.x == tile.x && other.y == tile.y && other.z == tile.z;
+    };
+    assert(std::ranges::any_of(before.city_tiles, same));
+    assert(std::ranges::none_of(after.city_tiles, same));
+    assert(after.city_tiles.size() == before.city_tiles.size() - 1U);
+}
+
+void city_scene_fingerprint_sees_every_voxel() {
+    map_editor::SbcMap map;
+    map_editor::SbcPortal portal;
+    portal.fields = {0, 1, 2, 3};
+    portal.blocks.assign(512, 0U);
+    map.portals.push_back(portal);
+    const auto base = map_editor::city_scene_fingerprint(map);
+    for (const std::size_t word : {0U, 1U, 2U, 3U, 255U, 510U, 511U}) {
+        auto changed = map;
+        changed.portals[0].blocks[word] = 0x40000000U;
+        assert(map_editor::city_scene_fingerprint(changed) != base);
+    }
+    assert(map_editor::city_scene_fingerprint(map) == base);
+}
+
+void fly_camera_moves_along_the_view() {
+    using map_editor::FlyInput;
+    using map_editor::fly_camera_step;
+    const auto near = [](map_editor::Vec3 v, float x, float y, float z) {
+        return std::abs(v.x - x) < 1e-4F && std::abs(v.y - y) < 1e-4F && std::abs(v.z - z) < 1e-4F;
+    };
+    const auto len = [](map_editor::Vec3 v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); };
+    const map_editor::Vec3 level{0.0F, 0.0F, -1.0F};
+    const map_editor::Vec3 up45{0.0F, 1.0F, -1.0F};
+    // W follows the view, including its pitch; S is the reverse.
+    assert(near(fly_camera_step(level, {.forward = true}, 10.0F, 1.0F), 0.0F, 0.0F, -10.0F));
+    const auto climb = fly_camera_step(up45, {.forward = true}, 10.0F, 1.0F);
+    assert(climb.y > 7.0F && climb.z < -7.0F && std::abs(len(climb) - 10.0F) < 1e-3F);
+    assert(near(fly_camera_step(up45, {.back = true}, 10.0F, 1.0F), -climb.x, -climb.y, -climb.z));
+    // D strafes right and stays level even while looking up; A is the reverse.
+    assert(near(fly_camera_step(up45, {.right = true}, 10.0F, 1.0F), 10.0F, 0.0F, 0.0F));
+    assert(near(fly_camera_step(level, {.left = true}, 10.0F, 1.0F), -10.0F, 0.0F, 0.0F));
+    // Space / Ctrl go straight up / down whatever the view; together they cancel.
+    assert(near(fly_camera_step(up45, {.up = true}, 10.0F, 1.0F), 0.0F, 10.0F, 0.0F));
+    assert(near(fly_camera_step(level, {.down = true}, 10.0F, 1.0F), 0.0F, -10.0F, 0.0F));
+    assert(near(fly_camera_step(level, {.up = true, .down = true}, 10.0F, 1.0F), 0.0F, 0.0F, 0.0F));
+    assert(near(fly_camera_step(level, {.forward = true, .back = true}, 10.0F, 1.0F), 0.0F, 0.0F, 0.0F));
+    // Diagonals are not faster.
+    assert(std::abs(len(fly_camera_step(level, {.forward = true, .right = true, .up = true}, 10.0F, 1.0F)) - 10.0F) < 1e-3F);
+    // Shift 1/4, Z 4x, Shift+Z 1/16; scales with frame time.
+    assert(std::abs(len(fly_camera_step(level, {.forward = true, .slow = true}, 16.0F, 1.0F)) - 4.0F) < 1e-3F);
+    assert(std::abs(len(fly_camera_step(level, {.forward = true, .fast = true}, 16.0F, 1.0F)) - 64.0F) < 1e-3F);
+    assert(std::abs(len(fly_camera_step(level, {.forward = true, .slow = true, .fast = true}, 16.0F, 1.0F)) - 1.0F) < 1e-3F);
+    assert(std::abs(len(fly_camera_step(level, {.forward = true}, 16.0F, 0.5F)) - 8.0F) < 1e-3F);
+    // Looking straight down: W descends, strafing still has a sane direction.
+    const map_editor::Vec3 down{0.0F, -1.0F, 0.0F};
+    assert(near(fly_camera_step(down, {.forward = true}, 10.0F, 1.0F), 0.0F, -10.0F, 0.0F));
+    const auto strafe = fly_camera_step(down, {.right = true}, 10.0F, 1.0F);
+    assert(std::isfinite(strafe.x) && std::abs(len(strafe) - 10.0F) < 1e-3F && strafe.y == 0.0F);
+    // No keys, no motion.
+    assert(near(fly_camera_step(level, {}, 10.0F, 1.0F), 0.0F, 0.0F, 0.0F));
+}
+
+void overlapping_city_placements_let_the_later_one_win() {
+    // InstantiateSbbVolumeIntoWorldAndMetadata deletes the world cell under each
+    // building cell with an exterior block word, so the later placement wins.
+    map_editor::SbbBuilding building;
+    for (std::uint32_t cx = 0; cx < 3; ++cx) {
+        map_editor::SbbCell cell;
+        cell.x = cx;
+        cell.occupied = true;
+        cell.words[0] = 0x40000000U;
+        building.cells.push_back(cell);
+    }
+    map_editor::SbcMap map;
+    map.buildings.push_back({0U, "a", 100, 8, 100, 0});
+    map.buildings.push_back({1U, "a", 102, 8, 100, 0});
+    const auto overwritten = map_editor::overwritten_building_cells(map, {&building, &building});
+    assert(overwritten.size() == 2U);
+    assert(overwritten[1].empty());
+    assert(overwritten[0].size() == 1U);
+    assert(overwritten[0][0] == 2U);
+}
+
 void city_terrain_inside_patch_conforms_to_building_footprints() {
     // Building instantiation stamps its anchor-layer footprint at record y*4;
     // inside a patched block the terrain conforms to the building plot.
@@ -1705,6 +1972,7 @@ void city_terrain_inside_patch_conforms_to_building_footprints() {
             cell.y = 0;
             cell.z = cz;
             cell.occupied = true;
+            cell.exterior_block() = 0x40000000U;
             building.cells.push_back(cell);
         }
     }
@@ -1747,6 +2015,18 @@ void city_road_tile_heights_follow_native_slope_region() {
     assert(close_to(middle->slope_x, expected_rise_per_cell));
     assert(close_to(middle->slope_z, 0.0F));
     assert(close_to(start->slope_x, 0.0F));
+
+    // Native cell payload: flat lanes are solid cells whose top face (slot 5)
+    // carries the lane marking code; sloped lanes are aa14 grade blocks with the
+    // code in slot 0 too (the grade quad's material slot).
+    assert(start->block == 0x40000000U);
+    assert(start->faces[5] == 0x4101U);
+    assert((middle->block & 0x80000000U) != 0U);
+    assert(middle->faces[0] == 0x4101U && middle->faces[5] == 0x4101U);
+    const auto grades = map_editor::native_grade_slot_table();
+    assert(std::ranges::find(grades, static_cast<std::int32_t>(middle->block & 0xffffU)) != grades.end());
+    const auto* left_lane = find_city_tile(scene, 600, 599, map_editor::CityTileKind::Road);
+    assert(left_lane != nullptr && left_lane->faces[5] == 0x4201U);
 
     // Curb plates ride one level above the lanes.
     assert(has_city_tile(scene, 600, 1, 598, map_editor::CityTileKind::Curb));
@@ -1860,6 +2140,15 @@ void traffic_light_poles_stand_at_native_corners_of_3way_plus_intersections() {
         return close_to(pole.base.x, 2405.0F) && close_to(pole.base.z, 2394.0F) &&
             pole.arm_direction.x < -0.5F && close_to(pole.arm_direction.z, 0.0F);
     }));
+    // Signs name the crossing street: streets along Z at gx 600 are the 7th
+    // avenue ((600-256)/56 = 6, Garriott Ave); streets along X at gz 600 are past
+    // Ninth Street and keep index 0 (First Street).
+    for (const auto& pole : scene.traffic_light_poles) {
+        const auto expected = std::abs(pole.arm_direction.z) > 0.5F ? 15 : 0;
+        assert(pole.sign_name == expected);
+        (void)expected;
+    }
+    assert(std::string_view{map_editor::native_street_names[15]} == "Garriott Ave");
 }
 
 void parses_buildblock_sbl_fixture() {
@@ -2783,6 +3072,27 @@ void native_portal_render_buffer_renders_unnamed_city_block_as_solid_cell_faces(
     }
 }
 
+void native_portal_render_buffer_drops_v10_cells_under_buildings() {
+    // World_LoadMapAndInitializeTerrain places v10 district cells first; a
+    // building cell with an exterior block word then replaces the world cell.
+    map_editor::SbbBuilding building{};
+    building.cells.push_back({0, 0, 0, 0, {0x40000000U, 0U, 0U, 0U, 0U, 0U}, 0, true, {}});
+    map_editor::SbcMap map{};
+    map.buildings.push_back({0, "b", 20, 0, 20, 0});
+    const auto world = map_editor::native_city_building_transform_point(map.buildings[0], {2.0F, 0.0F, 2.0F}, 4.0F);
+    const auto cx = static_cast<std::int32_t>(std::floor(world.x / 4.0F));
+    const auto cz = static_cast<std::int32_t>(std::floor(world.z / 4.0F));
+    map_editor::SbcPortal portal{};
+    portal.fields = {0, cx / 8, 0, cz / 8};
+    portal.legacy_blocks.assign(0x200, 0U);
+    portal.legacy_blocks[static_cast<std::size_t>((cx % 8) | ((cz % 8) << 3))] = 0x40000000U;
+    map.portals.push_back(std::move(portal));
+
+    assert(!map_editor::build_native_portal_render_buffer(map, {}).triangles.empty());
+    const std::vector<const map_editor::SbbBuilding*> placements{&building};
+    assert(map_editor::build_native_portal_render_buffer(map, {}, std::nullopt, {}, {}, placements).triangles.empty());
+}
+
 void native_portal_render_buffer_renders_unmatched_named_city_block_as_solid_cell_faces() {
     map_editor::SbcMap map{};
     map.city_blocks.push_back({
@@ -2991,9 +3301,17 @@ void native_city_render_buffer_tags_buildblock_window_openings_with_wall_materia
         const auto& c = buffer.vertices[triangle.indices[2]].position;
         const auto north_face = close_to(a.z, 0.0F) && close_to(b.z, 0.0F) && close_to(c.z, 0.0F);
         const auto south_face = close_to(a.z, 4.0F) && close_to(b.z, 4.0F) && close_to(c.z, 4.0F);
-        assert(north_face || south_face);
-        assert(a.y >= 1.5F && b.y >= 1.5F && c.y >= 1.5F);
-        assert(a.y <= 2.5F && b.y <= 2.5F && c.y <= 2.5F);
+        if (north_face || south_face) {
+            // Exterior pane (and its back face): the whole bounds (y 0.25..0.75
+            // of the cell) is the reflective area (_generatematerialwindowtexture).
+            assert(a.y >= 1.0F && b.y >= 1.0F && c.y >= 1.0F);
+            assert(a.y <= 3.0F && b.y <= 3.0F && c.y <= 3.0F);
+        } else {
+            // Room glass: the window record (y 0.4..0.6), 1/64 in from the edge.
+            assert(close_to(a.z, 4.0F / 64.0F) && close_to(b.z, 4.0F / 64.0F) && close_to(c.z, 4.0F / 64.0F));
+            assert(a.y >= 1.6F - 1e-3F && b.y >= 1.6F - 1e-3F && c.y >= 1.6F - 1e-3F);
+            assert(a.y <= 2.4F + 1e-3F && b.y <= 2.4F + 1e-3F && c.y <= 2.4F + 1e-3F);
+        }
     }
 }
 
@@ -3312,6 +3630,7 @@ void city_scene_fingerprint_changes_only_with_scene_inputs() {
 }
 
 int main() {
+    native_portal_render_buffer_drops_v10_cells_under_buildings();
     rebuilds_buildblock_after_adding_and_removing_openings();
     serializes_generated_quad_as_latest_sbl();
     preserves_sbc_header_records_on_upgrade();
@@ -3337,11 +3656,11 @@ int main() {
     attaches_portal_wall_rects_to_scene_edges();
     builds_native_building_render_buffer_from_piece_meshes();
     native_building_render_buffer_indexes_shared_cell_corners_and_uvs();
-    native_building_render_buffer_never_emits_down_face();
+    native_building_render_buffer_emits_down_face_only_over_open_cells();
     native_building_render_buffer_uses_editor_face_order_and_uvs();
     native_building_render_buffer_uses_cell_material_slots();
     native_building_render_buffer_renders_interior_piece_with_interior_materials();
-    native_city_building_render_buffer_keeps_plain_buildblock_walls_untextured();
+    native_building_buildblock_bounds_are_the_opening();
     native_building_tool_preview_uses_frame_faces_for_buildblock_opening();
     city_building_render_buffer_uses_full_building_preview_geometry();
     native_building_tool_preview_leaves_buildblock_opening_empty();
@@ -3363,10 +3682,17 @@ int main() {
     terrain_noise_hash_matches_native_all_ones_mask();
     terrain_noise_sample_uses_native_two_to_negative_thirty_normalizer();
     native_like_city_terrain_height_matches_native_core_and_far_island();
+    native_building_render_buffer_builds_interior_room();
+    building_face_pick_returns_the_painted_slot_of_each_face();
+    native_building_rooms_follow_the_game_room_key();
+    city_district_cell_replaces_the_street_tile_in_its_cell();
     city_terrain_patches_hardcoded_intersection_blocks();
     city_terrain_flat_block_patch_is_level();
     city_terrain_inside_patch_conforms_to_piece_cells();
     city_terrain_inside_patch_conforms_to_building_footprints();
+    overlapping_city_placements_let_the_later_one_win();
+    fly_camera_moves_along_the_view();
+    city_scene_fingerprint_sees_every_voxel();
     city_road_tile_heights_follow_native_slope_region();
     city_road_scene_positions_use_native_game_surface_height();
     city_editor_guides_use_native_expanded_extents();

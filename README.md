@@ -1,6 +1,6 @@
-# map_editor_cpp
+# Pafta
 
-C++23/raylib port slice of the SRC `map_editor`.
+Pafta is the Sub Rosa map editor: a C++23/raylib port slice of the SRC `map_editor`. The repository, CMake project and build targets keep the `map_editor_cpp` name.
 
 ## Scope
 
@@ -80,6 +80,18 @@ On Windows with Visual Studio, use the `dev-msvc` preset instead. The CTest suit
   per-frame portal render path; they are now cached and only rebuilt on load.
   Anything that edits block/buildblock data must call
   `invalidate_render_input_cache` (the `mark_*_changed` hooks already do).
+- **City geometry is instanced.** Each render buffer uploads as one VAO
+  (interleaved position/uv/normal, 32-bit indices) split into material parts.
+  Every visible placement of a template draws with one `glDrawElementsInstanced`
+  per part; stencil shadow volumes and outline masks use the same path. The
+  per-instance matrices are re-specified with `glBufferData` on every push:
+  `glBufferSubData` into storage still in flight stalled each draw on macOS.
+- **Draw-buffer state is tracked, not queried.** The game target's extra
+  outputs switch on once around world geometry; `glGet*` calls in that toggle
+  forced a pipeline sync per building.
+- **Benchmark mode.** `MAPED_AUTOLOAD=<map> MAPED_BENCH=300 ./map_editor_cpp`
+  runs uncapped, waits for the scene to settle, prints ms/frame, draws, triangles
+  and phase timings for 300 frames, then exits.
 - **Project loading fans out across threads.** Loose SBB/SBL parsing, CSX archive
   parsing, and PNG decode run through a bounded `parallel_for`; the order-dependent
   merges (CSX-wins upsert, index-aligned asset/byte vectors) and all GL texture
@@ -110,6 +122,8 @@ A selected city building shows a **drag gizmo**: grab the red/green/blue axis ha
 Closing the window, **Alt+F4**, or File → Exit is blocked while there are unsaved changes: a prompt offers **Save & Exit**, **Discard & Exit**, or **Cancel**. In the browser build, closing or reloading the tab with unsaved changes asks first.
 
 Saving (**Ctrl+S**) writes the map as a pair: the chosen `.sbc` and a `.csx` asset archive with the same name. The desktop editor asks where to save (defaulting to the loaded map, and the system dialog confirms before replacing it); the browser build downloads both files.
+
+**Windows → Map image** shows the game's map-screen image: the city rendered from above the way the game generates it, with the street names the map screen prints. The round map shows its `map.png` instead, as in the game.
 
 Global: **Ctrl+1/2** switch to the City and Building modes, **Ctrl+S** saves the map, **F** frames the current selection (or the city when nothing is selected), **Ctrl+O** opens a folder, and **Ctrl+Shift+H** opens Changes since save (Ctrl reads as Cmd on macOS). The Outliner, Properties, and asset drawer toggles have no default key; use the Windows menu. The status bar at the bottom keeps the latest message; hover it for recent ones. In the browser build, preferences and window layout are kept between visits.
 

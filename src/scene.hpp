@@ -59,12 +59,26 @@ struct RenderBufferVertex {
     Vec3 position{};
     float u{};
     float v{};
+    // Road-marking overlay layer (0 = none), sampled from the generated overlay
+    // array at the same UV.
+    float layer{};
 };
 
 struct RenderBufferTriangle {
     std::array<std::uint32_t, 3> indices{};
     std::uint32_t material{};
     bool city_window_surface{};
+    // Room surfaces inside a building (add_native_interior_room); the shell
+    // around them casts the building's shadow, so they cast none.
+    bool interior{};
+    // Building meshes: the SbbBuilding::cells index this face belongs to, and
+    // the cell.shorts slot its texture comes from, for picking and painting.
+    std::uint32_t cell{0xffffffffU};
+    std::uint8_t slot{0xffU};
+    // Buildings: the game's far LOD only. An exterior face with a buildblock
+    // side code is one window-array face (the reflective shell); within
+    // 192 units the game skips it and draws the interior room instead.
+    bool far_only{};
 };
 
 struct RenderBufferMaterialRun {
@@ -86,10 +100,32 @@ struct BuildingRenderBuffer {
     std::vector<RenderBufferTriangle> triangles;
     std::vector<RenderBufferMaterialRun> material_runs;
     std::vector<RenderLine> wire_lines;
+    // Stencil shadow volume baked by bake_shadow_volume: 9 floats per vertex
+    // (position, kind/0/0, face normal) and triangle indices.
+    std::vector<float> shadow_vertices;
+    std::vector<std::uint32_t> shadow_indices;
+    float shadow_top{};
 };
+
+// Bakes the buffer's light-independent shadow volume (see render_gpu.cpp's
+// shadow volume shader). Pure CPU work, safe on worker threads.
+void bake_shadow_volume(BuildingRenderBuffer& buffer);
+// Frees the baked volume once it is on the GPU; it is only read at upload.
+inline void release_shadow_volume(BuildingRenderBuffer& buffer) {
+    std::vector<float>().swap(buffer.shadow_vertices);
+    std::vector<std::uint32_t>().swap(buffer.shadow_indices);
+}
 
 struct CellPick {
     std::size_t cell_index{};
+    Vec3 hit_world{};
+    float t{};
+};
+
+// A ray hit on a building's rendered faces: the face's cell and texture slot.
+struct BuildingFacePick {
+    std::size_t cell_index{};
+    std::uint32_t slot{};
     Vec3 hit_world{};
     float t{};
 };
@@ -183,6 +219,13 @@ struct CityTileCell {
     CityTileKind kind{CityTileKind::Road};
     // SbcMap::streets index that owns this road tile, or -1 for intersection tiles.
     std::int32_t street_index{-1};
+    // The native world cell: 0x40000000 for a solid cell or 0x80000000 | catalog
+    // id for a block, and the eight face codes that pick each face's texture and
+    // road-marking overlay (World_SetTileBlockAndResolveNeighborLinks @f830).
+    std::uint32_t block{};
+    std::array<std::uint16_t, 8> faces{};
+    // SbcMap::intersections index of the junction that placed this tile, or -1.
+    std::int32_t intersection_index{-1};
 };
 
 struct CityTerrain {
@@ -200,6 +243,17 @@ struct CityTerrain {
 struct CityTrafficLightPole {
     Vec3 base{};
     Vec3 arm_direction{};
+    // Street name on the sign under the arm (index into native_street_names).
+    std::int32_t sign_name{};
+};
+
+// Generated street names, in subrosa.exe order (PTR_s_First_Street_002b2c00):
+// First..Ninth Street for streets along X, Abrash..Holland Ave along Z.
+inline constexpr std::array<const char*, 17> native_street_names{
+    "First Street", "Second Street", "Third Street", "Fourth Street", "Fifth Street",
+    "Sixth Street", "Seventh Street", "Eighth Street", "Ninth Street",
+    "Abrash Ave", "Bunten Ave", "Carmack Ave", "David Ave", "Eugene Ave",
+    "Flinn Ave", "Garriott Ave", "Holland Ave",
 };
 
 struct RenderBuildingPlacement {
@@ -212,6 +266,14 @@ struct CityBuildingBasis {
     Vec3 x_axis{1.0F, 0.0F, 0.0F};
     Vec3 y_axis{0.0F, 1.0F, 0.0F};
     Vec3 z_axis{0.0F, 0.0F, 1.0F};
+};
+
+// A street-name label on the in-game map (DrawMapMenu @88040), in map units:
+// the 512px map image spans 0..256, world (x - 896) / 8 and (z - 896) / 8.
+struct CityMapLabel {
+    std::int32_t name{};  // index into native_street_names
+    float x{};
+    float y{};
 };
 
 struct MapBounds {
@@ -227,9 +289,12 @@ struct MapScene {
     std::vector<RenderRoad> roads;
     std::vector<CityTileCell> city_tiles;
     BuildingRenderBuffer city_tile_buffer;
+    // Hash of city_tiles, so callers can skip re-uploading unchanged roads.
+    std::uint64_t city_tile_fingerprint{};
     std::optional<CityTerrain> terrain;
     std::vector<CityTrafficLightPole> traffic_light_poles;
     std::vector<RenderBuildingPlacement> buildings;
+    std::vector<CityMapLabel> map_labels;
     MapBounds bounds{};
 };
 
@@ -290,14 +355,29 @@ SbbScene build_sbb_scene(
     const SbbBuilding& building,
     const std::vector<NamedBlockMesh>& block_meshes,
     const std::vector<NamedBuildblockTemplate>& buildblock_templates);
+// The runtime building mesh (city placement, editor view, export). `floor`
+// keeps only that cell level, as the building editor's single-floor view;
+// roofs = false drops every upward outer face so the rooms show from above.
 BuildingRenderBuffer build_native_building_render_buffer(
     const SbbBuilding& building,
     const std::vector<NamedBlockMesh>& block_meshes,
-    const std::vector<NamedBuildblockTemplate>& buildblock_templates);
+    const std::vector<NamedBuildblockTemplate>& buildblock_templates,
+    std::optional<std::uint32_t> floor = std::nullopt,
+    bool roofs = true);
+// Nearest face of a building mesh along the ray (both sides), from the faces'
+// cell/slot tags; nullopt when the ray misses every tagged face.
+std::optional<BuildingFacePick> pick_building_face(const BuildingRenderBuffer& buffer, Vec3 origin, Vec3 direction);
+// The game's two building LODs (_render_buildsectorlist): Far is the shell
+// (buildblock faces as one reflective window-array face, no rooms), Near skips
+// those faces and shows the rooms, their openings and glass. Both keeps all.
+enum class BuildingLod { Both, Far, Near };
 BuildingRenderBuffer build_city_building_full_render_buffer(
     const SbbBuilding& building,
     const std::vector<NamedBlockMesh>& block_meshes,
-    const std::vector<NamedBuildblockTemplate>& buildblock_templates);
+    const std::vector<NamedBuildblockTemplate>& buildblock_templates,
+    BuildingLod lod = BuildingLod::Both);
+// Keeps one LOD's triangles (and only the vertices they use).
+BuildingRenderBuffer select_building_lod(BuildingRenderBuffer buffer, BuildingLod lod);
 BuildingRenderBuffer build_native_building_tool_preview_render_buffer(
     const SbbBuilding& building,
     const std::vector<NamedBlockMesh>& block_meshes,
@@ -317,7 +397,9 @@ BuildingRenderBuffer build_native_portal_render_buffer(
     // (portal.textures, 8 shorts per cell), each a texture index into this
     // load-order name list (matching the texture set the game loads). Empty =
     // flat/untextured v10 pieces.
-    const std::vector<std::string>& texture_names = {});
+    const std::vector<std::string>& texture_names = {},
+    // Placed buildings (map.buildings order); their cells replace v10 district cells.
+    const std::vector<const SbbBuilding*>& placement_buildings = {});
 // Name of the buildblock a v10 district piece word resolves to, indexed by
 // `word & 0xffff` into the game-ordered catalog (sorted, capped 64). Empty if the
 // index is out of range (the cell renders nothing). For inspector display.
@@ -387,12 +469,17 @@ SbcStreet canonical_city_street_endpoint_order(const SbcMap& map, SbcStreet stre
 CityBuildingBasis native_city_building_rotation_basis(std::int32_t rotation);
 Vec3 native_city_rotate_local(Vec3 local, std::int32_t rotation);
 Vec3 native_city_building_render_origin(const SbcBuilding& placement, float unit_size = 4.0F);
+// Per placement, indices of its cells that a later overlapping placement overwrites.
+std::vector<std::vector<std::size_t>> overwritten_building_cells(
+    const SbcMap& map, const std::vector<const SbbBuilding*>& placement_buildings);
 Vec3 native_city_building_transform_point(const SbcBuilding& placement, Vec3 local, float unit_size = 4.0F);
 MapScene build_map_scene(const SbcMap& map);
 // placement_buildings[i] resolves map.buildings[i] to its loaded .sbb data
 // (nullptr when unresolved); used to stamp building ground footprints into the
 // terrain corner-height grid like the native instantiation does.
-MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*>& placement_buildings);
+// auto_generated: isMapAutoGenerated (the "round" map), which skips the terrain
+// stamps, land-use mask, and block patches.
+MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*>& placement_buildings, bool auto_generated = false);
 std::uint64_t city_scene_fingerprint(const SbcMap& map);
 // Subset fingerprint over only terrain-affecting inputs (intersections, building
 // footprints, piece cells). Lets the GPU layer re-upload the heavy terrain mesh
@@ -400,7 +487,8 @@ std::uint64_t city_scene_fingerprint(const SbcMap& map);
 std::uint64_t city_terrain_fingerprint(const SbcMap& map);
 std::uint32_t terrain_noise_hash(std::int32_t x, std::int32_t y, std::uint32_t mask);
 float terrain_noise_sample(float x, float z, float frequency_x, float frequency_z);
-float native_like_city_terrain_height(float world_x, float world_z);
+// city_map: false on isMapAutoGenerated maps, which skip the shoreline cut.
+float native_like_city_terrain_height(float world_x, float world_z, bool city_map = true);
 float terrain_height_at(const CityTerrain& terrain, float world_x, float world_z);
 BuildblockPreviewScene build_buildblock_preview_scene(const SblTemplate& buildblock);
 CityBlockPreviewScene build_city_block_preview_scene(const SbcCityBlock& city_block, const std::vector<NamedBlockMesh>& block_meshes);

@@ -49,9 +49,10 @@ constexpr std::uint32_t kOrientMask = 0xf0000;
 // ---------------------------------------------------------------------------
 // Data tables read verbatim from subrosa.exe.
 //
-// Cube corners DAT_002b34f0 (8 corners, 3 floats each). The native ordering is
-// the binary cube: corner i = (x = i>>2 & 1, y = i>>1 & 1, z = i & 1). Verified
-// by reading the raw bytes at 0x002b34f0.
+// Cube corners DAT_002b34f0 (8 corners, 3 floats each), read from the raw bytes:
+// the bottom ring (y=0) then the top ring (y=1), each wound (0,0)->(1,0)->(1,1)->
+// (0,1) in x,z. Face 0 of DAT_002b3660 is therefore the bottom and face 5 the top,
+// matching the normal table DAT_002b3550.
 //
 // Edge/face table DAT_002b3660 (6 faces x 4 corner indices). _block_addbeam
 // @0x19940 walks it via piVar9 starting at &DAT_002b3664 and reading
@@ -60,13 +61,13 @@ constexpr std::uint32_t kOrientMask = 0xf0000;
 // ---------------------------------------------------------------------------
 constexpr Vec3f kCubeCorner[8] = {
     {0, 0, 0},  // C0
-    {0, 0, 1},  // C1
-    {0, 1, 0},  // C2
-    {0, 1, 1},  // C3
-    {1, 0, 0},  // C4
-    {1, 0, 1},  // C5
-    {1, 1, 0},  // C6
-    {1, 1, 1},  // C7
+    {1, 0, 0},  // C1
+    {1, 0, 1},  // C2
+    {0, 0, 1},  // C3
+    {0, 1, 0},  // C4
+    {1, 1, 0},  // C5
+    {1, 1, 1},  // C6
+    {0, 1, 1},  // C7
 };
 
 // Face -> 4 corner indices, matching DAT_002b3660 exactly.
@@ -429,41 +430,17 @@ void build_floor_patch(std::vector<BuildblockCatalogEntry>& out) {
     out[19] = std::move(r3);
 }
 
-// Build an 8-corner box (in kCubeCorner index order) spanning the unit cell in
-// the flat axes, from y=0 up to a top that slopes from h0 to h1 along the axis
-// selected by edge (edge<2 -> slope along +Z, else along +X). Used by the grade
-// (ramp) tiles.
-std::array<Vec3f, 8> kCubeCornerBox(float h0, float h1, int edge) {
-    // Corner i = (x=i>>2&1, y=i>>1&1, z=i&1). Top corners (y==1) take the sloped
-    // height; bottom corners stay at 0.
-    std::array<Vec3f, 8> c{};
-    for (int i = 0; i < 8; ++i) {
-        const float x = static_cast<float>((i >> 2) & 1);
-        const float yb = static_cast<float>((i >> 1) & 1);
-        const float z = static_cast<float>(i & 1);
-        const float t = (edge < 2) ? z : x;             // slope parameter
-        const float top = (edge & 1) ? (h1 - (h1 - h0) * t) : (h0 + (h1 - h0) * t);
-        c[static_cast<std::size_t>(i)] = {x, yb == 0.0F ? 0.0F : top, z};
+// Corner heights of a grade tile's sloped surface, in the order of the patch
+// control corners P00 (x0,z0), P03 (x1,z0), P30 (x0,z1), P33 (x1,z1). The edge
+// picks the direction (Buildblock_InitTemplateMeshCatalog grade loops): 0 rises
+// along +X, 1 along +Z, 2 falls along +X, 3 falls along +Z.
+std::array<float, 4> grade_corner_heights(int edge, float low, float high) {
+    switch (edge) {
+        case 0: return {low, high, low, high};
+        case 1: return {low, low, high, high};
+        case 2: return {high, low, high, low};
+        default: return {high, high, low, low};
     }
-    return c;
-}
-
-// A flat top quad whose far edge is raised from h0 to h1 (the aa14 grade quad),
-// tagged +Y so the bake position-projects its UVs.
-void add_grade_quad(ScratchMesh& m, float h0, float h1, int edge) {
-    Vec3f p0, p1, p2, p3;
-    if (edge < 2) {  // slope along Z
-        p0 = {0, h0, 0};
-        p1 = {1, h0, 0};
-        p2 = {1, h1, 1};
-        p3 = {0, h1, 1};
-    } else {  // slope along X
-        p0 = {0, h0, 0};
-        p1 = {1, h1, 0};
-        p2 = {1, h1, 1};
-        p3 = {0, h0, 1};
-    }
-    add_quad_patch(m, p0, p1, p2, p3, kUV00, kUV10, kUV11, kUV01, 0x30000);
 }
 
 // --- Prologue id model -----------------------------------------------------
@@ -537,39 +514,44 @@ SlotIds assign_slot_ids() {
     return s;
 }
 
-// --- Phase: grade-tile family (sloped ramp transition tiles) ----------------
-// The native grade loops build sloped wedge tiles: for grade level n the top
-// surface rises by step = 1/n across the cell, with the sloped edge chosen by the
-// edge index. The aa14 group is a flat bezier quad (one raised edge); the ba14
-// group is a box (AddBoxFaces, mask 0x3e) whose size_y becomes 2 when the slope
-// crosses a full cell. Round renders none of these; the id placement is exact and
-// the slope geometry follows the decoded fVar34/step parameterization.
+// --- Phase: grade-tile family (sloped street tiles) ------------------------
+// For grade n (4..12) each of the n steps rises 1/n across the cell. The ba14
+// group is the curb beside a sloped lane: a 1/16-thick slab whose top runs from
+// k/n+1/16 to (k+1)/n+1/16 (AddBoxFaces, all faces but the bottom, material 0),
+// with size_y 2 once the top reaches the next cell. The aa14 group is the lane
+// surface: one linear patch from k/n to (k+1)/n with authored UVs (x, z) and
+// material 0, so it takes the cell's face-array slot 0 (the lane code).
 void build_grade_tiles(std::vector<BuildblockCatalogEntry>& out, const SlotIds& s) {
-    constexpr float kBase = 0.0625F;  // fVar5 = FLOAT_002781bc
+    constexpr float kCurb = 0.0625F;  // fVar5 = FLOAT_002781bc
     for (int grade = 0; grade < 9; ++grade) {
         const int n = grade + 4;
         const float step = 1.0F / static_cast<float>(n);
         for (int edge = 0; edge < 4; ++edge) {
-            // ba14 group: sloped box.
             const auto& ba = s.grade[static_cast<std::size_t>(grade)][1][static_cast<std::size_t>(edge)];
             for (int k = 0; k < static_cast<int>(ba.size()); ++k) {
-                const float h0 = kBase + static_cast<float>(k) * step;
-                const float h1 = h0 + step;
-                // A box from y=0 up to a sloped top edge (h0..h1 along the chosen
-                // axis). edge<2 slopes along Z, else along X.
-                std::array<Vec3f, 8> c = kCubeCornerBox(h0, h1, edge);
+                const float low = static_cast<float>(k) * step + kCurb;
+                const auto top = grade_corner_heights(edge, low, low + step);
+                // Box corners in kCubeCorner order: bottom ring then top ring,
+                // each (x0,z0) (x1,z0) (x1,z1) (x0,z1).
+                const std::array<float, 4> ring{top[0], top[1], top[3], top[2]};
+                std::array<Vec3f, 8> c{};
+                for (int i = 0; i < 4; ++i) {
+                    const float x = (i == 1 || i == 2) ? 1.0F : 0.0F;
+                    const float z = (i >= 2) ? 1.0F : 0.0F;
+                    c[static_cast<std::size_t>(i)] = {x, ring[static_cast<std::size_t>(i)] - kCurb, z};
+                    c[static_cast<std::size_t>(i) + 4] = {x, ring[static_cast<std::size_t>(i)], z};
+                }
                 ScratchMesh m;
                 add_box_faces(m, c, 0, 0x3e);
-                const int sy = (h1 >= 1.0F) ? 2 : 1;
-                emit_single(out, m, ba[static_cast<std::size_t>(k)], 1, sy, 1);
+                emit_single(out, m, ba[static_cast<std::size_t>(k)], 1, low + step >= 1.0F ? 2 : 1, 1);
             }
-            // aa14 group: flat sloped quad.
             const auto& aa = s.grade[static_cast<std::size_t>(grade)][0][static_cast<std::size_t>(edge)];
             for (int k = 0; k < static_cast<int>(aa.size()); ++k) {
-                const float h0 = static_cast<float>(k) * step;
-                const float h1 = h0 + step;
+                const float low = static_cast<float>(k) * step;
+                const auto h = grade_corner_heights(edge, low, low + step);
                 ScratchMesh m;
-                add_grade_quad(m, h0, h1, edge);
+                add_quad_patch(m, {0, h[0], 0}, {1, h[1], 0}, {1, h[3], 1}, {0, h[2], 1},
+                               kUV00, kUV10, kUV11, kUV01, 0);
                 emit_single(out, m, aa[static_cast<std::size_t>(k)], 1, 1, 1);
             }
         }
@@ -644,6 +626,25 @@ void build_railing_group(std::vector<BuildblockCatalogEntry>& out, const SlotIds
 }
 
 }  // namespace
+
+std::array<std::int32_t, 2048> native_grade_slot_table() {
+    // DAT_0500aa14 row r = 4n + edge holds 16 ids: row-major 16 ints, rows at
+    // int offset n*64 + edge*16. ba14 is the next 0x1000 bytes.
+    std::array<std::int32_t, 2048> table{};
+    const SlotIds slots = assign_slot_ids();
+    for (int grade = 0; grade < 9; ++grade) {
+        const int n = grade + 4;
+        for (int group = 0; group < 2; ++group) {
+            for (int edge = 0; edge < 4; ++edge) {
+                const auto& ids = slots.grade[static_cast<std::size_t>(grade)][static_cast<std::size_t>(group)][static_cast<std::size_t>(edge)];
+                for (std::size_t step = 0; step < ids.size(); ++step) {
+                    table[static_cast<std::size_t>(group * 1024 + n * 64 + edge * 16) + step] = ids[step];
+                }
+            }
+        }
+    }
+    return table;
+}
 
 std::vector<BuildblockCatalogEntry> build_native_builtin_catalog() {
     // Faithful structural port of Buildblock_InitTemplateMeshCatalog: replays the
