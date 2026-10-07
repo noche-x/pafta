@@ -540,101 +540,98 @@ bool material_swatch_picker(const EditorProject& project, const char* id, const 
     return changed;
 }
 
-// editor.exe-style Place Block panel: choose exterior/interior shells, the
-// buildblock template, and a material for each of the six faces on each enabled
-// side. Edits ui.block_config in place; placement reads it.
+// Place Block panel, as editor.exe's building tool (EditorPanel_BuildingTool
+// @140062d60): an Exterior and an Interior layer, each switched on separately,
+// each "Normal" (solid shell / generated room) or a piece, with its own 8
+// texture slots. A click writes only the enabled layers.
 void draw_block_tool_panel(EditorProject& project, EditorUi& ui) {
     ui.selected_building = std::min(ui.selected_building, project.buildings.size() - 1U);
     auto& building = project.buildings[ui.selected_building].data;
     auto& cfg = ui.block_config;
 
-    // Face order matches the renderer's slot order (0..5).
-    static constexpr std::array<const char*, 6> face_names{"Bottom", "South", "West", "North", "East", "Top"};
+    // What each texture slot paints. The shell's sides use slots 1..4 as
+    // S/W/N/E; the room's walls use 1..4 as N/E/S/W and slot 6 for opening
+    // frames (add_native_interior_room). Pieces use the slots their faces name.
+    static constexpr std::array<const char*, 8> exterior_slots{"Bottom", "South", "West", "North", "East", "Top", "Slot 6", "Slot 7"};
+    static constexpr std::array<const char*, 8> interior_slots{"Floor", "North wall", "East wall", "South wall", "West wall", "Ceiling", "Opening frame", "Slot 7"};
 
-    ImGui::SeparatorText("Block to place");
-    if (ImGui::RadioButton("Shell", !cfg.piece)) cfg.piece = false;
-    ImGui::SameLine();
-    if (ImGui::RadioButton("Piece", cfg.piece)) cfg.piece = true;
-    if (cfg.piece) {
-        if (building.piece_names.empty()) {
-            ImGui::TextWrapped("Add a piece to the Pieces list above first.");
-        } else {
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            catalog_combo("##block_piece", building.piece_names, cfg.piece_index);
-            static constexpr std::array<const char*, 4> rotations{"0\xC2\xB0", "90\xC2\xB0", "180\xC2\xB0", "270\xC2\xB0"};
-            int rotation = static_cast<int>(cfg.piece_rotation & 3U);
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            if (ImGui::Combo("##block_piece_rotation", &rotation, rotations.data(), 4)) cfg.piece_rotation = static_cast<std::uint32_t>(rotation);
-        }
-    } else {
-        ImGui::Checkbox("Exterior", &cfg.exterior);
-        ImGui::SameLine();
-        ImGui::Checkbox("Interior", &cfg.interior);
-        if (!cfg.exterior && !cfg.interior) {
-            ImGui::Text("Enable a shell to place.");
-        }
-
-        ImGui::Spacing();
-        ImGui::TextUnformatted("Buildblock");
+    // "Normal" or one of the building's pieces.
+    const auto block_combo = [&](const char* id, const char* normal, std::size_t& selection) {
+        selection = std::min(selection, building.piece_names.size());
+        const auto name = [&](std::size_t i) { return i == 0U ? std::string{normal} : "Piece: " + building.piece_names[i - 1U]; };
         ImGui::SetNextItemWidth(-FLT_MIN);
-        catalog_combo("##block_buildblock", building.block_names, cfg.buildblock_index);
-    }
-
-    // Each face shows its current material as a thumbnail button; clicking opens a
-    // popup swatch grid to choose a new one. A "set all" copies the first face.
-    const auto face_material_grid = [&](const char* label, std::array<std::size_t, 6>& materials) {
-        if (!ImGui::TreeNodeEx(label, ImGuiTreeNodeFlags_DefaultOpen)) {
-            return;
+        if (ImGui::BeginCombo(id, name(selection).c_str())) {
+            for (std::size_t i = 0; i <= building.piece_names.size(); ++i) {
+                if (ImGui::Selectable(name(i).c_str(), i == selection)) selection = i;
+            }
+            ImGui::EndCombo();
         }
+    };
+    // Each slot shows its material as a thumbnail; clicking opens a swatch grid.
+    const auto texture_grid = [&](const char* label, std::array<std::size_t, 8>& materials, const std::array<const char*, 8>& names) {
+        if (!ImGui::TreeNodeEx(label, ImGuiTreeNodeFlags_DefaultOpen)) return;
         if (building.materials.empty()) {
             ImGui::TextDisabled("No materials in this building.");
             ImGui::TreePop();
             return;
         }
-        for (std::size_t face = 0; face < 6; ++face) {
-            ImGui::PushID(static_cast<int>(face));
-            materials[face] = std::min(materials[face], building.materials.size() - 1U);
-            const auto* tex = texture_for_material(project, building.materials[materials[face]]);
-            bool open = false;
-            if (tex != nullptr && tex->id != 0U) {
-                open = rlImGuiImageButtonSize("##facesw", tex, Vector2{34.0F, 34.0F});
-            } else {
-
-                open = ImGui::Button("##facesw", ImVec2(34.0F, 34.0F));
-
-            }
+        for (std::size_t slot = 0; slot < materials.size(); ++slot) {
+            ImGui::PushID(static_cast<int>(slot));
+            materials[slot] = std::min(materials[slot], building.materials.size() - 1U);
+            const auto* tex = texture_for_material(project, building.materials[materials[slot]]);
+            const bool open = tex != nullptr && tex->id != 0U
+                ? rlImGuiImageButtonSize("##slot", tex, Vector2{30.0F, 30.0F})
+                : ImGui::Button("##slot", ImVec2(30.0F, 30.0F));
             ImGui::SameLine();
-            ImGui::TextUnformatted(face_names[face]);
-            if (open) {
-                ImGui::OpenPopup("face_swatches");
-            }
-            if (ImGui::BeginPopup("face_swatches")) {
-                if (material_swatch_picker(project, "pop", building.materials, materials[face])) {
-                    ImGui::CloseCurrentPopup();
-                }
+            ImGui::TextUnformatted(names[slot]);
+            if (open) ImGui::OpenPopup("slot_swatches");
+            if (ImGui::BeginPopup("slot_swatches")) {
+                if (material_swatch_picker(project, "pop", building.materials, materials[slot])) ImGui::CloseCurrentPopup();
                 ImGui::EndPopup();
             }
+            if (slot % 2U == 0U) ImGui::SameLine(170.0F);
             ImGui::PopID();
         }
-        if (ImGui::SmallButton("Copy Bottom to all faces")) {
-            materials.fill(materials[0]);
-        }
+        if (ImGui::SmallButton("Use the first slot for all")) materials.fill(materials[0]);
         ImGui::TreePop();
     };
 
-    ImGui::Spacing();
-    if (cfg.piece) {
-        // A piece's material slots 0..5 read the cell's exterior texture set.
-        face_material_grid("Piece textures (slots 0-5)", cfg.exterior_face_material);
-    } else if (cfg.exterior) {
-        face_material_grid("Exterior textures", cfg.exterior_face_material);
+    ImGui::SeparatorText("Exterior");
+    ImGui::Checkbox("Write exterior", &cfg.exterior);
+    ImGui::BeginDisabled(!cfg.exterior);
+    block_combo("##exterior_block", "Normal (solid shell)", cfg.exterior_block);
+    texture_grid("Exterior textures", cfg.exterior_textures, exterior_slots);
+    ImGui::EndDisabled();
+
+    ImGui::SeparatorText("Interior");
+    ImGui::Checkbox("Write interior", &cfg.interior);
+    ImGui::BeginDisabled(!cfg.interior);
+    block_combo("##interior_block", "Normal (room)", cfg.interior_block);
+    if (cfg.interior_block == 0U) {
+        field_label("Walls from");
+        catalog_combo("##block_buildblock", building.block_names, cfg.buildblock_index);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("The buildblock whose layers give the room's walls their windows and doors.");
     }
-    if (!cfg.piece && cfg.interior) {
-        face_material_grid("Interior textures", cfg.interior_face_material);
+    texture_grid("Interior textures", cfg.interior_textures, interior_slots);
+    ImGui::EndDisabled();
+
+    if ((cfg.exterior && cfg.exterior_block != 0U) || (cfg.interior && cfg.interior_block != 0U)) {
+        static constexpr std::array<const char*, 4> rotations{"0\xC2\xB0", "90\xC2\xB0", "180\xC2\xB0", "270\xC2\xB0"};
+        int rotation = static_cast<int>(cfg.rotation & 3U);
+        field_label("Piece rotation");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::Combo("##block_rotation", &rotation, rotations.data(), 4)) cfg.rotation = static_cast<std::uint32_t>(rotation);
     }
+
     ImGui::Spacing();
+    ImGui::Checkbox("Change the clicked block", &cfg.apply_to_clicked);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("On: a click writes the enabled layers into the block you click, e.g. to add a room to a shell.\n"
+                          "Off: a click adds a block in the empty cell in front of the face.");
+    }
+    if (!cfg.exterior && !cfg.interior) ImGui::TextColored(ImVec4(1.0F, 0.8F, 0.2F, 1.0F), "Enable Exterior or Interior to place.");
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-    ImGui::TextWrapped("Click a block face in the viewport to place against it.");
+    ImGui::TextWrapped("Exterior is the outside of the cell; interior is the room inside it. Writing the interior also gives the room its floor.");
     ImGui::PopStyleColor();
 }
 
@@ -713,7 +710,7 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
                 }
             }
             for (auto& cell : building.cells) {
-                for (const auto base : {0U, 8U}) for (std::size_t face = 0; face < 6; ++face) {
+                for (const auto base : {0U, 8U}) for (std::size_t face = 0; face < 8; ++face) {
                     auto& value = cell.shorts[base + face];
                     if (value < remap.size()) value = remap[value];
                 }
@@ -721,8 +718,8 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
             building.materials = std::move(kept);
             ui.selected_materials.clear();
             ui.paint_material_index = 0;
-            ui.block_config.exterior_face_material.fill(0);
-            ui.block_config.interior_face_material.fill(0);
+            ui.block_config.exterior_textures.fill(0);
+            ui.block_config.interior_textures.fill(0);
             mark_building_changed(project, ui);
         }
         ImGui::EndDisabled();

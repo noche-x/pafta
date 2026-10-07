@@ -381,6 +381,8 @@ std::vector<std::uint8_t> patch_sbl_layer_portal_type(
     std::size_t layer_index,
     std::uint32_t portal_type);
 std::vector<std::uint8_t> rebuild_sbl_block(const SblBlockMesh& block);
+// Re-derives a cell's payloads and occupied flag from its words (as parsing does).
+void refresh_sbb_cell_payloads(SbbCell& cell);
 // The quads one patch or one box record produces, as the game builds them.
 std::vector<SblBlockFace> sbl_patch_faces(const SblAuthoredPatch& patch);
 std::vector<SblBlockFace> sbl_box_faces(const SblBlockLight& box);

@@ -1881,6 +1881,11 @@ std::vector<std::uint8_t> rebuild_sbl_block(const SblBlockMesh& block) {
     return bytes;
 }
 
+void refresh_sbb_cell_payloads(SbbCell& cell) {
+    cell.payloads = read_cell_payloads(cell.words);
+    cell.occupied = std::ranges::any_of(cell.words, [](std::uint32_t word) { return word != 0; });
+}
+
 std::vector<SblBlockFace> sbl_patch_faces(const SblAuthoredPatch& patch) {
     std::vector<SblBlockFace> faces;
     append_authored_patch_faces(faces, {patch});

@@ -31,9 +31,25 @@ SblBlockMesh* selected_block(EditorProject& project, EditorUi& ui) {
     return &project.blocks[ui.selected_block].data;
 }
 
-// A flat patch over the quad a-b-c-d (order 1, one tile): the 4x4 control grid
-// is the bilinear blend of the corners, as the game's linear patches store it.
-void set_patch_quad(SblAuthoredPatch& patch, Vec3f a, Vec3f b, Vec3f c, Vec3f d) {
+std::array<Vec3f, 4> patch_corners(const SblAuthoredPatch& patch) {
+    const auto& p = patch.control_points;
+    return {p[0].position, p[3].position, p[15].position, p[12].position};
+}
+
+bool patch_is_flat(const SblAuthoredPatch& patch) {
+    return patch.column_order == 1U && patch.row_order == 1U && patch.control_points.size() == 16U;
+}
+
+// Corner UVs of a patch: control points 0, 3, 15, 12 (the corners in order).
+std::array<Vec2f, 4> patch_corner_uvs(const SblAuthoredPatch& patch) {
+    const auto& p = patch.control_points;
+    if (p.size() != 16) return {{{0, 1}, {1, 1}, {1, 0}, {0, 0}}};
+    return {{{p[0].u, p[0].v}, {p[3].u, p[3].v}, {p[15].u, p[15].v}, {p[12].u, p[12].v}}};
+}
+
+// A flat patch over the quad a-b-c-d (order 1): the 4x4 control grid is the
+// bilinear blend of the corners and of their UVs, as linear patches store it.
+void set_patch_quad(SblAuthoredPatch& patch, Vec3f a, Vec3f b, Vec3f c, Vec3f d, std::array<Vec2f, 4> uvs) {
     patch.column_order = patch.row_order = 1;
     patch.column_tess = std::max(1U, patch.column_tess);
     patch.row_tess = std::max(1U, patch.row_tess);
@@ -46,19 +62,100 @@ void set_patch_quad(SblAuthoredPatch& patch, Vec3f a, Vec3f b, Vec3f c, Vec3f d)
             };
             auto& point = patch.control_points[static_cast<std::size_t>(row * 4 + column)];
             point.position = {blend(a.x, b.x, c.x, d.x), blend(a.y, b.y, c.y, d.y), blend(a.z, b.z, c.z, d.z)};
-            point.u = u;
-            point.v = 1.0F - v;
+            point.u = blend(uvs[0].u, uvs[1].u, uvs[2].u, uvs[3].u);
+            point.v = blend(uvs[0].v, uvs[1].v, uvs[2].v, uvs[3].v);
         }
     }
 }
 
-std::array<Vec3f, 4> patch_corners(const SblAuthoredPatch& patch) {
-    const auto& p = patch.control_points;
-    return {p[0].position, p[3].position, p[15].position, p[12].position};
+// Same, keeping the patch's current corner UVs.
+void set_patch_quad(SblAuthoredPatch& patch, Vec3f a, Vec3f b, Vec3f c, Vec3f d) {
+    set_patch_quad(patch, a, b, c, d, patch_corner_uvs(patch));
 }
 
-bool patch_is_flat(const SblAuthoredPatch& patch) {
-    return patch.column_order == 1U && patch.row_order == 1U && patch.control_points.size() == 16U;
+float distance(Vec3f a, Vec3f b) {
+    return std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) + (a.z - b.z) * (a.z - b.z));
+}
+
+// Stored-UV tools: every control point's UV through one mapping.
+void map_patch_uvs(SblAuthoredPatch& patch, const auto& mapping) {
+    for (auto& point : patch.control_points) {
+        const auto uv = mapping(Vec2f{point.u, point.v});
+        point.u = uv.u;
+        point.v = uv.v;
+    }
+}
+
+void draw_patch_uv_tools(SblAuthoredPatch& patch, bool& changed) {
+    ImGui::SeparatorText("UVs (stored)");
+    if (patch_is_flat(patch)) {
+        auto corners = patch_corners(patch);
+        auto uvs = patch_corner_uvs(patch);
+        static constexpr std::array<const char*, 4> names{"Corner 1 UV", "Corner 2 UV", "Corner 3 UV", "Corner 4 UV"};
+        bool moved = false;
+        for (std::size_t i = 0; i < uvs.size(); ++i) {
+            field_label(names[i]);
+            ImGui::PushID(static_cast<int>(i));
+            std::array<float, 2> uv{uvs[i].u, uvs[i].v};
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::DragFloat2("##uv", uv.data(), 0.01F, -64.0F, 64.0F, "%.3g")) {
+                uvs[i] = {uv[0], uv[1]};
+                moved = true;
+            }
+            ImGui::PopID();
+        }
+        if (ImGui::Button("Fit 0-1")) {
+            uvs = {{{0, 1}, {1, 1}, {1, 0}, {0, 0}}};
+            moved = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Stretch the texture once over the whole surface.");
+        ImGui::SameLine();
+        if (ImGui::Button("One per cell")) {
+            // As many repeats as the edges are long in cells, like projected walls.
+            const auto across = distance(corners[0], corners[1]), up = distance(corners[0], corners[3]);
+            uvs = {{{0, up}, {across, up}, {across, 0}, {0, 0}}};
+            moved = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Repeat the texture once per cell, so it matches the walls next to it.");
+        if (moved) {
+            set_patch_quad(patch, corners[0], corners[1], corners[2], corners[3], uvs);
+            changed = true;
+        }
+    }
+    if (ImGui::Button("Rotate 90")) {
+        map_patch_uvs(patch, [](Vec2f uv) { return Vec2f{uv.v, -uv.u}; });
+        changed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Flip U")) {
+        map_patch_uvs(patch, [](Vec2f uv) { return Vec2f{-uv.u, uv.v}; });
+        changed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Flip V")) {
+        map_patch_uvs(patch, [](Vec2f uv) { return Vec2f{uv.u, -uv.v}; });
+        changed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("x2")) {
+        map_patch_uvs(patch, [](Vec2f uv) { return Vec2f{uv.u * 2.0F, uv.v * 2.0F}; });
+        changed = true;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Repeat the texture twice as often.");
+    ImGui::SameLine();
+    if (ImGui::Button("/2")) {
+        map_patch_uvs(patch, [](Vec2f uv) { return Vec2f{uv.u * 0.5F, uv.v * 0.5F}; });
+        changed = true;
+    }
+    static std::array<float, 2> offset{};
+    field_label("Shift by");
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 60.0F);
+    ImGui::DragFloat2("##uv_shift", offset.data(), 0.01F, -8.0F, 8.0F, "%.3g");
+    ImGui::SameLine();
+    if (ImGui::Button("Apply##shift")) {
+        map_patch_uvs(patch, [](Vec2f uv) { return Vec2f{uv.u + offset[0], uv.v + offset[1]}; });
+        changed = true;
+    }
 }
 
 void set_box_bounds(SblBlockLight& box, Vec3f lo, Vec3f hi) {
@@ -231,6 +328,14 @@ void draw_patch_properties(SblBlockMesh& block, SblAuthoredPatch& patch, bool& c
         ImGui::SetTooltip("Projected: the game lines the texture up with the world like a wall (recommended).\n"
                           "Stored: uses each control point's u, v.");
     }
+    if (patch.normal_flag_b == 0U && (patch.normal_flag_a & 0xf0000U) == 0U) {
+        draw_patch_uv_tools(patch, changed);
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("UVs are projected from the facing: one texture repeat per cell, lined up with the walls. "
+                           "Choose Stored UVs to set them yourself.");
+        ImGui::PopStyleColor();
+    }
     if (patch_is_flat(patch)) {
         ImGui::SeparatorText("Corners (cells)");
         auto corners = patch_corners(patch);
@@ -313,6 +418,7 @@ void draw_patch_properties(SblBlockMesh& block, SblAuthoredPatch& patch, bool& c
 void draw_box_properties(SblBlockLight& box, bool& changed) {
     field_label("Texture");
     changed |= slot_combo("##box_slot", box.scalars[0]);
+    ImGui::TextDisabled("Box textures are always projected from each side's facing.");
     auto [lo, hi] = box_bounds(box);
     ImGui::SeparatorText("Bounds (cells)");
     field_label("From");

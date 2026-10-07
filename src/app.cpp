@@ -2068,34 +2068,32 @@ SbbCell* building_cell_at(SbbBuilding& building, std::uint32_t x, std::uint32_t 
 constexpr std::uint32_t kSolidExteriorBlock = 0x40000000U;
 constexpr std::uint32_t kSolidInteriorBlock = 0x0000FFFFU;
 
-// Writes a cell from the Place Block config: exterior and/or interior shell, the
-// chosen buildblock template (cell_type), and the per-face textures for each side.
-// Faces 0..5 map to texture slots 0..5 (exterior) and 8..13 (interior).
+// Writes the enabled layers of the Place Block config into a cell, as
+// BuildingTool_WriteCellFromCurrentSelection @1400672a0 does: the exterior word
+// and its texture set (slots 0..7); the interior word, cell type, placed flag
+// (bit 0: the room's floor) and interior set (slots 8..15). Shipped rooms carry
+// placed flag 1; without it a room has no floor.
 void apply_block_config(SbbCell& cell, const BlockToolConfig& config, const SbbBuilding& building) {
-    cell.occupied = true;
-    const bool piece = config.piece && !building.piece_names.empty();
-    const auto piece_word = 0x80000000U | ((config.piece_rotation & 3U) << 24U) |
-        static_cast<std::uint32_t>(std::min(config.piece_index, building.piece_names.size() - (piece ? 1U : 0U)) & 0x3ffU);
-    cell.exterior_block() = piece ? piece_word : config.exterior ? kSolidExteriorBlock : 0U;
-    cell.interior_block() = piece ? 0U : config.interior ? kSolidInteriorBlock : 0U;
-    cell.cell_type() = static_cast<std::uint32_t>(
-        building.block_names.empty() ? 0U : std::min(config.buildblock_index, building.block_names.size() - 1U));
-    cell.exterior_portal_face() = 0U;
-    cell.interior_portal_face() = 0U;
-    cell.placed_flag() = 0U;
-    cell.payloads.clear();
-    if (piece) cell.payloads.push_back({PayloadKind::Piece, piece_word, piece_word & 0x3ffU});
-    const auto material = [&](std::size_t face_material) -> std::uint16_t {
-        if (building.materials.empty()) {
-            return 0U;
-        }
-        return static_cast<std::uint16_t>(std::min(face_material, building.materials.size() - 1U));
+    const auto word = [&](std::size_t selection, std::uint32_t normal) {
+        if (selection == 0U || building.piece_names.empty()) return normal;
+        const auto index = std::min(selection - 1U, building.piece_names.size() - 1U);
+        return 0x80000000U | (config.rotation & 3U) << 24U | static_cast<std::uint32_t>(index & 0x3ffU);
     };
-    for (std::size_t face = 0; face < 6; ++face) {
-        // A piece's material slots read the exterior set.
-        cell.shorts[face] = config.exterior || piece ? material(config.exterior_face_material[face]) : cell.shorts[face];
-        cell.shorts[8 + face] = config.interior ? material(config.interior_face_material[face]) : cell.shorts[8 + face];
+    const auto material = [&](std::size_t index) -> std::uint16_t {
+        return building.materials.empty() ? std::uint16_t{0} : static_cast<std::uint16_t>(std::min(index, building.materials.size() - 1U));
+    };
+    if (config.exterior) {
+        cell.exterior_block() = word(config.exterior_block, kSolidExteriorBlock);
+        for (std::size_t slot = 0; slot < 8; ++slot) cell.shorts[slot] = material(config.exterior_textures[slot]);
     }
+    if (config.interior) {
+        cell.interior_block() = word(config.interior_block, kSolidInteriorBlock);
+        cell.cell_type() = static_cast<std::uint32_t>(
+            building.block_names.empty() ? 0U : std::min(config.buildblock_index, building.block_names.size() - 1U));
+        cell.placed_flag() = 1U;
+        for (std::size_t slot = 0; slot < 8; ++slot) cell.shorts[8 + slot] = material(config.interior_textures[slot]);
+    }
+    refresh_sbb_cell_payloads(cell);
 }
 
 // Place Block: extrude a new cell into the empty neighbour of the picked face,
@@ -2108,16 +2106,19 @@ std::optional<std::size_t> place_building_block(EditorProject& project, EditorUi
     }
     ui.selected_building = std::min(ui.selected_building, project.buildings.size() - 1U);
     auto& building = project.buildings[ui.selected_building].data;
-    if (ui.block_config.piece && building.piece_names.empty()) {
-        status = "add a piece to this building's Pieces list first";
-        return std::nullopt;
-    }
-    if (!ui.block_config.piece && !ui.block_config.exterior && !ui.block_config.interior) {
+    if (!ui.block_config.exterior && !ui.block_config.interior) {
         status = "enable Exterior or Interior in the block panel first";
         return std::nullopt;
     }
     if (pick.cell_index >= building.cells.size()) {
         return std::nullopt;
+    }
+    if (ui.block_config.apply_to_clicked) {
+        auto& clicked = building.cells[pick.cell_index];
+        apply_block_config(clicked, ui.block_config, building);
+        mark_building_changed(project, ui);
+        status = "changed block at [" + std::to_string(clicked.x) + "," + std::to_string(clicked.y) + "," + std::to_string(clicked.z) + "]";
+        return pick.cell_index;
     }
     // The empty cell in front of the clicked face: a step back along the ray
     // from the hit, in anchor-relative cells (the edit view's space).
@@ -7073,6 +7074,11 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     if (const auto* asset = find_building_asset(*project, name)) {
                         ui.selected_building = static_cast<std::size_t>(asset - project->buildings.data());
                     }
+                }
+                if (screenshot_tab == "buildings_place") {
+                    ui.tab = EditorTab::Buildings;
+                    ui.building_tool = BuildingTool::PlaceBlock;
+                    ui.block_config.interior = true;
                 }
                 if (screenshot_tab == "pieces") { ui.tab = EditorTab::City; ui.city_tool = CityTool::Piece; }
                 if (screenshot_tab == "buildblocks") ui.tab = EditorTab::Buildblocks;

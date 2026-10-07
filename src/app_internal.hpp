@@ -541,21 +541,25 @@ enum class BuildingTool {
 // or both (neither = nothing to place), pick the buildblock template (cell_type)
 // that shapes its walls, and pick the material for each of the six faces on each
 // side. Place writes exactly this into the target cell.
+// The Place Block tool, as editor.exe's building tool
+// (BuildingTool_WriteCellFromCurrentSelection @1400672a0): the exterior and
+// interior layers are written independently, each only when enabled.
 struct BlockToolConfig {
     bool exterior{true};
     bool interior{false};
-    // Buildblock template index into building.block_names (cell_type). 0 = the
-    // plain solid box.
+    // 0 = normal (exterior: the solid shell 0x40000000; interior: the generated
+    // room 0xffff), n = piece n-1 of building.piece_names
+    // (0x80000000 | rotation << 24 | index).
+    std::size_t exterior_block{};
+    std::size_t interior_block{};
+    std::uint32_t rotation{};
+    // Buildblock template (cell_type) for the room's walls; written with the interior.
     std::size_t buildblock_index{};
-    // Material index (into building.materials) per face. Faces 0..5 are
-    // Down, South, West, North, East, Up - the renderer's slot order.
-    std::array<std::size_t, 6> exterior_face_material{};
-    std::array<std::size_t, 6> interior_face_material{};
-    // Place a piece (block mesh, building.piece_names) instead of a shell: the
-    // exterior word becomes 0x80000000 | rotation << 24 | piece index.
-    bool piece{false};
-    std::size_t piece_index{};
-    std::uint32_t piece_rotation{};
+    // Material (into building.materials) per texture slot 0..7 of each set.
+    std::array<std::size_t, 8> exterior_textures{};
+    std::array<std::size_t, 8> interior_textures{};
+    // Write into the clicked block instead of the empty cell in front of it.
+    bool apply_to_clicked{false};
 };
 
 // Drag-gizmo handle on the selected city building. MoveX/MoveZ slide along the
