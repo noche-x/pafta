@@ -167,6 +167,7 @@ target_compile_options(map_editor_core PRIVATE
 if(NOT EMSCRIPTEN)
   add_executable(map_editor_cpp
     src/app.cpp
+    src/block_editor.cpp
     src/main.cpp
     src/mesh_export.cpp
     src/render_gpu.cpp
@@ -201,6 +202,7 @@ if(MAP_EDITOR_CPP_BUILD_WEB)
   # browser-safe paths in app.cpp/web_main.cpp.
   add_executable(map_editor_web
     src/app.cpp
+    src/block_editor.cpp
     src/web_main.cpp
     src/render_gpu.cpp
     src/ui_panels.cpp

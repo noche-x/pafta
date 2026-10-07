@@ -381,6 +381,11 @@ std::vector<std::uint8_t> patch_sbl_layer_portal_type(
     std::size_t layer_index,
     std::uint32_t portal_type);
 std::vector<std::uint8_t> rebuild_sbl_block(const SblBlockMesh& block);
+// The quads one patch or one box record produces, as the game builds them.
+std::vector<SblBlockFace> sbl_patch_faces(const SblAuthoredPatch& patch);
+std::vector<SblBlockFace> sbl_box_faces(const SblBlockLight& box);
+// Writes the block as stored (version 2): side flags, patches and boxes kept.
+std::vector<std::uint8_t> write_sbl_block(const SblBlockMesh& block);
 std::vector<std::uint8_t> rebuild_sbl_buildblock(const SblTemplate& template_file);
 std::vector<std::uint8_t> patch_sbl_layers(const std::vector<std::uint8_t>& bytes, const SblTemplate& template_file);
 std::vector<std::uint8_t> build_csx(const CsxArchive& archive);

@@ -1,5 +1,7 @@
 #include "formats.hpp"
 
+#include <bit>
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -1222,12 +1224,15 @@ void refresh_sbl_block_faces(SblBlockMesh& block) {
     const auto authored_count = authored_render_face_count(block.authored_patches);
     std::vector<SblBlockFace> preserved_light_faces;
     const auto light_begin = static_cast<std::size_t>(exterior_count) + static_cast<std::size_t>(authored_count);
-    if (light_begin < block.faces.size()) {
+    // Box faces come from the box records; a block without records (the
+    // native procedural catalog) keeps the box faces it was built with.
+    if (block.lights.empty() && light_begin < block.faces.size()) {
         preserved_light_faces.assign(block.faces.begin() + static_cast<std::ptrdiff_t>(light_begin), block.faces.end());
     }
 
     auto faces = build_exterior_block_faces(block.width, block.height, block.depth, block.exterior_flags);
     append_authored_patch_faces(faces, block.authored_patches);
+    for (const auto& box : block.lights) emit_sbl_light_faces(faces, box.points, box.scalars, box.final_value);
     faces.insert(faces.end(), preserved_light_faces.begin(), preserved_light_faces.end());
     block.face_count = static_cast<std::uint32_t>(faces.size());
     block.faces = std::move(faces);
@@ -1873,6 +1878,58 @@ std::vector<std::uint8_t> rebuild_sbl_block(const SblBlockMesh& block) {
         }
     }
     append_u32(bytes, 0); // No supplemental v2 records.
+    return bytes;
+}
+
+std::vector<SblBlockFace> sbl_patch_faces(const SblAuthoredPatch& patch) {
+    std::vector<SblBlockFace> faces;
+    append_authored_patch_faces(faces, {patch});
+    return faces;
+}
+
+std::vector<SblBlockFace> sbl_box_faces(const SblBlockLight& box) {
+    std::vector<SblBlockFace> faces;
+    emit_sbl_light_faces(faces, box.points, box.scalars, box.final_value);
+    return faces;
+}
+
+std::vector<std::uint8_t> write_sbl_block(const SblBlockMesh& block) {
+    // BlockSbl_LoadFromFile @e6e50: version, size, six side flags, patches,
+    // then (version 2) the box records.
+    std::vector<std::uint8_t> bytes;
+    const auto number = [&](float value) { append_u32(bytes, std::bit_cast<std::uint32_t>(value)); };
+    append_u32(bytes, 2);
+    append_u32(bytes, block.width);
+    append_u32(bytes, block.height);
+    append_u32(bytes, block.depth);
+    for (const auto flag : block.exterior_flags) append_u32(bytes, flag);
+    append_u32(bytes, static_cast<std::uint32_t>(block.authored_patches.size()));
+    for (const auto& patch : block.authored_patches) {
+        if (patch.control_points.size() != 16) throw std::runtime_error("A block patch needs 16 control points");
+        append_u32(bytes, patch.column_order);
+        append_u32(bytes, patch.column_tess);
+        append_u32(bytes, patch.row_order);
+        append_u32(bytes, patch.row_tess);
+        append_u32(bytes, patch.normal_flag_a);
+        append_u32(bytes, patch.normal_flag_b);
+        for (const auto& point : patch.control_points) {
+            number(point.position.x);
+            number(point.position.y);
+            number(point.position.z);
+            number(point.u);
+            number(point.v);
+        }
+    }
+    append_u32(bytes, static_cast<std::uint32_t>(block.lights.size()));
+    for (const auto& box : block.lights) {
+        for (const auto& corner : box.points) {
+            number(corner.x);
+            number(corner.y);
+            number(corner.z);
+        }
+        for (const auto scalar : box.scalars) append_u32(bytes, scalar);
+        append_u32(bytes, box.final_value);
+    }
     return bytes;
 }
 

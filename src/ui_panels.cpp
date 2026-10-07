@@ -827,15 +827,6 @@ const char* block_field_label(std::size_t field) {
     return labels[std::min(field, labels.size() - 1U)];
 }
 
-void draw_block_inspector(EditorProject& project, EditorUi& ui, std::string&) {
-    if (project.blocks.empty()) return;
-    ui.selected_block = std::min(ui.selected_block, project.blocks.size() - 1U);
-    const auto& asset = project.blocks[ui.selected_block];
-    ImGui::TextUnformatted(asset.name.c_str());
-    ImGui::Text("Size: %u x %u x %u", asset.data.width, asset.data.height, asset.data.depth);
-    ImGui::TextWrapped("Mesh preview. Edit the source mesh in your modelling tool, then reload the map folder.");
-}
-
 void draw_portal_details(const SbcPortal& portal) {
     if (ImGui::BeginTable("##portal_summary", 2, ImGuiTableFlags_SizingStretchProp)) {
         property_row("Index", std::to_string(portal.index));

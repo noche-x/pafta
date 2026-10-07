@@ -515,6 +515,9 @@ enum class CityTool {
 
 // What the Select tool currently has selected, so the gizmo/inspector know what to
 // act on and the outline knows what to trace.
+// What the block editor has selected inside the block.
+enum class BlockElementKind { None, Patch, Box };
+
 enum class CitySelectionKind {
     None,
     Building,
@@ -718,6 +721,8 @@ struct EditorUi {
     std::array<std::array<char, 128>, 6> asset_search{};
     std::size_t selected_building{};
     std::size_t selected_block{};
+    BlockElementKind block_element{BlockElementKind::None};
+    std::size_t block_element_index{};
     std::size_t selected_block_field{};
     std::size_t selected_block_patch{};
     std::size_t selected_block_point{};
@@ -1191,6 +1196,13 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
 // bottom-right of the render image (origin + size). Shows only the bindings for
 // the active tab/tool so it stays small and never needs scrolling.
 void draw_block_inspector(EditorProject& project, EditorUi& ui, std::string& status);
+// Block editor (block_editor.cpp): the selected patch or box of the selected block.
+void duplicate_block_element(EditorProject& project, EditorUi& ui);
+void delete_block_element(EditorProject& project, EditorUi& ui);
+void nudge_block_element(EditorProject& project, EditorUi& ui, Vec3f delta);
+void draw_block_editor_view(EditorProject& project, const EditorUi& ui);
+void pick_block_element(EditorProject& project, EditorUi& ui, Ray ray);
+void frame_block_camera(const EditorProject& project, const EditorUi& ui, Camera3D& camera);
 void draw_buildblock_inspector(EditorProject& project, EditorUi& ui, std::string& status);
 void draw_struct_inspector_header(const char* file_type, const char* struct_name, const std::string& record_name);
 void draw_struct_section(const char* name);

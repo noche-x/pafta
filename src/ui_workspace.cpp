@@ -159,6 +159,9 @@ std::optional<std::size_t> thumbnail_strip(const char* id, std::size_t count, st
 
 // One-line hint for the active tool, drawn under the toolbar.
 const char* tool_hint(const EditorUi& ui) {
+    if (ui.tab == EditorTab::Blocks) {
+        return "Click a patch or box to select it. Arrows / PgUp PgDn move it; Ctrl+D copies; Delete removes.";
+    }
     if (ui.tab == EditorTab::Buildings) {
         switch (ui.building_tool) {
             case BuildingTool::Select: return "Click a block to select it. Delete removes it; Tab cycles blocks.";
@@ -210,6 +213,11 @@ void draw_viewport_overlays(EditorProject* project, EditorUi& ui, Camera3D& came
                 ui.requested_tab = EditorTab::Buildings;
             }
             ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (tool_button(ICON_FA_CUBES, ui.tab == EditorTab::Blocks, ui, "Block mode: make and edit block meshes") &&
+                ui.tab != EditorTab::Blocks) {
+                ui.requested_tab = EditorTab::Blocks;
+            }
             toolbar_divider();
             if (ui.tab == EditorTab::City && project->city) {
                 struct Tool { const char* icon; CityTool tool; const char* tip; EditorAction action; };
@@ -407,7 +415,24 @@ void draw_outliner_window(EditorProject* project, EditorUi& ui) {
         ImGui::End();
         return;
     }
-    if (project == nullptr || !project->city) {
+    if (project != nullptr && ui.tab == EditorTab::Blocks) {
+        // Block mode lists the blocks; the selection is the block being edited.
+        static std::array<char, 128> search{};
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputTextWithHint("##block_search", "Filter by name", search.data(), search.size());
+        const auto key = lower_name(search.data());
+        if (ImGui::BeginListBox("##block_list", ImVec2(-FLT_MIN, -FLT_MIN))) {
+            for (std::size_t i = 0; i < project->blocks.size(); ++i) {
+                const auto& name = project->blocks[i].name;
+                if (!key.empty() && lower_name(name).find(key) == std::string::npos) continue;
+                if (ImGui::Selectable((name + "##block" + std::to_string(i)).c_str(), ui.selected_block == i) && ui.selected_block != i) {
+                    ui.selected_block = i;
+                    ui.block_element = BlockElementKind::None;
+                }
+            }
+            ImGui::EndListBox();
+        }
+    } else if (project == nullptr || !project->city) {
         ImGui::TextDisabled("The map's buildings and roads are listed here.");
     } else if (ImGui::BeginTabBar("##outliner")) {
         if (ImGui::BeginTabItem("Buildings")) {

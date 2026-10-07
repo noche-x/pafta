@@ -332,6 +332,28 @@ void extracts_render_cells() {
     assert(has_piece_payload);
 }
 
+void writes_sbl_blocks_losslessly() {
+    // Every shipped block survives write_sbl_block: same structure, and a
+    // version-2 file comes back byte for byte.
+    std::size_t checked = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(fixture_root() / "server/data/test2/block")) {
+        if (entry.path().extension() != ".sbl") continue;
+        const auto bytes = map_editor::read_file_bytes(entry.path());
+        const auto parsed = map_editor::parse_sbl(bytes);
+        if (!parsed.block) continue;
+        const auto written = map_editor::write_sbl_block(*parsed.block);
+        const auto reparsed = map_editor::parse_sbl(written);
+        assert(reparsed.block.has_value());
+        assert(reparsed.block->width == parsed.block->width && reparsed.block->exterior_flags == parsed.block->exterior_flags);
+        assert(reparsed.block->authored_patches == parsed.block->authored_patches);
+        assert(reparsed.block->lights == parsed.block->lights);
+        assert(reparsed.block->faces == parsed.block->faces);
+        if (parsed.version == 2) assert(written == bytes);
+        ++checked;
+    }
+    assert(checked > 10);
+}
+
 void resolves_sbb_piece_meshes() {
     const auto block = map_editor::parse_sbl_file(
         fixture_root() / "server/data/test2/block/astairwellfloor.sbl");
@@ -3669,6 +3691,7 @@ int main() {
     parses_sbb_v14_lod_tail();
     extracts_render_cells();
     resolves_sbb_piece_meshes();
+    writes_sbl_blocks_losslessly();
     build_sbb_scene_recenters_cells_with_native_anchor();
     native_building_rendering_includes_interior_piece_words();
     native_building_tool_preview_generates_floor_faces_from_floor_cell_key();

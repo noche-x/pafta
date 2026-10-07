@@ -53,20 +53,36 @@ The editor caps the parsed patch count at `0x400` and clamps tessellation while
 building preview triangles. Those are local safety limits, not confirmed file
 limits.
 
-## Version-2 light section
+## Version-2 box section
 
-Version 2 stores a `u32` light count immediately after the authored patches.
-Each light record occupies `0x7c` bytes:
+Version 2 stores a `u32` box count immediately after the authored patches
+(`BlockSbl_LoadFromFile @e6e50` reads it only when the version is above 1).
+These records are extra textured boxes, not lights: the game has no lights, and
+`Buildblock_InitTemplateMeshCatalog` passes each record to
+`BuildblockMeshBuilder_AddBoxFaces @19c10`. The editor's code still names them
+`SblBlockLight`. Each record occupies `0x7c` bytes:
 
 | Relative offset | Type | Field |
 |---:|---|---|
-| `0x00` | `Vec3f[8]` | eight points, 96 bytes |
-| `0x60` | `u32[6]` | scalar or material words |
-| `0x78` | `u32` | enabled-face mask |
+| `0x00` | `Vec3f[8]` | eight corners, 96 bytes: 0-3 one ring, 4-7 the ring above it |
+| `0x60` | `u32` | material: the face texture slot |
+| `0x64` | `u32[5]` | read and kept, not used to build the mesh |
+| `0x78` | `u32` | side mask: bit n emits side n (63 = all six) |
 
-Native `LoadAndInitBlockTemplates_SBL` uses the mask to select faces, takes the
-material from the first scalar word, and derives orientation from each emitted
-face normal. The remaining scalar meanings need more evidence.
+Sides use corners `3 2 1 0`, `7 6 2 3`, `4 7 3 0`, `5 4 0 1`, `6 5 1 2` and
+`4 5 6 7` for bits 0 to 5. The game ORs a UV projection into each side's
+material from its normal (component beyond 0.7071): +Y `0x40000`, -Y `0x30000`,
++X `0x20000`, -X `0x10000`, +Z `0x60000`, otherwise `0x50000`. The first word is
+the material and the last word the mask; a record written as `63, 0, 0, 0, 0,
+0, 0` has no sides.
+
+Face materials of a block (patch flag A, box material) are texture slots 0 to
+7 of the building cell that places the block, not global texture indices
+(see `material_for_piece_face` in `scene.cpp`).
+
+Inside a CSX archive, `BlockSblContainer_ReadWrite @1967e0` requires version 1
+but always reads the box count and records, so an archived block is the
+version-2 layout with 1 in the version field.
 
 ## Buildblock layer stream
 

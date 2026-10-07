@@ -1084,6 +1084,12 @@ void draw_block_browser_window(EditorProject& project, EditorUi& ui) {
                 ui.city_tool = CityTool::Piece;
                 ui.requested_tab = EditorTab::City;
             }
+            ImGui::SameLine();
+            if (ImGui::Button(ICON_FA_PEN " Edit block")) {
+                ui.selected_block = ui.browser_block;
+                ui.block_element = BlockElementKind::None;
+                ui.requested_tab = EditorTab::Blocks;
+            }
             const float side = std::max(120.0F, std::min(ImGui::GetContentRegionAvail().x, ImGui::GetContentRegionAvail().y - 22.0F));
             Vector3 center{};
             float radius = 1.0F;

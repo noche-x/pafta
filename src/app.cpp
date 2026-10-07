@@ -3170,6 +3170,13 @@ void mark_buildblock_changed(EditorProject& project, EditorUi& ui) {
 void mark_block_changed(EditorProject& project, EditorUi& ui, SblBlockMesh& block) {
     ui.block_dirty = true;
     refresh_sbl_block_faces(block);
+    // The archive is written from block_bytes; keep them the edited block.
+    for (std::size_t i = 0; i < project.blocks.size(); ++i) {
+        if (&project.blocks[i].data != &block) continue;
+        project.blocks[i].dirty = true;
+        if (i < project.block_bytes.size()) project.block_bytes[i] = write_sbl_block(block);
+        if (i < project.block_thumbnail_ready.size()) project.block_thumbnail_ready[i] = false;
+    }
     project.render_buffers_dirty = true;
     // Editing block data invalidates the cached block-mesh catalog.
     invalidate_render_input_cache(project);
@@ -5099,6 +5106,19 @@ void handle_editor_hotkeys(
                 ui.selected_building_cell = (ui.selected_building_cell + 1U) % occupied.size();
             }
         }
+    } else if (ui.tab == EditorTab::Blocks && !project.blocks.empty() && ui.block_element != BlockElementKind::None) {
+        // The selected patch or box: arrows move it 1/8 cell (Shift: a cell).
+        const float step = shift ? 1.0F : 0.125F;
+        Vec3f delta{};
+        if (action_pressed(ui, EditorAction::NudgeLeft)) delta.x -= step;
+        if (action_pressed(ui, EditorAction::NudgeRight)) delta.x += step;
+        if (action_pressed(ui, EditorAction::NudgeForward)) delta.z -= step;
+        if (action_pressed(ui, EditorAction::NudgeBack)) delta.z += step;
+        if (action_pressed(ui, EditorAction::NudgeUp)) delta.y += step;
+        if (action_pressed(ui, EditorAction::NudgeDown)) delta.y -= step;
+        if (delta.x != 0.0F || delta.y != 0.0F || delta.z != 0.0F) nudge_block_element(project, ui, delta);
+        if (action_pressed(ui, EditorAction::DuplicateSelection)) duplicate_block_element(project, ui);
+        if (action_pressed(ui, EditorAction::DeleteSelection)) delete_block_element(project, ui);
     } else if (ui.tab == EditorTab::Buildblocks && !project.buildblocks.empty()) {
         ui.selected_buildblock = std::min(ui.selected_buildblock, project.buildblocks.size() - 1U);
         const auto& buildblock = project.buildblocks[ui.selected_buildblock].data;
@@ -5476,6 +5496,7 @@ int run_editor_app() {
                     } else {
                         camera = default_camera();
                         if (next == EditorTab::Buildings) focus_current_selection(*project, ui, camera);
+                        if (next == EditorTab::Blocks) frame_block_camera(*project, ui, camera);
                     }
                 }
             }
@@ -5874,8 +5895,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                         ui.selected_buildblock = std::min(ui.selected_buildblock, project->buildblocks.size() - 1U);
                         draw_buildblock_preview_3d(buildblock_preview_scene(*project, ui.selected_buildblock));
                     } else if (ui.tab == EditorTab::Blocks && !project->blocks.empty()) {
-                        ui.selected_block = std::min(ui.selected_block, project->blocks.size() - 1U);
-                        draw_mesh_faces(project->blocks[ui.selected_block].data, 4.0F, {98, 148, 204, 220});
+                        draw_block_editor_view(*project, ui);
                     } else {
                         DrawGrid(64, 4.0F);
                     }
@@ -5992,6 +6012,9 @@ start_city_scene_rebuild(*project, scene_fingerprint);
 
         if (show_3d_viewport && project && is_viewport_hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !IsCursorHidden() &&
             ui.camera_drag == CameraDrag::None) {
+            if (ui.tab == EditorTab::Blocks && !project->blocks.empty()) {
+                pick_block_element(*project, ui, get_viewport_mouse_ray(camera, viewport_mouse_pos, last_viewport_size));
+            }
             if (ui.tab == EditorTab::City && project->city) {
                 // Name the undo step. Select only mutates if it grabs a gizmo
                 // (handled by the gizmo-drag start), so it is excluded here.
@@ -6440,6 +6463,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             if (ImGui::BeginMenu("View", project.has_value())) {
                 if (ImGui::MenuItem(ICON_FA_CITY " City mode", action_shortcut_label(ui, EditorAction::TabCity).c_str(), ui.tab == EditorTab::City)) ui.requested_tab = EditorTab::City;
                 if (ImGui::MenuItem(ICON_FA_BUILDING " Building mode", action_shortcut_label(ui, EditorAction::TabBuildings).c_str(), ui.tab == EditorTab::Buildings, !project->buildings.empty())) ui.requested_tab = EditorTab::Buildings;
+                if (ImGui::MenuItem(ICON_FA_CUBES " Block mode", nullptr, ui.tab == EditorTab::Blocks)) ui.requested_tab = EditorTab::Blocks;
                 ImGui::Separator();
                 if (ImGui::MenuItem(ICON_FA_CROSSHAIRS " Frame selection", action_shortcut_label(ui, EditorAction::FocusSelection).c_str())) focus_current_selection(*project, ui, camera);
                 if (ImGui::MenuItem(ICON_FA_EXPAND " Whole city", action_shortcut_label(ui, EditorAction::FrameCity).c_str(), false, project->city.has_value())) focus_camera_on_city(camera, *project);
@@ -7052,7 +7076,16 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 }
                 if (screenshot_tab == "pieces") { ui.tab = EditorTab::City; ui.city_tool = CityTool::Piece; }
                 if (screenshot_tab == "buildblocks") ui.tab = EditorTab::Buildblocks;
-                if (screenshot_tab == "blocks") ui.tab = EditorTab::Blocks;
+                if (screenshot_tab == "blocks") {
+                    ui.tab = EditorTab::Blocks;
+                    // Show a selection: the first patch, else the first box.
+                    if (!project->blocks.empty()) {
+                        const auto& block = project->blocks[std::min(ui.selected_block, project->blocks.size() - 1U)].data;
+                        if (!block.authored_patches.empty()) ui.block_element = BlockElementKind::Patch;
+                        else if (!block.lights.empty()) ui.block_element = BlockElementKind::Box;
+                        ui.block_element_index = 0;
+                    }
+                }
                 if (screenshot_tab == "win_buildings") ui.show_building_browser = true;
                 if (screenshot_tab == "win_blocks") ui.show_block_browser = true;
                 if (screenshot_tab == "win_buildblock") ui.show_buildblock_window = true;
@@ -7075,6 +7108,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     if (ui.tab == EditorTab::Buildings) {
                         focus_current_selection(*project, ui, camera);
                     }
+                    if (ui.tab == EditorTab::Blocks) frame_block_camera(*project, ui, camera);
                 }
 
             }
