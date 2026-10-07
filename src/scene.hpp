@@ -116,6 +116,10 @@ inline void release_shadow_volume(BuildingRenderBuffer& buffer) {
     std::vector<std::uint32_t>().swap(buffer.shadow_indices);
 }
 
+// Shrinks an uploaded building buffer to what picking reads: one vertex per
+// distinct position (texture coordinates cleared) and the triangle indices.
+void keep_pick_data_only(BuildingRenderBuffer& buffer);
+
 struct CellPick {
     std::size_t cell_index{};
     Vec3 hit_world{};

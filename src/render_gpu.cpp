@@ -2,6 +2,10 @@
 #include "profiler.hpp"
 
 #include <rlgl.h>
+#include <imgui.h>
+
+// rlImGui's texture upload (rlImGui.cpp); its draw loop is replaced below.
+void ImGui_ImplRaylib_UpdateTexture(ImTextureData* tex);
 #include <raymath.h>
 #ifdef __EMSCRIPTEN__
 #include <GLES3/gl3.h>
@@ -11,6 +15,11 @@
 #endif
 
 #include <algorithm>
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#elif defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -656,7 +665,9 @@ void upload_next_pending_building(EditorProject& project) {
         return;
     }
     project.building_gpu_models[index] = upload_building_render_model(project.building_render_buffers[index], project.buildings[index].data, project);
-    release_shadow_volume(project.building_render_buffers[index]);
+    keep_pick_data_only(project.building_render_buffers[index]);
+    // Loading peaks far above what the editor keeps: hand the freed pages back.
+    if (project.pending_gpu_upload_indices.empty()) release_free_memory();
     const auto end = Clock::now();
     const auto ms = std::chrono::duration<double, std::milli>(end - begin).count();
     const auto name = index < project.buildings.size() ? project.buildings[index].name : std::to_string(index);
@@ -1194,9 +1205,124 @@ void build_shadow_volume(GpuBuildingRenderModel& model, const BuildingRenderBuff
         bake_shadow_volume(local);
         baked = &local;
     }
-    model.shadow_top = baked->shadow_top;
     model.shadow_volume = upload_shadow_volume(pack_shadow_vertices(baked->shadow_vertices), baked->shadow_indices);
+    model.shadow_top = baked->shadow_top;
     if (!model.shadow_volume.empty()) model.shadow_volume.parts.push_back({0U, model.shadow_volume.index_count});
+}
+
+void render_imgui_draw_data(ImDrawData* draw_data) {
+    if (draw_data->Textures != nullptr) {
+        for (ImTextureData* texture : *draw_data->Textures) {
+            if (texture->Status != ImTextureStatus_OK) ::ImGui_ImplRaylib_UpdateTexture(texture);
+        }
+    }
+    const int fb_width = static_cast<int>(draw_data->DisplaySize.x * draw_data->FramebufferScale.x);
+    const int fb_height = static_cast<int>(draw_data->DisplaySize.y * draw_data->FramebufferScale.y);
+    if (fb_width <= 0 || fb_height <= 0) return;
+    rlDrawRenderBatchActive();
+
+    static Shader shader{};
+    static int projection_loc = -1;
+    static GLuint vao = 0, vbo = 0, ibo = 0;
+    if (vao == 0) {
+        shader = LoadShaderFromMemory(MAPED_GLSL_VERSION R"glsl(
+layout(location=0) in vec2 position;
+layout(location=1) in vec2 uv;
+layout(location=2) in vec4 color;
+uniform mat4 projection;
+out vec2 frag_uv;
+out vec4 frag_color;
+void main() {
+    frag_uv = uv;
+    frag_color = color;
+    gl_Position = projection * vec4(position, 0.0, 1.0);
+}
+)glsl", MAPED_GLSL_VERSION R"glsl(
+in vec2 frag_uv;
+in vec4 frag_color;
+uniform sampler2D texture0;
+out vec4 out_color;
+void main() { out_color = frag_color * texture(texture0, frag_uv); }
+)glsl");
+        projection_loc = GetShaderLocation(shader, "projection");
+        glGenVertexArrays(1, &vao);
+        glGenBuffers(1, &vbo);
+        glGenBuffers(1, &ibo);
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+        glEnableVertexAttribArray(0);
+        glEnableVertexAttribArray(1);
+        glEnableVertexAttribArray(2);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(ImDrawVert), reinterpret_cast<void*>(offsetof(ImDrawVert, pos)));
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(ImDrawVert), reinterpret_cast<void*>(offsetof(ImDrawVert, uv)));
+        glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(ImDrawVert), reinterpret_cast<void*>(offsetof(ImDrawVert, col)));
+        glBindVertexArray(0);
+    }
+
+    const GLboolean blend = glIsEnabled(GL_BLEND), cull = glIsEnabled(GL_CULL_FACE), depth = glIsEnabled(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendEquation(GL_FUNC_ADD);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_SCISSOR_TEST);
+    glViewport(0, 0, fb_width, fb_height);
+    const float l = draw_data->DisplayPos.x, r = l + draw_data->DisplaySize.x;
+    const float t = draw_data->DisplayPos.y, b = t + draw_data->DisplaySize.y;
+    const float projection[16] = {
+        2.0F / (r - l), 0.0F, 0.0F, 0.0F,
+        0.0F, 2.0F / (t - b), 0.0F, 0.0F,
+        0.0F, 0.0F, -1.0F, 0.0F,
+        (r + l) / (l - r), (t + b) / (b - t), 0.0F, 1.0F,
+    };
+    glUseProgram(shader.id);
+    glUniformMatrix4fv(projection_loc, 1, GL_FALSE, projection);
+    glActiveTexture(GL_TEXTURE0);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+    const auto scale = draw_data->FramebufferScale;
+    for (const ImDrawList* list : draw_data->CmdLists) {
+        // Fresh storage per list: the GPU may still read the previous contents,
+        // and writing into them would make the driver wait for it.
+        glBufferData(GL_ARRAY_BUFFER, list->VtxBuffer.Size * static_cast<GLsizeiptr>(sizeof(ImDrawVert)), list->VtxBuffer.Data, GL_STREAM_DRAW);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, list->IdxBuffer.Size * static_cast<GLsizeiptr>(sizeof(ImDrawIdx)), list->IdxBuffer.Data, GL_STREAM_DRAW);
+        for (const auto& cmd : list->CmdBuffer) {
+            const float x0 = (cmd.ClipRect.x - l) * scale.x, y0 = (cmd.ClipRect.y - t) * scale.y;
+            const float x1 = (cmd.ClipRect.z - l) * scale.x, y1 = (cmd.ClipRect.w - t) * scale.y;
+            if (x1 <= x0 || y1 <= y0 || cmd.ElemCount == 0) continue;
+            glScissor(static_cast<GLint>(x0), static_cast<GLint>(static_cast<float>(fb_height) - y1),
+                static_cast<GLsizei>(x1 - x0), static_cast<GLsizei>(y1 - y0));
+            glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(cmd.GetTexID()));
+            glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(cmd.ElemCount), sizeof(ImDrawIdx) == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT,
+                reinterpret_cast<void*>(static_cast<std::size_t>(cmd.IdxOffset) * sizeof(ImDrawIdx)));
+        }
+    }
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(0);
+    glDisable(GL_SCISSOR_TEST);
+    if (!blend) glDisable(GL_BLEND);
+    if (cull) glEnable(GL_CULL_FACE);
+    if (depth) glEnable(GL_DEPTH_TEST);
+}
+
+void apply_texture_anisotropy(EditorProject& project, int level) {
+    rlDrawRenderBatchActive();
+    for (auto* textures : {&project.textures, &project.material_textures}) {
+        for (const auto& loaded : *textures) rlTextureParameters(loaded.texture.id, RL_TEXTURE_FILTER_ANISOTROPIC, level);
+    }
+}
+
+void release_free_memory() {
+#if defined(__APPLE__)
+    malloc_zone_pressure_relief(nullptr, 0);
+#elif defined(__GLIBC__)
+    malloc_trim(0);
+#endif
 }
 
 GpuBuildingRenderModel upload_building_render_model(const BuildingRenderBuffer& buffer, const SbbBuilding& building, const EditorProject& project) {
@@ -2258,13 +2384,13 @@ void create_environment_cubemap(EnvironmentCubemap& cubemap) {
 
 } // namespace
 
-void update_environment_cubemap(const GpuMesh* terrain, Vector3 camera_position) {
+void update_environment_cubemap(const GpuMesh* terrain, Vector3 camera_position, bool follow_camera) {
     auto& cubemap = environment_cubemap();
     const auto light = Vector3Normalize(game_light_direction());
     const auto terrain_indices = terrain != nullptr ? terrain->index_count : 0U;
     // ponytail: recaptured only when the sun, the terrain, or the camera (by more
     // than 16 units) changes; the game recaptures more eagerly.
-    if (cubemap.valid && Vector3Distance(cubemap.camera, camera_position) < 16.0F &&
+    if (cubemap.valid && (!follow_camera || Vector3Distance(cubemap.camera, camera_position) < 16.0F) &&
         Vector3LengthSqr(Vector3Subtract(cubemap.light, light)) < 1e-10F &&
         cubemap.terrain == terrain && cubemap.terrain_indices == terrain_indices) {
         return;
@@ -2877,6 +3003,7 @@ void rebuild_single_building_render(EditorProject& project, std::size_t index) {
         build_city_building_full_render_buffer(project.buildings[index].data, blocks, templates, BuildingLod::Far);
     project.building_gpu_models[index] =
         upload_building_render_model(project.building_render_buffers[index], project.buildings[index].data, project);
+    keep_pick_data_only(project.building_render_buffers[index]);
 }
 
 const RenderTexture2D* building_thumbnail(EditorProject& project, std::size_t index) {
@@ -3198,6 +3325,30 @@ void draw_city_shadow_volumes(EditorProject& project, const Camera3D& camera, fl
     const auto sector_extrusion = [&](std::size_t sector) {
         return Vector3Scale(light, -static_cast<float>(sector + 1U) * 32.0F / std::max(light.y, 0.125F));
     };
+    // View frustum planes (the 3D pass's matrices are current): a volume is
+    // skipped when its building swept along the extrusion is outside a plane.
+    std::array<std::array<float, 4>, 6> planes{};
+    {
+        const auto m = MatrixMultiply(rlGetMatrixModelview(), rlGetMatrixProjection());
+        const std::array<std::array<float, 4>, 6> raw{{
+            {m.m3 + m.m0, m.m7 + m.m4, m.m11 + m.m8, m.m15 + m.m12}, {m.m3 - m.m0, m.m7 - m.m4, m.m11 - m.m8, m.m15 - m.m12},
+            {m.m3 + m.m1, m.m7 + m.m5, m.m11 + m.m9, m.m15 + m.m13}, {m.m3 - m.m1, m.m7 - m.m5, m.m11 - m.m9, m.m15 - m.m13},
+            {m.m3 + m.m2, m.m7 + m.m6, m.m11 + m.m10, m.m15 + m.m14}, {m.m3 - m.m2, m.m7 - m.m6, m.m11 - m.m10, m.m15 - m.m14},
+        }};
+        for (std::size_t i = 0; i < 6; ++i) {
+            const auto length = std::sqrt(raw[i][0] * raw[i][0] + raw[i][1] * raw[i][1] + raw[i][2] * raw[i][2]);
+            for (std::size_t k = 0; k < 4; ++k) planes[i][k] = length > 1e-8F ? raw[i][k] / length : 0.0F;
+        }
+    }
+    const auto swept_visible = [&](Vector3 center, float radius, Vector3 extrusion) {
+        const auto end = Vector3Add(center, extrusion);
+        for (const auto& p : planes) {
+            const auto a = p[0] * center.x + p[1] * center.y + p[2] * center.z + p[3];
+            const auto b = p[0] * end.x + p[1] * end.y + p[2] * end.z + p[3];
+            if (std::max(a, b) < -radius) return false;
+        }
+        return true;
+    };
     // Group placements by (asset, top sector): each group is one instanced draw
     // of the asset's volume with that sector's extrusion.
     std::unordered_map<std::size_t, std::vector<Matrix>> groups;
@@ -3215,6 +3366,16 @@ void draw_city_shadow_volumes(EditorProject& project, const Camera3D& camera, fl
         const auto& building = project.buildings[asset_index].data;
         const auto top_cell = placement.y + static_cast<std::int32_t>(building.size_z) - static_cast<std::int32_t>(building.anchor_y);
         const auto top_sector = static_cast<std::size_t>(std::max(0, top_cell) / 8);
+        {
+            // Bounding sphere of the building's cell box, swept along its extrusion.
+            const auto half = Vector3Scale({static_cast<float>(building.size_x + 1U), static_cast<float>(building.size_z),
+                static_cast<float>(building.size_y + 1U)}, 2.0F);
+            const auto local_center = Vec3{half.x - static_cast<float>(building.anchor_x) * 4.0F,
+                half.y - static_cast<float>(building.anchor_y) * 4.0F, half.z - static_cast<float>(building.anchor_z) * 4.0F};
+            const auto center = native_city_building_transform_point(placement, local_center, 4.0F);
+            if (!swept_visible({center.x, center.y, center.z}, Vector3Length(half),
+                    sector_extrusion(std::min<std::size_t>(top_sector, 63U)))) continue;
+        }
         if (const auto found = project.placement_override_models.find(placement_index); found != project.placement_override_models.end()) {
             set_shadow_volume_light(light, sector_extrusion(std::min<std::size_t>(top_sector, 63U)));
             draw_gpu_mesh_instances(found->second.shadow_volume, {city_placement_matrix(placement)}, GpuSurface::ShadowVolume);
@@ -3243,7 +3404,7 @@ void draw_city_shadow_volumes(EditorProject& project, const Camera3D& camera, fl
     // Vertices are already world-space, so no translation is needed.
     set_shadow_volume_light(light, Vector3Scale(light, -32.0F));
     draw_gpu_mesh_instances(project.portal_gpu_model.shadow_volume, {MatrixIdentity()}, GpuSurface::ShadowVolume);
-    draw_street_object_shadow_volumes(project.city_scene_cache, camera, max_distance, light);
+    if (g_render_settings.street_objects) draw_street_object_shadow_volumes(project.city_scene_cache, camera, max_distance, light);
     glDisable(GL_POLYGON_OFFSET_FILL);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDepthMask(GL_TRUE);

@@ -6,6 +6,7 @@
 #include <rlgl.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -455,6 +456,18 @@ void load_preferences(EditorUi& ui) {
             ui.building_distance = std::clamp(std::strtof(value.c_str(), nullptr), 0.0F, 4000.0F);
         } else if (key == "render.half_textures") {
             ui.half_textures = value == "1";
+        } else if (key == "render.vsync") {
+            ui.vsync = value == "1";
+        } else if (key == "render.fps_limit") {
+            ui.fps_limit = std::clamp(std::atoi(value.c_str()), 0, 240);
+        } else if (key == "render.background_throttle") {
+            ui.background_throttle = value == "1";
+        } else if (key == "render.street_objects") {
+            ui.street_objects = value == "1";
+        } else if (key == "render.live_reflections") {
+            ui.live_reflections = value == "1";
+        } else if (key == "render.anisotropy") {
+            ui.anisotropy = std::clamp(std::atoi(value.c_str()), 1, 16);
         } else if (key == "render.world_time") {
             ui.world_time_hours = std::clamp(std::strtof(value.c_str(), nullptr), 0.0F, 24.0F);
         } else if (key == "view.coordinates") {
@@ -514,6 +527,12 @@ void save_preferences(const EditorUi& ui) {
     out << "render.building_distance=" << ui.building_distance << '\n';
     out << "render.half_textures=" << (ui.half_textures ? 1 : 0) << '\n';
     out << "render.world_time=" << ui.world_time_hours << '\n';
+    out << "render.vsync=" << (ui.vsync ? 1 : 0) << '\n';
+    out << "render.fps_limit=" << ui.fps_limit << '\n';
+    out << "render.background_throttle=" << (ui.background_throttle ? 1 : 0) << '\n';
+    out << "render.street_objects=" << (ui.street_objects ? 1 : 0) << '\n';
+    out << "render.live_reflections=" << (ui.live_reflections ? 1 : 0) << '\n';
+    out << "render.anisotropy=" << ui.anisotropy << '\n';
     out << "camera.fly_speed=" << ui.camera_fly_speed << '\n';
     out << "view.coordinates=" << (ui.show_coordinates ? 1 : 0) << '\n';
     out << "map.street_labels=" << (ui.map_menu.street_labels ? 1 : 0) << '\n';
@@ -787,6 +806,40 @@ void draw_preferences_contents(EditorUi& ui) {
     field_label("Shadow range");
     changed |= ImGui::SliderFloat("##shadow_distance", &ui.shadow_distance, 64.0F, 2000.0F, "%.0f");
     ImGui::EndDisabled();
+    changed |= ImGui::Checkbox("Street lights and signs", &ui.street_objects);
+    changed |= ImGui::Checkbox("Live sky reflections", &ui.live_reflections);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("On: windows reflect the sky around the camera and update as you move.\n"
+                          "Off: the reflection is captured once and kept (cheaper while flying).");
+    }
+    field_label("Filtering");
+    {
+        static constexpr std::array<int, 5> levels{1, 2, 4, 8, 16};
+        static constexpr std::array<const char*, 5> names{"Off", "2x", "4x", "8x", "16x (game)"};
+        auto current = static_cast<int>(std::ranges::find(levels, ui.anisotropy) - levels.begin());
+        if (current >= static_cast<int>(levels.size())) current = 4;
+        if (ImGui::Combo("##anisotropy", &current, names.data(), static_cast<int>(names.size()))) {
+            ui.anisotropy = levels[static_cast<std::size_t>(current)];
+            changed = true;
+        }
+    }
+
+    ImGui::SeparatorText("Frame rate");
+    changed |= ImGui::Checkbox("V-Sync", &ui.vsync);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Waits for the display refresh, like the game's V-Sync option.");
+    field_label("Max FPS");
+    {
+        static constexpr std::array<int, 5> limits{30, 60, 120, 144, 0};
+        static constexpr std::array<const char*, 5> names{"30", "60", "120", "144", "Unlimited"};
+        auto current = static_cast<int>(std::ranges::find(limits, ui.fps_limit) - limits.begin());
+        if (current >= static_cast<int>(limits.size())) current = 1;
+        if (ImGui::Combo("##fps_limit", &current, names.data(), static_cast<int>(names.size()))) {
+            ui.fps_limit = limits[static_cast<std::size_t>(current)];
+            changed = true;
+        }
+    }
+    changed |= ImGui::Checkbox("Save power in the background", &ui.background_throttle);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Drops to 15 frames per second while another window has focus.");
 
     ImGui::SeparatorText("Performance");
     changed |= ImGui::Checkbox("Interiors up close (game LOD)", &ui.near_lod);
@@ -807,6 +860,21 @@ void draw_preferences_contents(EditorUi& ui) {
         ui.building_distance = 900.0F;
         ui.render_shadows = false;
         ui.half_textures = true;
+        ui.live_reflections = false;
+        ui.anisotropy = 4;
+        ui.fps_limit = 30;
+        changed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Game preset")) {
+        ui.near_lod = true;
+        ui.render_scale = 1.0F;
+        ui.building_distance = 0.0F;
+        ui.render_shadows = true;
+        ui.render_sky = true;
+        ui.street_objects = true;
+        ui.live_reflections = true;
+        ui.anisotropy = 16;
         changed = true;
     }
 

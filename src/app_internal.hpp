@@ -25,6 +25,8 @@
 #include <variant>
 #include <vector>
 
+struct ImDrawData;
+
 namespace map_editor::app_internal {
 
 template <typename T>
@@ -252,6 +254,9 @@ struct RenderSettings {
     bool near_lod{true};           // rooms and glass within kNearLodDistance
     float building_distance{0.0F}; // 0 = draw every placement
     bool half_textures{false};     // halve texture resolution at load
+    bool street_objects{true};     // traffic lights and street signs
+    bool live_reflections{true};   // recapture the sky reflection as the camera moves
+    int anisotropy{16};            // texture filtering; the game uses 16 (0x278774)
 };
 extern RenderSettings g_render_settings;
 
@@ -815,6 +820,12 @@ struct EditorUi {
     bool render_shadows{true};
     bool render_sky{true};
     float shadow_distance{700.0F};
+    bool vsync{false};
+    int fps_limit{60};               // 0 = unlimited
+    bool background_throttle{true};  // 15 fps while the window is not focused
+    bool street_objects{true};
+    bool live_reflections{true};
+    int anisotropy{16};
     std::size_t selected_building_cell{};
     // Building-view hover: the cell index under the cursor this frame (for the
     // silhouette outline), recomputed each frame; nullopt when none.
@@ -874,6 +885,13 @@ void set_game_render_depth_output(bool enabled);
 const std::vector<std::optional<std::size_t>>& resolve_placement_asset_indices(EditorProject& project);
 // Rebuilds placement_override_models when placements or template models change.
 void refresh_placement_override_models(EditorProject& project);
+// Returns freed heap pages to the OS (the allocator otherwise keeps a load's peak).
+void release_free_memory();
+// Sets the anisotropic filtering level on every loaded texture (1 = off).
+void apply_texture_anisotropy(EditorProject& project, int level);
+// Draws ImGui's frame with one upload per draw list (rlImGui's renderer
+// re-fills raylib's single batch buffer per command, stalling on the GPU).
+void render_imgui_draw_data(ImDrawData* draw_data);
 // Display label for a key, localized to the user's keyboard layout (printable
 // keys via glfwGetKeyName, fixed names for the rest). Defined in app.cpp.
 // What of the map won't appear in game (GameWorldFit), in plain words; empty when it all fits.
@@ -1019,7 +1037,8 @@ const RenderTexture2D* game_render_display_texture(RenderTexture2D target);
 void draw_game_sky(const Camera3D& camera, Vector2 viewport_size, Texture2D depth_texture);
 // Recaptures the blurred landscape cubemap world surfaces sample for
 // environment light, when the sun, terrain or camera moved (render_gpu.cpp).
-void update_environment_cubemap(const GpuMesh* terrain, Vector3 camera_position);
+// follow_camera false: keep the last capture while the camera moves.
+void update_environment_cubemap(const GpuMesh* terrain, Vector3 camera_position, bool follow_camera = true);
 void set_game_surface_camera(Vector3 position);
 void set_game_world_time(float hours);
 // Loaded texture for a material name (matches project.textures by name), or

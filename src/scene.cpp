@@ -2617,6 +2617,98 @@ void add_city_tile_quad(BuildingRenderBuffer& buffer, const std::array<Vec3, 4>&
 
 } // namespace
 
+// Open-addressing hash map in flat arrays: the shadow bake inserts millions
+// of small keys, where node-based maps spend most of their time in malloc.
+template <typename K, typename V, typename Hash>
+class FlatMap {
+public:
+    void reserve(std::size_t count) {
+        std::size_t capacity = 16;
+        while (capacity < count * 2U) capacity *= 2U;
+        if (capacity > slots_.size()) rehash(capacity);
+    }
+    // The value for key, and whether it was added.
+    std::pair<V*, bool> emplace(const K& key, const V& value) {
+        if ((size_ + 1U) * 2U > slots_.size()) rehash(std::max<std::size_t>(16, slots_.size() * 2U));
+        auto i = slot_of(key);
+        std::optional<std::size_t> reuse;
+        for (; slots_[i].state != kEmpty; i = (i + 1U) & (slots_.size() - 1U)) {
+            if (slots_[i].state == kFull && slots_[i].key == key) return {&slots_[i].value, false};
+            if (slots_[i].state == kErased && !reuse) reuse = i;
+        }
+        if (reuse) i = *reuse;
+        slots_[i] = {key, value, kFull};
+        ++size_;
+        return {&slots_[i].value, true};
+    }
+    V* find(const K& key) {
+        if (slots_.empty()) return nullptr;
+        for (auto i = slot_of(key); slots_[i].state != kEmpty; i = (i + 1U) & (slots_.size() - 1U)) {
+            if (slots_[i].state == kFull && slots_[i].key == key) return &slots_[i].value;
+        }
+        return nullptr;
+    }
+    const V* find(const K& key) const { return const_cast<FlatMap*>(this)->find(key); }
+    const V& at(const K& key) const { return *find(key); }
+    // Erases the entry whose value find() returned.
+    void erase(V* value) {
+        auto& slot = *reinterpret_cast<Slot*>(reinterpret_cast<char*>(value) - offsetof(Slot, value));
+        slot.state = kErased;
+        --size_;
+    }
+
+private:
+    enum : std::uint8_t { kEmpty, kFull, kErased };
+    // Mixes the hash so linear probing over a power-of-two table spreads well.
+    std::size_t slot_of(const K& key) const {
+        auto x = static_cast<std::uint64_t>(Hash{}(key));
+        x ^= x >> 33U; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33U;
+        return static_cast<std::size_t>(x) & (slots_.size() - 1U);
+    }
+    struct Slot {
+        K key{};
+        V value{};
+        std::uint8_t state{kEmpty};
+    };
+    void rehash(std::size_t capacity) {
+        auto old = std::move(slots_);
+        slots_.assign(capacity, Slot{});
+        size_ = 0;
+        for (auto& slot : old) if (slot.state == kFull) emplace(slot.key, slot.value);
+    }
+    std::vector<Slot> slots_;
+    std::size_t size_{};
+};
+
+void keep_pick_data_only(BuildingRenderBuffer& buffer) {
+    struct PositionHash {
+        std::size_t operator()(const Vec3& p) const {
+            return std::hash<float>{}(p.x) * 73856093U ^ std::hash<float>{}(p.y) * 19349663U ^ std::hash<float>{}(p.z) * 83492791U;
+        }
+    };
+    struct PositionEqual {
+        bool operator()(const Vec3& a, const Vec3& b) const { return a.x == b.x && a.y == b.y && a.z == b.z; }
+    };
+    std::unordered_map<Vec3, std::uint32_t, PositionHash, PositionEqual> index_of;
+    index_of.reserve(buffer.vertices.size());
+    std::vector<RenderBufferVertex> vertices;
+    std::vector<std::uint32_t> remap(buffer.vertices.size());
+    for (std::size_t i = 0; i < buffer.vertices.size(); ++i) {
+        const auto [found, added] = index_of.emplace(buffer.vertices[i].position, static_cast<std::uint32_t>(vertices.size()));
+        if (added) vertices.push_back({buffer.vertices[i].position});
+        remap[i] = found->second;
+    }
+    for (auto& triangle : buffer.triangles) {
+        for (auto& index : triangle.indices) index = index < remap.size() ? remap[index] : 0U;
+    }
+    vertices.shrink_to_fit();
+    buffer.vertices = std::move(vertices);
+    buffer.triangles.shrink_to_fit();
+    std::vector<RenderBufferMaterialRun>().swap(buffer.material_runs);
+    std::vector<RenderLine>().swap(buffer.wire_lines);
+    release_shadow_volume(buffer);
+}
+
 void bake_shadow_volume(BuildingRenderBuffer& buffer) {
     // Build the volume once from the face adjacency. RenderQueuedShadowVolumeAdjacencyPass @11c950
     // extrudes every triangle of a sector, window panes included. The game's
@@ -2634,26 +2726,40 @@ void bake_shadow_volume(BuildingRenderBuffer& buffer) {
             return static_cast<std::size_t>((key[0] * 73856093) ^ (key[1] * 19349663) ^ (key[2] * 83492791));
         }
     };
-    struct EdgeHash {
-        std::size_t operator()(const std::pair<Key, Key>& edge) const {
-            return KeyHash{}(edge.first) * 31U ^ KeyHash{}(edge.second);
-        }
+    struct IdentityHash {
+        std::size_t operator()(std::uint64_t value) const { return static_cast<std::size_t>(value); }
     };
+    // Directed edge a->b of point ids.
+    const auto edge_key = [](std::uint32_t a, std::uint32_t b) { return static_cast<std::uint64_t>(a) << 32U | b; };
 
-    // Unique vertices, bucketed by 1-unit grid cell.
-    std::unordered_map<Key, Vec3, KeyHash> points;
-    std::unordered_map<Key, std::vector<Key>, KeyHash> grid;
-    const auto cell_of = [](const Key& key) { return Key{key[0] >> 10, key[1] >> 10, key[2] >> 10}; };
-    points.reserve(buffer.vertices.size());
-    grid.reserve(buffer.vertices.size());
-    for (const auto& vertex : buffer.vertices) {
-        const auto key = point_key(vertex.position);
-        if (points.emplace(key, vertex.position).second) grid[cell_of(key)].push_back(key);
+    // Distinct points (1/1024-unit grid) get ids; edges and faces use the ids.
+    FlatMap<Key, std::uint32_t, KeyHash> point_id;
+    std::vector<Key> point_keys;
+    std::vector<Vec3> point_positions;
+    const auto id_of = [&](const Key& key, Vec3 position) {
+        const auto [id, added] = point_id.emplace(key, static_cast<std::uint32_t>(point_keys.size()));
+        if (added) {
+            point_keys.push_back(key);
+            point_positions.push_back(position);
+        }
+        return *id;
+    };
+    point_id.reserve(buffer.vertices.size());
+    std::vector<std::uint32_t> vertex_point(buffer.vertices.size());
+    for (std::size_t i = 0; i < buffer.vertices.size(); ++i) {
+        vertex_point[i] = id_of(point_key(buffer.vertices[i].position), buffer.vertices[i].position);
     }
-    // Vertices strictly inside segment a-b, ordered from a.
-    std::vector<std::pair<std::int64_t, Key>> on_edge;
-    const auto split_points = [&](const Key& a, const Key& b) {
+    // The buffer's own points, bucketed by 1-unit grid cell.
+    const auto cell_of = [](const Key& key) { return Key{key[0] >> 10, key[1] >> 10, key[2] >> 10}; };
+    std::unordered_map<Key, std::vector<std::uint32_t>, KeyHash> grid;
+    for (std::uint32_t id = 0; id < point_keys.size(); ++id) grid[cell_of(point_keys[id])].push_back(id);
+
+    // Points strictly inside segment a-b, ordered from a.
+    std::vector<std::pair<std::int64_t, std::uint32_t>> on_edge;
+    const auto split_points = [&](std::uint32_t a_id, std::uint32_t b_id) {
         on_edge.clear();
+        const auto& a = point_keys[a_id];
+        const auto& b = point_keys[b_id];
         const Key d{b[0] - a[0], b[1] - a[1], b[2] - a[2]};
         const auto length_sq = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
         if (length_sq == 0) return;
@@ -2664,7 +2770,8 @@ void bake_shadow_volume(BuildingRenderBuffer& buffer) {
         for (auto z = lo[2]; z <= hi[2]; ++z) {
             const auto bucket = grid.find({x, y, z});
             if (bucket == grid.end()) continue;
-            for (const auto& p : bucket->second) {
+            for (const auto id : bucket->second) {
+                const auto& p = point_keys[id];
                 const Key v{p[0] - a[0], p[1] - a[1], p[2] - a[2]};
                 const auto t = v[0] * d[0] + v[1] * d[1] + v[2] * d[2];
                 if (t <= 0 || t >= length_sq) continue;
@@ -2673,7 +2780,7 @@ void bake_shadow_volume(BuildingRenderBuffer& buffer) {
                 const auto cy = static_cast<double>(v[2] * d[0] - v[0] * d[2]);
                 const auto cz = static_cast<double>(v[0] * d[1] - v[1] * d[0]);
                 if (cx * cx + cy * cy + cz * cz > 4.0 * static_cast<double>(length_sq)) continue;
-                on_edge.emplace_back(t, p);
+                on_edge.emplace_back(t, id);
             }
         }
         std::ranges::sort(on_edge);
@@ -2683,63 +2790,72 @@ void bake_shadow_volume(BuildingRenderBuffer& buffer) {
     // triangle as drawn, so a cap depth-matches its surface exactly, and every
     // piece of it shares its normal, so the pieces agree on facing.
     struct Face {
-        std::array<Key, 3> keys{};
+        std::array<std::uint32_t, 3> points{};
         std::array<std::int32_t, 3> adjacent{{-1, -1, -1}};
-        std::size_t parent{};
+        std::uint32_t parent{};
     };
-    std::vector<Face> faces;
-    faces.reserve(buffer.triangles.size());
-    std::vector<std::array<Vec3, 3>> parents;
+    const auto usable = [&](const RenderBufferTriangle& triangle) {
+        return !triangle.interior && triangle.indices[0] < buffer.vertices.size() &&
+            triangle.indices[1] < buffer.vertices.size() && triangle.indices[2] < buffer.vertices.size();
+    };
+    std::vector<std::array<std::uint32_t, 3>> parents;
     parents.reserve(buffer.triangles.size());
-    std::unordered_map<std::pair<Key, Key>, std::pair<std::size_t, std::size_t>, EdgeHash> open_edges;
-    open_edges.reserve(buffer.triangles.size() * 2U);
-    std::vector<Key> ring;
-    const auto add_face = [&](const std::array<Key, 3>& keys) {
-        const auto face_index = faces.size();
-        faces.push_back({keys, {{-1, -1, -1}}, parents.size() - 1U});
-        for (std::size_t edge = 0; edge < 3; ++edge) {
-            const auto& from = keys[edge];
-            const auto& to = keys[(edge + 1U) % 3U];
-            if (const auto owner = open_edges.find({to, from}); owner != open_edges.end()) {
-                faces[face_index].adjacent[edge] = static_cast<std::int32_t>(owner->second.first);
-                faces[owner->second.first].adjacent[owner->second.second] = static_cast<std::int32_t>(face_index);
+    for (const auto& triangle : buffer.triangles) {
+        if (usable(triangle)) {
+            parents.push_back({vertex_point[triangle.indices[0]], vertex_point[triangle.indices[1]], vertex_point[triangle.indices[2]]});
+        }
+    }
+    // An edge whose reverse is another triangle's edge pairs as is; only the
+    // rest can meet a T-junction, so only they are searched for split points.
+    FlatMap<std::uint64_t, std::uint8_t, IdentityHash> directed_edges;
+    directed_edges.reserve(parents.size() * 3U);
+    for (const auto& ids : parents) {
+        for (std::size_t edge = 0; edge < 3; ++edge) directed_edges.emplace(edge_key(ids[edge], ids[(edge + 1U) % 3U]), 1U);
+    }
+
+    std::vector<Face> faces;
+    faces.reserve(parents.size());
+    FlatMap<std::uint64_t, std::pair<std::uint32_t, std::uint32_t>, IdentityHash> open_edges;
+    open_edges.reserve(parents.size() * 2U);
+    const auto add_face = [&](const std::array<std::uint32_t, 3>& ids, std::uint32_t parent) {
+        const auto face_index = static_cast<std::uint32_t>(faces.size());
+        faces.push_back({ids, {{-1, -1, -1}}, parent});
+        for (std::uint32_t edge = 0; edge < 3; ++edge) {
+            const auto from = ids[edge];
+            const auto to = ids[(edge + 1U) % 3U];
+            if (auto* owner = open_edges.find(edge_key(to, from)); owner != nullptr) {
+                faces[face_index].adjacent[edge] = static_cast<std::int32_t>(owner->first);
+                faces[owner->first].adjacent[owner->second] = static_cast<std::int32_t>(face_index);
                 open_edges.erase(owner);
             } else {
-                open_edges.emplace(std::pair{from, to}, std::pair{face_index, edge});
+                open_edges.emplace(edge_key(from, to), {face_index, edge});
             }
         }
     };
-    for (const auto& triangle : buffer.triangles) {
-        if (triangle.interior) continue;
-        if (triangle.indices[0] >= buffer.vertices.size() ||
-            triangle.indices[1] >= buffer.vertices.size() ||
-            triangle.indices[2] >= buffer.vertices.size()) continue;
-        std::array<Key, 3> keys{};
-        auto& parent = parents.emplace_back();
-        for (std::size_t i = 0; i < 3; ++i) {
-            parent[i] = buffer.vertices[triangle.indices[i]].position;
-            keys[i] = point_key(parent[i]);
-        }
+    std::vector<std::uint32_t> ring;
+    for (std::uint32_t t = 0; t < parents.size(); ++t) {
+        const auto ids = parents[t];
         ring.clear();
         for (std::size_t edge = 0; edge < 3; ++edge) {
-            ring.push_back(keys[edge]);
-            split_points(keys[edge], keys[(edge + 1U) % 3U]);
-            for (const auto& [t, p] : on_edge) ring.push_back(p);
+            ring.push_back(ids[edge]);
+            const auto next = ids[(edge + 1U) % 3U];
+            if (directed_edges.find(edge_key(next, ids[edge])) != nullptr) continue;
+            split_points(ids[edge], next);
+            for (const auto& [distance, id] : on_edge) ring.push_back(id);
         }
         if (ring.size() == 3) {
-            add_face(keys);
+            add_face(ids, t);
             continue;
         }
         // Fan the split polygon from its centroid so no fan triangle is
         // degenerate (split points are collinear with their edge's corners).
         Vec3 centroid{};
-        for (const auto& key : keys) {
-            const auto& p = points.at(key);
+        for (const auto id : ids) {
+            const auto& p = point_positions[id];
             centroid = {centroid.x + p.x / 3.0F, centroid.y + p.y / 3.0F, centroid.z + p.z / 3.0F};
         }
-        const auto center = point_key(centroid);
-        points.emplace(center, centroid);
-        for (std::size_t i = 0; i < ring.size(); ++i) add_face({center, ring[i], ring[(i + 1U) % ring.size()]});
+        const auto center = id_of(point_key(centroid), centroid);
+        for (std::size_t i = 0; i < ring.size(); ++i) add_face({center, ring[i], ring[(i + 1U) % ring.size()]}, t);
     }
 
     // RenderQueuedShadowVolumeAdjacencyPass decides silhouettes per frame in a
@@ -2756,40 +2872,58 @@ void bake_shadow_volume(BuildingRenderBuffer& buffer) {
     // Vertex layout matches the GPU mesh: position, uv (kind, 0, 0), normal.
     auto& vertices = buffer.shadow_vertices;
     vertices.clear();
-    vertices.reserve((parents.size() * 6U + faces.size() * 6U) * 9U);
+    vertices.reserve(parents.size() * 4U * 9U);
     std::uint32_t vertex_count = 0;
     std::vector<Vec3> normals(parents.size());
-    const auto emit_at = [&](Vec3 p, Vec3 normal, std::uint8_t kind) {
-        vertices.insert(vertices.end(), {p.x, p.y, p.z, static_cast<float>(kind), 0.0F, 0.0F, normal.x, normal.y, normal.z});
-        ++vertex_count;
+    // Identical vertices (corners shared by caps of one plane) are stored once:
+    // point id, kind, and the normal's bits.
+    using VertexKey = std::array<std::uint32_t, 5>;
+    struct VertexHash {
+        std::size_t operator()(const VertexKey& key) const {
+            std::uint64_t hash = 1469598103934665603ULL;
+            for (const auto value : key) hash = (hash ^ value) * 1099511628211ULL;
+            return static_cast<std::size_t>(hash);
+        }
     };
-    const auto emit = [&](const Key& key, Vec3 normal, std::uint8_t kind) { emit_at(points.at(key), normal, kind); };
+    FlatMap<VertexKey, std::uint32_t, VertexHash> vertex_index;
+    vertex_index.reserve(parents.size() * 4U);
+    const auto emit = [&](std::uint32_t point, Vec3 normal, std::uint8_t kind) {
+        const auto [found, added] = vertex_index.emplace(VertexKey{point, kind, std::bit_cast<std::uint32_t>(normal.x),
+            std::bit_cast<std::uint32_t>(normal.y), std::bit_cast<std::uint32_t>(normal.z)}, vertex_count);
+        if (added) {
+            const auto& p = point_positions[point];
+            vertices.insert(vertices.end(), {p.x, p.y, p.z, static_cast<float>(kind), 0.0F, 0.0F, normal.x, normal.y, normal.z});
+            ++vertex_count;
+        }
+        return *found;
+    };
     auto& indices = buffer.shadow_indices;
     indices.clear();
     indices.reserve(parents.size() * 6U + faces.size() * 9U);
     buffer.shadow_top = 0.0F;
     for (std::size_t t = 0; t < parents.size(); ++t) {
-        const auto& [p0, p1, p2] = parents[t];
+        const auto& p0 = point_positions[parents[t][0]];
+        const auto& p1 = point_positions[parents[t][1]];
+        const auto& p2 = point_positions[parents[t][2]];
         const Vec3 e1{p1.x - p0.x, p1.y - p0.y, p1.z - p0.z};
         const Vec3 e2{p2.x - p0.x, p2.y - p0.y, p2.z - p0.z};
-        normals[t] = {e1.y * e2.z - e1.z * e2.y, e1.z * e2.x - e1.x * e2.z, e1.x * e2.y - e1.y * e2.x};
+        // Unit length, rounded: the shader reads only the sign against the light,
+        // and coplanar faces then share their cap corners.
+        const Vec3 n{e1.y * e2.z - e1.z * e2.y, e1.z * e2.x - e1.x * e2.z, e1.x * e2.y - e1.y * e2.x};
+        const auto length = std::sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+        const auto unit = [&](float v) { return length > 0.0F ? std::round(v / length * 65536.0F) / 65536.0F : 0.0F; };
+        normals[t] = {unit(n.x), unit(n.y), unit(n.z)};
         buffer.shadow_top = std::max({buffer.shadow_top, p0.y, p1.y, p2.y});
-        for (const auto i : {0, 1, 2}) {
-            indices.push_back(vertex_count);
-            emit_at(parents[t][i], normals[t], kFrontCap);
-        }
-        for (const auto i : {0, 2, 1}) {
-            indices.push_back(vertex_count);
-            emit_at(parents[t][i], normals[t], kBackCap);
-        }
+        for (const auto i : {0, 1, 2}) indices.push_back(emit(parents[t][i], normals[t], kFrontCap));
+        for (const auto i : {0, 2, 1}) indices.push_back(emit(parents[t][i], normals[t], kBackCap));
     }
     for (std::size_t f = 0; f < faces.size(); ++f) {
         const auto normal = normals[faces[f].parent];
         for (std::size_t edge = 0; edge < 3; ++edge) {
             const auto other = faces[f].adjacent[edge];
             if (other >= 0 && static_cast<std::size_t>(other) < f) continue;
-            const auto& from = faces[f].keys[edge];
-            const auto& to = faces[f].keys[(edge + 1U) % 3U];
+            const auto from = faces[f].points[edge];
+            const auto to = faces[f].points[(edge + 1U) % 3U];
             const auto other_normal = other >= 0 ? normals[faces[static_cast<std::size_t>(other)].parent] : Vec3{};
             // Two faces on one plane always face the light the same way, so
             // their shared edge is never a silhouette: skip its quad.
@@ -2803,12 +2937,11 @@ void bake_shadow_volume(BuildingRenderBuffer& buffer) {
             }
             const auto far_kind = other >= 0 ? kEdge : kOpenEdge;
             // (to, from, to'), (to', from, from') when this face is the dark one.
-            const auto first = vertex_count;
-            emit(to, normal, kEdge);
-            emit(from, normal, kEdge);
-            emit(to, other_normal, far_kind);
-            emit(from, other_normal, far_kind);
-            indices.insert(indices.end(), {first, first + 1U, first + 2U, first + 2U, first + 1U, first + 3U});
+            const auto a = emit(to, normal, kEdge);
+            const auto b = emit(from, normal, kEdge);
+            const auto c = emit(to, other_normal, far_kind);
+            const auto d = emit(from, other_normal, far_kind);
+            indices.insert(indices.end(), {a, b, c, c, b, d});
         }
     }
 }
@@ -3021,16 +3154,21 @@ std::optional<CityTerrain> build_city_terrain(
     };
     auto render_height = terrain_height;
 
-    for (auto chunk_z = landscape_min; chunk_z < landscape_max; chunk_z += static_cast<float>(chunk_size)) {
+    // Chunk rows build in parallel into their own buffers, joined in row order.
+    const auto chunk_rows = static_cast<std::int32_t>((landscape_max - landscape_min) / static_cast<float>(chunk_size));
+    std::vector<BuildingRenderBuffer> rows(static_cast<std::size_t>(chunk_rows));
+    parallel_rows(chunk_rows, [&](std::int32_t row) {
+        auto& mesh = rows[static_cast<std::size_t>(row)];
+        const auto chunk_z = landscape_min + static_cast<float>(row * chunk_size);
         for (auto chunk_x = landscape_min; chunk_x < landscape_max; chunk_x += static_cast<float>(chunk_size)) {
             const auto step = lod_step(chunk_x, chunk_z);
             const auto side = chunk_size / step + 1;
-            const auto first_vertex = static_cast<std::uint32_t>(terrain.mesh.vertices.size());
+            const auto first_vertex = static_cast<std::uint32_t>(mesh.vertices.size());
             for (auto z = 0; z < side; ++z) {
                 for (auto x = 0; x < side; ++x) {
                     const auto world_x = chunk_x + static_cast<float>(x * step);
                     const auto world_z = chunk_z + static_cast<float>(z * step);
-                    terrain.mesh.vertices.push_back({
+                    mesh.vertices.push_back({
                         {world_x, render_height(world_x, world_z) - city_terrain_mesh_y_offset, world_z},
                         world_x/32.0F,
                         1.0F-world_z/32.0F});
@@ -3038,38 +3176,50 @@ std::optional<CityTerrain> build_city_terrain(
             }
             for (auto z = 0; z < side - 1; ++z) {
                 for (auto x = 0; x < side - 1; ++x) {
-            // Skip terrain quads that sit under a road/curb tile — the tile's top
-            // surface is the ground there, and the coincident terrain plane
-            // z-fights it. The quad's footprint (2 units) fits inside one 4-unit
-            // tile cell; test the four corners and skip only when all are covered
-            // so the cut follows the tile footprint without leaving holes.
-            const auto quad_min_x = chunk_x + static_cast<float>(x * step);
-            const auto quad_min_z = chunk_z + static_cast<float>(z * step);
-            const auto quad_max_x = quad_min_x + static_cast<float>(step);
-            const auto quad_max_z = quad_min_z + static_cast<float>(step);
-            const auto cell_of = [&](float wx, float wz) {
-                return cell_covered(
-                    static_cast<std::int32_t>(std::floor(wx / unit_size)),
-                    static_cast<std::int32_t>(std::floor(wz / unit_size)));
-            };
-            // Sample just inside each corner so a quad flush against a tile edge
-            // resolves to the cell it actually overlaps.
-            constexpr auto eps = 0.01F;
-            if (cell_of(quad_min_x + eps, quad_min_z + eps) &&
-                cell_of(quad_max_x - eps, quad_min_z + eps) &&
-                cell_of(quad_min_x + eps, quad_max_z - eps) &&
-                cell_of(quad_max_x - eps, quad_max_z - eps)) {
-                continue;
-            }
-            const auto i0 = first_vertex + static_cast<std::uint32_t>(z * side + x);
-            const auto i1 = i0 + 1U;
-            const auto i3 = first_vertex + static_cast<std::uint32_t>((z + 1) * side + x);
-            const auto i2 = i3 + 1U;
-            terrain.mesh.triangles.push_back({{i0, i1, i2}, 0U, false});
-            terrain.mesh.triangles.push_back({{i0, i2, i3}, 0U, false});
+                    // Skip terrain quads that sit under a road/curb tile — the tile's top
+                    // surface is the ground there, and the coincident terrain plane
+                    // z-fights it. Test the four corners and skip only when all are
+                    // covered so the cut follows the tile footprint without holes.
+                    const auto quad_min_x = chunk_x + static_cast<float>(x * step);
+                    const auto quad_min_z = chunk_z + static_cast<float>(z * step);
+                    const auto quad_max_x = quad_min_x + static_cast<float>(step);
+                    const auto quad_max_z = quad_min_z + static_cast<float>(step);
+                    const auto cell_of = [&](float wx, float wz) {
+                        return cell_covered(
+                            static_cast<std::int32_t>(std::floor(wx / unit_size)),
+                            static_cast<std::int32_t>(std::floor(wz / unit_size)));
+                    };
+                    // Sample just inside each corner so a quad flush against a tile edge
+                    // resolves to the cell it actually overlaps.
+                    constexpr auto eps = 0.01F;
+                    if (cell_of(quad_min_x + eps, quad_min_z + eps) &&
+                        cell_of(quad_max_x - eps, quad_min_z + eps) &&
+                        cell_of(quad_min_x + eps, quad_max_z - eps) &&
+                        cell_of(quad_max_x - eps, quad_max_z - eps)) {
+                        continue;
+                    }
+                    const auto i0 = first_vertex + static_cast<std::uint32_t>(z * side + x);
+                    const auto i1 = i0 + 1U;
+                    const auto i3 = first_vertex + static_cast<std::uint32_t>((z + 1) * side + x);
+                    const auto i2 = i3 + 1U;
+                    mesh.triangles.push_back({{i0, i1, i2}, 0U, false});
+                    mesh.triangles.push_back({{i0, i2, i3}, 0U, false});
                 }
             }
         }
+    });
+    std::size_t vertex_total = 0, triangle_total = 0;
+    for (const auto& row : rows) { vertex_total += row.vertices.size(); triangle_total += row.triangles.size(); }
+    terrain.mesh.vertices.reserve(vertex_total);
+    terrain.mesh.triangles.reserve(triangle_total);
+    for (auto& row : rows) {
+        const auto offset = static_cast<std::uint32_t>(terrain.mesh.vertices.size());
+        terrain.mesh.vertices.insert(terrain.mesh.vertices.end(), row.vertices.begin(), row.vertices.end());
+        for (auto triangle : row.triangles) {
+            for (auto& index : triangle.indices) index += offset;
+            terrain.mesh.triangles.push_back(triangle);
+        }
+        row = {};
     }
 
     // One material run so the terrain mesh can be uploaded as a GPU chunk (it is

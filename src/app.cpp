@@ -408,7 +408,7 @@ void configure_texture(Texture2D& texture) {
     GenTextureMipmaps(&texture);
     SetTextureWrap(texture, TEXTURE_WRAP_REPEAT);
     SetTextureFilter(texture, TEXTURE_FILTER_TRILINEAR);
-    SetTextureFilter(texture, TEXTURE_FILTER_ANISOTROPIC_16X);
+    rlTextureParameters(texture.id, RL_TEXTURE_FILTER_ANISOTROPIC, g_render_settings.anisotropy);
 }
 
 // Runs body(i) for i in [0, count) across a bounded set of worker threads (capped
@@ -5276,7 +5276,8 @@ void present_parsing_frame(const std::filesystem::path& folder) {
     }
     ImGui::End();
 
-    rlImGuiEnd();
+    ImGui::Render();
+    render_imgui_draw_data(ImGui::GetDrawData());
     EndDrawing();
 }
 
@@ -5418,6 +5419,26 @@ int run_editor_app() {
         g_render_settings.building_distance = ui.building_distance;
         g_render_settings.half_textures = ui.half_textures;
         g_render_settings.near_lod = ui.near_lod;
+        g_render_settings.street_objects = ui.street_objects;
+        g_render_settings.live_reflections = ui.live_reflections;
+        if (project && g_render_settings.anisotropy != ui.anisotropy) apply_texture_anisotropy(*project, ui.anisotropy);
+        g_render_settings.anisotropy = ui.anisotropy;
+#ifndef __EMSCRIPTEN__
+        // Frame pacing: V-Sync, the limit, and a low rate behind other windows.
+        if (bench_frames == 0) {
+            static bool vsync_on = false;
+            if (ui.vsync != vsync_on) {
+                vsync_on = ui.vsync;
+                if (vsync_on) SetWindowState(FLAG_VSYNC_HINT); else ClearWindowState(FLAG_VSYNC_HINT);
+            }
+            const int target = ui.background_throttle && !IsWindowFocused() ? 15 : ui.fps_limit;
+            static int applied_target = -1;
+            if (target != applied_target) {
+                applied_target = target;
+                SetTargetFPS(target);
+            }
+        }
+#endif
 
 #ifdef __EMSCRIPTEN__
         // raylib's browser resize handler resizes the canvas but not GLFW's
@@ -5567,7 +5588,7 @@ commit_pending_edits(*project, ui);
         if (show_3d_viewport && last_viewport_size.x > 0 && last_viewport_size.y > 0) {
             set_game_world_time(ui.world_time_hours);
             update_environment_cubemap(project && project->terrain_gpu_valid ? &project->terrain_gpu_model.mesh : nullptr,
-                camera.position);
+                camera.position, g_render_settings.live_reflections);
             begin_game_texture_mode(viewport_texture);
             ClearBackground(BLACK);
             clear_game_render_packed_depth();
@@ -5640,6 +5661,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                                 project->city_tile_gpu_model =
                                     upload_city_tile_model(project->city_scene_cache.city_tile_buffer, *project);
                                 release_shadow_volume(project->city_scene_cache.city_tile_buffer);
+                                release_free_memory();
                                 project->city_tile_gpu_fingerprint = project->city_scene_cache.city_tile_fingerprint;
                             }
 
@@ -5719,7 +5741,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                             draw_city_piece_voxels(*project, ui.portal_preview_textured, selected_portal);
                         }
                         GfxDebugScopedTimer timer{gfx_debug_stats, GfxDebugTimingPhase::PoleDraw};
-                        draw_city_traffic_light_poles(*project, city_scene);
+                        if (g_render_settings.street_objects) draw_city_traffic_light_poles(*project, city_scene);
                         if (ui.render_shadows) {
                             draw_city_shadow_volumes(*project, camera, ui.building_distance > 0.0F
                                 ? std::min(ui.shadow_distance, ui.building_distance) : ui.shadow_distance);
@@ -6860,9 +6882,16 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             ImGui::EndPopup();
         }
 
-        rlImGuiEnd();
+        ImGui::Render();
+        render_imgui_draw_data(ImGui::GetDrawData());
         EndDrawing();
         g_gfx_debug_stats = nullptr;
+        // Background builds (scene, near detail, pieces) free large buffers at
+        // any time; return those pages to the OS now and then.
+        if (static double last_release = 0.0; GetTime() - last_release > 10.0) {
+            last_release = GetTime();
+            release_free_memory();
+        }
 
         if (bench_frames > 0 && project && project->city_scene_gpu_valid && !project->render_build_in_progress &&
             project->pending_gpu_upload_indices.empty()) {
@@ -6995,6 +7024,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 if (screenshot_tab == "win_blocks") ui.show_block_browser = true;
                 if (screenshot_tab == "win_buildblock") ui.show_buildblock_window = true;
                 if (screenshot_tab == "win_changes") ui.show_changes_window = true;
+                if (screenshot_tab == "win_preferences") ui.show_preferences_window = true;
                 if (screenshot_tab == "win_map") ui.show_map_image_window = true;
                 if (screenshot_tab == "win_shortcuts") ui.show_shortcuts_window = true;
                 if (screenshot_path && project->city && !project->city->data.buildings.empty() && screenshot_tab != "pieces") {
