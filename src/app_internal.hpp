@@ -47,6 +47,10 @@ struct GpuMeshPart {
     unsigned int material_texture{};  // metallic/roughness map
     Color color{WHITE};
     bool window_material{};
+    // World-space bounds of a chunked shadow volume part, for view culling.
+    bool has_bounds{};
+    Vector3 bounds_min{};
+    Vector3 bounds_max{};
 };
 
 // A whole render buffer in one VAO: interleaved position/uv/normal with 32-bit

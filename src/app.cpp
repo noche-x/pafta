@@ -5410,6 +5410,8 @@ int run_editor_app() {
 #ifndef __EMSCRIPTEN__
     std::optional<MeshExportTask> mesh_export_task;
 #endif
+    // Frames left to redraw the 3D view after the last change (see redraw_3d).
+    int redraw_frames = 60;
     while (running) {
         MAPED_PROFILE_BLOCK("editor frame");
         gfx_debug_stats.reset_frame();
@@ -5585,7 +5587,32 @@ commit_pending_edits(*project, ui);
         std::optional<SbcBuilding> ghost_building;
         // Pixel size of the 3D render target (the panel times render scale).
         const Vector2 render_size{static_cast<float>(viewport_texture.texture.width), static_cast<float>(viewport_texture.texture.height)};
-        if (show_3d_viewport && last_viewport_size.x > 0 && last_viewport_size.y > 0) {
+        // Idle: an unchanged view keeps its last frame instead of being redrawn.
+        // Any input, background work, or a map change since the last scene
+        // build keeps it redrawing, and so does a short settle after them.
+        {
+            bool input = GetMouseDelta().x != 0.0F || GetMouseDelta().y != 0.0F || GetMouseWheelMove() != 0.0F ||
+                IsMouseButtonDown(MOUSE_BUTTON_LEFT) || IsMouseButtonDown(MOUSE_BUTTON_RIGHT) || IsMouseButtonDown(MOUSE_BUTTON_MIDDLE) ||
+                IsWindowResized();
+            for (int key = KEY_SPACE; key <= KEY_KB_MENU && !input; ++key) input = IsKeyDown(key);
+            const bool working = project && (project->render_build_in_progress || !project->pending_gpu_upload_indices.empty() ||
+                project->city_scene_build_in_progress || !project->city_scene_gpu_valid ||
+                project->city_scene_current_fingerprint != project->city_scene_cache_fingerprint ||
+                !project->building_near_jobs.empty() || project->portal_rebuild_future.has_value() || !ui.road_ghost.empty());
+            if (input || working || bench_frames > 0 || screenshot_path.has_value()) redraw_frames = 60;
+#ifndef __EMSCRIPTEN__
+            // Settled with nothing running: sleep until the next input event
+            // instead of redrawing the interface at the frame-rate limit.
+            static bool waiting = false;
+            if ((redraw_frames == 0) != waiting) {
+                waiting = redraw_frames == 0;
+                if (waiting) EnableEventWaiting(); else DisableEventWaiting();
+            }
+#endif
+        }
+        const bool redraw_3d = redraw_frames > 0;
+        if (redraw_frames > 0) --redraw_frames;
+        if (redraw_3d && show_3d_viewport && last_viewport_size.x > 0 && last_viewport_size.y > 0) {
             set_game_world_time(ui.world_time_hours);
             update_environment_cubemap(project && project->terrain_gpu_valid ? &project->terrain_gpu_model.mesh : nullptr,
                 camera.position, g_render_settings.live_reflections);
@@ -6586,13 +6613,14 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     last_viewport_size = {static_cast<float>(static_cast<int>(size.x)), static_cast<float>(static_cast<int>(size.y))};
                     last_render_scale = render_scale;
                     last_viewport_resize = GetTime();
+                    redraw_frames = 60;
                 }
 
-                resolve_game_render_texture(viewport_texture);
+                if (redraw_3d) resolve_game_render_texture(viewport_texture);
                 const auto* display_texture = game_render_display_texture(viewport_texture);
                 // Handles belong above the finished scene, including shadows,
                 // atmosphere and outlines. They must never be tone-mapped away.
-                if (project) {
+                if (project && redraw_3d) {
                     const auto target = display_texture ? *display_texture : viewport_texture;
                     begin_game_texture_mode(target);
                     BeginMode3D(camera);

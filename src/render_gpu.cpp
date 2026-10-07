@@ -1194,7 +1194,10 @@ GpuBuildingRenderModel upload_city_buffer_model(
     return model;
 }
 
-void build_shadow_volume(GpuBuildingRenderModel& model, const BuildingRenderBuffer& buffer) {
+// chunked: the volume is world-space and large (roads, pieces); its triangles
+// are grouped into 256-unit ground chunks, one part each with its bounds, so
+// draws can skip the chunks outside the view.
+void build_shadow_volume(GpuBuildingRenderModel& model, const BuildingRenderBuffer& buffer, bool chunked = false) {
     // Workers bake the volume with the buffer (bake_shadow_volume); small
     // buffers built on this thread are baked here.
     const BuildingRenderBuffer* baked = &buffer;
@@ -1205,10 +1208,71 @@ void build_shadow_volume(GpuBuildingRenderModel& model, const BuildingRenderBuff
         bake_shadow_volume(local);
         baked = &local;
     }
-    model.shadow_volume = upload_shadow_volume(pack_shadow_vertices(baked->shadow_vertices), baked->shadow_indices);
     model.shadow_top = baked->shadow_top;
-    if (!model.shadow_volume.empty()) model.shadow_volume.parts.push_back({0U, model.shadow_volume.index_count});
+    if (!chunked) {
+        model.shadow_volume = upload_shadow_volume(pack_shadow_vertices(baked->shadow_vertices), baked->shadow_indices);
+        if (!model.shadow_volume.empty()) model.shadow_volume.parts.push_back({0U, model.shadow_volume.index_count});
+        return;
+    }
+    const auto& positions = baked->shadow_vertices;  // 9 floats per vertex, position first
+    const auto& source = baked->shadow_indices;
+    const auto position = [&](std::uint32_t index) {
+        return Vector3{positions[index * 9U], positions[index * 9U + 1U], positions[index * 9U + 2U]};
+    };
+    struct Triangle { std::uint64_t chunk; std::uint32_t first; };
+    std::vector<Triangle> triangles;
+    triangles.reserve(source.size() / 3U);
+    for (std::uint32_t t = 0; t + 2U < source.size(); t += 3U) {
+        const auto a = position(source[t]), b = position(source[t + 1U]), c = position(source[t + 2U]);
+        const auto cx = static_cast<std::int32_t>(std::floor((a.x + b.x + c.x) / (3.0F * 256.0F)));
+        const auto cz = static_cast<std::int32_t>(std::floor((a.z + b.z + c.z) / (3.0F * 256.0F)));
+        triangles.push_back({static_cast<std::uint64_t>(static_cast<std::uint32_t>(cx)) << 32U | static_cast<std::uint32_t>(cz), t});
+    }
+    std::ranges::stable_sort(triangles, {}, &Triangle::chunk);
+    std::vector<std::uint32_t> indices;
+    indices.reserve(source.size());
+    std::vector<GpuMeshPart> parts;
+    for (std::size_t i = 0; i < triangles.size(); ++i) {
+        if (i == 0 || triangles[i].chunk != triangles[i - 1].chunk) {
+            GpuMeshPart part{static_cast<std::uint32_t>(indices.size()), 0U};
+            part.has_bounds = true;
+            part.bounds_min = {FLT_MAX, FLT_MAX, FLT_MAX};
+            part.bounds_max = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+            parts.push_back(part);
+        }
+        auto& part = parts.back();
+        for (std::uint32_t k = 0; k < 3U; ++k) {
+            const auto index = source[triangles[i].first + k];
+            indices.push_back(index);
+            part.bounds_min = Vector3Min(part.bounds_min, position(index));
+            part.bounds_max = Vector3Max(part.bounds_max, position(index));
+        }
+        part.index_count += 3U;
+    }
+    model.shadow_volume = upload_shadow_volume(pack_shadow_vertices(positions), indices);
+    if (!model.shadow_volume.empty()) model.shadow_volume.parts = std::move(parts);
 }
+
+namespace {
+// View frustum and extrusion for culling chunked shadow volume parts.
+struct ShadowCull {
+    std::array<std::array<float, 4>, 6> planes{};
+    Vector3 extrusion{};
+};
+std::optional<ShadowCull> g_shadow_cull;
+
+// Whether the box swept along the extrusion can reach the view.
+bool shadow_part_visible(const ShadowCull& cull, const GpuMeshPart& part) {
+    const auto lo = Vector3Min(part.bounds_min, Vector3Add(part.bounds_min, cull.extrusion));
+    const auto hi = Vector3Max(part.bounds_max, Vector3Add(part.bounds_max, cull.extrusion));
+    for (const auto& p : cull.planes) {
+        // The box corner farthest along the plane normal.
+        const Vector3 corner{p[0] >= 0.0F ? hi.x : lo.x, p[1] >= 0.0F ? hi.y : lo.y, p[2] >= 0.0F ? hi.z : lo.z};
+        if (p[0] * corner.x + p[1] * corner.y + p[2] * corner.z + p[3] < 0.0F) return false;
+    }
+    return true;
+}
+} // namespace
 
 void render_imgui_draw_data(ImDrawData* draw_data) {
     if (draw_data->Textures != nullptr) {
@@ -1982,6 +2046,7 @@ void draw_gpu_mesh_batch(const std::vector<GpuMeshDraw>& draws, GpuSurface surfa
         const auto instances = static_cast<GLsizei>(draw.transforms.size());
         for (const auto& part : mesh.parts) {
             if ((filter == GpuPartFilter::Opaque && part.window_material) || (glass && !part.window_material)) continue;
+            if (part.has_bounds && g_shadow_cull && !shadow_part_visible(*g_shadow_cull, part)) continue;
             if (lit) {
                 const auto& shader = lit_shader();
                 const auto material = part.material_texture != 0U ? part.material_texture : default_texture;
@@ -2010,11 +2075,11 @@ void draw_gpu_mesh_batch(const std::vector<GpuMeshDraw>& draws, GpuSurface surfa
             }
             glDrawElementsInstanced(GL_TRIANGLES, static_cast<GLsizei>(part.index_count), GL_UNSIGNED_INT,
                 reinterpret_cast<void*>(static_cast<std::size_t>(part.first_index) * sizeof(std::uint32_t)), instances);
+            triangles += static_cast<std::uint64_t>(part.index_count / 3U) * draw.transforms.size();
+            indices += static_cast<std::uint64_t>(part.index_count) * draw.transforms.size();
+            ++calls;
         }
         first_instance += draw.transforms.size();
-        triangles += static_cast<std::uint64_t>(mesh.index_count / 3U) * draw.transforms.size();
-        indices += static_cast<std::uint64_t>(mesh.index_count) * draw.transforms.size();
-        calls += mesh.parts.size();
     }
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -3398,12 +3463,17 @@ void draw_city_shadow_volumes(EditorProject& project, const Camera3D& camera, fl
         }
     }
     // Road and curb tiles are world sectors too; one volume at the highest sector.
-    set_shadow_volume_light(light, sector_extrusion(static_cast<std::size_t>(project.city_tile_gpu_model.shadow_top / 32.0F)));
+    // Both world volumes draw only their chunks whose shadow can reach the view.
+    const auto road_extrusion = sector_extrusion(static_cast<std::size_t>(project.city_tile_gpu_model.shadow_top / 32.0F));
+    set_shadow_volume_light(light, road_extrusion);
+    g_shadow_cull = ShadowCull{planes, road_extrusion};
     draw_gpu_mesh_instances(project.city_tile_gpu_model.shadow_volume, {MatrixIdentity()}, GpuSurface::ShadowVolume);
     // Native queued district meshes use a 32-unit extrusion (0x2787d4).
     // Vertices are already world-space, so no translation is needed.
     set_shadow_volume_light(light, Vector3Scale(light, -32.0F));
+    g_shadow_cull = ShadowCull{planes, Vector3Scale(light, -32.0F)};
     draw_gpu_mesh_instances(project.portal_gpu_model.shadow_volume, {MatrixIdentity()}, GpuSurface::ShadowVolume);
+    g_shadow_cull.reset();
     if (g_render_settings.street_objects) draw_street_object_shadow_volumes(project.city_scene_cache, camera, max_distance, light);
     glDisable(GL_POLYGON_OFFSET_FILL);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -3463,7 +3533,7 @@ void composite_city_shadows(Vector2 viewport_size) {
 GpuBuildingRenderModel upload_portal_render_model(const BuildingRenderBuffer& buffer, const EditorProject& project, bool textured) {
     GpuBuildingRenderModel model;
     model.wire_lines = buffer.wire_lines;
-    build_shadow_volume(model, buffer);
+    build_shadow_volume(model, buffer, true);
     model.mesh = upload_gpu_mesh(buffer, [&](GpuMeshPart& part) {
         describe_textured_part(part,
             textured ? texture_for_buffer_material(project, buffer, part.material_id) : nullptr,
@@ -3635,7 +3705,7 @@ GpuBuildingRenderModel upload_city_tile_model(const BuildingRenderBuffer& buffer
     auto model = upload_city_buffer_model(buffer, project, true, [&buffer](std::uint32_t material) {
         return city_tile_material_color(buffer, material);
     });
-    build_shadow_volume(model, buffer);
+    build_shadow_volume(model, buffer, true);
     for (auto& part : model.mesh.parts) {
         if (part.texture != 0U) part.color = WHITE;
     }
