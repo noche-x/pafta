@@ -3264,7 +3264,8 @@ const GpuMesh* building_near_mesh(EditorProject& project, std::size_t asset_inde
         project.building_near_models.erase(found);
     }
     if (auto job = project.building_near_jobs.find(asset_index); job != project.building_near_jobs.end()) {
-        if (job->second.buffers.wait_for(std::chrono::seconds{0}) != std::future_status::ready) return nullptr;
+        // Deferred (the web build) runs in get() below.
+        if (job->second.buffers.wait_for(std::chrono::seconds{0}) == std::future_status::timeout) return nullptr;
         auto built = job->second.buffers.get();
         const bool stale = job->second.far_vao != far_vao;
         project.building_near_jobs.erase(job);
@@ -3286,7 +3287,12 @@ const GpuMesh* building_near_mesh(EditorProject& project, std::size_t asset_inde
     }
     if (build_budget <= 0) return nullptr;
     --build_budget;
-    project.building_near_jobs[asset_index] = {far_vao, std::async(std::launch::async,
+    project.building_near_jobs[asset_index] = {far_vao, std::async(
+#ifdef __EMSCRIPTEN__
+        std::launch::deferred,  // no pthreads in the browser build: std::thread aborts
+#else
+        std::launch::async,
+#endif
         [building = project.buildings[asset_index].data, blocks = block_meshes(project), templates = buildblock_templates(project)] {
             MAPED_PROFILE_THREAD("Near building build");
             auto buffer = build_city_building_full_render_buffer(building, blocks, templates, BuildingLod::Near);
