@@ -724,12 +724,14 @@ void service_render_rebuild(EditorProject& project) {
 #endif
 
     if (!project.pending_gpu_upload_indices.empty()) {
-        if (g_gfx_debug_stats != nullptr) {
-            GfxDebugScopedTimer timer{*g_gfx_debug_stats, GfxDebugTimingPhase::GpuUpload};
+        // Upload for up to ~8 ms of the frame rather than one building per
+        // frame, so loading is bound by the work, not the frame rate.
+        std::optional<GfxDebugScopedTimer> timer;
+        if (g_gfx_debug_stats != nullptr) timer.emplace(*g_gfx_debug_stats, GfxDebugTimingPhase::GpuUpload);
+        const auto budget_end = std::chrono::steady_clock::now() + std::chrono::milliseconds{8};
+        do {
             upload_next_pending_building(project);
-        } else {
-            upload_next_pending_building(project);
-        }
+        } while (!project.pending_gpu_upload_indices.empty() && std::chrono::steady_clock::now() < budget_end);
     }
 
     if (!project.render_build_in_progress &&

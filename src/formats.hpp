@@ -1,8 +1,10 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <initializer_list>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -26,6 +28,35 @@ struct SbbCellPayload {
     std::uint32_t index{};
 
     bool operator==(const SbbCellPayload&) const = default;
+};
+
+// A cell's payloads, at most three (read_cell_payloads: the solid block plus
+// one per non-solid block word), stored inline instead of on the heap.
+class SbbCellPayloads {
+public:
+    SbbCellPayloads() = default;
+    SbbCellPayloads(std::initializer_list<SbbCellPayload> payloads) {
+        for (const auto& payload : payloads) push_back(payload);
+    }
+    void push_back(const SbbCellPayload& payload) {
+        if (count_ < items_.size()) items_[count_++] = payload;
+    }
+    void clear() { count_ = 0; }
+    [[nodiscard]] std::size_t size() const { return count_; }
+    [[nodiscard]] bool empty() const { return count_ == 0; }
+    const SbbCellPayload& operator[](std::size_t i) const { return items_[i]; }
+    SbbCellPayload& operator[](std::size_t i) { return items_[i]; }
+    const SbbCellPayload* begin() const { return items_.data(); }
+    const SbbCellPayload* end() const { return items_.data() + count_; }
+    SbbCellPayload* begin() { return items_.data(); }
+    SbbCellPayload* end() { return items_.data() + count_; }
+    bool operator==(const SbbCellPayloads& other) const {
+        return count_ == other.count_ && std::equal(begin(), end(), other.begin());
+    }
+
+private:
+    std::array<SbbCellPayload, 3> items_{};
+    std::uint8_t count_{};
 };
 
 struct SbbCell {
@@ -53,7 +84,7 @@ struct SbbCell {
     // SaveBuilding_SBB_1400548d0.decomp.txt:164-167.
     std::uint32_t item_set_index{};
     bool occupied{};
-    std::vector<SbbCellPayload> payloads;
+    SbbCellPayloads payloads;
     std::array<std::uint16_t, 16> shorts{};
 
     [[nodiscard]] std::uint32_t exterior_block() const { return words[exterior_block_word]; }

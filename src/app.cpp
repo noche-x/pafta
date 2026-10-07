@@ -5606,7 +5606,12 @@ commit_pending_edits(*project, ui);
             static bool waiting = false;
             if ((redraw_frames == 0) != waiting) {
                 waiting = redraw_frames == 0;
-                if (waiting) EnableEventWaiting(); else DisableEventWaiting();
+                if (waiting) {
+                    EnableEventWaiting();
+                    release_free_memory();  // the periodic release does not run while asleep
+                } else {
+                    DisableEventWaiting();
+                }
             }
 #endif
         }

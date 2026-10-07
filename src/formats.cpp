@@ -162,8 +162,8 @@ std::vector<std::string> read_counted_names(const BinaryReader& reader, std::siz
     return read_fixed_ascii_chunks(reader, offset + 4, 0x40, count);
 }
 
-std::vector<SbbCellPayload> read_cell_payloads(const std::array<std::uint32_t, 6>& words) {
-    std::vector<SbbCellPayload> payloads;
+SbbCellPayloads read_cell_payloads(const std::array<std::uint32_t, 6>& words) {
+    SbbCellPayloads payloads;
     const auto exterior = words[sbb_exterior_block_word];
     const auto interior = words[sbb_interior_block_word];
 
