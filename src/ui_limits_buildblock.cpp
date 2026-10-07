@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <cmath>
 #include <string>
-#include <unordered_set>
 
 namespace map_editor::app_internal {
 namespace {
@@ -22,8 +21,6 @@ constexpr int kMaxBuildings = 8192;       // g_cityBuildingRecords, 0x60 B each 
 constexpr int kMaxCityBlocks = 4096;      // g_cityBuildingDataName, 0x4248 B each up to g_cityDistrictCount
 constexpr int kMaxPortals = 16384;        // g_cityDistrictId, 0xe04 B each up to the header records
 constexpr int kMaxHeaderRecords = 1088;   // 0x35eea090..0x35efb090, 64 B each
-constexpr int kWorldCellsXZ = 4096;       // _createarea(64 x 8 x 64 chunks of 64 cells)
-constexpr int kWorldCellsY = 512;
 constexpr int kMaxChunks = 512;           // World_AllocateAreaChunkIndex slot table
 constexpr int kMaxSectors = 4096;         // sector tables loop to 0x1000
 constexpr unsigned kMaxBuildingSide = 63; // SBB cell grid is 64 x 64 (loops run 0..size inclusive)
@@ -42,17 +39,6 @@ struct MapLimitReport {
 MapLimitReport& cached_report() {
     static MapLimitReport report;
     return report;
-}
-
-struct CellKey {
-    std::int64_t v;
-    bool operator==(const CellKey& o) const { return v == o.v; }
-};
-struct CellKeyHash {
-    std::size_t operator()(const CellKey& k) const { return std::hash<std::int64_t>{}(k.v); }
-};
-CellKey key3(std::int32_t x, std::int32_t y, std::int32_t z) {
-    return {(static_cast<std::int64_t>(x) << 40) ^ (static_cast<std::int64_t>(y) << 20) ^ static_cast<std::int64_t>(z)};
 }
 
 void rebuild_report(EditorProject& project, MapLimitReport& report) {
@@ -75,49 +61,15 @@ void rebuild_report(EditorProject& project, MapLimitReport& report) {
     count_line("Piece portals", map.portals.size(), kMaxPortals * 9 / 10, kMaxPortals);
     count_line("Header records", map.header_records.size(), kMaxHeaderRecords * 9 / 10, kMaxHeaderRecords);
 
-    std::unordered_set<CellKey, CellKeyHash> sectors;
-    std::unordered_set<CellKey, CellKeyHash> chunks;
-    int out_of_world = 0;
-    const auto touch = [&](std::int32_t cx, std::int32_t cy, std::int32_t cz) {
-        if (cx < 0 || cz < 0 || cy < 0 || cx >= kWorldCellsXZ || cz >= kWorldCellsXZ || cy >= kWorldCellsY) {
-            ++out_of_world;
-            return;
-        }
-        sectors.insert(key3(cx >> 3, cy >> 3, cz >> 3));
-        chunks.insert(key3(cx >> 6, cy >> 6, cz >> 6));
-    };
-    const auto placement_buildings = resolve_placement_buildings(project);
-    for (std::size_t i = 0; i < map.buildings.size(); ++i) {
-        const auto* b = placement_buildings[i];
-        if (b == nullptr) continue;
-        const auto& pl = map.buildings[i];
-        for (const auto& cell : b->cells) {
-            if (!cell.occupied) continue;
-            const Vec3 local{
-                (static_cast<float>(cell.x) - static_cast<float>(b->anchor_x) + 0.5F) * 4.0F,
-                (static_cast<float>(cell.y) - static_cast<float>(b->anchor_y) + 0.5F) * 4.0F,
-                (static_cast<float>(cell.z) - static_cast<float>(b->anchor_z) + 0.5F) * 4.0F,
-            };
-            const auto w = native_city_building_transform_point(pl, local, 4.0F);
-            touch(static_cast<std::int32_t>(std::floor(w.x / 4.0F)),
-                  static_cast<std::int32_t>(std::floor(w.y / 4.0F)),
-                  static_cast<std::int32_t>(std::floor(w.z / 4.0F)));
-        }
+    // World bounds and space: the scene's replay of the game's load (GameWorldFit).
+    for (auto& problem : game_world_fit_problems(project)) report.lines.emplace_back(true, std::move(problem));
+    const auto& fit = project.city_scene_cache.world_fit;
+    report.sectors = static_cast<int>(fit.sectors_used);
+    report.chunks = static_cast<int>(fit.chunks_used);
+    if (fit.road_tiles_no_room + fit.building_cells_no_room == 0) {
+        count_line("Game space used", fit.sectors_used, kMaxSectors * 9 / 10, kMaxSectors);
+        count_line("Game space used (large areas)", fit.chunks_used, kMaxChunks * 9 / 10, kMaxChunks);
     }
-    for (const auto& portal : map.portals) {
-        // A portal is one aligned 8x8x8 block of cells.
-        touch(portal.fields[1] * 8, portal.fields[2] * 8, portal.fields[3] * 8);
-    }
-    for (const auto& tile : project.city_scene_cache.city_tiles) {
-        touch(tile.x, tile.y, tile.z);
-    }
-    report.sectors = static_cast<int>(sectors.size());
-    report.chunks = static_cast<int>(chunks.size());
-    if (out_of_world > 0) {
-        report.lines.emplace_back(true, std::to_string(out_of_world) + " cell(s) outside the world (x,z 0..4095, y 0..511)");
-    }
-    count_line("World sectors (8x8x8 cell blocks)", sectors.size(), kMaxSectors * 9 / 10, kMaxSectors);
-    count_line("World chunks (64x64x64 cell blocks)", chunks.size(), kMaxChunks * 9 / 10, kMaxChunks);
 
     for (const auto& asset : project.buildings) {
         const auto& b = asset.data;
@@ -187,18 +139,20 @@ int draw_map_limit_warnings(EditorProject& project) {
         rebuild_report(project, report);
     }
     if (report.lines.empty()) {
-        ImGui::TextDisabled(ICON_FA_CIRCLE_CHECK " Within game limits (%d sectors, %d chunks)", report.sectors, report.chunks);
+        ImGui::TextDisabled(ICON_FA_CIRCLE_CHECK " Everything fits in the game. Space used: %d of %d", report.sectors, kMaxSectors);
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Game limits: 1024 junctions, ~669 roads, 8192 buildings, 4096 city blocks,\n"
-                "16384 piece portals, world 4096x512x4096 cells in at most 512 chunks / 4096 sectors,\n"
-                "building templates 63x63 cells, 192 floors, 320 materials.");
+            ImGui::SetTooltip("Game limits: 1024 junctions, about 669 roads, 8192 buildings, 4096 city blocks,\n"
+                "16384 piece portals, a map area 16384 wide, 16384 long and 2048 high with 4096 units of space,\n"
+                "buildings up to 63x63 cells, 192 floors and 320 materials.");
         }
         return 0;
     }
+    ImGui::PushTextWrapPos(0.0F);
     for (const auto& [error, text] : report.lines) {
         ImGui::TextColored(error ? ImVec4(1.0F, 0.35F, 0.3F, 1.0F) : ImVec4(1.0F, 0.8F, 0.2F, 1.0F),
             "%s %s", error ? ICON_FA_TRIANGLE_EXCLAMATION : ICON_FA_CIRCLE_EXCLAMATION, text.c_str());
     }
+    ImGui::PopTextWrapPos();
     return static_cast<int>(report.lines.size());
 }
 

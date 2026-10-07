@@ -1692,6 +1692,31 @@ void builds_grid_aligned_city_street_tile_strip() {
     }));
 }
 
+void removes_junctions_no_road_uses() {
+    map_editor::SbcMap map{};
+    for (std::int32_t i = 0; i < 4; ++i) map.intersections.push_back({static_cast<std::size_t>(i), 100 + i * 20, 5, 100});
+    map.streets.push_back({0U, 0, 3, 0, 1, 1, "Kept"});
+    map_editor::remove_unused_city_intersections(map);
+    assert(map.intersections.size() == 2U);
+    assert(map.intersections[1].index == 1U && map.intersections[1].x == 160);
+    assert(map.streets[0].from_intersection == 0 && map.streets[0].to_intersection == 1);
+}
+
+void drops_city_tiles_outside_the_game_world() {
+    map_editor::SbcMap map{};
+    // Climbs from level 500 to 520 over 300 cells: the top crosses the
+    // 512-level world ceiling, where the game drops the tiles.
+    map.intersections.push_back({0U, 100, 500, 100});
+    map.intersections.push_back({1U, 400, 520, 100});
+    map.streets.push_back({0U, 0, 1, 0, 1, 2, "East"});
+    const auto full = map_editor::build_map_scene(map);
+    const auto fit = map_editor::build_map_scene(map, {});
+    assert(fit.world_fit.road_tiles_outside > 0U && fit.world_fit.road_tiles_no_room == 0U);
+    assert(fit.city_tiles.size() + fit.world_fit.road_tiles_outside == full.city_tiles.size());
+    assert(std::ranges::all_of(fit.city_tiles, [](const auto& t) { return map_editor::city_cell_in_game_world(t.x, t.y, t.z); }));
+    assert(fit.world_fit.sectors_used > 0U && fit.world_fit.sectors_used <= map_editor::GameWorldFit::max_sectors);
+}
+
 void builds_city_street_tile_strips_for_all_cardinal_endpoint_orders() {
     const auto has_segment = [](std::int32_t from_x, std::int32_t from_z, std::int32_t to_x, std::int32_t to_z,
                                  std::int32_t probe_x, std::int32_t probe_z) {
@@ -3676,6 +3701,8 @@ int main() {
     rejects_unsupported_sbc_version();
     builds_map_scene();
     builds_grid_aligned_city_street_tile_strip();
+    drops_city_tiles_outside_the_game_world();
+    removes_junctions_no_road_uses();
     builds_city_street_tile_strips_for_all_cardinal_endpoint_orders();
     canonicalizes_city_street_endpoint_order_for_native_axes();
     fills_intersection_footprint_and_closes_missing_sides_with_curbs();

@@ -1027,17 +1027,6 @@ GpuMesh upload_gpu_vertices(const std::vector<GpuVertex>& vertices, const std::v
     return mesh;
 }
 
-// Shadow volume vertices: the shader reads only the normal's direction (a sign
-// test against the light) and the vertex kind, so they pack into 20 bytes
-// instead of GpuVertex's 36.
-struct ShadowVertex {
-    float position[3];
-    std::uint16_t normal[3];  // unit normal as half floats
-    std::uint8_t kind;
-    std::uint8_t pad;
-};
-static_assert(sizeof(ShadowVertex) == 20);
-
 // IEEE half from a float in [-1, 1]; magnitudes below the half range flush
 // to a signed zero.
 std::uint16_t half_from_unit_float(float value) {
@@ -1053,10 +1042,8 @@ std::uint16_t half_from_unit_float(float value) {
     return static_cast<std::uint16_t>(sign | std::min<std::uint32_t>(half + (mantissa >> 13U), 0x7c00U));
 }
 
-GpuMesh upload_shadow_volume(const std::vector<float>& baked, const std::vector<std::uint32_t>& indices) {
-    GpuMesh mesh;
+std::vector<ShadowVertex> pack_shadow_vertices(const std::vector<float>& baked) {
     const auto count = baked.size() / 9U;
-    if (count == 0U || indices.empty()) return mesh;
     std::vector<ShadowVertex> vertices(count);
     for (std::size_t i = 0; i < count; ++i) {
         const auto* v = &baked[i * 9U];  // position, kind, 0, 0, normal
@@ -1068,6 +1055,13 @@ GpuMesh upload_shadow_volume(const std::vector<float>& baked, const std::vector<
         out.kind = static_cast<std::uint8_t>(v[3]);
         out.pad = 0;
     }
+    return vertices;
+}
+
+GpuMesh upload_shadow_volume(const std::vector<ShadowVertex>& vertices, const std::vector<std::uint32_t>& indices) {
+    GpuMesh mesh;
+    const auto count = vertices.size();
+    if (count == 0U || indices.empty()) return mesh;
     rlDrawRenderBatchActive();
     glGenVertexArrays(1, &mesh.vao);
     glBindVertexArray(mesh.vao);
@@ -1201,7 +1195,7 @@ void build_shadow_volume(GpuBuildingRenderModel& model, const BuildingRenderBuff
         baked = &local;
     }
     model.shadow_top = baked->shadow_top;
-    model.shadow_volume = upload_shadow_volume(baked->shadow_vertices, baked->shadow_indices);
+    model.shadow_volume = upload_shadow_volume(pack_shadow_vertices(baked->shadow_vertices), baked->shadow_indices);
     if (!model.shadow_volume.empty()) model.shadow_volume.parts.push_back({0U, model.shadow_volume.index_count});
 }
 
@@ -1661,8 +1655,8 @@ GLuint instance_stream() {
 GfxDebugDrawCategory category_for(GpuSurface surface) {
     switch (surface) {
         case GpuSurface::Terrain: return GfxDebugDrawCategory::Terrain;
-        case GpuSurface::Mask:
-        case GpuSurface::ShadowVolume: return GfxDebugDrawCategory::WireOverlay;
+        case GpuSurface::Mask: return GfxDebugDrawCategory::WireOverlay;
+        case GpuSurface::ShadowVolume: return GfxDebugDrawCategory::ShadowVolumes;
         default: return GfxDebugDrawCategory::CityCells;
     }
 }
@@ -2866,6 +2860,12 @@ void rebuild_single_building_render(EditorProject& project, std::size_t index) {
         return;
     }
     if (project.building_render_buffers.size() != project.buildings.size()) {
+        // A new building uploads here, outside the queue; count it as uploaded so
+        // the loading overlay (uploaded vs. buffer count) does not wait forever.
+        if (!project.render_build_in_progress && project.pending_gpu_upload_indices.empty() &&
+            project.pending_gpu_upload_index >= project.building_render_buffers.size()) {
+            project.pending_gpu_upload_index = project.buildings.size();
+        }
         project.building_render_buffers.resize(project.buildings.size());
     }
     if (project.building_gpu_models.size() != project.buildings.size()) {
@@ -3069,19 +3069,49 @@ const GpuMesh* building_near_mesh(EditorProject& project, std::size_t asset_inde
         }
         project.building_near_models.erase(found);
     }
+    if (auto job = project.building_near_jobs.find(asset_index); job != project.building_near_jobs.end()) {
+        if (job->second.buffers.wait_for(std::chrono::seconds{0}) != std::future_status::ready) return nullptr;
+        auto built = job->second.buffers.get();
+        const bool stale = job->second.far_vao != far_vao;
+        project.building_near_jobs.erase(job);
+        // An edit replaced the shell while this built; start over below.
+        if (!stale) {
+            const auto& building = project.buildings[asset_index].data;
+            EditorProject::NearBuildingModel model;
+            model.mesh = upload_gpu_mesh(built.mesh, [&](GpuMeshPart& part) {
+                describe_textured_part(part,
+                    texture_for_material(project, building, part.material_id),
+                    material_texture_for_material(project, building, part.material_id));
+            });
+            model.room_shadow_volume = upload_shadow_volume(built.room_shadow_vertices, built.room_shadow_indices);
+            if (!model.room_shadow_volume.empty()) model.room_shadow_volume.parts.push_back({0U, model.room_shadow_volume.index_count});
+            model.last_used = GetTime();
+            model.far_vao = far_vao;
+            return &project.building_near_models.insert_or_assign(asset_index, std::move(model)).first->second.mesh;
+        }
+    }
     if (build_budget <= 0) return nullptr;
     --build_budget;
-    const auto& building = project.buildings[asset_index].data;
-    const auto buffer = build_city_building_full_render_buffer(building, block_meshes(project), buildblock_templates(project), BuildingLod::Near);
-    EditorProject::NearBuildingModel model;
-    model.mesh = upload_gpu_mesh(buffer, [&](GpuMeshPart& part) {
-        describe_textured_part(part,
-            texture_for_material(project, building, part.material_id),
-            material_texture_for_material(project, building, part.material_id));
-    });
-    model.last_used = GetTime();
-    model.far_vao = far_vao;
-    return &project.building_near_models.insert_or_assign(asset_index, std::move(model)).first->second.mesh;
+    project.building_near_jobs[asset_index] = {far_vao, std::async(std::launch::async,
+        [building = project.buildings[asset_index].data, blocks = block_meshes(project), templates = buildblock_templates(project)] {
+            MAPED_PROFILE_THREAD("Near building build");
+            auto buffer = build_city_building_full_render_buffer(building, blocks, templates, BuildingLod::Near);
+            BuildingRenderBuffer rooms;
+            rooms.vertices = buffer.vertices;
+            for (auto triangle : buffer.triangles) {
+                if (!triangle.interior || triangle.city_window_surface) continue;
+                triangle.interior = false;
+                rooms.triangles.push_back(triangle);
+            }
+            EditorProject::NearBuildingBuffers built{std::move(buffer)};
+            if (!rooms.triangles.empty()) {
+                bake_shadow_volume(rooms);
+                built.room_shadow_vertices = pack_shadow_vertices(rooms.shadow_vertices);
+                built.room_shadow_indices = std::move(rooms.shadow_indices);
+            }
+            return built;
+        })};
+    return nullptr;
 }
 
 void evict_building_near_models(EditorProject& project) {
@@ -3108,6 +3138,9 @@ void refresh_placement_override_models(EditorProject& project) {
     }
     // A re-uploaded template model gets a new vao.
     for (const auto& model : project.building_gpu_models) mix(model.mesh.vao);
+    // Cells the game's world storage cannot hold (GameWorldFit) are hidden too.
+    const auto* dropped = project.city_scene_cache_valid ? &project.city_scene_cache.world_fit.building_cells : nullptr;
+    if (dropped != nullptr) for (const auto& cells : *dropped) mix(cells.size());
     if (fingerprint == project.placement_override_fingerprint) return;
     project.placement_override_fingerprint = fingerprint;
     project.placement_override_models.clear();
@@ -3116,7 +3149,12 @@ void refresh_placement_override_models(EditorProject& project) {
     for (std::size_t i = 0; i < asset_indices.size(); ++i) {
         if (asset_indices[i].has_value()) buildings[i] = &project.buildings[*asset_indices[i]].data;
     }
-    const auto overwritten = overwritten_building_cells(project.city->data, buildings);
+    auto overwritten = overwritten_building_cells(project.city->data, buildings);
+    std::vector<std::size_t> later_placements(overwritten.size());
+    for (std::size_t i = 0; i < overwritten.size(); ++i) {
+        later_placements[i] = overwritten[i].size();
+        if (dropped != nullptr && i < dropped->size()) overwritten[i].insert(overwritten[i].end(), (*dropped)[i].begin(), (*dropped)[i].end());
+    }
     for (std::size_t i = 0; i < overwritten.size(); ++i) {
         if (overwritten[i].empty()) continue;
         auto building = *buildings[i];
@@ -3125,8 +3163,9 @@ void refresh_placement_override_models(EditorProject& project) {
         project.placement_override_models.emplace(i, upload_building_render_model(buffer, building, project));
         const auto& p = project.city->data.buildings[i];
         append_render_log(project, "placement " + std::to_string(i) + " " + p.name + " at " + std::to_string(p.x) + "," +
-            std::to_string(p.y) + "," + std::to_string(p.z) + ": " + std::to_string(overwritten[i].size()) +
-            " cells overwritten by later placements");
+            std::to_string(p.y) + "," + std::to_string(p.z) + ": " + std::to_string(later_placements[i]) +
+            " cells overwritten by later placements, " + std::to_string(overwritten[i].size() - later_placements[i]) +
+            " past the game's world storage");
     }
 }
 
@@ -3148,6 +3187,12 @@ void draw_city_shadow_volumes(EditorProject& project, const Camera3D& camera, fl
     glEnable(GL_DEPTH_TEST);
     glStencilOpSeparate(GL_FRONT, GL_KEEP, GL_DECR_WRAP, GL_KEEP);
     glStencilOpSeparate(GL_BACK, GL_KEEP, GL_INCR_WRAP, GL_KEEP);
+    // A face turned from the sun keeps its front cap on its own surface, where
+    // equal depths pass or fail at random: streaks on walls the sun grazes. Push
+    // the volumes a little deeper (slope-scaled) so that cap always fails and
+    // counts the same as the back cap; the face's lighting already darkens it.
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(1.0F, 4.0F);
 
     const auto light = Vector3Normalize(game_light_direction());
     const auto sector_extrusion = [&](std::size_t sector) {
@@ -3181,6 +3226,16 @@ void draw_city_shadow_volumes(EditorProject& project, const Camera3D& camera, fl
         set_shadow_volume_light(light, sector_extrusion(key % 64U));
         draw_gpu_mesh_instances(project.building_gpu_models[key / 64U].shadow_volume, transforms, GpuSurface::ShadowVolume);
     }
+    // Near sectors' rooms cast too, extruded a fixed 32 units (0x2787d4), not by
+    // sector height (RenderQueuedShadowVolumeAdjacencyPass @946d0).
+    std::unordered_map<std::size_t, std::vector<Matrix>> rooms_by_asset;
+    for (const auto& [asset_index, transform] : near_lod_placements()) rooms_by_asset[asset_index].push_back(transform);
+    set_shadow_volume_light(light, Vector3Scale(light, -32.0F));
+    for (const auto& [asset_index, transforms] : rooms_by_asset) {
+        if (const auto found = project.building_near_models.find(asset_index); found != project.building_near_models.end()) {
+            draw_gpu_mesh_instances(found->second.room_shadow_volume, transforms, GpuSurface::ShadowVolume);
+        }
+    }
     // Road and curb tiles are world sectors too; one volume at the highest sector.
     set_shadow_volume_light(light, sector_extrusion(static_cast<std::size_t>(project.city_tile_gpu_model.shadow_top / 32.0F)));
     draw_gpu_mesh_instances(project.city_tile_gpu_model.shadow_volume, {MatrixIdentity()}, GpuSurface::ShadowVolume);
@@ -3189,6 +3244,7 @@ void draw_city_shadow_volumes(EditorProject& project, const Camera3D& camera, fl
     set_shadow_volume_light(light, Vector3Scale(light, -32.0F));
     draw_gpu_mesh_instances(project.portal_gpu_model.shadow_volume, {MatrixIdentity()}, GpuSurface::ShadowVolume);
     draw_street_object_shadow_volumes(project.city_scene_cache, camera, max_distance, light);
+    glDisable(GL_POLYGON_OFFSET_FILL);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDepthMask(GL_TRUE);
     glDisable(GL_STENCIL_TEST);

@@ -38,6 +38,7 @@
 #include <numeric>
 #include <optional>
 #include <sstream>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -218,6 +219,8 @@ const char* gfx_draw_category_name(GfxDebugDrawCategory category) {
             return "Pieces";
         case GfxDebugDrawCategory::WireOverlay:
             return "Wire/overlay";
+        case GfxDebugDrawCategory::ShadowVolumes:
+            return "Shadow volumes";
         case GfxDebugDrawCategory::Count:
             break;
     }
@@ -1547,6 +1550,11 @@ void start_city_scene_rebuild(EditorProject& project, std::uint64_t fingerprint)
 #endif
 }
 
+std::vector<std::pair<std::size_t, Matrix>>& near_lod_placements() {
+    static std::vector<std::pair<std::size_t, Matrix>> placements;
+    return placements;
+}
+
 void draw_city_building_models_full_detail(EditorProject& project, const Camera3D& camera, Vector2 viewport_size) {
     if (!project.city) {
         return;
@@ -1657,6 +1665,7 @@ void draw_city_building_models_full_detail(EditorProject& project, const Camera3
     const auto& placement_asset_indices = resolve_placement_asset_indices(project);
     std::vector<std::pair<const GpuMesh*, Matrix>> overridden;
     std::map<const GpuMesh*, std::vector<Matrix>> near_by_asset;
+    near_lod_placements().clear();
     int near_builds_left = 1;
     static std::vector<std::vector<Matrix>> transforms_by_asset;
     transforms_by_asset.resize(project.buildings.size());
@@ -1684,6 +1693,7 @@ void draw_city_building_models_full_detail(EditorProject& project, const Camera3
         if (g_render_settings.near_lod && placement_distance < kNearLodDistance) {
             if (const auto* near = building_near_mesh(project, asset_index, near_builds_left)) {
                 near_by_asset[near].push_back(city_placement_matrix(placement));
+                near_lod_placements().push_back({asset_index, city_placement_matrix(placement)});
                 continue;
             }
         }
@@ -2526,7 +2536,7 @@ struct StreetSplitHit {
 // Finds an existing road whose footprint the grid point lands on, away from its
 // endpoints, so a click there can split it into a T/4-way junction instead of
 // dropping a free-floating node. Endpoints are left to nearest_city_intersection.
-std::optional<StreetSplitHit> nearest_street_split(const SbcMap& map, CityGridPoint point) {
+std::optional<StreetSplitHit> nearest_street_split(const SbcMap& map, CityGridPoint point, bool auto_generated) {
     std::optional<StreetSplitHit> best;
     double best_dist = std::numeric_limits<double>::max();
     for (std::size_t i = 0; i < map.streets.size(); ++i) {
@@ -2558,7 +2568,19 @@ std::optional<StreetSplitHit> nearest_street_split(const SbcMap& map, CityGridPo
         if (dist > half_width || dist >= best_dist) {
             continue;
         }
-        const auto road_y = static_cast<std::int32_t>(std::lround(a.y + (b.y - a.y) * u));
+        auto road_y = static_cast<std::int32_t>(std::lround(a.y + (b.y - a.y) * u));
+        // The game ramps a street in its middle with flat ends, not straight from
+        // end to end: split at the height of the lane the game lays there
+        // (lanes sit at level y - 1).
+        if (a.y != b.y) {
+            const auto gx = static_cast<std::int32_t>(std::lround(cx)), gz = static_cast<std::int32_t>(std::lround(cz));
+            for (const auto& tile : preview_city_street(map, i, auto_generated).cells) {
+                if (tile.kind == CityTileKind::Road && tile.street_index == static_cast<std::int32_t>(i) && tile.x == gx && tile.z == gz) {
+                    road_y = tile.y + 1;
+                    break;
+                }
+            }
+        }
         if (std::abs(road_y - point.y) > 1) continue;
         // Snap the split node onto the exact grid cell nearest the projection so
         // the two halves stay axis-aligned with the original road.
@@ -2578,8 +2600,7 @@ std::optional<StreetSplitHit> nearest_street_split(const SbcMap& map, CityGridPo
 // Splits street[street_index] at a new node placed at split_point: the original
 // segment becomes from->new, and a fresh segment new->to is appended, both
 // carrying the source road's width/district/name. Returns the new node index.
-std::size_t split_street_at(EditorProject& project, std::size_t street_index, CityGridPoint split_point) {
-    auto& map = project.city->data;
+std::size_t split_street_at(SbcMap& map, std::size_t street_index, CityGridPoint split_point) {
     const auto existing = nearest_city_intersection(map, split_point, 0);
     const auto node_index = existing ? *existing : add_city_intersection(map, split_point);
 
@@ -2603,13 +2624,12 @@ std::size_t split_street_at(EditorProject& project, std::size_t street_index, Ci
 // Resolves a click to an intersection index: snaps to a nearby existing node,
 // else splits an existing road the click lands on (forming a junction), else
 // creates a new node at the clicked surface height.
-std::size_t resolve_or_create_intersection(EditorProject& project, CityGridPoint point) {
-    auto& map = project.city->data;
+std::size_t resolve_or_create_intersection(SbcMap& map, CityGridPoint point, bool auto_generated) {
     if (const auto existing = nearest_city_intersection(map, point, 1)) {
         return *existing;
     }
-    if (const auto split = nearest_street_split(map, point)) {
-        return split_street_at(project, split->street_index, split->point);
+    if (const auto split = nearest_street_split(map, point, auto_generated)) {
+        return split_street_at(map, split->street_index, split->point);
     }
     return add_city_intersection(map, point);
 }
@@ -2620,6 +2640,7 @@ void append_city_road_point(EditorProject& project, EditorUi& ui, CityGridPoint 
     }
 
     auto& map = project.city->data;
+    const bool auto_generated = project_is_auto_generated(project);
 
     // First click only records the start, snapped to a nearby node or road so the
     // preview matches. Nothing is created until the second click lays a segment.
@@ -2627,45 +2648,52 @@ void append_city_road_point(EditorProject& project, EditorUi& ui, CityGridPoint 
         if (const auto node = nearest_city_intersection(map, point, 1)) {
             const auto& existing = map.intersections[*node];
             point = {existing.x, existing.y, existing.z};
-        } else if (const auto split = nearest_street_split(map, point)) {
+        } else if (const auto split = nearest_street_split(map, point, auto_generated)) {
             point = split->point;
         }
         ui.pending_road_start = point;
         return;
     }
 
+    const auto streets = map.streets.size(), intersections = map.intersections.size();
+    const auto laid = lay_city_road(map, *ui.pending_road_start, point, ui.new_road_width, auto_generated);
+    ui.pending_road_start = laid.next_start;
+    if (laid.last_street) ui.selected_city_street = *laid.last_street;
+    if (map.streets.size() != streets || map.intersections.size() != intersections) ui.city_dirty = true;
+}
+
+// Lays the road the Road tool lays from start_point to a click at point: snaps
+// to junctions, splits the roads it starts, ends, or crosses on, and adds the
+// segments. Shared by the click and its preview so they always agree.
+RoadLay lay_city_road(SbcMap& map, CityGridPoint start_point, CityGridPoint point, std::int32_t width, bool auto_generated) {
+    RoadLay laid;
     // Clicking the start point again ends the chain without a 0-length road.
-    const auto start_point = *ui.pending_road_start;
-    if (start_point.x == point.x && start_point.z == point.z) {
-        ui.pending_road_start.reset();
-        return;
-    }
+    if (start_point.x == point.x && start_point.z == point.z) return {};
 
     // Axis-lock the end relative to the start, then resolve/create that node.
     const auto end_point = snap_to_axis(start_point, point);
     // An end one cell from the start would snap back onto the start node; stop
     // before creating that node so the click leaves nothing behind.
-    if (std::abs(end_point.x - start_point.x) + std::abs(end_point.z - start_point.z) <= 1) return;
-    const auto start_index = resolve_or_create_intersection(project, start_point);
-    const auto end_index = resolve_or_create_intersection(project, end_point);
+    if (std::abs(end_point.x - start_point.x) + std::abs(end_point.z - start_point.z) <= 1) return {start_point, std::nullopt};
+    const auto start_index = resolve_or_create_intersection(map, start_point, auto_generated);
+    const auto end_index = resolve_or_create_intersection(map, end_point, auto_generated);
     const auto node_point = [&](std::size_t index) {
         const auto& node = map.intersections[index];
         return CityGridPoint{node.x, node.y, node.z};
     };
-    if (end_index == start_index) return;
+    if (end_index == start_index) return {start_point, std::nullopt};
     for (const auto& existing : map.streets) {
         if ((existing.from_intersection == static_cast<int>(start_index) && existing.to_intersection == static_cast<int>(end_index)) ||
             (existing.to_intersection == static_cast<int>(start_index) && existing.from_intersection == static_cast<int>(end_index))) {
-            ui.pending_road_start = node_point(end_index);
-            return;
+            return {node_point(end_index), std::nullopt};
         }
     }
     // New roads use the Tools width and continue the district of a road already
     // meeting the start node.
     SbcStreet street{};
     street.name = "Street";
-    street.left_width = ui.new_road_width / 2;
-    street.right_width = ui.new_road_width - street.left_width;
+    street.left_width = width / 2;
+    street.right_width = width - street.left_width;
     for (const auto& existing : map.streets) {
         if (existing.from_intersection == static_cast<int>(start_index) || existing.to_intersection == static_cast<int>(start_index)) {
             street.district = existing.district;
@@ -2678,7 +2706,7 @@ void append_city_road_point(EditorProject& project, EditorUi& ui, CityGridPoint 
     const bool along_x = start_point.z == finish.z;
     const int from = along_x ? start_point.x : start_point.z;
     const int to = along_x ? finish.x : finish.z;
-    if (from == to) return;
+    if (from == to) return {node_point(end_index), std::nullopt};
     const auto old_streets = map.streets;
     for (std::size_t i = 0; i < old_streets.size(); ++i) {
         const auto& existing = old_streets[i];
@@ -2696,7 +2724,7 @@ void append_city_road_point(EditorProject& project, EditorUi& ui, CityGridPoint 
         const float y = start_point.y + (finish.y - start_point.y) * (static_cast<float>(crossing - from) / (to - from));
         const float other_y = a.y + (b.y - a.y) * (static_cast<float>(fixed - ca) / (cb - ca));
         if (std::abs(y - other_y) > .25F) continue;
-        split_street_at(project, i, {along_x ? crossing : fixed, static_cast<int>(std::lround(y)), along_x ? fixed : crossing});
+        split_street_at(map, i, {along_x ? crossing : fixed, static_cast<int>(std::lround(y)), along_x ? fixed : crossing});
     }
     std::vector<std::size_t> junctions{start_index, end_index};
     for (std::size_t i = 0; i < map.intersections.size(); ++i) {
@@ -2720,11 +2748,11 @@ void append_city_road_point(EditorProject& project, EditorUi& ui, CityGridPoint 
         auto segment = street;
         segment.index = map.streets.size(); segment.from_intersection = a; segment.to_intersection = b;
         map.streets.push_back(canonical_city_street_endpoint_order(map, std::move(segment)));
-        ui.selected_city_street = map.streets.size() - 1;
+        laid.last_street = map.streets.size() - 1;
     }
     // The new end node becomes the next start: chained laying.
-    ui.pending_road_start = node_point(end_index);
-    ui.city_dirty = true;
+    laid.next_start = node_point(end_index);
+    return laid;
 }
 
 // Ends the current road-laying chain (Esc, or mode/selection change).
@@ -2872,6 +2900,8 @@ void delete_city_street(EditorProject& project, EditorUi& ui) {
     ui.selected_city_street = std::min(ui.selected_city_street, map.streets.size() - 1U);
     map.streets.erase(map.streets.begin() + static_cast<std::ptrdiff_t>(ui.selected_city_street));
     reindex_city_streets(map);
+    remove_unused_city_intersections(map);
+    ui.selected_city_intersection = std::min(ui.selected_city_intersection, map.intersections.size() - 1U);
     ui.selected_city_street = std::min(ui.selected_city_street, map.streets.size() - 1U);
     ui.city_dirty = true;
 }
@@ -3074,6 +3104,52 @@ void mark_building_changed(EditorProject& project, EditorUi& ui) {
     invalidate_building_thumbnail(project, ui.selected_building);
 }
 
+void rename_building(EditorProject& project, EditorUi& ui, const std::string& name, std::string& status) {
+    auto& asset = project.buildings[ui.selected_building];
+    if (name == asset.name) return;
+    if (name.empty() || name.size() > 51 || name == "." || name == ".." || name.find_first_of("/\\:") != std::string::npos) {
+        status = "A building name needs 1-51 characters and no / \\ or :";
+        return;
+    }
+    for (const auto& other : project.buildings) {
+        if (&other != &asset && lower_name(other.name) == lower_name(name)) {
+            status = "Another building is already named " + other.name;
+            return;
+        }
+    }
+    // Rename its placements first: they resolve by name. The undo history gets
+    // the same rename, so undoing other edits keeps the placements resolved.
+    const auto rename_in = [&](SbcMap& map) {
+        for (auto& placement : map.buildings) {
+            if (find_building_asset(project, placement.name) == &asset) placement.name = name;
+        }
+    };
+    if (project.city) {
+        if (project.city->data.buildings.end() != std::ranges::find_if(project.city->data.buildings,
+                [&](const SbcBuilding& p) { return find_building_asset(project, p.name) == &asset; })) {
+            ui.city_dirty = true;
+        }
+        rename_in(project.city->data);
+    }
+    if (project.city_baseline) rename_in(*project.city_baseline);
+    for (auto& [label, map] : project.undo_stack) rename_in(map);
+    for (auto& [label, map] : project.redo_stack) rename_in(map);
+    // Building edit history finds its asset by index and name.
+    const auto index = static_cast<std::size_t>(&asset - project.buildings.data());
+    const auto rename_snapshot = [&](AssetSnapshot& snapshot) {
+        if (std::holds_alternative<SbbBuilding>(snapshot.data) && snapshot.index == index && snapshot.name == asset.name) snapshot.name = name;
+    };
+    for (auto* stacks : {&project.asset_undo_stacks, &project.asset_redo_stacks}) {
+        for (auto& stack : *stacks) for (auto& snapshot : stack) rename_snapshot(snapshot);
+    }
+    for (auto& baseline : project.asset_baselines) if (baseline) rename_snapshot(*baseline);
+    status = "renamed " + asset.name + " to " + name;
+    asset.name = name;
+    asset.dirty = true;
+    ui.building_dirty = true;
+    project.placement_assets_dirty = true;
+}
+
 void mark_buildblock_changed(EditorProject& project, EditorUi& ui) {
     project.buildblocks[ui.selected_buildblock].dirty = true;
     auto& model = project.buildblocks[ui.selected_buildblock].data;
@@ -3112,12 +3188,26 @@ CsxArchive project_archive(const EditorProject& project) {
         if (existing == archive.entries.end()) archive.entries.push_back(std::move(entry));
         else *existing = std::move(entry);
     };
-    // Loose textures load first; archive textures override them, as in the viewport.
+    // Archive textures keep their order: v10 texture grids hold absolute indices
+    // into it (see build_grid_texture_names). Loose textures only add new names
+    // after them, so the archive still wins a name clash, as in the viewport.
+    for (const auto& path : project_archive_paths(project))
+        for (auto& entry : parse_csx_file(path).entries)
+            if (entry.kind == CsxEntryKind::Texture || entry.kind == CsxEntryKind::Unknown) add(std::move(entry));
     std::vector<std::filesystem::path> pngs = files_with_extension(project.root / "texture", ".png");
-    for (const auto& path : files_with_extension(project.root, ".png")) pngs.push_back(path);
+    for (const auto& path : files_with_extension(project.root, ".png")) {
+        // The game loads these from the map folder into fixed slots, not from the archive.
+        const auto stem = path.stem().string();
+        if (stem == "asphalt2" || stem == "map") continue;
+        pngs.push_back(path);
+    }
     for (const auto& path : pngs) {
         const auto stem = path.stem().string();
         if (stem.ends_with("_material")) continue;
+        const bool archived = std::any_of(archive.entries.begin(), archive.entries.end(), [&](const auto& entry) {
+            return entry.type == 0x585a0004U && lower_name(entry.name) == lower_name(stem);
+        });
+        if (archived) continue;
         const auto color = read_file_bytes(path);
         auto material_path = project.root / "texturematerial" / path.filename();
         if (!std::filesystem::exists(material_path)) material_path = project.root / (stem + "_material.png");
@@ -3132,9 +3222,6 @@ CsxArchive project_archive(const EditorProject& project) {
         entry.payload.insert(entry.payload.end(), material.begin(), material.end());
         add(std::move(entry));
     }
-    for (const auto& path : project_archive_paths(project))
-        for (auto& entry : parse_csx_file(path).entries)
-            if (entry.kind == CsxEntryKind::Texture || entry.kind == CsxEntryKind::Unknown) add(std::move(entry));
     const auto geometry = [&](const std::string& name, CsxEntryKind kind, std::vector<std::uint8_t> bytes) {
         CsxEntry entry{}; entry.name = name; entry.kind = kind;
         entry.type = kind == CsxEntryKind::Sbb ? 0x585a0002U : 0x585a0001U;
@@ -3184,28 +3271,100 @@ void export_map_image(EditorProject& project, const EditorUi& ui, std::string& s
 #endif
 }
 
-// A map consists of its city layout plus the complete, current asset archive.
-// The chosen basename names both files; no edited copies or stale source payloads.
+void save_map_to(EditorProject& project, EditorUi& ui, const std::filesystem::path& folder, std::string& status);
+
+std::string city_upgrade_notice(std::uint32_t from_version) {
+    return "This map was upgraded from format v" + std::to_string(from_version) +
+        " to v12. The next save writes v12.";
+}
+
+void draw_city_upgrade_dialogs(EditorProject& project, EditorUi& ui, std::string& status) {
+    if (ui.confirm_piece_upgrade && !ImGui::IsPopupOpen("Upgrade map format?")) ImGui::OpenPopup("Upgrade map format?");
+    ImGui::SetNextWindowSizeConstraints(ImVec2(460.0F, 0.0F), ImVec2(720.0F, FLT_MAX));
+    if (ImGui::BeginPopupModal("Upgrade map format?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        const auto from = project.city ? project.city->data.version : 12U;
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 440.0F);
+        ImGui::Text("This map uses format v%u. Placing pieces needs v12.", from);
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Upgrading converts its legacy district cells into pieces. The game draws v12 "
+            "pieces differently: their textures resolve by name and they draw after buildings, so those "
+            "areas can look different in game. Saving without upgrading keeps the map as it is.");
+        ImGui::PopTextWrapPos();
+        ImGui::Spacing();
+        if (ImGui::Button("Upgrade to v12")) {
+            try { promote_city(project); status = "map format upgraded from v" + std::to_string(from) + " to v12"; }
+            catch (const std::exception& error) {
+                project.city_promotion_failed = true;
+                report_failure(status, std::string{"Map upgrade failed: "} + error.what());
+            }
+            ui.confirm_piece_upgrade = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            ui.city_tool = CityTool::Select;
+            ui.confirm_piece_upgrade = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    if (!ui.city_upgrade_notice.empty() && !ImGui::IsPopupOpen("Map format upgraded")) ImGui::OpenPopup("Map format upgraded");
+    ImGui::SetNextWindowSizeConstraints(ImVec2(420.0F, 0.0F), ImVec2(720.0F, FLT_MAX));
+    if (ImGui::BeginPopupModal("Map format upgraded", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 400.0F);
+        ImGui::TextUnformatted(ui.city_upgrade_notice.c_str());
+        ImGui::PopTextWrapPos();
+        if (ImGui::Button("OK")) { ui.city_upgrade_notice.clear(); ImGui::CloseCurrentPopup(); }
+        ImGui::EndPopup();
+    }
+}
+
+// A map is a folder: the game loads only <folder>/city2.sbc and <folder>/test.csx.
 void save_active_tab(EditorProject& project, EditorUi& ui, std::string& status) {
 #ifndef __EMSCRIPTEN__
     NFD::Guard guard;
     NFD::UniquePath selected;
-    const nfdnfilteritem_t filters[] = {{"Sub Rosa map", "sbc"}};
     const auto directory = project.city ? project.city->path.parent_path() : project.root;
-    const auto name = project.city ? project.city->path.filename().string() : "city2.sbc";
-    const auto result = NFD::SaveDialog(selected, filters, 1, directory.string().c_str(), name.c_str());
+    const auto result = NFD::PickFolder(selected, directory.string().c_str());
     if (result == NFD_CANCEL) return;
     if (result == NFD_ERROR) { report_failure(status, std::string{"Map save failed: "} + NFD::GetError()); return; }
-    auto output = std::filesystem::path{selected.get()};
+    const auto output = std::filesystem::path{selected.get()};
 #else
-    // No save dialog in the browser: keep the loaded name and download.
-    auto output = project.city ? project.city->path : project.root / "city2.sbc";
+    // No folder dialog in the browser: the files download.
+    const auto output = project.root;
 #endif
+    save_map_to(project, ui, output, status);
+}
+
+std::vector<std::string> game_world_fit_problems(const EditorProject& project) {
+    if (!project.city_scene_cache_valid) return {};
+    const auto& fit = project.city_scene_cache.world_fit;
+    const auto pieces = [](std::size_t roads, std::size_t buildings) {
+        std::string text;
+        if (roads > 0) text = std::to_string(roads) + " road pieces";
+        if (roads > 0 && buildings > 0) text += " and ";
+        if (buildings > 0) text += std::to_string(buildings) + " building pieces";
+        return text;
+    };
+    std::vector<std::string> problems;
+    if (fit.road_tiles_outside + fit.building_cells_outside > 0) {
+        problems.push_back(pieces(fit.road_tiles_outside, fit.building_cells_outside) +
+            " are outside the game's map area and won't appear in game. The area is 16384 wide, 16384 long and 2048 high.");
+    }
+    if (fit.road_tiles_no_room + fit.building_cells_no_room > 0) {
+        problems.push_back("The game runs out of space for this map: " + pieces(fit.road_tiles_no_room, fit.building_cells_no_room) +
+            " won't appear in game. Remove roads or buildings to make room.");
+    }
+    return problems;
+}
+
+void save_map_to(EditorProject& project, EditorUi& ui, const std::filesystem::path& folder, std::string& status) {
     try {
-        if (output.extension() != ".sbc") output += ".sbc";
+        const auto output = folder / "city2.sbc";
         // A legacy map keeps its version; its district grid is copied as loaded.
         const bool legacy = project.city && has_legacy_district_cells(project.city->data);
         if (legacy && !project.city_bytes) throw std::runtime_error("Legacy city has no loaded bytes to keep its district grid");
+        const auto loaded_version = project.city ? project.city->data.version : 12U;
         if (!legacy) promote_city(project);
         const auto archive = project_archive(project);
         auto city = project.city ? project.city->data : SbcMap{};
@@ -3217,8 +3376,7 @@ void save_active_tab(EditorProject& project, EditorUi& ui, std::string& status) 
         }
         const auto map_bytes = legacy ? rebuild_sbc_layout(*project.city_bytes, city) : rebuild_sbc(city);
         const auto archive_bytes = build_csx(archive);
-        // The game reads only <map>/test.csx, next to <map>/city2.sbc.
-        const auto archive_path = output.parent_path() / kGameArchiveName;
+        const auto archive_path = folder / kGameArchiveName;
         // Buildblocks are loose files. Saving in place rewrites the edited ones;
         // saving elsewhere writes them all so the new folder is complete.
         const bool same_folder = std::filesystem::equivalent(output.parent_path(), project.root);
@@ -3250,8 +3408,13 @@ void save_active_tab(EditorProject& project, EditorUi& ui, std::string& status) 
         // Saving normalizes the map; that is not an edit to undo.
         project.city_baseline = project.city->data;
         status.clear();
-        if (output.filename() != "city2.sbc") {
-            status = "saved; the game only loads a map named city2.sbc";
+        if (legacy) {
+            status = "saved in format v" + std::to_string(loaded_version) + ": its legacy district cells have no v12 equivalent";
+        } else if (loaded_version < 12) {
+            status = "saved; map format upgraded from v" + std::to_string(loaded_version) + " to v12";
+        }
+        for (const auto& problem : game_world_fit_problems(project)) {
+            status = (status.empty() ? std::string{"saved"} : status) + ". " + problem;
         }
     } catch (const std::exception& error) {
         report_failure(status, std::string{"Map save failed: "} + error.what());
@@ -4153,6 +4316,17 @@ void draw_coordinate_readout(EditorProject& project, const EditorUi& ui, const C
         if (const auto hit = city_surface_hit_under_mouse(project, camera, mouse, size)) {
             add_point("Cursor", hit->point, IM_COL32(120, 200, 255, 255));
         }
+        // The road the next click lays: '+' when the game can build its slope, '!' when not.
+        if (ui.city_tool == CityTool::Road && !ui.road_preview_info.empty()) {
+            const auto color = ui.road_preview_info[0] == '+' ? IM_COL32(150, 255, 165, 255) : IM_COL32(255, 115, 100, 255);
+            std::string_view rest{ui.road_preview_info};
+            rest.remove_prefix(1);
+            for (std::size_t at = 0; at <= rest.size();) {
+                const auto end = std::min(rest.find('\n', at), rest.size());
+                lines.push_back({std::string{rest.substr(at, end - at)}, color});
+                at = end + 1;
+            }
+        }
     } else if (ui.tab == EditorTab::Buildings && ui.building_hover_cell.has_value() && !project.buildings.empty()) {
         const auto& building = project.buildings[std::min(ui.selected_building, project.buildings.size() - 1U)].data;
         if (*ui.building_hover_cell < building.cells.size()) {
@@ -4359,7 +4533,13 @@ void draw_csx_editor(bool& open, EditorProject* project) {
     if (ImGui::BeginTable("##archive_files", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 220))) {
         ImGui::TableSetupColumn("Name"); ImGui::TableSetupColumn("Type"); ImGui::TableSetupColumn("Bytes"); ImGui::TableSetupColumn("Material");
         ImGui::TableHeadersRow();
-        for (std::size_t i = 0; i < archive.entries.size(); ++i) {
+        // Parsing an SBL every frame stalled the window; cache its label per payload.
+        static std::vector<std::tuple<const std::uint8_t*, std::size_t, const char*>> sbl_labels;
+        sbl_labels.resize(archive.entries.size());
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(archive.entries.size()));
+        while (clipper.Step()) for (auto row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+            const auto i = static_cast<std::size_t>(row);
             const auto& entry = archive.entries[i];
             ImGui::PushID(static_cast<int>(i)); ImGui::TableNextRow(); ImGui::TableNextColumn();
             const auto it = std::find(selected.begin(), selected.end(), i);
@@ -4369,8 +4549,13 @@ void draw_csx_editor(bool& open, EditorProject* project) {
             }
             ImGui::TableNextColumn();
             if (entry.kind == CsxEntryKind::Sbl) {
-                try { ImGui::TextUnformatted(parse_sbl(entry.payload).block ? "Block mesh" : "Buildblock"); }
-                catch (const std::exception&) { ImGui::TextUnformatted("Invalid SBL"); }
+                auto& [data, size, label] = sbl_labels[i];
+                if (data != entry.payload.data() || size != entry.payload.size()) {
+                    data = entry.payload.data(); size = entry.payload.size();
+                    try { label = parse_sbl(entry.payload).block ? "Block mesh" : "Buildblock"; }
+                    catch (const std::exception&) { label = "Invalid SBL"; }
+                }
+                ImGui::TextUnformatted(label);
             } else ImGui::TextUnformatted(entry.kind == CsxEntryKind::Sbb ? "Building" : entry.kind == CsxEntryKind::Texture ? "Texture" : "Unknown");
             ImGui::TableNextColumn(); ImGui::Text("%zu", entry.payload.size()); ImGui::TableNextColumn();
             if (entry.kind == CsxEntryKind::Texture && entry.payload.size() >= 0x4c)
@@ -4461,9 +4646,30 @@ void draw_csx_editor(bool& open, EditorProject* project) {
     ImGui::End();
 }
 
-void draw_road_lay_preview(const EditorProject& project, const EditorUi& ui, std::optional<CityGridPoint> cursor) {
+// Draws the road the next click lays and returns its description for the
+// coordinate readout (this runs in the 3D pass, outside the ImGui frame).
+// Road tile tops, tilted like the rendered road (draw_city_road_mask). Junction
+// tiles get the fainter fill and an outline.
+void draw_road_tiles(const std::vector<CityTileCell>& tiles, float unit, Color fill, Color junction_fill, Color edge) {
+    for (const auto& tile : tiles) {
+        if (tile.kind != CityTileKind::Road) continue;
+        const bool junction = tile.intersection_index >= 0;
+        const float x0 = static_cast<float>(tile.x) * unit, z0 = static_cast<float>(tile.z) * unit;
+        const float cx = x0 + unit * 0.5F, cz = z0 + unit * 0.5F;
+        const auto corner = [&](float px, float pz) {
+            return Vector3{px, tile.base_y + unit + tile.slope_x * ((px - cx) / unit) + tile.slope_z * ((pz - cz) / unit) + unit * 0.05F, pz};
+        };
+        const auto p0 = corner(x0, z0), p1 = corner(x0 + unit, z0), p2 = corner(x0 + unit, z0 + unit), p3 = corner(x0, z0 + unit);
+        // Counter-clockwise seen from above (raylib culls the other side).
+        DrawTriangle3D(p0, p2, p1, junction ? junction_fill : fill); DrawTriangle3D(p0, p3, p2, junction ? junction_fill : fill);
+        if (junction) { DrawLine3D(p0, p1, edge); DrawLine3D(p1, p2, edge); DrawLine3D(p2, p3, edge); DrawLine3D(p3, p0, edge); }
+    }
+}
+
+std::string draw_road_lay_preview(const EditorProject& project, EditorUi& ui, std::optional<CityGridPoint> cursor) {
+    ui.road_preview_cells.clear();
     if (ui.city_tool != CityTool::Road || !project.city) {
-        return;
+        return {};
     }
     const auto& map = project.city->data;
     const auto unit = project.city_scene_cache_valid ? project.city_scene_cache.unit_size : 4.0F;
@@ -4485,30 +4691,68 @@ void draw_road_lay_preview(const EditorProject& project, const EditorUi& ui, std
     }
 
     if (!ui.pending_road_start.has_value()) {
-        return;
+        return {};
     }
 
     const auto& start = *ui.pending_road_start;
     const Vector3 start_pos{static_cast<float>(start.x) * unit, ground(start.x, start.z, start.y), static_cast<float>(start.z) * unit};
     DrawSphere(start_pos, unit * 0.8F, Color{120, 230, 130, 235});
+    if (!cursor.has_value()) return {};
 
-    if (cursor.has_value()) {
-        const auto end = snap_to_axis(CityGridPoint{start.x, start.y, start.z}, *cursor);
-        const Vector3 end_pos{static_cast<float>(end.x) * unit, ground(end.x, end.z, start.y), static_cast<float>(end.z) * unit};
-        // A strip as wide as the road the click will lay, so its footprint is
-        // readable at city zoom (a 1px line was not).
-        const auto along = Vector3Subtract(end_pos, start_pos);
-        const auto side = Vector3Normalize(Vector3{-along.z, 0.0F, along.x});
-        const auto half = Vector3Scale(side, static_cast<float>(ui.new_road_width) * unit * 0.5F);
-        const Vector3 a = Vector3Add(start_pos, half), b = Vector3Subtract(start_pos, half);
-        const Vector3 c = Vector3Subtract(end_pos, half), d = Vector3Add(end_pos, half);
-        const Color fill{255, 230, 120, 90};
-        const Color edge{255, 240, 140, 255};
-        DrawTriangle3D(a, b, c, fill); DrawTriangle3D(c, b, a, fill);
-        DrawTriangle3D(a, c, d, fill); DrawTriangle3D(d, c, a, fill);
-        DrawLine3D(a, d, edge); DrawLine3D(b, c, edge);
-        DrawSphere(end_pos, unit * 0.6F, Color{255, 220, 110, 220});
+    // Lay the road on a copy of the map with the Road tool's own code, then draw
+    // the tiles the city build places for every road it adds or changes (a road
+    // it starts, ends, or crosses on is split there).
+    auto map_copy = map;
+    const bool auto_generated = project_is_auto_generated(project);
+    lay_city_road(map_copy, start, *cursor, ui.new_road_width, auto_generated);
+    const auto ends = [](const SbcMap& m, const SbcStreet& street) {
+        if (street.from_intersection < 0 || street.to_intersection < 0 ||
+            static_cast<std::size_t>(std::max(street.from_intersection, street.to_intersection)) >= m.intersections.size()) {
+            return std::array<std::int32_t, 8>{};
+        }
+        const auto& a = m.intersections[static_cast<std::size_t>(street.from_intersection)];
+        const auto& b = m.intersections[static_cast<std::size_t>(street.to_intersection)];
+        return std::array<std::int32_t, 8>{a.x, a.y, a.z, b.x, b.y, b.z, street.left_width, street.right_width};
+    };
+    std::set<std::array<std::int32_t, 8>> unchanged;
+    for (const auto& street : map.streets) unchanged.insert(ends(map, street));
+    std::vector<StreetPreview> previews;
+    for (std::size_t i = 0; i < map_copy.streets.size(); ++i) {
+        if (!unchanged.contains(ends(map_copy, map_copy.streets[i]))) previews.push_back(preview_city_street(map_copy, i, auto_generated));
     }
+    if (previews.empty()) return {};
+
+    // The first road the game cannot build decides the message; else the longest.
+    const auto in_world = [](const StreetPreview& p) {
+        return std::ranges::all_of(p.cells, [](const CityTileCell& c) { return city_cell_in_game_world(c.x, c.y, c.z); });
+    };
+    const auto bad = std::ranges::find_if(previews, [&](const StreetPreview& p) { return !p.run.slope_ok() || !in_world(p); });
+    const auto& shown = bad != previews.end() ? *bad
+        : *std::ranges::max_element(previews, {}, [](const StreetPreview& p) { return p.run.length; });
+    const bool ok = bad == previews.end();
+    const Color fill = ok ? Color{120, 230, 130, 110} : Color{240, 80, 70, 130};
+    const Color edge = ok ? Color{150, 255, 160, 255} : Color{255, 110, 100, 255};
+    // Curbs are left out so the road surface reads clearly.
+    for (const auto& preview : previews) {
+        ui.road_preview_cells.insert(ui.road_preview_cells.end(), preview.cells.begin(), preview.cells.end());
+    }
+    draw_road_tiles(ui.road_preview_cells, unit, fill, Color{fill.r, fill.g, fill.b, 55}, edge);
+
+    const auto& run = shown.run;
+    const auto climb = std::abs(run.climb);
+    std::string info = "Road " + std::to_string(std::max(0, run.length)) + " cells";
+    if (climb == 0) info += ", flat";
+    else info += ", " + std::string(run.climb > 0 ? "climbs " : "drops ") + std::to_string(climb) + (climb == 1 ? " level" : " levels") +
+        ", " + std::to_string(run.cells_per_level) + " cells per level";
+    if (previews.size() > 1) info += " (" + std::to_string(previews.size()) + " road pieces change)";
+    if (!in_world(shown)) info += "\nOutside the game's map area: the game will not draw this road.";
+    if (!run.slope_ok()) {
+        if (run.length <= 0) info += "\nThe junctions overlap: no room for a road.";
+        else if (run.cells_per_level * climb > run.length) info += "\nThe slope does not fit: the road ends in a step. Lengthen it.";
+        else if (run.cells_per_level < 4) info += "\nToo steep: the game has no slope block for this. Needs " + std::to_string(4 * climb) + "+ cells.";
+        else info += "\nToo shallow: the game has no slope block for this. Keep it under " + std::to_string(13 * climb) + " cells or climb more.";
+    }
+    return (ok ? "+" : "!") + info;
 }
 
 struct FocusTarget {
@@ -5257,7 +5501,7 @@ int run_editor_app() {
         ui.view_camera_position = camera.position;
         ui.view_camera_target = camera.target;
         // Visual QA: MAPED_CAMERA="px,py,pz,tx,ty,tz" pins the camera.
-        if (const char* pose = std::getenv("MAPED_CAMERA"); pose && screenshot_path) {
+        if (const char* pose = std::getenv("MAPED_CAMERA"); pose && (screenshot_path || bench_frames > 0)) {
             float v[6]{};
             if (std::sscanf(pose, "%f,%f,%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) {
                 camera.position = {v[0], v[1], v[2]};
@@ -5379,6 +5623,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                             project->city_scene_build_in_progress = false;
                             if (project->city_scene_build_target_fingerprint == scene_fingerprint) {
                                 project->city_scene_cache = std::move(built);
+                                ui.road_ghost.clear();
                                 project->city_scene_cache_fingerprint = scene_fingerprint;
                                 project->city_scene_cache_valid = true;
                                 project->city_scene_gpu_valid = false;
@@ -5517,7 +5762,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                                 draw_city_edit_grid(*cell, city_scene, Color{91, 166, 206, 255}, true);
                             }
                         }
-                        draw_road_lay_preview(*project, ui, city_cursor);
+                        ui.road_preview_info = draw_road_lay_preview(*project, ui, city_cursor);
+                        draw_road_tiles(ui.road_ghost, city_scene.unit_size, Color{220, 220, 225, 120}, Color{220, 220, 225, 60}, Color{235, 235, 240, 200});
 
                     } else if (ui.tab == EditorTab::Buildings && !project->buildings.empty()) {
                         ui.selected_building = std::min(ui.selected_building, project->buildings.size() - 1U);
@@ -5708,11 +5954,19 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 const Vec3 ray_origin{pick_ray.position.x, pick_ray.position.y, pick_ray.position.z};
                 const Vec3 ray_dir{pick_ray.direction.x, pick_ray.direction.y, pick_ray.direction.z};
 
-                if (ui.city_tool == CityTool::Piece && project->city->data.version < 11) {
-                    try { promote_city(*project); }
-                    catch (const std::exception& error) {
-                        project->city_promotion_failed = true;
-                        report_failure(status, std::string{"Piece placement blocked: "} + error.what());
+                if (ui.city_tool == CityTool::Piece && project->city->data.version < 11 && !ui.confirm_piece_upgrade &&
+                    !project->city_promotion_failed) {
+                    // Converting legacy district cells changes what the game draws,
+                    // so that upgrade waits for the user (draw_city_upgrade_dialogs).
+                    if (has_legacy_district_cells(project->city->data)) {
+                        ui.confirm_piece_upgrade = true;
+                    } else {
+                        const auto from = project->city->data.version;
+                        try { promote_city(*project); ui.city_upgrade_notice = city_upgrade_notice(from); }
+                        catch (const std::exception& error) {
+                            project->city_promotion_failed = true;
+                            report_failure(status, std::string{"Piece placement blocked: "} + error.what());
+                        }
                     }
                 }
                 if (ui.city_tool == CityTool::Select) {
@@ -5880,11 +6134,16 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     const Vec3 ray_dir{pick_ray.direction.x, pick_ray.direction.y, pick_ray.direction.z};
                     begin_city_action(*project, ui, "lay road");
                     const auto picked_node = pick_city_intersection(project->city->data, project->city_scene_cache, ray_origin, ray_dir);
+                    const auto streets_before = project->city->data.streets.size();
                     if (picked_node.has_value()) {
                         const auto& node = project->city->data.intersections[*picked_node];
                         append_city_road_point(*project, ui, {node.x, node.y, node.z});
                     } else if (city_cursor.has_value()) {
                         append_city_road_point(*project, ui, *city_cursor);
+                    }
+                    // Show the laid road until the rebuilt scene draws it.
+                    if (project->city->data.streets.size() != streets_before) {
+                        ui.road_ghost.insert(ui.road_ghost.end(), ui.road_preview_cells.begin(), ui.road_preview_cells.end());
                     }
                 }
             }
@@ -6433,15 +6692,18 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             // An upgrade right after undo (map equals the committed state) is not
             // a new edit; otherwise it folds into the pending edit's undo step.
             const bool at_baseline = project->city_baseline == project->city->data;
+            const auto from = project->city->data.version;
             try {
                 promote_city(*project);
                 if (at_baseline) project->city_baseline = project->city->data;
+                ui.city_upgrade_notice = city_upgrade_notice(from);
             }
             catch (const std::exception& error) {
                 project->city_promotion_failed = true;
                 report_failure(status, std::string{"City upgrade failed; edits retained, saving blocked: "} + error.what());
             }
         }
+        if (project) draw_city_upgrade_dialogs(*project, ui, status);
         draw_csx_editor(show_csx_editor, project ? &*project : nullptr);
         static std::string shown_error;
         if (!g_failure_message.empty() && !ImGui::IsPopupOpen("Operation failed")) {
@@ -6608,6 +6870,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             static int bench_count = 0;
             static double bench_ms = 0.0;
             static GfxDebugDrawCounter bench_draw{};
+            static std::array<std::uint64_t, static_cast<std::size_t>(GfxDebugDrawCategory::Count)> bench_category_tris{};
             static std::array<double, static_cast<std::size_t>(GfxDebugTimingPhase::Count)> bench_phase_ms{};
             if (bench_warmup > 0) {
                 --bench_warmup;
@@ -6617,10 +6880,15 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 const auto draw = gfx_debug_stats.total_draw();
                 bench_draw.draw_calls += draw.draw_calls;
                 bench_draw.triangles += draw.triangles;
+                for (std::size_t i = 0; i < bench_category_tris.size(); ++i) bench_category_tris[i] += gfx_debug_stats.draw[i].triangles;
                 if (++bench_count == bench_frames) {
                     std::printf("bench: %d frames, %.3f ms/frame, %.0f draws/frame, %.0f tris/frame\n", bench_count,
                         bench_ms / bench_count, static_cast<double>(bench_draw.draw_calls) / bench_count,
                         static_cast<double>(bench_draw.triangles) / bench_count);
+                    for (std::size_t i = 0; i < bench_category_tris.size(); ++i) {
+                        std::printf("  %s: %.0f tris\n", gfx_draw_category_name(static_cast<GfxDebugDrawCategory>(i)),
+                            static_cast<double>(bench_category_tris[i]) / bench_count);
+                    }
                     // Measured frames only (the running averages include loading).
                     for (std::size_t i = 0; i < bench_phase_ms.size(); ++i) {
                         std::printf("  %s: %.3f ms\n", gfx_timing_phase_name(static_cast<GfxDebugTimingPhase>(i)), bench_phase_ms[i] / bench_count);
@@ -6628,6 +6896,21 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     running = false;
                 }
             }
+        }
+        // Round-trip QA: MAPED_SAVE=<folder> saves the loaded map there and
+        // exits; MAPED_SAVE_NUDGE=1 first moves building 0 up and back down.
+        if (const char* save_to = std::getenv("MAPED_SAVE"); save_to && project && project->city) {
+            if (std::getenv("MAPED_SAVE_NUDGE") && !project->city->data.buildings.empty()) {
+                ui.city_selection = CitySelectionKind::Building;
+                ui.selected_city_building = 0;
+                begin_city_action(*project, ui, "edit selection");
+                nudge_city_building(*project, ui, 0, 1, 0, 0);
+                begin_city_action(*project, ui, "edit selection");
+                nudge_city_building(*project, ui, 0, -1, 0, 0);
+            }
+            save_map_to(*project, ui, save_to, status);
+            std::printf("save: %s\n", status.empty() ? "ok" : status.c_str());
+            running = false;
         }
         if (screenshot_path && project && ++screenshot_ready_frames >= screenshot_frame_target) {
             auto screenshot = LoadImageFromScreen();

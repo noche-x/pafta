@@ -139,6 +139,7 @@ enum class GfxDebugDrawCategory : std::size_t {
     TrafficLightPoles,
     Pieces,
     WireOverlay,
+    ShadowVolumes,
     Count,
 };
 
@@ -298,6 +299,17 @@ struct AssetSnapshot {
     std::variant<SbbBuilding, SblTemplate, SblBlockMesh> data;
 };
 
+// Shadow volume vertices: the shader reads only the normal's direction (a sign
+// test against the light) and the vertex kind, so they pack into 20 bytes
+// instead of GpuVertex's 36.
+struct ShadowVertex {
+    float position[3];
+    std::uint16_t normal[3];  // unit normal as half floats
+    std::uint8_t kind;
+    std::uint8_t pad;
+};
+static_assert(sizeof(ShadowVertex) == 20);
+
 struct EditorProject {
     std::filesystem::path root;
     std::vector<std::pair<std::filesystem::path, std::vector<std::uint8_t>>> generated_city_assets;
@@ -360,10 +372,26 @@ struct EditorProject {
     // the shell model it was built beside, so a template edit rebuilds it.
     struct NearBuildingModel {
         GpuMesh mesh;
+        // Shadow volume of the room triangles (glass excluded): the game's
+        // RenderQueuedShadowVolumeAdjacencyPass @946d0 draws near sectors'
+        // interior models with a fixed 32-unit extrusion.
+        GpuMesh room_shadow_volume;
         double last_used{};
         unsigned int far_vao{};
     };
     std::unordered_map<std::size_t, NearBuildingModel> building_near_models;
+    // Near meshes and room volumes build on a worker (the bake took >100 ms on
+    // a skyscraper); the main thread only uploads the result.
+    struct NearBuildingBuffers {
+        BuildingRenderBuffer mesh;
+        std::vector<ShadowVertex> room_shadow_vertices;
+        std::vector<std::uint32_t> room_shadow_indices;
+    };
+    struct NearBuildingJob {
+        unsigned int far_vao{};
+        std::future<NearBuildingBuffers> buffers;
+    };
+    std::unordered_map<std::size_t, NearBuildingJob> building_near_jobs;
     std::uint64_t placement_override_fingerprint{};
     bool placement_assets_dirty{true};
     MapScene city_scene_cache;
@@ -709,6 +737,10 @@ struct EditorUi {
     std::int32_t place_building_rotation{};
     // Why the Building-tool preview would overlap something (empty = clear).
     std::string placement_conflict;
+    std::string road_preview_info;  // set by draw_road_lay_preview, shown by draw_coordinate_readout
+    std::vector<CityTileCell> road_preview_cells;  // the road tiles draw_road_lay_preview drew
+    // A just-placed road's tiles, drawn until the rebuilt city scene shows it.
+    std::vector<CityTileCell> road_ghost;
     BuildingTool building_tool{BuildingTool::Select};
     // Place Block tool configuration (editor.exe-style block panel).
     BlockToolConfig block_config{};
@@ -815,6 +847,9 @@ struct EditorUi {
     Vector3 focus_end_position{};
     Vector3 focus_end_target{};
     bool city_dirty{};
+    // Map format upgrades are announced, never silent (draw_city_upgrade_dialogs).
+    bool confirm_piece_upgrade{};
+    std::string city_upgrade_notice;
     bool building_dirty{};
     bool block_dirty{};
     bool buildblock_dirty{};
@@ -841,6 +876,8 @@ const std::vector<std::optional<std::size_t>>& resolve_placement_asset_indices(E
 void refresh_placement_override_models(EditorProject& project);
 // Display label for a key, localized to the user's keyboard layout (printable
 // keys via glfwGetKeyName, fixed names for the rest). Defined in app.cpp.
+// What of the map won't appear in game (GameWorldFit), in plain words; empty when it all fits.
+std::vector<std::string> game_world_fit_problems(const EditorProject& project);
 std::string key_label(int key);
 
 // ui_windows.cpp: shortcuts, preferences, and the floating tool windows.
@@ -917,6 +954,8 @@ inline constexpr float kNearLodDistance = 192.0F;
 const GpuMesh* building_near_mesh(EditorProject& project, std::size_t asset_index, int& build_budget);
 // Drops near meshes unused for a few seconds.
 void evict_building_near_models(EditorProject& project);
+// Near-LOD placements drawn this frame: (asset index, placement transform).
+std::vector<std::pair<std::size_t, Matrix>>& near_lod_placements();
 // One mesh and the transforms to instance it with, for draw_gpu_mesh_batch.
 struct GpuMeshDraw {
     const GpuMesh* mesh{};
@@ -1089,12 +1128,19 @@ void nudge_city_street_width(EditorProject& project, EditorUi& ui, int side, int
 void nudge_city_street_district(EditorProject& project, EditorUi& ui, int delta);
 void duplicate_city_street(EditorProject& project, EditorUi& ui);
 void append_city_road_point(EditorProject& project, EditorUi& ui, CityGridPoint point);
+struct RoadLay {
+    std::optional<CityGridPoint> next_start;  // where the chain continues; empty ends it
+    std::optional<std::size_t> last_street;   // the last segment added
+};
+RoadLay lay_city_road(SbcMap& map, CityGridPoint start_point, CityGridPoint point, std::int32_t width, bool auto_generated);
 void set_city_piece_voxel(EditorProject& project, EditorUi& ui, CityGridPoint point);
 void delete_city_street(EditorProject& project, EditorUi& ui);
 void nudge_city_block_slot(EditorProject& project, EditorUi& ui, int delta);
 void clear_city_block_slot(EditorProject& project, EditorUi& ui);
 void edit_building(EditorProject& project, EditorUi& ui, std::size_t asset_index);
 void recalculate_building_size(SbbBuilding& building);
+// Renames the selected building and every placement of it; reports problems in status.
+void rename_building(EditorProject& project, EditorUi& ui, const std::string& name, std::string& status);
 void mark_building_changed(EditorProject& project, EditorUi& ui);
 void mark_buildblock_changed(EditorProject& project, EditorUi& ui);
 void rebuild_buildings_using_buildblock(EditorProject& project, const std::string& buildblock_name);

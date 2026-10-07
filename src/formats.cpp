@@ -1356,13 +1356,21 @@ std::vector<std::uint8_t> rebuild_sbb(const SbbBuilding& building) {
     append_name_table(building.block_names);
     append_name_table(building.item_set_names);
 
+    // Index the cells once; a per-slot search made large buildings take seconds.
+    // The first cell at a position wins, as the search did.
+    const auto stride_x = static_cast<std::size_t>(size_x) + 1U;
+    const auto stride_z = static_cast<std::size_t>(size_y) + 1U;
+    std::vector<const SbbCell*> grid(stride_x * stride_z * size_z, nullptr);
+    for (const auto& cell : building.cells) {
+        if (cell.x > size_x || cell.z > size_y || cell.y >= size_z) continue;
+        auto& slot = grid[(static_cast<std::size_t>(cell.y) * stride_z + cell.z) * stride_x + cell.x];
+        if (slot == nullptr) slot = &cell;
+    }
     for (std::uint32_t y = 0; y < size_z; ++y) {
         for (std::uint32_t z = 0; z <= size_y; ++z) {
             for (std::uint32_t x = 0; x <= size_x; ++x) {
-                const auto match = std::ranges::find_if(building.cells, [x, y, z](const SbbCell& cell) {
-                    return cell.x == x && cell.y == y && cell.z == z;
-                });
-                if (match == building.cells.end()) {
+                const auto* match = grid[(static_cast<std::size_t>(y) * stride_z + z) * stride_x + x];
+                if (match == nullptr) {
                     rebuilt.resize(rebuilt.size() + 0x3c);
                     continue;
                 }

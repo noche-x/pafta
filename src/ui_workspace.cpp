@@ -300,6 +300,17 @@ void draw_viewport_overlays(EditorProject* project, EditorUi& ui, Camera3D& came
             auto* draw = ImGui::GetWindowDrawList();
             draw->AddRectFilled(ImVec2(at.x - 8.0F, at.y - 3.0F), ImVec2(at.x + size.x + 8.0F, at.y + size.y + 3.0F), IM_COL32(0, 0, 0, 150), 4.0F);
             draw->AddText(at, IM_COL32(225, 225, 225, 255), hint);
+            if (ui.tab == EditorTab::City) {
+                std::string warning;
+                for (const auto& problem : game_world_fit_problems(*project)) warning += (warning.empty() ? "" : "\n") + problem;
+                if (!warning.empty()) {
+                    const ImVec2 warning_size = ImGui::CalcTextSize(warning.c_str(), nullptr, false, toolbar_width);
+                    const ImVec2 warning_at{origin.x + (extent.x - warning_size.x) * 0.5F, at.y + size.y + 10.0F};
+                    draw->AddRectFilled(ImVec2(warning_at.x - 8.0F, warning_at.y - 3.0F),
+                        ImVec2(warning_at.x + warning_size.x + 8.0F, warning_at.y + warning_size.y + 3.0F), IM_COL32(90, 10, 10, 200), 4.0F);
+                    draw->AddText(nullptr, 0.0F, warning_at, IM_COL32(255, 150, 140, 255), warning.c_str(), nullptr, toolbar_width);
+                }
+            }
         }
     } else {
         ImGui::EndChild();

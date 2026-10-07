@@ -4,6 +4,10 @@
 #include "profiler.hpp"
 
 #include <algorithm>
+#include <thread>
+#include <atomic>
+#include <future>
+#include <numeric>
 #include <bit>
 #include <cmath>
 #include <tuple>
@@ -1769,6 +1773,89 @@ void remove_replaced_city_tiles(
     std::erase_if(tiles, [&](const CityTileCell& tile) { return replaced.contains({tile.x, tile.y, tile.z}); });
 }
 
+// Replays the game's world storage allocation (GameWorldFit) in load order and
+// drops the road tiles it cannot hold from `tiles`.
+// ponytail: tiles keep only their last writer, so a street's tiles are replayed
+// in order along the street instead of the game's exact write order; they only
+// differ in which cells of the one street that fills the storage survive.
+GameWorldFit fit_to_game_world(
+    std::vector<CityTileCell>& tiles,
+    const NativeCityGraph& graph,
+    const SbcMap& map,
+    const std::vector<const SbbBuilding*>& placement_buildings) {
+    GameWorldFit fit;
+    std::unordered_set<CityTileKey, CityTileKeyHash> sectors, chunks;
+    enum class Placed { Ok, Outside, NoRoom };
+    const auto place = [&](std::int32_t x, std::int32_t y, std::int32_t z) {
+        if (!city_cell_in_game_world(x, y, z)) return Placed::Outside;
+        if (sectors.contains({x >> 3, y >> 3, z >> 3})) return Placed::Ok;
+        if (!chunks.contains({x >> 6, y >> 6, z >> 6})) {
+            if (chunks.size() >= GameWorldFit::max_chunks) return Placed::NoRoom;
+            chunks.insert({x >> 6, y >> 6, z >> 6});
+        }
+        if (sectors.size() >= GameWorldFit::max_sectors) return Placed::NoRoom;
+        sectors.insert({x >> 3, y >> 3, z >> 3});
+        return Placed::Ok;
+    };
+
+    // Street tiles street by street, then junction tiles (intersection index -1 last).
+    std::vector<std::size_t> order(tiles.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    const auto rank = [&](const CityTileCell& t) {
+        const bool street = t.intersection_index < 0 && t.street_index >= 0 &&
+            static_cast<std::size_t>(t.street_index) < graph.streets.size();
+        const auto along = !street ? 0 : graph.streets[static_cast<std::size_t>(t.street_index)].orientation == 0 ? t.x : t.z;
+        return std::tuple{street ? 0 : 1, street ? t.street_index : t.intersection_index, along};
+    };
+    std::ranges::stable_sort(order, [&](std::size_t a, std::size_t b) { return rank(tiles[a]) < rank(tiles[b]); });
+    std::vector<bool> dropped(tiles.size());
+    for (const auto i : order) {
+        const auto placed = place(tiles[i].x, tiles[i].y, tiles[i].z);
+        dropped[i] = placed != Placed::Ok;
+        if (placed == Placed::Outside) ++fit.road_tiles_outside;
+        if (placed == Placed::NoRoom) ++fit.road_tiles_no_room;
+    }
+
+    for (const auto& portal : map.portals) {
+        const auto& voxels = portal.voxel_blocks();
+        for (std::size_t i = 0; i < std::min<std::size_t>(voxels.size(), 0x200); ++i) {
+            if (voxels[i] == 0U) continue;
+            place(portal.fields[1] * 8 + static_cast<std::int32_t>(i & 7U),
+                portal.fields[2] * 8 + static_cast<std::int32_t>((i >> 6U) & 7U),
+                portal.fields[3] * 8 + static_cast<std::int32_t>((i >> 3U) & 7U));
+        }
+    }
+
+    fit.building_cells.resize(map.buildings.size());
+    for (std::size_t index = 0; index < map.buildings.size() && index < placement_buildings.size(); ++index) {
+        const auto* building = placement_buildings[index];
+        if (building == nullptr) continue;
+        const auto& placement = map.buildings[index];
+        for (std::size_t c = 0; c < building->cells.size(); ++c) {
+            const auto& cell = building->cells[c];
+            if (!cell.occupied) continue;
+            const Vec3 local{
+                (static_cast<float>(cell.x) - static_cast<float>(building->anchor_x) + 0.5F) * 4.0F,
+                0.0F,
+                (static_cast<float>(cell.z) - static_cast<float>(building->anchor_z) + 0.5F) * 4.0F,
+            };
+            const auto world = native_city_building_transform_point(placement, local, 4.0F);
+            const auto placed = place(static_cast<std::int32_t>(std::floor(world.x / 4.0F)),
+                placement.y + static_cast<std::int32_t>(cell.y) - static_cast<std::int32_t>(building->anchor_y),
+                static_cast<std::int32_t>(std::floor(world.z / 4.0F)));
+            if (placed == Placed::Ok) continue;
+            fit.building_cells[index].push_back(c);
+            ++(placed == Placed::Outside ? fit.building_cells_outside : fit.building_cells_no_room);
+        }
+    }
+
+    std::size_t i = 0;
+    std::erase_if(tiles, [&](const CityTileCell&) { return dropped[i++]; });
+    fit.sectors_used = sectors.size();
+    fit.chunks_used = chunks.size();
+    return fit;
+}
+
 } // namespace
 
 // Per placement, the cells a later placement overwrites. The game deletes the
@@ -1812,11 +1899,33 @@ namespace {
 // blocks from the ba14 table at the lane level inside the slope region.
 // Branch 0 (orientation 0) walks +X with lanes offset in Z and uses table edges
 // 0 (up) / 2 (down); branch 1 walks +Z with lanes in X and edges 1 / 3.
+// Length between the junction footprints, level change, and cells per level of
+// a street's slope, as MapConnector_PlaceStreetSegmentTilesAndSlopes computes them.
+StreetRun native_street_run(const NativeCityGraph& graph, const NativeCityStreet& street, bool auto_generated) {
+    const auto& from = graph.intersections[static_cast<std::size_t>(street.a)];
+    const auto& to = graph.intersections[static_cast<std::size_t>(street.b)];
+    const auto along_x = street.orientation == 0;
+    const auto start = along_x ? from.gx + from.ext_x_pos : from.gz + from.ext_z_pos;
+    StreetRun run;
+    run.length = (along_x ? to.gx - to.ext_x_neg : to.gz - to.ext_z_neg) - start;
+    run.climb = to.level - from.level;
+    const auto abs_delta = std::abs(run.climb);
+    // ponytail: the game divides by zero when a street is shorter than its climb;
+    // clamp the run length to 1 instead of reproducing the crash.
+    run.cells_per_level = abs_delta > 0 ? std::max(1, run.length / abs_delta) : 6;
+    // isMapAutoGenerated (the "round" map) uses a short fixed run instead: 6
+    // cells per level, 10 when the street is at least 10x longer than its climb,
+    // so the street runs flat, slopes in the middle, then runs flat again.
+    if (auto_generated) run.cells_per_level = abs_delta > 0 && abs_delta <= run.length / 10 ? 10 : 6;
+    return run;
+}
+
 void place_native_street_tiles(
     CityTileMap& tiles,
     CityCornerStampMap& stamps,
     const NativeCityGraph& graph,
-    const NativeCityStreet& street) {
+    const NativeCityStreet& street,
+    bool auto_generated) {
     static const auto grade_slots = native_grade_slot_table();
     if (street.a < 0 || street.b < 0) {
         return;
@@ -1826,14 +1935,12 @@ void place_native_street_tiles(
     const auto along_x = street.orientation == 0;
 
     const auto start = along_x ? from.gx + from.ext_x_pos : from.gz + from.ext_z_pos;
-    const auto seg_len = (along_x ? to.gx - to.ext_x_neg : to.gz - to.ext_z_neg) - start;
     const auto center = along_x ? from.gz : from.gx;
-
-    const auto delta = to.level - from.level;
+    const auto run = native_street_run(graph, street, auto_generated);
+    const auto seg_len = run.length;
+    const auto delta = run.climb;
     const auto abs_delta = std::abs(delta);
-    // ponytail: the game divides by zero when a street is shorter than its climb;
-    // clamp the run length to 1 instead of reproducing the crash.
-    const auto run_len = abs_delta > 0 ? std::max(1, seg_len / abs_delta) : 6;
+    const auto run_len = run.cells_per_level;
     const auto half = (abs_delta * run_len) >> 1;
     const auto slope_start = (seg_len >> 1) - half;
     const auto slope_end = (seg_len >> 1) + half;
@@ -2003,6 +2110,32 @@ void place_native_intersection_tiles(CityTileMap& tiles, const NativeCityInterse
 
 } // namespace
 
+// Drops junctions no road uses. The game still lays a junction's tiles
+// (MapConnector_PlaceIntersectionPerimeterTiles), so a leftover shows as a slab.
+void remove_unused_city_intersections(SbcMap& map) {
+    std::vector<bool> used(map.intersections.size());
+    for (const auto& street : map.streets) {
+        for (const auto end : {street.from_intersection, street.to_intersection}) {
+            if (end >= 0 && static_cast<std::size_t>(end) < used.size()) used[static_cast<std::size_t>(end)] = true;
+        }
+    }
+    std::vector<std::int32_t> remap(map.intersections.size(), -1);
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < map.intersections.size(); ++i) {
+        if (!used[i]) continue;
+        remap[i] = static_cast<std::int32_t>(kept);
+        map.intersections[kept] = map.intersections[i];
+        map.intersections[kept].index = kept;
+        ++kept;
+    }
+    map.intersections.resize(kept);
+    for (auto& street : map.streets) {
+        for (auto* end : {&street.from_intersection, &street.to_intersection}) {
+            if (*end >= 0 && static_cast<std::size_t>(*end) < remap.size()) *end = remap[static_cast<std::size_t>(*end)];
+        }
+    }
+}
+
 SbcStreet canonical_city_street_endpoint_order(const SbcMap& map, SbcStreet street) {
     if (street.from_intersection < 0 || street.to_intersection < 0) {
         return street;
@@ -2094,14 +2227,32 @@ namespace {
 
 constexpr auto city_terrain_mesh_y_offset = 0.05F;
 
+// Runs row(0..rows-1) across the CPU cores (in order on the web build).
+template <typename F>
+void parallel_rows(std::int32_t rows, F&& row) {
+#ifdef __EMSCRIPTEN__
+    for (std::int32_t r = 0; r < rows; ++r) row(r);
+#else
+    std::atomic<std::int32_t> next{0};
+    std::vector<std::thread> workers(std::max(1U, std::thread::hardware_concurrency()));
+    for (auto& worker : workers) worker = std::thread([&] {
+        for (std::int32_t r; (r = next++) < rows;) row(r);
+    });
+    for (auto& worker : workers) worker.join();
+#endif
+}
+
 // 1-world-unit terrain height grid over the city region, indexed by integer
 // world coordinates (the native land-sample grid minus its +4096 offset).
+// Only patched samples are stored; the rest is the island height, computed on
+// demand (a dense grid of a long map is tens of millions of samples).
 struct CityHeightfield {
     std::int32_t min_x{};
     std::int32_t min_z{};
     std::int32_t count_x{};
     std::int32_t count_z{};
-    std::vector<float> heights;
+    bool city_map{true};
+    std::unordered_map<std::size_t, float> patched;
 
     bool contains(std::int32_t x, std::int32_t z) const {
         return x >= min_x && z >= min_z && x < min_x + count_x && z < min_z + count_z;
@@ -2113,12 +2264,15 @@ struct CityHeightfield {
     }
 
     float get(std::int32_t x, std::int32_t z) const {
-        return contains(x, z) ? heights[index(x, z)] : 0.0F;
+        if (!contains(x, z)) return 0.0F;
+        const auto found = patched.find(index(x, z));
+        return found != patched.end() ? found->second
+            : native_like_city_terrain_height(static_cast<float>(x), static_cast<float>(z), city_map);
     }
 
     void set(std::int32_t x, std::int32_t z, float height) {
         if (contains(x, z)) {
-            heights[index(x, z)] = height;
+            patched[index(x, z)] = height;
         }
     }
 };
@@ -2384,10 +2538,11 @@ void apply_native_city_terrain_patch(
 
 std::vector<CityTileCell> build_city_tile_cells(
     const NativeCityGraph& graph,
-    CityCornerStampMap& stamps) {
+    CityCornerStampMap& stamps,
+    bool auto_generated) {
     CityTileMap tile_map;
     for (const auto& street : graph.streets) {
-        place_native_street_tiles(tile_map, stamps, graph, street);
+        place_native_street_tiles(tile_map, stamps, graph, street, auto_generated);
     }
     for (std::size_t index = 0; index < graph.intersections.size(); ++index) {
         place_native_intersection_tiles(tile_map, graph.intersections[index], static_cast<std::int32_t>(index));
@@ -2489,6 +2644,8 @@ void bake_shadow_volume(BuildingRenderBuffer& buffer) {
     std::unordered_map<Key, Vec3, KeyHash> points;
     std::unordered_map<Key, std::vector<Key>, KeyHash> grid;
     const auto cell_of = [](const Key& key) { return Key{key[0] >> 10, key[1] >> 10, key[2] >> 10}; };
+    points.reserve(buffer.vertices.size());
+    grid.reserve(buffer.vertices.size());
     for (const auto& vertex : buffer.vertices) {
         const auto key = point_key(vertex.position);
         if (points.emplace(key, vertex.position).second) grid[cell_of(key)].push_back(key);
@@ -2535,6 +2692,7 @@ void bake_shadow_volume(BuildingRenderBuffer& buffer) {
     std::vector<std::array<Vec3, 3>> parents;
     parents.reserve(buffer.triangles.size());
     std::unordered_map<std::pair<Key, Key>, std::pair<std::size_t, std::size_t>, EdgeHash> open_edges;
+    open_edges.reserve(buffer.triangles.size() * 2U);
     std::vector<Key> ring;
     const auto add_face = [&](const std::array<Key, 3>& keys) {
         const auto face_index = faces.size();
@@ -2633,6 +2791,16 @@ void bake_shadow_volume(BuildingRenderBuffer& buffer) {
             const auto& from = faces[f].keys[edge];
             const auto& to = faces[f].keys[(edge + 1U) % 3U];
             const auto other_normal = other >= 0 ? normals[faces[static_cast<std::size_t>(other)].parent] : Vec3{};
+            // Two faces on one plane always face the light the same way, so
+            // their shared edge is never a silhouette: skip its quad.
+            if (other >= 0) {
+                const Vec3 cross{normal.y * other_normal.z - normal.z * other_normal.y,
+                    normal.z * other_normal.x - normal.x * other_normal.z, normal.x * other_normal.y - normal.y * other_normal.x};
+                const auto dot = normal.x * other_normal.x + normal.y * other_normal.y + normal.z * other_normal.z;
+                const auto lengths = (normal.x * normal.x + normal.y * normal.y + normal.z * normal.z) *
+                    (other_normal.x * other_normal.x + other_normal.y * other_normal.y + other_normal.z * other_normal.z);
+                if (dot > 0.0F && cross.x * cross.x + cross.y * cross.y + cross.z * cross.z <= lengths * 1e-8F) continue;
+            }
             const auto far_kind = other >= 0 ? kEdge : kOpenEdge;
             // (to, from, to'), (to', from, from') when this face is the dark one.
             const auto first = vertex_count;
@@ -2790,21 +2958,7 @@ std::optional<CityTerrain> build_city_terrain(
     field.min_z = static_cast<std::int32_t>(terrain.min_z);
     field.count_x = static_cast<std::int32_t>(terrain.max_x - terrain.min_x) + 1;
     field.count_z = static_cast<std::int32_t>(terrain.max_z - terrain.min_z) + 1;
-#ifdef __EMSCRIPTEN__
-    // A dense base field stalls WebAssembly for minutes on large maps. Store
-    // only the patches; unpatched samples fall back to the island height.
-    field.heights.assign(static_cast<std::size_t>(field.count_x) * static_cast<std::size_t>(field.count_z),
-        std::numeric_limits<float>::quiet_NaN());
-#else
-    field.heights.resize(static_cast<std::size_t>(field.count_x) * static_cast<std::size_t>(field.count_z));
-    for (auto z = 0; z < field.count_z; ++z) {
-        for (auto x = 0; x < field.count_x; ++x) {
-            field.heights[static_cast<std::size_t>(z) * static_cast<std::size_t>(field.count_x) +
-                static_cast<std::size_t>(x)] = native_like_city_terrain_height(
-                    static_cast<float>(field.min_x + x), static_cast<float>(field.min_z + z), !stamps.disabled);
-        }
-    }
-#endif
+    field.city_map = !stamps.disabled;
     // Terrain_RebuildLandTilesRoadPatchesAndChunkCaches patches city maps only.
     for (const auto patch_index : native_city_terrain_patch_indices) {
         if (stamps.disabled) break;
@@ -2818,28 +2972,27 @@ std::optional<CityTerrain> build_city_terrain(
                 static_cast<std::int32_t>(world_x), field.min_x, field.min_x + field.count_x - 1);
             const auto sample_z = std::clamp(
                 static_cast<std::int32_t>(world_z), field.min_z, field.min_z + field.count_z - 1);
-            const auto height = field.get(sample_x, sample_z);
-            if (!std::isnan(height)) return height;
+            return field.get(sample_x, sample_z);
         }
         return native_like_city_terrain_height(world_x, world_z, !stamps.disabled);
     };
 
     terrain.sample_count_x = std::max(2, static_cast<std::int32_t>(std::ceil((terrain.max_x - terrain.min_x) / terrain.sample_spacing)) + 1);
     terrain.sample_count_z = std::max(2, static_cast<std::int32_t>(std::ceil((terrain.max_z - terrain.min_z) / terrain.sample_spacing)) + 1);
-    terrain.heights.reserve(static_cast<std::size_t>(terrain.sample_count_x * terrain.sample_count_z));
+    terrain.heights.resize(static_cast<std::size_t>(terrain.sample_count_x) * static_cast<std::size_t>(terrain.sample_count_z));
     terrain.mesh.unit_size = unit_size;
     terrain.mesh.material_names.push_back("city_terrain_grass");
 
-    for (auto z = 0; z < terrain.sample_count_z; ++z) {
+    // Keep the patched local height samples for picking and object placement.
+    // The render mesh is generated below in the native 128-unit landscape chunks.
+    parallel_rows(terrain.sample_count_z, [&](std::int32_t z) {
         for (auto x = 0; x < terrain.sample_count_x; ++x) {
             const auto world_x = std::min(terrain.max_x, terrain.min_x + static_cast<float>(x) * terrain.sample_spacing);
             const auto world_z = std::min(terrain.max_z, terrain.min_z + static_cast<float>(z) * terrain.sample_spacing);
-            terrain.heights.push_back(terrain_height(world_x, world_z));
-            // Keep the patched local height samples for picking and object
-            // placement. The render mesh is generated below in the native
-            // 128-unit landscape chunks.
+            terrain.heights[static_cast<std::size_t>(z) * static_cast<std::size_t>(terrain.sample_count_x) + static_cast<std::size_t>(x)] =
+                terrain_height(world_x, world_z);
         }
-    }
+    });
 
     // Native landscape dimensions proven in
     // Terrain_RebuildLandTilesRoadPatchesAndChunkCaches @ d12e0:
@@ -4449,10 +4602,31 @@ std::uint64_t city_terrain_fingerprint(const SbcMap& map) {
 }
 
 MapScene build_map_scene(const SbcMap& map) {
-    return build_map_scene(map, {});
+    return build_map_scene(map, {}, false, false);
 }
 
-MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*>& placement_buildings, bool auto_generated) {
+StreetPreview preview_city_street(const SbcMap& map, std::size_t street_index, bool auto_generated) {
+    StreetPreview preview;
+    const auto graph = build_native_city_graph(map);
+    const auto street = std::ranges::find(graph.streets, static_cast<std::int32_t>(street_index), &NativeCityStreet::source_index);
+    if (street == graph.streets.end() || street->a < 0 || street->b < 0) return preview;
+    preview.run = native_street_run(graph, *street, auto_generated);
+    CityTileMap tile_map;
+    CityCornerStampMap stamps;
+    stamps.disabled = true;
+    place_native_street_tiles(tile_map, stamps, graph, *street, auto_generated);
+    for (const auto index : {street->a, street->b}) {
+        place_native_intersection_tiles(tile_map, graph.intersections[static_cast<std::size_t>(index)], index);
+    }
+    for (const auto& [key, value] : tile_map) {
+        preview.cells.push_back({key.x, key.y, key.z, value.base_y, value.slope_x, value.slope_z, value.kind, value.street_index,
+            value.block, value.faces, value.intersection_index});
+    }
+    return preview;
+}
+
+MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*>& placement_buildings, bool auto_generated,
+    bool fit_game_world) {
     MAPED_PROFILE_FUNCTION();
     MapScene scene;
     // Native build order (World_LoadMapAndInitializeTerrain @56980): street
@@ -4474,8 +4648,22 @@ MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*
             corner_stamps.mask_max_z = std::max(corner_stamps.mask_max_z, intersection.z);
         }
     }
-    scene.city_tiles = build_city_tile_cells(graph, corner_stamps);
+    scene.city_tiles = build_city_tile_cells(graph, corner_stamps, auto_generated);
+    if (fit_game_world) scene.world_fit = fit_to_game_world(scene.city_tiles, graph, map, placement_buildings);
     remove_replaced_city_tiles(scene.city_tiles, map, placement_buildings);
+    // The road mesh and its shadow volume need only the tiles: build them while
+    // the terrain builds.
+    auto tile_buffer = std::async(
+#ifdef __EMSCRIPTEN__
+        std::launch::deferred,
+#else
+        std::launch::async,
+#endif
+        [&tiles = std::as_const(scene.city_tiles), unit = scene.unit_size] {
+            auto buffer = build_city_tile_render_buffer(tiles, unit);
+            bake_shadow_volume(buffer);
+            return buffer;
+        });
     stamp_city_portal_cells(corner_stamps, map);
     stamp_city_building_footprints(corner_stamps, map, placement_buildings);
     scene.traffic_light_poles = build_city_traffic_light_poles(graph, scene.unit_size);
@@ -4563,8 +4751,7 @@ MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*
             editor_quad,
         });
     }
-    scene.city_tile_buffer = build_city_tile_render_buffer(scene.city_tiles, scene.unit_size);
-    bake_shadow_volume(scene.city_tile_buffer);
+    scene.city_tile_buffer = tile_buffer.get();
     scene.city_tile_fingerprint = 1469598103934665603ULL;
     for (const auto& tile : scene.city_tiles) {
         for (const auto value : {static_cast<std::uint64_t>(static_cast<std::uint32_t>(tile.x)),

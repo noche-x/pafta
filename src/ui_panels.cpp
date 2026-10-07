@@ -647,12 +647,18 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
         ui.selected_materials.clear();
         ui.material_selection_building = ui.selected_building;
     }
+    // Placements and the map archive use the asset name; the name stored inside
+    // the .sbb is separate, usually blank, and unused by the game.
+    std::array<char, 52> asset_name{};
+    std::copy_n(asset.name.data(), std::min(asset.name.size(), asset_name.size() - 1), asset_name.data());
+    field_label("Name");
+    if (ImGui::InputText("##asset_name", asset_name.data(), asset_name.size(), ImGuiInputTextFlags_EnterReturnsTrue)) {
+        rename_building(project, ui, asset_name.data(), status);
+    }
+    if (ImGui::IsItemActive()) ImGui::TextDisabled("Press Enter to rename. Every placement of it is renamed too.");
     std::array<char, 64> name{};
     std::copy_n(building.name.data(), std::min(building.name.size(), name.size() - 1), name.data());
-    // Placements reference the file name (asset.name); the name stored inside
-    // the .sbb is separate and usually blank, so show both for what they are.
-    ImGui::Text("File: %s.sbb", asset.name.c_str());
-    field_label("Name in file");
+    field_label("Name in file (unused by the game)");
     if (ImGui::InputTextWithHint("##name_in_file", "(blank)", name.data(), name.size())) {
         building.name = name.data();
         mark_building_changed(project, ui);

@@ -415,10 +415,15 @@ nonzero legacy grid entry uses has no name. The editor therefore keeps a map wit
 district cells at its version (saving it with `rebuild_sbc_layout`) and promotes only on an
 explicit piece edit.
 
-Shadows (`RenderQueuedShadowVolumeAdjacencyPass`): only exterior-world sectors cast, and the
-geometry shader extrudes only triangles turned away from the sun. Rooms are in the interior
-world and never cast; the inside of a closed shell is lit unless another away-facing face
-(an overhang, another building) covers it.
+Shadows (`RenderWorldOffscreenPrepassPipeline` calls `RenderQueuedShadowVolumeAdjacencyPass
+@946d0`): the geometry shader extrudes only triangles turned away from the sun, in three sets:
+- exterior-world sectors (`@11c950`), extruded `(sector y + 1) * 32 / max(sun.y, 0.125)`;
+- the interior (room) models of near sectors, extruded a fixed 32 units (`0x2787d4`), so a
+  room's ceiling and sun-side walls shadow its own floor;
+- flagged queued models (`RenderQueuedModelWithAdjacencyGeometryPass @124fe0`), 64 units.
+Room floors are therefore mostly in their own shadow, which hides exterior casters (signs,
+overhangs) there; only floor the slanted 32-unit room prisms miss, e.g. just inside a window,
+is lit. Room glass is a separate alpha-quad list and does not cast.
 
 Room key details (`InstantiateSbbVolumeIntoWorldAndMetadata`): an open side becomes code 2 when a
 neighbour's wall ends at that side's starting corner (north: the west cell's north wall or the
