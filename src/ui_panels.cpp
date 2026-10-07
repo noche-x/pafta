@@ -540,10 +540,44 @@ bool material_swatch_picker(const EditorProject& project, const char* id, const 
     return changed;
 }
 
-// Place Block panel, as editor.exe's building tool (EditorPanel_BuildingTool
-// @140062d60): an Exterior and an Interior layer, each switched on separately,
-// each "Normal" (solid shell / generated room) or a piece, with its own 8
-// texture slots. A click writes only the enabled layers.
+std::optional<std::size_t> search_grid(const char* id, std::array<char, 128>& search, std::size_t count, std::size_t selected,
+    float size, float height, const std::function<const std::string&(std::size_t)>& name,
+    const std::function<std::pair<unsigned int, bool>(std::size_t)>& image) {
+    std::optional<std::size_t> clicked;
+    ImGui::PushID(id);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("##search", ICON_FA_MAGNIFYING_GLASS " Search", search.data(), search.size());
+    const auto needle = lower_name(search.data());
+    if (ImGui::BeginChild("##grid", ImVec2(-FLT_MIN, height), ImGuiChildFlags_Borders)) {
+        const int per_row = std::max(1, static_cast<int>(ImGui::GetContentRegionAvail().x / (size + ImGui::GetStyle().ItemSpacing.x + 8.0F)));
+        int column = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            const std::string& label = name(i);
+            if (!needle.empty() && lower_name(label).find(needle) == std::string::npos) continue;
+            if (column++ % per_row != 0) ImGui::SameLine();
+            ImGui::PushID(static_cast<int>(i));
+            const auto [texture, flipped] = image(i);
+            const bool hit = texture != 0U
+                ? ImGui::ImageButton("##i", ImTextureID(texture), ImVec2(size, size), ImVec2(0.0F, flipped ? 1.0F : 0.0F), ImVec2(1.0F, flipped ? 0.0F : 1.0F))
+                : ImGui::Button(fit_label(label, size).c_str(), ImVec2(size + 8.0F, size + 8.0F));
+            if (hit) clicked = i;
+            if (i == selected) {
+                ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), IM_COL32(235, 190, 78, 255), 2.0F, 0, 3.0F);
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", label.c_str());
+            ImGui::PopID();
+        }
+        if (column == 0) ImGui::TextDisabled("Nothing matches.");
+    }
+    ImGui::EndChild();
+    ImGui::PopID();
+    return clicked;
+}
+
+// Place Block panel: Exterior and Interior, each switched on separately and
+// each either normal (solid shell / generated room) or a piece. A click writes
+// only the enabled layers (BuildingTool_WriteCellFromCurrentSelection
+// @1400672a0).
 void draw_block_tool_panel(EditorProject& project, EditorUi& ui) {
     ui.selected_building = std::min(ui.selected_building, project.buildings.size() - 1U);
     auto& building = project.buildings[ui.selected_building].data;
@@ -555,23 +589,26 @@ void draw_block_tool_panel(EditorProject& project, EditorUi& ui) {
     static constexpr std::array<const char*, 8> exterior_slots{"Bottom", "South", "West", "North", "East", "Top", "Slot 6", "Slot 7"};
     static constexpr std::array<const char*, 8> interior_slots{"Floor", "North wall", "East wall", "South wall", "West wall", "Ceiling", "Opening frame", "Slot 7"};
 
-    // "Normal" or one of the building's pieces.
-    const auto block_combo = [&](const char* id, const char* normal, std::size_t& selection) {
-        selection = std::min(selection, building.piece_names.size());
-        const auto name = [&](std::size_t i) { return i == 0U ? std::string{normal} : "Piece: " + building.piece_names[i - 1U]; };
-        ImGui::SetNextItemWidth(-FLT_MIN);
-        if (ImGui::BeginCombo(id, name(selection).c_str())) {
-            for (std::size_t i = 0; i <= building.piece_names.size(); ++i) {
-                if (ImGui::Selectable(name(i).c_str(), i == selection)) selection = i;
-            }
-            ImGui::EndCombo();
+    const auto piece_picker = [&](const char* id, std::array<char, 128>& search, std::size_t& block) {
+        if (project.blocks.empty()) {
+            ImGui::TextDisabled("No blocks loaded.");
+            return;
         }
+        block = std::min(block, project.blocks.size() - 1U);
+        ImGui::Text("Piece: %s", project.blocks[block].name.c_str());
+        const auto picked = search_grid(id, search, project.blocks.size(), block, 48.0F, 132.0F,
+            [&](std::size_t i) -> const std::string& { return project.blocks[i].name; },
+            [&](std::size_t i) {
+                const auto* t = block_thumbnail(project, i);
+                return std::pair{t != nullptr ? t->texture.id : 0U, true};
+            });
+        if (picked) block = *picked;
     };
     // Each slot shows its material as a thumbnail; clicking opens a swatch grid.
     const auto texture_grid = [&](const char* label, std::array<std::size_t, 8>& materials, const std::array<const char*, 8>& names) {
         if (!ImGui::TreeNodeEx(label, ImGuiTreeNodeFlags_DefaultOpen)) return;
         if (building.materials.empty()) {
-            ImGui::TextDisabled("No materials in this building.");
+            ImGui::TextDisabled("No materials yet. Add some under Materials above.");
             ImGui::TreePop();
             return;
         }
@@ -582,6 +619,7 @@ void draw_block_tool_panel(EditorProject& project, EditorUi& ui) {
             const bool open = tex != nullptr && tex->id != 0U
                 ? rlImGuiImageButtonSize("##slot", tex, Vector2{30.0F, 30.0F})
                 : ImGui::Button("##slot", ImVec2(30.0F, 30.0F));
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s: %s", names[slot], building.materials[materials[slot]].c_str());
             ImGui::SameLine();
             ImGui::TextUnformatted(names[slot]);
             if (open) ImGui::OpenPopup("slot_swatches");
@@ -596,26 +634,38 @@ void draw_block_tool_panel(EditorProject& project, EditorUi& ui) {
         ImGui::TreePop();
     };
 
-    ImGui::SeparatorText("Exterior");
-    ImGui::Checkbox("Write exterior", &cfg.exterior);
+    static std::array<char, 128> exterior_search{};
+    static std::array<char, 128> interior_search{};
+    ImGui::SeparatorText("Block to place");
+    ImGui::Checkbox("Exterior", &cfg.exterior);
+    ImGui::SameLine(110.0F);
     ImGui::BeginDisabled(!cfg.exterior);
-    block_combo("##exterior_block", "Normal (solid shell)", cfg.exterior_block);
-    texture_grid("Exterior textures", cfg.exterior_textures, exterior_slots);
-    ImGui::EndDisabled();
-
-    ImGui::SeparatorText("Interior");
-    ImGui::Checkbox("Write interior", &cfg.interior);
-    ImGui::BeginDisabled(!cfg.interior);
-    block_combo("##interior_block", "Normal (room)", cfg.interior_block);
-    if (cfg.interior_block == 0U) {
-        field_label("Walls from");
-        catalog_combo("##block_buildblock", building.block_names, cfg.buildblock_index);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("The buildblock whose layers give the room's walls their windows and doors.");
+    ImGui::Checkbox("Piece##exterior", &cfg.exterior_piece);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Off: a plain solid block. On: a piece mesh (.sbl).");
+    if (cfg.exterior) {
+        if (cfg.exterior_piece) piece_picker("exterior_piece", exterior_search, cfg.exterior_piece_block);
+        texture_grid("Exterior textures", cfg.exterior_textures, exterior_slots);
     }
-    texture_grid("Interior textures", cfg.interior_textures, interior_slots);
     ImGui::EndDisabled();
 
-    if ((cfg.exterior && cfg.exterior_block != 0U) || (cfg.interior && cfg.interior_block != 0U)) {
+    ImGui::Checkbox("Interior", &cfg.interior);
+    ImGui::SameLine(110.0F);
+    ImGui::BeginDisabled(!cfg.interior);
+    ImGui::Checkbox("Piece##interior", &cfg.interior_piece);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Off: a room. On: a piece mesh (.sbl) inside the block.");
+    if (cfg.interior) {
+        if (cfg.interior_piece) {
+            piece_picker("interior_piece", interior_search, cfg.interior_piece_block);
+        } else if (!building.block_names.empty()) {
+            field_label("Room windows and doors from");
+            catalog_combo("##block_buildblock", building.block_names, cfg.buildblock_index);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("The buildblock (.sbl in buildblock/) whose layers give the room's walls their windows and doors.");
+        }
+        texture_grid("Interior textures", cfg.interior_textures, interior_slots);
+    }
+    ImGui::EndDisabled();
+
+    if ((cfg.exterior && cfg.exterior_piece) || (cfg.interior && cfg.interior_piece)) {
         static constexpr std::array<const char*, 4> rotations{"0\xC2\xB0", "90\xC2\xB0", "180\xC2\xB0", "270\xC2\xB0"};
         int rotation = static_cast<int>(cfg.rotation & 3U);
         field_label("Piece rotation");
@@ -629,10 +679,7 @@ void draw_block_tool_panel(EditorProject& project, EditorUi& ui) {
         ImGui::SetTooltip("On: a click writes the enabled layers into the block you click, e.g. to add a room to a shell.\n"
                           "Off: a click adds a block in the empty cell in front of the face.");
     }
-    if (!cfg.exterior && !cfg.interior) ImGui::TextColored(ImVec4(1.0F, 0.8F, 0.2F, 1.0F), "Enable Exterior or Interior to place.");
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-    ImGui::TextWrapped("Exterior is the outside of the cell; interior is the room inside it. Writing the interior also gives the room its floor.");
-    ImGui::PopStyleColor();
+    if (!cfg.exterior && !cfg.interior) ImGui::TextColored(ImVec4(1.0F, 0.8F, 0.2F, 1.0F), "Tick Exterior or Interior to place.");
 }
 
 void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& status) {
@@ -672,11 +719,16 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
         ImGui::TextWrapped("Drag an anchor arrow. The anchor snaps to whole cells.");
     if (ImGui::CollapsingHeader("Materials", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::TextDisabled("Ctrl/Cmd-click to select several materials.");
-        if (ImGui::BeginListBox("##materials", ImVec2(-FLT_MIN, 130))) {
+        if (ImGui::BeginListBox("##materials", ImVec2(-FLT_MIN, 150))) {
             for (std::size_t i = 0; i < building.materials.size(); ++i) {
                 ImGui::PushID(static_cast<int>(i));
+                const auto* tex = texture_for_material(project, building.materials[i]);
+                if (tex != nullptr && tex->id != 0U) rlImGuiImageSize(tex, 22, 22);
+                else ImGui::Dummy(ImVec2(22.0F, 22.0F));
+                ImGui::SameLine();
                 const auto it = std::find(ui.selected_materials.begin(), ui.selected_materials.end(), i);
-                if (ImGui::Selectable(building.materials[i].c_str(), it != ui.selected_materials.end())) {
+                const auto label = std::to_string(i) + "  " + building.materials[i] + (tex == nullptr ? "  (no texture)" : "");
+                if (ImGui::Selectable(label.c_str(), it != ui.selected_materials.end(), 0, ImVec2(0.0F, 22.0F))) {
                     if (!ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeySuper) ui.selected_materials = {i};
                     else if (it == ui.selected_materials.end()) ui.selected_materials.push_back(i);
                     else ui.selected_materials.erase(it);
@@ -686,17 +738,26 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
             }
             ImGui::EndListBox();
         }
-        field_label("New material");
-        ImGui::InputTextWithHint("##texture_name", "texture name", ui.new_material_name.data(), ui.new_material_name.size());
-        ImGui::BeginDisabled(ui.new_material_name[0] == '\0' || building.materials.size() >= 1024);
-        if (ImGui::Button("Add material")) {
-            const std::string material = ui.new_material_name.data();
-            if (std::find(building.materials.begin(), building.materials.end(), material) == building.materials.end()) {
+        // Add: click a texture, or type a name that is not loaded and press Enter.
+        const auto add_material = [&](const std::string& material) {
+            if (material.empty() || building.materials.size() >= 1024) return;
+            const auto key = lower_name(material);
+            if (std::ranges::none_of(building.materials, [&](const std::string& m) { return lower_name(m) == key; })) {
                 building.materials.push_back(material);
                 mark_building_changed(project, ui);
             }
+        };
+        ImGui::SeparatorText("Add material");
+        const auto picked = search_grid("add_material", ui.new_material_name, project.textures.size(), project.textures.size(), 36.0F, 120.0F,
+            [&](std::size_t i) -> const std::string& { return project.textures[i].name; },
+            [&](std::size_t i) { return std::pair{project.textures[i].texture.id, false}; });
+        if (picked) add_material(project.textures[*picked].name);
+        ImGui::BeginDisabled(ui.new_material_name[0] == '\0' || building.materials.size() >= 1024);
+        if (ImGui::Button("Add typed name")) {
+            add_material(ui.new_material_name.data());
             ui.new_material_name.fill(0);
         }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Adds the search text as a material name, for a texture that is not loaded here.");
         ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::BeginDisabled(ui.selected_materials.empty());

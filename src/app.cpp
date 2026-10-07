@@ -2073,21 +2073,28 @@ constexpr std::uint32_t kSolidInteriorBlock = 0x0000FFFFU;
 // and its texture set (slots 0..7); the interior word, cell type, placed flag
 // (bit 0: the room's floor) and interior set (slots 8..15). Shipped rooms carry
 // placed flag 1; without it a room has no floor.
-void apply_block_config(SbbCell& cell, const BlockToolConfig& config, const SbbBuilding& building) {
-    const auto word = [&](std::size_t selection, std::uint32_t normal) {
-        if (selection == 0U || building.piece_names.empty()) return normal;
-        const auto index = std::min(selection - 1U, building.piece_names.size() - 1U);
-        return 0x80000000U | (config.rotation & 3U) << 24U | static_cast<std::uint32_t>(index & 0x3ffU);
+void apply_block_config(SbbCell& cell, const BlockToolConfig& config, SbbBuilding& building, const EditorProject& project) {
+    const auto word = [&](bool piece, std::size_t block, std::uint32_t normal) {
+        if (!piece || project.blocks.empty()) return normal;
+        const auto key = lower_name(project.blocks[std::min(block, project.blocks.size() - 1U)].name);
+        auto it = std::ranges::find_if(building.piece_names, [&](const std::string& n) { return lower_name(n) == key; });
+        if (it == building.piece_names.end()) {
+            if (building.piece_names.size() > 0x3ffU) return normal;  // the word holds a 10-bit index
+            building.piece_names.push_back(project.blocks[std::min(block, project.blocks.size() - 1U)].name);
+            it = std::prev(building.piece_names.end());
+        }
+        const auto index = static_cast<std::uint32_t>(it - building.piece_names.begin());
+        return 0x80000000U | (config.rotation & 3U) << 24U | index;
     };
     const auto material = [&](std::size_t index) -> std::uint16_t {
         return building.materials.empty() ? std::uint16_t{0} : static_cast<std::uint16_t>(std::min(index, building.materials.size() - 1U));
     };
     if (config.exterior) {
-        cell.exterior_block() = word(config.exterior_block, kSolidExteriorBlock);
+        cell.exterior_block() = word(config.exterior_piece, config.exterior_piece_block, kSolidExteriorBlock);
         for (std::size_t slot = 0; slot < 8; ++slot) cell.shorts[slot] = material(config.exterior_textures[slot]);
     }
     if (config.interior) {
-        cell.interior_block() = word(config.interior_block, kSolidInteriorBlock);
+        cell.interior_block() = word(config.interior_piece, config.interior_piece_block, kSolidInteriorBlock);
         cell.cell_type() = static_cast<std::uint32_t>(
             building.block_names.empty() ? 0U : std::min(config.buildblock_index, building.block_names.size() - 1U));
         cell.placed_flag() = 1U;
@@ -2115,7 +2122,7 @@ std::optional<std::size_t> place_building_block(EditorProject& project, EditorUi
     }
     if (ui.block_config.apply_to_clicked) {
         auto& clicked = building.cells[pick.cell_index];
-        apply_block_config(clicked, ui.block_config, building);
+        apply_block_config(clicked, ui.block_config, building, project);
         mark_building_changed(project, ui);
         status = "changed block at [" + std::to_string(clicked.x) + "," + std::to_string(clicked.y) + "," + std::to_string(clicked.z) + "]";
         return pick.cell_index;
@@ -2146,7 +2153,7 @@ std::optional<std::size_t> place_building_block(EditorProject& project, EditorUi
         status = "neighbour cell already filled";
         return std::nullopt;
     }
-    apply_block_config(*target, ui.block_config, building);
+    apply_block_config(*target, ui.block_config, building, project);
     mark_building_changed(project, ui);
     status = "placed block at [" + std::to_string(target->x) + "," + std::to_string(target->y) + "," + std::to_string(target->z) + "]";
     return static_cast<std::size_t>(target - building.cells.data());
@@ -2801,28 +2808,58 @@ std::uint32_t encode_city_piece_word(const EditorUi& ui) {
         (static_cast<std::uint32_t>(ui.selected_piece_rotation & 3U) << 24U);
 }
 
+// The city block with this mesh name (empty = the game's solid "nblock" cube)
+// and one layer of these textures; appended when no record matches.
+std::optional<std::size_t> find_or_add_city_block(SbcMap& map, const std::string& name, const std::array<std::string, 8>& layer) {
+    const auto block = std::ranges::find_if(map.city_blocks, [&](const SbcCityBlock& candidate) {
+        return candidate.name == name && candidate.layers.size() == 1 && candidate.layers[0] == layer;
+    });
+    if (block != map.city_blocks.end()) return static_cast<std::size_t>(block - map.city_blocks.begin());
+    if (map.city_blocks.size() >= 4096) return std::nullopt;
+    map.city_blocks.push_back({map.city_blocks.size(), name, {layer}});
+    return map.city_blocks.size() - 1U;
+}
+
 void set_city_piece_voxel(EditorProject& project, EditorUi& ui, CityGridPoint point) {
-    if (!project.city || project.blocks.empty() || project.city->data.version < 11) return;
+    if (!project.city || project.city->data.version < 11 || (project.blocks.empty() && !ui.place_piece_solid)) return;
     auto& map = project.city->data;
-    ui.place_piece_mesh = std::min(ui.place_piece_mesh, project.blocks.size() - 1);
-    const auto& mesh = project.blocks[ui.place_piece_mesh];
+    std::string name;
+    if (!ui.place_piece_solid) {
+        ui.place_piece_mesh = std::min(ui.place_piece_mesh, project.blocks.size() - 1);
+        name = project.blocks[ui.place_piece_mesh].name;
+    }
     std::array<std::string, 8> layer{};
     if (!project.textures.empty()) layer.fill(project.textures[std::min(ui.place_piece_texture, project.textures.size() - 1)].name);
-    auto block = std::find_if(map.city_blocks.begin(), map.city_blocks.end(), [&](const auto& candidate) {
-        return candidate.name == mesh.name && candidate.layers.size() == 1 && candidate.layers[0] == layer;
-    });
-    if (block == map.city_blocks.end()) {
-        if (map.city_blocks.size() >= 4096) return;
-        map.city_blocks.push_back({map.city_blocks.size(), mesh.name, {layer}});
-        block = std::prev(map.city_blocks.end());
-    }
-    ui.selected_city_block = static_cast<std::size_t>(block - map.city_blocks.begin());
+    const auto block = find_or_add_city_block(map, name, layer);
+    if (!block) return;
+    ui.selected_city_block = *block;
     ui.selected_city_block_layer = 0;
     auto& portal = find_or_create_portal(project.city->data, point);
     if (portal.blocks.size() < 0x200) {
         portal.blocks.resize(0x200);
     }
     portal.blocks[local_portal_index(point)] = encode_city_piece_word(ui);
+    invalidate_portal_render_models(project);
+    ui.city_dirty = true;
+}
+
+// Repaints the selected piece: its voxel points at a city block with the same
+// mesh and these textures, keeping the rotation.
+void repaint_city_piece(EditorProject& project, EditorUi& ui, const std::array<std::string, 8>& textures, std::string& status) {
+    if (!project.city || !ui.selected_piece_voxel || project.city->data.version < 11) return;
+    auto& map = project.city->data;
+    const auto current = static_cast<std::size_t>(ui.selected_piece_word & 0xfffU);
+    if (current >= map.city_blocks.size()) return;
+    const auto block = find_or_add_city_block(map, std::string{map.city_blocks[current].name}, textures);
+    if (!block) {
+        status = "the map already has 4096 city blocks";
+        return;
+    }
+    const auto word = (ui.selected_piece_word & 0x03000000U) | (1U << 16U) | static_cast<std::uint32_t>(*block & 0xfffU);
+    auto& portal = find_or_create_portal(map, *ui.selected_piece_voxel);
+    if (portal.blocks.size() < 0x200) portal.blocks.resize(0x200);
+    portal.blocks[local_portal_index(*ui.selected_piece_voxel)] = word;
+    ui.selected_piece_word = word;
     invalidate_portal_render_models(project);
     ui.city_dirty = true;
 }
@@ -5831,7 +5868,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                         if (ui.city_tool == CityTool::Piece) {
                             if (const auto cell = raised(city_surface_cell_under_mouse(*project, camera, viewport_mouse_pos, last_viewport_size),
                                     ui.place_height_offset)) {
-                                const auto* mesh = project->blocks.empty()
+                                const auto* mesh = project->blocks.empty() || ui.place_piece_solid
                                     ? nullptr
                                     : &project->blocks[std::min(ui.place_piece_mesh, project->blocks.size() - 1U)].data;
                                 draw_piece_ghost(mesh, *cell, static_cast<std::int32_t>(ui.selected_piece_rotation & 3U));
@@ -6165,7 +6202,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                                     fresh.shorts.fill(0xffffU);
                                     edited.cells.push_back(fresh); cell = &edited.cells.back();
                                 }
-                                apply_block_config(*cell, ui.block_config, edited);
+                                apply_block_config(*cell, ui.block_config, edited, *project);
                                 ui.stroke_block_cells.assign(1, static_cast<std::size_t>(cell - edited.cells.data()));
                                 mark_building_changed(*project, ui);
                             }

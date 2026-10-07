@@ -374,11 +374,21 @@ void draw_viewport_overlays(EditorProject* project, EditorUi& ui, Camera3D& came
             if (ui.asset_drawer_open) {
                 if (drawer_pieces) {
                     ui.place_piece_mesh = std::min(ui.place_piece_mesh, project->blocks.size() - 1U);
-                    const auto picked = thumbnail_strip("##piece_strip", project->blocks.size(), ui.place_piece_mesh, search,
+                    // The game's solid cube: a city block with no mesh name.
+                    if (ImGui::Button("Solid\nblock\n(nblock)", ImVec2(94.0F, 94.0F))) ui.place_piece_solid = true;
+                    if (ui.place_piece_solid) {
+                        ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), IM_COL32(235, 190, 78, 255), 3.0F, 0, 3.0F);
+                    }
+                    help_tooltip(ui, "A plain solid cube with the chosen texture on every side");
+                    ImGui::SameLine();
+                    const auto picked = thumbnail_strip("##piece_strip", project->blocks.size(), ui.place_piece_solid ? project->blocks.size() : ui.place_piece_mesh, search,
                         [&](std::size_t i) -> const std::string& { return project->blocks[i].name; },
                         [&](std::size_t i) { return block_thumbnail(*project, i); },
                         [](std::size_t) {});
-                    if (picked) ui.place_piece_mesh = *picked;
+                    if (picked) {
+                        ui.place_piece_mesh = *picked;
+                        ui.place_piece_solid = false;
+                    }
                 } else {
                     const bool editing = ui.tab == EditorTab::Buildings;
                     const auto current = editing ? ui.selected_building : ui.place_building_template;
@@ -515,7 +525,7 @@ void draw_properties_window(EditorProject* project, EditorUi& ui, std::string& s
                 }
             } else if (ui.city_tool == CityTool::Piece && !project->blocks.empty()) {
                 ImGui::SeparatorText("Placing piece");
-                ImGui::TextUnformatted(project->blocks[std::min(ui.place_piece_mesh, project->blocks.size() - 1U)].name.c_str());
+                ImGui::TextUnformatted(ui.place_piece_solid ? "nblock (solid block)" : project->blocks[std::min(ui.place_piece_mesh, project->blocks.size() - 1U)].name.c_str());
                 if (!project->textures.empty()) {
                     ImGui::Text("Texture: %s", project->textures[std::min(ui.place_piece_texture, project->textures.size() - 1U)].name.c_str());
                 }
@@ -638,7 +648,49 @@ void draw_properties_window(EditorProject* project, EditorUi& ui, std::string& s
             const auto& city_blocks = project->city->data.city_blocks;
             const auto block_index = static_cast<std::size_t>(ui.selected_piece_word & 0xfffU);
             if (block_index < city_blocks.size()) {
-                ImGui::Text("Piece: %s", std::string{city_block_display_name(city_blocks[block_index])}.c_str());
+                const auto& city_block = city_blocks[block_index];
+                ImGui::Text("Piece: %s", std::string{city_block_display_name(city_block)}.c_str());
+                // Repaint: the 8 texture names of the layer the voxel uses.
+                const auto layer = std::min<std::size_t>(std::max(1U, (ui.selected_piece_word >> 16U) & 0x3fU) - 1U,
+                    city_block.layers.empty() ? 0U : city_block.layers.size() - 1U);
+                auto textures = city_block.layers.empty() ? std::array<std::string, 8>{} : city_block.layers[layer];
+                static std::array<char, 128> texture_search{};
+                static std::size_t repaint_slot{};
+                bool repaint = false;
+                ImGui::SeparatorText("Textures");
+                for (std::size_t slot = 0; slot <= textures.size(); ++slot) {
+                    ImGui::PushID(static_cast<int>(slot));
+                    const bool all = slot == textures.size();
+                    const auto* tex = all ? nullptr : find_project_texture(*project, textures[slot]);
+                    const bool open = tex != nullptr && tex->id != 0U
+                        ? ImGui::ImageButton("##t", ImTextureID(tex->id), ImVec2(30.0F, 30.0F))
+                        : ImGui::Button(all ? "All" : "?", ImVec2(38.0F, 38.0F));
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", all ? "Set every slot" : textures[slot].empty() ? "(none)" : textures[slot].c_str());
+                    if (open) {
+                        repaint_slot = slot;
+                        ImGui::OpenPopup("repaint");
+                    }
+                    if (ImGui::BeginPopup("repaint")) {
+                        ImGui::BeginChild("##repaint", ImVec2(320.0F, 250.0F));
+                        const auto picked = search_grid("repaint_grid", texture_search, project->textures.size(), project->textures.size(), 44.0F, 210.0F,
+                            [&](std::size_t i) -> const std::string& { return project->textures[i].name; },
+                            [&](std::size_t i) { return std::pair{project->textures[i].texture.id, false}; });
+                        ImGui::EndChild();
+                        if (picked) {
+                            if (repaint_slot == textures.size()) textures.fill(project->textures[*picked].name);
+                            else textures[repaint_slot] = project->textures[*picked].name;
+                            repaint = true;
+                            ImGui::CloseCurrentPopup();
+                        }
+                        ImGui::EndPopup();
+                    }
+                    if (slot % 5U != 4U && slot != textures.size()) ImGui::SameLine();
+                    ImGui::PopID();
+                }
+                if (repaint) {
+                    begin_city_action(*project, ui, "repaint piece");
+                    repaint_city_piece(*project, ui, textures, status);
+                }
             }
             ImGui::Text("Rotation: %u degrees", ((ui.selected_piece_word >> 24U) & 3U) * 90U);
             if (ui.selected_piece_voxel.has_value()) {

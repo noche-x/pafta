@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -547,11 +548,14 @@ enum class BuildingTool {
 struct BlockToolConfig {
     bool exterior{true};
     bool interior{false};
-    // 0 = normal (exterior: the solid shell 0x40000000; interior: the generated
-    // room 0xffff), n = piece n-1 of building.piece_names
-    // (0x80000000 | rotation << 24 | index).
-    std::size_t exterior_block{};
-    std::size_t interior_block{};
+    // Off = normal (exterior: the solid shell 0x40000000; interior: the
+    // generated room 0xffff). On = a piece (0x80000000 | rotation << 24 | index
+    // into building.piece_names); the block is picked from project.blocks and
+    // added to the building's piece list when placed.
+    bool exterior_piece{false};
+    bool interior_piece{false};
+    std::size_t exterior_piece_block{};
+    std::size_t interior_piece_block{};
     std::uint32_t rotation{};
     // Buildblock template (cell_type) for the room's walls; written with the interior.
     std::size_t buildblock_index{};
@@ -765,7 +769,7 @@ struct EditorUi {
     // Paint Texture tool: the material it writes and which side (exterior/interior
     // texture slots) it paints.
     std::vector<std::size_t> selected_materials;
-    std::array<char, 64> new_material_name{};
+    std::array<char, 128> new_material_name{};
     std::size_t material_selection_building{static_cast<std::size_t>(-1)};
     GizmoAxis anchor_axis{GizmoAxis::None};
     Vector2 anchor_drag_mouse{};
@@ -817,6 +821,8 @@ struct EditorUi {
     std::size_t selected_piece_rotation{};
     std::size_t place_piece_mesh{};
     std::size_t place_piece_texture{};
+    // Place the game's solid cube city block (empty name, shown as "nblock").
+    bool place_piece_solid{false};
     std::size_t selected_portal{};
     std::array<int, 3> new_portal_cell{};
     bool portal_preview_textured{true};
@@ -964,6 +970,12 @@ void draw_outliner_window(EditorProject* project, EditorUi& ui);
 std::string fit_label(const std::string& name, float width);
 // Left-hand label at a shared column for the next widget (ui_panels.cpp).
 void field_label(const char* label);
+// Search box over a wrapping grid of thumbnails; returns the clicked index
+// (ui_panels.cpp). `image(i)` gives a GL texture id (0 = none yet) and whether
+// it is a render target (stored upside down).
+std::optional<std::size_t> search_grid(const char* id, std::array<char, 128>& search, std::size_t count, std::size_t selected,
+    float size, float height, const std::function<const std::string&(std::size_t)>& name,
+    const std::function<std::pair<unsigned int, bool>(std::size_t)>& image);
 void draw_properties_window(EditorProject* project, EditorUi& ui, std::string& status);
 bool asset_search_matches(const EditorUi& ui, std::string_view name);
 void toggle_in_selection(std::vector<std::size_t>& set, std::size_t index);
@@ -1166,6 +1178,7 @@ struct RoadLay {
 };
 RoadLay lay_city_road(SbcMap& map, CityGridPoint start_point, CityGridPoint point, std::int32_t width, bool auto_generated);
 void set_city_piece_voxel(EditorProject& project, EditorUi& ui, CityGridPoint point);
+void repaint_city_piece(EditorProject& project, EditorUi& ui, const std::array<std::string, 8>& textures, std::string& status);
 void delete_city_street(EditorProject& project, EditorUi& ui);
 void nudge_city_block_slot(EditorProject& project, EditorUi& ui, int delta);
 void clear_city_block_slot(EditorProject& project, EditorUi& ui);

@@ -1057,9 +1057,11 @@ void draw_block_browser_window(EditorProject& project, EditorUi& ui) {
                 ui.browser_block = i;
                 ui.selected_block = i;
                 ui.place_piece_mesh = i;
+                ui.place_piece_solid = false;
             }
             if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && project.city) {
                 ui.place_piece_mesh = i;
+                ui.place_piece_solid = false;
                 ui.city_tool = CityTool::Piece;
                 ui.requested_tab = EditorTab::City;
             }
@@ -1081,6 +1083,7 @@ void draw_block_browser_window(EditorProject& project, EditorUi& ui) {
             ImGui::TextDisabled("%zu faces", asset.data.faces.size());
             if (project.city && ImGui::Button(ICON_FA_CUBE " Use as piece brush")) {
                 ui.place_piece_mesh = ui.browser_block;
+                ui.place_piece_solid = false;
                 ui.city_tool = CityTool::Piece;
                 ui.requested_tab = EditorTab::City;
             }
