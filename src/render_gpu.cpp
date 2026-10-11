@@ -23,6 +23,7 @@ void ImGui_ImplRaylib_UpdateTexture(ImTextureData* tex);
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <filesystem>
 #include <cstdio>

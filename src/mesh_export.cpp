@@ -8,10 +8,6 @@
 #include <future>
 #include <unordered_map>
 
-// raylib already links stb_image / stb_image_write; let tinygltf use the existing
-// symbols rather than recompiling them (avoids duplicate-symbol link errors). We
-// write texture PNGs via raylib's ExportImage, so tinygltf only needs glTF I/O.
-#define TINYGLTF_IMPLEMENTATION
 #define TINYGLTF_NO_STB_IMAGE
 #define TINYGLTF_NO_STB_IMAGE_WRITE
 #define TINYGLTF_NO_EXTERNAL_IMAGE

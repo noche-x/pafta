@@ -60,6 +60,13 @@ extern "C" int glfwGetKeyScancode(int key);
 
 namespace map_editor::app_internal {
 
+#ifndef __EMSCRIPTEN__
+std::string path_utf8(const std::filesystem::path& path) {
+    const auto bytes = path.u8string();
+    return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
+}
+#endif
+
 // A failure the user must see: status keeps showing it, and the "Operation
 // failed" popup opens once for it. Plain status text never opens the popup.
 std::string g_failure_message;
@@ -3359,12 +3366,13 @@ void export_map_image(EditorProject& project, const EditorUi& ui, std::string& s
     status = "downloaded " + name;
 #else
     NFD::Guard guard;
-    NFD::UniquePath selected;
-    const nfdnfilteritem_t filters[] = {{"PNG image", "png"}};
-    const auto result = NFD::SaveDialog(selected, filters, 1, project.root.string().c_str(), name.c_str());
+    NFD::UniquePathU8 selected;
+    const nfdu8filteritem_t filters[] = {{"PNG image", "png"}};
+    const auto default_dir = path_utf8(project.root);
+    const auto result = NFD::SaveDialog(selected, filters, 1, default_dir.c_str(), name.c_str());
     if (result == NFD_CANCEL) return;
     if (result == NFD_ERROR) { report_failure(status, std::string{"Map image export failed: "} + NFD::GetError()); return; }
-    const std::filesystem::path output{selected.get()};
+    const auto output = std::filesystem::u8path(selected.get());
     std::ofstream out(output, std::ios::binary);
     out.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
     if (!out) { report_failure(status, "Map image export failed: cannot write " + output.string()); return; }
@@ -3424,12 +3432,13 @@ void draw_city_upgrade_dialogs(EditorProject& project, EditorUi& ui, std::string
 void save_active_tab(EditorProject& project, EditorUi& ui, std::string& status) {
 #ifndef __EMSCRIPTEN__
     NFD::Guard guard;
-    NFD::UniquePath selected;
+    NFD::UniquePathU8 selected;
     const auto directory = project.city ? project.city->path.parent_path() : project.root;
-    const auto result = NFD::PickFolder(selected, directory.string().c_str());
+    const auto default_dir = path_utf8(directory);
+    const auto result = NFD::PickFolder(selected, default_dir.c_str());
     if (result == NFD_CANCEL) return;
     if (result == NFD_ERROR) { report_failure(status, std::string{"Map save failed: "} + NFD::GetError()); return; }
-    const auto output = std::filesystem::path{selected.get()};
+    const auto output = std::filesystem::u8path(selected.get());
 #else
     // No folder dialog in the browser: the files download.
     const auto output = project.root;
@@ -6990,14 +6999,14 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             const auto default_path = default_export_path(*project, ui, reason);
             // Native save dialog (NFD-e: Cocoa NSSavePanel on macOS, not osascript).
             NFD::Guard nfd_guard;
-            NFD::UniquePath out_path;
-            const nfdnfilteritem_t filters[1] = {{"glTF", "gltf"}};
-            const auto default_dir = default_path.parent_path().string();
-            const auto default_name = default_path.filename().string();
+            NFD::UniquePathU8 out_path;
+            const nfdu8filteritem_t filters[1] = {{"glTF", "gltf"}};
+            const auto default_dir = path_utf8(default_path.parent_path());
+            const auto default_name = path_utf8(default_path.filename());
             const auto result = NFD::SaveDialog(
                 out_path, filters, 1, default_dir.c_str(), default_name.c_str());
             if (result == NFD_OKAY) {
-                mesh_export_task = start_mesh_export(*project, ui, std::filesystem::path{out_path.get()}, export_options, status);
+                mesh_export_task = start_mesh_export(*project, ui, std::filesystem::u8path(out_path.get()), export_options, status);
             } else if (result == NFD_ERROR) {
                 report_failure(status, std::string("Export: dialog error: ") + NFD::GetError());
             }

@@ -190,6 +190,7 @@ if(NOT EMSCRIPTEN)
     src/file_dialogs.cpp
     src/main.cpp
     src/mesh_export.cpp
+    src/tinygltf_impl.cpp
     src/render_gpu.cpp
     src/ui_panels.cpp
     src/ui_limits_buildblock.cpp
@@ -295,7 +296,7 @@ if(MAP_EDITOR_CPP_BUILD_TESTS AND NOT EMSCRIPTEN)
   endif()
   add_test(NAME editor_state_tests COMMAND editor_state_tests)
 
-  add_executable(mesh_export_tests tests/mesh_export_tests.cpp src/mesh_export.cpp)
+  add_executable(mesh_export_tests tests/mesh_export_tests.cpp src/mesh_export.cpp src/tinygltf_impl.cpp)
   target_include_directories(mesh_export_tests PRIVATE "${tinygltf_SOURCE_DIR}")
   target_link_libraries(mesh_export_tests PRIVATE map_editor_core imgui_rlimgui raylib)
   target_compile_definitions(mesh_export_tests PRIVATE
