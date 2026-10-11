@@ -1280,6 +1280,36 @@ CsxArchive parse_csx(const std::vector<std::uint8_t>& bytes) {
     return archive;
 }
 
+std::vector<SisItem> parse_sis(const std::vector<std::uint8_t>& bytes) {
+    const BinaryReader reader{bytes};
+    const auto vec = [&](std::size_t o) { return Vec3f{reader.f32(o), reader.f32(o + 4), reader.f32(o + 8)}; };
+    // version (1), count, then 64-byte type name, position and 3 rotation rows.
+    std::vector<SisItem> items(safe_record_count(reader.u32(4), 4096U));
+    for (std::size_t i = 0, o = 8; i < items.size(); ++i, o += 112) {
+        items[i] = {reader.ascii(o, 64), vec(o + 64), {vec(o + 76), vec(o + 88), vec(o + 100)}};
+    }
+    return items;
+}
+
+It3Mesh parse_it3(const std::vector<std::uint8_t>& bytes) {
+    const BinaryReader reader{bytes};
+    It3Mesh mesh;
+    // version 3, chunk id 0, render sub-version, then vertices and faces.
+    if (reader.i32(0) != 3 || reader.i32(4) != 0) return mesh;
+    std::size_t o = 16;
+    mesh.vertices.resize(safe_record_count(reader.u32(12), 65536U));
+    for (auto& v : mesh.vertices) { v = {reader.f32(o), reader.f32(o + 4), reader.f32(o + 8)}; o += 12; }
+    mesh.faces.resize(safe_record_count(reader.u32(o), 65536U));
+    o += 4;
+    for (auto& face : mesh.faces) {
+        face.resize(safe_record_count(reader.u32(o), 64U));
+        o += 4;
+        // Each corner: vertex index then its UV.
+        for (auto& index : face) { index = reader.u32(o); o += 12; }
+    }
+    return mesh;
+}
+
 CsxArchive parse_csx_file(const std::filesystem::path& path) {
     return parse_csx(read_file_bytes(path));
 }
@@ -1288,17 +1318,16 @@ CsxArchive parse_csx_file(const std::filesystem::path& path) {
 // Patch and Rebuild Writers
 // -----------------------------------------------------------------------------
 
-std::vector<std::uint8_t> patch_sbb_cell(const std::vector<std::uint8_t>& bytes, const SbbBuilding& building, const SbbCell& cell) {
-    BinaryWriter writer{bytes};
+static void write_sbb_cell(BinaryWriter& writer, const SbbBuilding& building, const SbbCell& cell) {
     const auto cell_volume_offset = sbb_table_offset(building.version)
         + building.materials.size() * 0x40
         + 4 + building.piece_names.size() * 0x40
         + 4 + building.block_names.size() * 0x40
         + 4 + building.item_set_names.size() * 0x40;
+    if (cell.index >= sbb_cell_count(building) || cell_volume_offset > writer.raw().size() ||
+        cell.index >= (writer.raw().size() - cell_volume_offset) / 0x3c)
+        throw std::runtime_error("SBB cell index exceeds file data");
     const auto cell_offset = cell_volume_offset + cell.index * 0x3c;
-    if (cell_offset + 0x3c > bytes.size()) {
-        return std::move(writer).bytes();
-    }
 
     for (std::size_t index = 0; index < cell.words.size(); ++index) {
         writer.u32(cell_offset + index * 4, cell.words[index]);
@@ -1307,15 +1336,18 @@ std::vector<std::uint8_t> patch_sbb_cell(const std::vector<std::uint8_t>& bytes,
         writer.u16(cell_offset + 24 + index * 2, cell.shorts[index]);
     }
     writer.u32(cell_offset + 56, cell.item_set_index);
+}
+
+std::vector<std::uint8_t> patch_sbb_cell(const std::vector<std::uint8_t>& bytes, const SbbBuilding& building, const SbbCell& cell) {
+    BinaryWriter writer{bytes};
+    write_sbb_cell(writer, building, cell);
     return std::move(writer).bytes();
 }
 
 std::vector<std::uint8_t> patch_sbb_cells(const std::vector<std::uint8_t>& bytes, const SbbBuilding& building) {
-    auto patched = bytes;
-    for (const auto& cell : building.cells) {
-        patched = patch_sbb_cell(patched, building, cell);
-    }
-    return patched;
+    BinaryWriter writer{bytes};
+    for (const auto& cell : building.cells) write_sbb_cell(writer, building, cell);
+    return std::move(writer).bytes();
 }
 
 std::vector<std::uint8_t> rebuild_sbb(const SbbBuilding& building) {
@@ -1420,7 +1452,7 @@ std::vector<std::uint8_t> patch_sbc_building(const std::vector<std::uint8_t>& by
         return std::move(writer).bytes();
     }
 
-    writer.ascii(offset, 0x40, building.name);
+    if (reader.ascii(offset, 0x40) != building.name) writer.ascii(offset, 0x40, building.name);
     writer.i32(offset + 0x40, building.x);
     writer.i32(offset + 0x44, building.y);
     writer.i32(offset + 0x48, building.z);
@@ -1456,7 +1488,8 @@ std::vector<std::uint8_t> patch_sbc_streets(const std::vector<std::uint8_t>& byt
         writer.i32(street_offset + 8, street.district);
         writer.i32(street_offset + 12, street.left_width);
         writer.i32(street_offset + 16, street.right_width);
-        writer.ascii(street_offset + 20, 0x20, street.name);
+        if (reader.ascii(street_offset + 20, 0x20) != street.name)
+            writer.ascii(street_offset + 20, 0x20, street.name);
     }
 
     return std::move(writer).bytes();
@@ -1498,7 +1531,7 @@ std::vector<std::uint8_t> patch_sbc_city_blocks(const std::vector<std::uint8_t>&
     const auto count = std::min<std::size_t>(city_block_count, map.city_blocks.size());
     for (std::size_t index = 0; index < count && offset + 0x40 <= bytes.size(); ++index) {
         const auto& city_block = map.city_blocks[index];
-        writer.ascii(offset, 0x40, city_block.name);
+        if (reader.ascii(offset, 0x40) != city_block.name) writer.ascii(offset, 0x40, city_block.name);
         offset += 0x40;
 
         std::uint32_t layer_count = 1;
@@ -1518,7 +1551,8 @@ std::vector<std::uint8_t> patch_sbc_city_blocks(const std::vector<std::uint8_t>&
                     return std::move(writer).bytes();
                 }
                 if (layer < city_block.layers.size()) {
-                    writer.ascii(slot_offset, 0x40, city_block.layers[layer][slot]);
+                    if (reader.ascii(slot_offset, 0x40) != city_block.layers[layer][slot])
+                        writer.ascii(slot_offset, 0x40, city_block.layers[layer][slot]);
                 }
             }
         }

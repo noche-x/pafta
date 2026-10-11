@@ -2,7 +2,9 @@
 
 **Source binary:** `editor.exe`  
 **Fresh Ghidra program:** `/codex_temp/editor.exe`  
-**Analysis date:** 2026-08-24
+**Source SHA-256:** `957af3bd6ea6e990aecbd1f9ba49887a7d1312bee8f6931b12c272087f4608eb`
+
+**Analysis dates:** 2026-08-24, 2026-10-11
 
 ## Main render path
 
@@ -23,6 +25,23 @@ The canvas sets its work plane to `floor * 4`. All cell positions use the native
 
 The Buildings viewport now draws the proven 65-line grid and fourth-line cadence in the same anchor-relative coordinate space as its mesh and picker. It also draws the saved SBB footprint as a red work bound. Its floor selector uses `size_z`, which is the parsed SBB height. The old selector used `size_y`, which is map depth. Thumbnail framing, selection focus, and city frustum bounds now use the same axis mapping.
 
-The current port has no native-equivalent portal, itemset, or agent tool mode. Their mode-specific markers are therefore not drawn. The native cursor cross also depends on a free grid-plane cursor; the current picker only identifies occupied cells or hit faces. Adding marker-only controls without the matching edit operation would give false feedback, so this remains open.
+The Building editor now has an item-set tool. It edits the packed item-set word
+on a clicked block, offers the building's item-set name table, and draws a
+yellow placement guide for nonzero words. It discovers loose `.sis` names in
+the map's `itemset/` folder or the adjacent `data/itemset/` folder. The game
+loads the `.sis` definition and its `.it3` items separately; Pafta does not
+render those item meshes or author `.sis` files.
+
+The native `FUN_140059150 @ 0x140059150` reads item-set definitions, and
+`FUN_14007be50 @ 0x14007be50` resolves each placed set's low 10 name-index
+bits and bits 24-25 for rotation. The latter bit operations were checked in
+the instruction bytes at `0x14007be90`-`0x14007bea6`. Shipped SBB files
+confirm the `0x40000000 | rotation << 24 | index` form. The new tool's click
+flow and yellow guide are Pafta interface choices, not claimed native UI
+parity.
+
+The port still has no native-equivalent portal or agent tool mode. The native
+cursor cross also depends on a free grid-plane cursor; the current picker
+only identifies occupied cells or hit faces. Their markers remain open.
 
 The preview-camera marker also remains open because its per-view runtime fields are not represented in the file model.

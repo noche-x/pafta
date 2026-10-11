@@ -69,24 +69,24 @@
     {
       "name": "dev",
       "configurePreset": "dev",
-      "targets": ["map_editor_cpp", "map_editor_tests"]
+      "targets": ["map_editor_cpp", "map_editor_tests", "binary_export_tests", "editor_state_tests", "mesh_export_tests"]
     },
     {
       "name": "dev-msvc",
       "configurePreset": "dev-msvc",
       "configuration": "Debug",
-      "targets": ["map_editor_cpp", "map_editor_tests"]
+      "targets": ["map_editor_cpp", "map_editor_tests", "binary_export_tests", "editor_state_tests", "mesh_export_tests"]
     },
     {
       "name": "ci",
       "configurePreset": "ci",
-      "targets": ["map_editor_cpp", "map_editor_tests"]
+      "targets": ["map_editor_cpp", "map_editor_tests", "binary_export_tests", "editor_state_tests", "mesh_export_tests"]
     },
     {
       "name": "ci-msvc",
       "configurePreset": "ci-msvc",
       "configuration": "Release",
-      "targets": ["map_editor_cpp", "map_editor_tests"]
+      "targets": ["map_editor_cpp", "map_editor_tests", "binary_export_tests", "editor_state_tests", "mesh_export_tests"]
     }
   ],
   "testPresets": [

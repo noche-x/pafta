@@ -167,6 +167,7 @@ const char* tool_hint(const EditorUi& ui) {
             case BuildingTool::Select: return "Click a block to select it. Delete removes it; Tab cycles blocks.";
             case BuildingTool::PlaceBlock: return "Click a face to add a block against it; drag to keep adding.";
             case BuildingTool::PaintTexture: return ui.paint_side_code ? "Pick a wall type in Properties, then click walls." : "Pick a material in Properties, then click or drag over faces.";
+            case BuildingTool::ItemSet: return "Pick an item set in Properties, then click a block. Delete clears the selected block's set.";
             case BuildingTool::Anchor: return "Drag an arrow to move the building's anchor. Esc cancels.";
         }
         return "";
@@ -253,8 +254,10 @@ void draw_viewport_overlays(EditorProject* project, EditorUi& ui, Camera3D& came
                     {ICON_FA_SQUARE_PLUS, BuildingTool::PlaceBlock, "Add block"},
                     {ICON_FA_PAINTBRUSH, BuildingTool::PaintTexture, "Paint faces"},
                     {ICON_FA_ANCHOR, BuildingTool::Anchor, "Move anchor"},
+                    {ICON_FA_OBJECT_GROUP, BuildingTool::ItemSet, "Place item set"},
                 };
-                const EditorAction keys[] = {EditorAction::ToolSelect, EditorAction::ToolBuilding, EditorAction::ToolRoad, EditorAction::ToolPiece};
+                const EditorAction keys[] = {EditorAction::ToolSelect, EditorAction::ToolBuilding, EditorAction::ToolRoad,
+                    EditorAction::ToolPiece, EditorAction::ToolErase};
                 for (std::size_t t = 0; t < std::size(tools); ++t) {
                     if (t != 0) ImGui::SameLine();
                     if (tool_button(tools[t].icon, ui.building_tool == tools[t].tool, ui, tools[t].tip, keys[t])) ui.building_tool = tools[t].tool;

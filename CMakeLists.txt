@@ -11,7 +11,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(MAP_EDITOR_CPP_BUILD_TESTS "Build map_editor_cpp tests" ON)
 option(MAP_EDITOR_CPP_ENABLE_PROFILER "Build map_editor_cpp with yse/easy_profiler instrumentation" OFF)
+option(MAP_EDITOR_CPP_ENABLE_COVERAGE "Instrument editor code for LLVM source coverage" OFF)
 option(MAP_EDITOR_CPP_BUILD_WEB "Build the browser/WASM editor shell" OFF)
+set(MAP_EDITOR_CPP_FIXTURE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." CACHE PATH
+  "SRC workspace root containing server/data/test2 for fixture tests")
 set(MAP_EDITOR_CPP_WEB_PRELOAD_PROJECT "" CACHE PATH
   "QA-only map folder to embed at /web_project in the Emscripten build")
 
@@ -31,6 +34,19 @@ if(EMSCRIPTEN)
 elseif(MAP_EDITOR_CPP_WEB_PRELOAD_PROJECT)
   message(FATAL_ERROR
     "MAP_EDITOR_CPP_WEB_PRELOAD_PROJECT is only supported for Emscripten builds")
+endif()
+
+if(MAP_EDITOR_CPP_ENABLE_COVERAGE)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR EMSCRIPTEN)
+    message(FATAL_ERROR "Source coverage requires a native Clang build")
+  endif()
+  function(map_editor_enable_coverage target)
+    target_compile_options(${target} PRIVATE -fprofile-instr-generate -fcoverage-mapping)
+    get_target_property(target_type ${target} TYPE)
+    if(target_type STREQUAL "EXECUTABLE")
+      target_link_options(${target} PRIVATE -fprofile-instr-generate)
+    endif()
+  endfunction()
 endif()
 
 include(FetchContent)
@@ -152,6 +168,9 @@ add_library(map_editor_core
   src/scene.cpp
 )
 target_include_directories(map_editor_core PUBLIC src)
+if(MAP_EDITOR_CPP_ENABLE_COVERAGE)
+  map_editor_enable_coverage(map_editor_core)
+endif()
 if(MAP_EDITOR_CPP_ENABLE_PROFILER)
   target_compile_definitions(map_editor_core PUBLIC
     BUILD_WITH_EASY_PROFILER
@@ -183,6 +202,9 @@ if(NOT EMSCRIPTEN)
     "${tinygltf_SOURCE_DIR}"
   )
   target_link_libraries(map_editor_cpp PRIVATE map_editor_core imgui_rlimgui raylib nfd)
+  if(MAP_EDITOR_CPP_ENABLE_COVERAGE)
+    map_editor_enable_coverage(map_editor_cpp)
+  endif()
   if(MAP_EDITOR_CPP_ENABLE_PROFILER)
     target_compile_definitions(map_editor_cpp PRIVATE
       BUILD_WITH_EASY_PROFILER
@@ -258,66 +280,98 @@ endif()
 
 if(MAP_EDITOR_CPP_BUILD_TESTS AND NOT EMSCRIPTEN)
   enable_testing()
+  add_executable(binary_export_tests tests/binary_export_tests.cpp)
+  target_link_libraries(binary_export_tests PRIVATE map_editor_core)
+  if(MAP_EDITOR_CPP_ENABLE_COVERAGE)
+    map_editor_enable_coverage(binary_export_tests)
+  endif()
+  add_test(NAME binary_export_tests COMMAND binary_export_tests)
+
+  add_executable(editor_state_tests tests/editor_state_tests.cpp)
+  target_link_libraries(editor_state_tests PRIVATE map_editor_core)
+  if(MAP_EDITOR_CPP_ENABLE_COVERAGE)
+    map_editor_enable_coverage(editor_state_tests)
+  endif()
+  add_test(NAME editor_state_tests COMMAND editor_state_tests)
+
+  add_executable(mesh_export_tests tests/mesh_export_tests.cpp src/mesh_export.cpp)
+  target_include_directories(mesh_export_tests PRIVATE "${tinygltf_SOURCE_DIR}")
+  target_link_libraries(mesh_export_tests PRIVATE map_editor_core imgui_rlimgui raylib)
+  target_compile_definitions(mesh_export_tests PRIVATE
+    MAP_EDITOR_CPP_TEST_OUTPUT_ROOT="${CMAKE_CURRENT_BINARY_DIR}/mesh_export_test")
+  if(MAP_EDITOR_CPP_ENABLE_COVERAGE)
+    map_editor_enable_coverage(mesh_export_tests)
+  endif()
+  add_test(NAME mesh_export_tests COMMAND mesh_export_tests)
+
   add_executable(map_editor_tests tests/parser_tests.cpp)
   target_link_libraries(map_editor_tests PRIVATE map_editor_core)
   target_compile_definitions(map_editor_tests PRIVATE
-    MAP_EDITOR_CPP_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/.."
+    MAP_EDITOR_CPP_FIXTURE_ROOT="${MAP_EDITOR_CPP_FIXTURE_ROOT}"
   )
+  if(MAP_EDITOR_CPP_ENABLE_COVERAGE)
+    map_editor_enable_coverage(map_editor_tests)
+  endif()
   target_compile_options(map_editor_tests PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/W4>
     $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
   )
-  add_test(NAME map_editor_tests COMMAND map_editor_tests)
-  add_test(
-    NAME map_editor_cpp_check_sbb
-    COMMAND map_editor_cpp --check "${CMAKE_CURRENT_SOURCE_DIR}/../server/data/test2/building/test.sbb"
-  )
-  add_test(
-    NAME map_editor_cpp_check_sbc
-    COMMAND map_editor_cpp --check "${CMAKE_CURRENT_SOURCE_DIR}/../server/data/test2/city2.sbc"
-  )
-  add_test(
-    NAME map_editor_cpp_check_sbl_buildblock
-    COMMAND map_editor_cpp --check "${CMAKE_CURRENT_SOURCE_DIR}/../server/data/test2/buildblock/test.sbl"
-  )
-  add_test(
-    NAME map_editor_cpp_check_sbl_block
-    COMMAND map_editor_cpp --check "${CMAKE_CURRENT_SOURCE_DIR}/../server/data/test2/block/astairwellfloor.sbl"
-  )
-  add_test(
-    NAME map_editor_cpp_check_csx
-    COMMAND map_editor_cpp --check "${CMAKE_CURRENT_SOURCE_DIR}/../server/data/test2/test.csx"
-  )
-  add_test(
-    NAME map_editor_cpp_edit_sbb_cell
-    COMMAND "${CMAKE_COMMAND}"
-      -D "MAP_EDITOR_CPP_EXE=$<TARGET_FILE:map_editor_cpp>"
-      -D "FIXTURE=${CMAKE_CURRENT_SOURCE_DIR}/../server/data/test2/building/test.sbb"
-      -D "WORK=${CMAKE_CURRENT_BINARY_DIR}/edit_sbb_cell"
-      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/edit_sbb_cell.cmake"
-  )
-  add_test(
-    NAME map_editor_cpp_edit_sbc_building
-    COMMAND "${CMAKE_COMMAND}"
-      -D "MAP_EDITOR_CPP_EXE=$<TARGET_FILE:map_editor_cpp>"
-      -D "FIXTURE=${CMAKE_CURRENT_SOURCE_DIR}/../server/data/test2/city2.sbc"
-      -D "WORK=${CMAKE_CURRENT_BINARY_DIR}/edit_sbc_building"
-      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/edit_sbc_building.cmake"
-  )
-  add_test(
-    NAME map_editor_cpp_edit_sbl_word
-    COMMAND "${CMAKE_COMMAND}"
-      -D "MAP_EDITOR_CPP_EXE=$<TARGET_FILE:map_editor_cpp>"
-      -D "FIXTURE=${CMAKE_CURRENT_SOURCE_DIR}/../server/data/test2/buildblock/test.sbl"
-      -D "WORK=${CMAKE_CURRENT_BINARY_DIR}/edit_sbl_word"
-      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/edit_sbl_word.cmake"
-  )
-  add_test(
-    NAME map_editor_cpp_edit_sbl_layer_portal
-    COMMAND "${CMAKE_COMMAND}"
-      -D "MAP_EDITOR_CPP_EXE=$<TARGET_FILE:map_editor_cpp>"
-      -D "FIXTURE=${CMAKE_CURRENT_SOURCE_DIR}/../server/data/test2/buildblock/test.sbl"
-      -D "WORK=${CMAKE_CURRENT_BINARY_DIR}/edit_sbl_layer_portal"
-      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/edit_sbl_layer_portal.cmake"
-  )
+  add_test(NAME map_editor_portable_tests COMMAND map_editor_tests --portable)
+  if(EXISTS "${MAP_EDITOR_CPP_FIXTURE_ROOT}/server/data/test2/city2.sbc")
+    add_test(NAME map_editor_tests COMMAND map_editor_tests)
+    add_test(NAME binary_fixture_exports
+      COMMAND binary_export_tests "${MAP_EDITOR_CPP_FIXTURE_ROOT}/server/data/test2")
+    add_test(
+      NAME map_editor_cpp_check_sbb
+      COMMAND map_editor_cpp --check "${MAP_EDITOR_CPP_FIXTURE_ROOT}/server/data/test2/building/test.sbb"
+    )
+    add_test(
+      NAME map_editor_cpp_check_sbc
+      COMMAND map_editor_cpp --check "${MAP_EDITOR_CPP_FIXTURE_ROOT}/server/data/test2/city2.sbc"
+    )
+    add_test(
+      NAME map_editor_cpp_check_sbl_buildblock
+      COMMAND map_editor_cpp --check "${MAP_EDITOR_CPP_FIXTURE_ROOT}/server/data/test2/buildblock/test.sbl"
+    )
+    add_test(
+      NAME map_editor_cpp_check_sbl_block
+      COMMAND map_editor_cpp --check "${MAP_EDITOR_CPP_FIXTURE_ROOT}/server/data/test2/block/astairwellfloor.sbl"
+    )
+    add_test(
+      NAME map_editor_cpp_check_csx
+      COMMAND map_editor_cpp --check "${MAP_EDITOR_CPP_FIXTURE_ROOT}/server/data/test2/test.csx"
+    )
+    add_test(
+      NAME map_editor_cpp_edit_sbb_cell
+      COMMAND "${CMAKE_COMMAND}"
+        -D "MAP_EDITOR_CPP_EXE=$<TARGET_FILE:map_editor_cpp>"
+        -D "FIXTURE=${MAP_EDITOR_CPP_FIXTURE_ROOT}/server/data/test2/building/test.sbb"
+        -D "WORK=${CMAKE_CURRENT_BINARY_DIR}/edit_sbb_cell"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/edit_sbb_cell.cmake"
+    )
+    add_test(
+      NAME map_editor_cpp_edit_sbc_building
+      COMMAND "${CMAKE_COMMAND}"
+        -D "MAP_EDITOR_CPP_EXE=$<TARGET_FILE:map_editor_cpp>"
+        -D "FIXTURE=${MAP_EDITOR_CPP_FIXTURE_ROOT}/server/data/test2/city2.sbc"
+        -D "WORK=${CMAKE_CURRENT_BINARY_DIR}/edit_sbc_building"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/edit_sbc_building.cmake"
+    )
+    add_test(
+      NAME map_editor_cpp_edit_sbl_word
+      COMMAND "${CMAKE_COMMAND}"
+        -D "MAP_EDITOR_CPP_EXE=$<TARGET_FILE:map_editor_cpp>"
+        -D "FIXTURE=${MAP_EDITOR_CPP_FIXTURE_ROOT}/server/data/test2/buildblock/test.sbl"
+        -D "WORK=${CMAKE_CURRENT_BINARY_DIR}/edit_sbl_word"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/edit_sbl_word.cmake"
+    )
+    add_test(
+      NAME map_editor_cpp_edit_sbl_layer_portal
+      COMMAND "${CMAKE_COMMAND}"
+        -D "MAP_EDITOR_CPP_EXE=$<TARGET_FILE:map_editor_cpp>"
+        -D "FIXTURE=${MAP_EDITOR_CPP_FIXTURE_ROOT}/server/data/test2/buildblock/test.sbl"
+        -D "WORK=${CMAKE_CURRENT_BINARY_DIR}/edit_sbl_layer_portal"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/edit_sbl_layer_portal.cmake"
+    )
+  endif()
 endif()

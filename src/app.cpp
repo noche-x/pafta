@@ -1040,6 +1040,34 @@ std::optional<EditorProject> load_project_folder(const std::filesystem::path& fo
     MAPED_PROFILE_END_BLOCK;
     if (stage) stage->store(4);
 
+    // Item sets are loose game assets beside a map folder (data/itemset), or
+    // inside a self-contained map folder. SBB stores their names and placements.
+    for (const auto& dir : {root / "itemset", root.parent_path() / "itemset"}) {
+        for (const auto& path : files_with_extension(dir, ".sis")) {
+            const auto name = stem_name(path);
+            if (std::ranges::none_of(project.item_set_catalog, [&](const std::string& loaded) {
+                    return lower_name(loaded) == lower_name(name);
+                })) project.item_set_catalog.push_back(name);
+            if (project.item_sets.contains(lower_name(name))) continue;
+            try {
+                auto items = parse_sis(read_file_bytes(path));
+                for (const auto& item : items) {
+                    const auto type = lower_name(item.type);
+                    if (project.item_meshes.contains(type)) continue;
+                    // Only types with a data/item mesh draw; the rest keep the guide.
+                    for (const auto& mesh : {root / "item" / (item.type + ".it3"), root.parent_path() / "item" / (item.type + ".it3")}) {
+                        if (!std::filesystem::exists(mesh)) continue;
+                        project.item_meshes[type] = parse_it3(read_file_bytes(mesh));
+                        break;
+                    }
+                }
+                project.item_sets[lower_name(name)] = std::move(items);
+            } catch (const std::exception& error) {
+                project.load_warnings.push_back(path.filename().string() + ": " + error.what());
+            }
+        }
+    }
+
     if (load_textures) {
         MAPED_PROFILE_BLOCK("load project textures");
         load_project_textures(project);
@@ -2157,6 +2185,34 @@ std::optional<std::size_t> place_building_block(EditorProject& project, EditorUi
     mark_building_changed(project, ui);
     status = "placed block at [" + std::to_string(target->x) + "," + std::to_string(target->y) + "," + std::to_string(target->z) + "]";
     return static_cast<std::size_t>(target - building.cells.data());
+}
+
+void place_building_item_set(EditorProject& project, EditorUi& ui, std::size_t cell_index, std::string& status) {
+    auto& building = project.buildings[ui.selected_building].data;
+    if (cell_index >= building.cells.size()) return;
+    if (!ui.clear_item_set && ui.selected_item_set >= building.item_set_names.size()) {
+        status = "add an item-set name in Properties first";
+        return;
+    }
+    auto& cell = building.cells[cell_index];
+    const auto occupied = occupied_cell_indices(building);
+    const auto selected = std::ranges::find(occupied, cell_index);
+    if (selected != occupied.end()) ui.selected_building_cell = static_cast<std::size_t>(selected - occupied.begin());
+    std::uint32_t value = 0U;
+    if (!ui.clear_item_set) {
+        const auto packed = sbb_item_set_payload(ui.selected_item_set, ui.item_set_rotation);
+        if (!packed) {
+            status = "item-set index or rotation does not fit the game's placement word";
+            return;
+        }
+        value = *packed;
+    }
+    if (cell.item_set_index == value) return;
+    cell.item_set_index = value;
+    mark_building_changed(project, ui);
+    const auto action = ui.clear_item_set ? std::string{"cleared item set"} : "placed " + building.item_set_names[ui.selected_item_set];
+    status = action + " at [" +
+        std::to_string(cell.x) + "," + std::to_string(cell.y) + "," + std::to_string(cell.z) + "]";
 }
 
 // Paint Texture: write the chosen material into the texture slot of the face
@@ -5000,12 +5056,12 @@ void handle_editor_hotkeys(
     }
     if (action_pressed(ui, EditorAction::ToggleShadows)) { ui.render_shadows = !ui.render_shadows; save_preferences(ui); }
     if (action_pressed(ui, EditorAction::ToggleSky)) { ui.render_sky = !ui.render_sky; save_preferences(ui); }
-    // Number keys pick tools in both modes: 1-5 in the city, 1-4 in the
-    // building editor (Select, Add block, Paint, Anchor).
+    // Number keys pick tools in both modes: 1-5 in the city and building editors.
     if (ui.tab == EditorTab::Buildings) {
         const std::pair<EditorAction, BuildingTool> building_tool_actions[] = {
             {EditorAction::ToolSelect, BuildingTool::Select}, {EditorAction::ToolBuilding, BuildingTool::PlaceBlock},
             {EditorAction::ToolRoad, BuildingTool::PaintTexture}, {EditorAction::ToolPiece, BuildingTool::Anchor},
+            {EditorAction::ToolErase, BuildingTool::ItemSet},
         };
         for (const auto& [action, tool] : building_tool_actions) {
             if (action_pressed(ui, action)) ui.building_tool = tool;
@@ -5133,9 +5189,16 @@ void handle_editor_hotkeys(
             auto& building = project.buildings[ui.selected_building].data;
             const auto index = occupied[std::min(ui.selected_building_cell, occupied.size() - 1)];
             auto& cell = building.cells[index];
-            cell.words.fill(0); cell.item_set_index = 0; cell.payloads.clear(); cell.occupied = false;
-            cell.shorts.fill(0xffffU);
-            mark_building_changed(project, ui);
+            if (ui.building_tool == BuildingTool::ItemSet) {
+                if (cell.item_set_index != 0U) {
+                    cell.item_set_index = 0U;
+                    mark_building_changed(project, ui);
+                }
+            } else {
+                cell.words.fill(0); cell.item_set_index = 0; cell.payloads.clear(); cell.occupied = false;
+                cell.shorts.fill(0xffffU);
+                mark_building_changed(project, ui);
+            }
         }
         if (!occupied.empty() && action_pressed(ui, EditorAction::NextCell)) {
             if (shift) {
@@ -5910,6 +5973,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                                 preview_model,
                                 selected,
                                 static_cast<std::uint32_t>(std::max(0, ui.building_view_floor)));
+                            draw_building_item_set_guides(*project, project->buildings[ui.selected_building].data, preview_floor);
                             if (ui.building_tool == BuildingTool::PaintTexture &&
                                 ui.building_hover_cell.has_value() && ui.building_hover_face.has_value()) {
                                 draw_building_face_highlight(project->building_floor_preview_render_buffer,
@@ -6158,8 +6222,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 if (ui.building_tool == BuildingTool::Select) {
                     select_building_cell_from_viewport(*project, ui, camera, viewport_mouse_pos, last_viewport_size, pick_floor, status);
                 } else if (ui.building_tool != BuildingTool::Anchor) {
-                    // Place Block / Paint Texture both need the face under the
-                    // cursor, so they pick the cell ray-hit directly for hit_world.
+                    // These tools use the face hit to identify the cell to edit.
                     ui.selected_building = std::min(ui.selected_building, project->buildings.size() - 1U);
                     const auto& building = project->buildings[ui.selected_building].data;
                     const auto pick_ray = get_viewport_mouse_ray(camera, viewport_mouse_pos, last_viewport_size);
@@ -6181,6 +6244,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                                 static_cast<std::int32_t>(building.cells[pick->cell_index].y),
                                 static_cast<std::int32_t>(building.cells[pick->cell_index].z),
                             };
+                        } else if (ui.building_tool == BuildingTool::ItemSet) {
+                            place_building_item_set(*project, ui, pick->cell_index, status);
                         } else {
                             if (ui.paint_side_code) paint_building_side_code(*project, ui, pick->cell_index, pick->slot, status);
                             else paint_building_face(*project, ui, pick->cell_index, pick->slot, status);
@@ -6206,6 +6271,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                                 ui.stroke_block_cells.assign(1, static_cast<std::size_t>(cell - edited.cells.data()));
                                 mark_building_changed(*project, ui);
                             }
+                        } else if (ui.building_tool == BuildingTool::ItemSet) {
+                            status = "Click a block to place or clear its item set.";
                         } else status = "Click a block face to paint.";
                     }
                 }

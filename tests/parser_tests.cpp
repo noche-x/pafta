@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <set>
 #include <string>
+#include <string_view>
 #include <stdexcept>
 #include <vector>
 
@@ -263,6 +264,21 @@ void parses_sbb_piece_payload_index_from_low_10_bits() {
     assert(building.cells[0].payloads.size() == 1);
     assert(building.cells[0].payloads[0].kind == map_editor::PayloadKind::Piece);
     assert(building.cells[0].payloads[0].index == 5U);
+}
+
+void parses_item_set_and_item_mesh_fixtures() {
+    const auto items = map_editor::parse_sis(map_editor::read_file_bytes(fixture_root() / "server/data/itemset/cubetable.sis"));
+    assert(items.size() == 2);
+    assert(items[0].type == "tabletest2" && items[1].type == "computer");
+    assert(std::fabs(items[0].pos.z - 0.5F) < 1e-4F);
+    assert(items[1].rot[0].x == -1.0F && items[1].rot[2].z == -1.0F);
+
+    const auto mesh = map_editor::parse_it3(map_editor::read_file_bytes(fixture_root() / "server/data/item/computer.it3"));
+    assert(mesh.vertices.size() == 20 && mesh.faces.size() == 18);
+    for (const auto& face : mesh.faces) {
+        assert(face.size() == 4);
+        for (const auto index : face) assert(index < mesh.vertices.size());
+    }
 }
 
 void rejects_unsupported_sbb_version() {
@@ -2892,6 +2908,34 @@ void rebuilds_sbb_as_native_v14_with_lod_tail() {
     assert(reparsed.lod_tail == building.lod_tail);
 }
 
+void rebuilds_sbb_item_set_placement() {
+    const auto shipped = map_editor::parse_sbb_file(fixture_root() / "server/data/test2/building/laboratory.sbb");
+    assert(shipped.item_set_names == (std::vector<std::string>{"table", "cubetable"}));
+    const auto placed = std::ranges::find_if(shipped.cells, [](const map_editor::SbbCell& candidate) {
+        return candidate.item_set_index == 0x42000001U;
+    });
+    assert(placed != shipped.cells.end());
+
+    auto building = map_editor::parse_sbb_file(fixture_root() / "server/data/test2/building/test.sbb");
+    const auto cell = std::ranges::find_if(building.cells, [](const map_editor::SbbCell& candidate) {
+        return candidate.occupied;
+    });
+    assert(cell != building.cells.end());
+    building.item_set_names = {"table", "cubetable"};
+    cell->item_set_index = *map_editor::sbb_item_set_payload(1U, 2U);
+
+    const auto saved = map_editor::rebuild_sbb(building);
+    const auto reopened = map_editor::parse_sbb(saved);
+    assert(reopened.item_set_names == building.item_set_names);
+    const auto value = reopened.cells[cell - building.cells.begin()].item_set_index;
+    assert(value == 0x42000001U);
+    assert(map_editor::is_sbb_item_set_payload(value));
+    assert(map_editor::sbb_item_set_name_index(value) == 1U);
+    assert(map_editor::sbb_item_set_rotation(value) == 2U);
+    assert(!map_editor::sbb_item_set_payload(1024U, 0U));
+    assert(!map_editor::sbb_item_set_payload(0U, 4U));
+}
+
 void rebuilds_sbb_grows_native_dimensions_for_occupied_cells() {
     auto building = map_editor::parse_sbb_file(fixture_root() / "server/data/test2/building/test.sbb");
     auto cell = building.cells[0];
@@ -3676,22 +3720,25 @@ void city_scene_fingerprint_changes_only_with_scene_inputs() {
     assert(map_editor::city_scene_fingerprint(renamed) == base);
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc != 1 && !(argc == 2 && std::string_view{argv[1]} == "--portable")) return 2;
+    const bool with_fixtures = argc == 1;
     native_portal_render_buffer_drops_v10_cells_under_buildings();
     rebuilds_buildblock_after_adding_and_removing_openings();
     serializes_generated_quad_as_latest_sbl();
     preserves_sbc_header_records_on_upgrade();
     city_scene_fingerprint_changes_only_with_scene_inputs();
-    parses_sbb_fixture();
-    rebuilds_sbb_keeps_native_dimensions();
+    if (with_fixtures) parses_sbb_fixture();
+    if (with_fixtures) rebuilds_sbb_keeps_native_dimensions();
     parses_sbb_v12_without_anchor_words();
     parses_sbb_cell_words_in_native_file_order();
     parses_sbb_piece_payload_index_from_low_10_bits();
     rejects_unsupported_sbb_version();
+    if (with_fixtures) parses_item_set_and_item_mesh_fixtures();
     parses_sbb_v14_lod_tail();
-    extracts_render_cells();
-    resolves_sbb_piece_meshes();
-    writes_sbl_blocks_losslessly();
+    if (with_fixtures) extracts_render_cells();
+    if (with_fixtures) resolves_sbb_piece_meshes();
+    if (with_fixtures) writes_sbl_blocks_losslessly();
     build_sbb_scene_recenters_cells_with_native_anchor();
     native_building_rendering_includes_interior_piece_words();
     native_building_tool_preview_generates_floor_faces_from_floor_cell_key();
@@ -3699,10 +3746,10 @@ int main() {
     native_building_tool_preview_emits_only_exposed_solid_top_faces();
     native_building_tool_preview_places_side_code_faces_on_source_side();
     native_building_tool_preview_generates_inset_boxes_from_floor_cell_side_code();
-    resolves_sbb_portal_edge_units();
+    if (with_fixtures) resolves_sbb_portal_edge_units();
     native_portal_edge_side_codes_follow_editor_edge_flags();
     attaches_portal_wall_rects_to_scene_edges();
-    builds_native_building_render_buffer_from_piece_meshes();
+    if (with_fixtures) builds_native_building_render_buffer_from_piece_meshes();
     native_building_render_buffer_indexes_shared_cell_corners_and_uvs();
     native_building_render_buffer_emits_down_face_only_over_open_cells();
     native_building_render_buffer_uses_editor_face_order_and_uvs();
@@ -3716,13 +3763,13 @@ int main() {
     building_cell_picker_respects_visible_floor_filter();
     city_building_picker_ignores_empty_cells_inside_bounds();
     city_piece_picker_selects_occupied_portal_voxel();
-    edits_selected_sbb_cell_state();
-    edits_selected_sbc_building_state();
-    edits_selected_sbl_word_state();
-    parses_sbc_fixture();
+    if (with_fixtures) edits_selected_sbb_cell_state();
+    if (with_fixtures) edits_selected_sbc_building_state();
+    if (with_fixtures) edits_selected_sbl_word_state();
+    if (with_fixtures) parses_sbc_fixture();
     parses_sbc_v10_without_city_blocks();
     rejects_unsupported_sbc_version();
-    builds_map_scene();
+    if (with_fixtures) builds_map_scene();
     builds_grid_aligned_city_street_tile_strip();
     drops_city_tiles_outside_the_game_world();
     removes_junctions_no_road_uses();
@@ -3748,19 +3795,19 @@ int main() {
     city_editor_guides_use_native_expanded_extents();
     picks_city_intersection_marker_from_ray();
     traffic_light_poles_stand_at_native_corners_of_3way_plus_intersections();
-    parses_buildblock_sbl_fixture();
-    builds_buildblock_preview_scene();
-    city_block_preview_treats_unmatched_record_name_as_solid_not_layer_meshes();
-    city_block_preview_prefers_native_record_name_mesh();
+    if (with_fixtures) parses_buildblock_sbl_fixture();
+    if (with_fixtures) builds_buildblock_preview_scene();
+    if (with_fixtures) city_block_preview_treats_unmatched_record_name_as_solid_not_layer_meshes();
+    if (with_fixtures) city_block_preview_prefers_native_record_name_mesh();
     city_block_preview_renders_empty_name_as_nblock_solid_cell();
     city_block_preview_renders_unmatched_name_as_solid_cell();
-    builds_portal_wall_rects_from_sbl_layer();
+    if (with_fixtures) builds_portal_wall_rects_from_sbl_layer();
     builds_native_portal_overlay_rect_from_sbl_layer();
-    parses_block_sbl_fixture();
+    if (with_fixtures) parses_block_sbl_fixture();
     unsupported_sbl_version_is_not_block_mesh();
-    parses_sbl_block_face_vertices();
+    if (with_fixtures) parses_sbl_block_face_vertices();
     native_sbl_default_faces_keep_material_slots_and_oriented_uvs();
-    parses_authored_sbl_patch_vertices();
+    if (with_fixtures) parses_authored_sbl_patch_vertices();
     applies_native_sbl_authored_uv_orientation_flags();
     applies_native_sbl_authored_auto_orientation_flag();
     native_building_render_buffer_rotates_piece_material_slots_and_uvs();
@@ -3768,20 +3815,21 @@ int main() {
     native_block_mesh_catalog_seeds_builtin_blocks_before_file_blocks();
     native_block_rotation_uses_positive_rotated_bounds();
     native_block_mesh_rotation_only_cycles_side_material_slots();
-    tessellates_authored_sbl_patches();
+    if (with_fixtures) tessellates_authored_sbl_patches();
     emits_sbl_v2_light_record_faces();
-    patches_sbl_authored_patch_control_point();
-    refreshes_sbl_authored_patch_render_faces();
-    parses_csx_fixture();
-    patches_sbb_cell_words();
-    patches_sbb_cells();
-    rebuilds_sbb_as_native_v14_with_lod_tail();
-    rebuilds_sbb_grows_native_dimensions_for_occupied_cells();
-    patches_sbc_building_record();
-    patches_sbc_building_records();
-    patches_sbc_street_records();
-    patches_sbc_city_block_layers();
-    patches_sbc_portal_blocks();
+    if (with_fixtures) patches_sbl_authored_patch_control_point();
+    if (with_fixtures) refreshes_sbl_authored_patch_render_faces();
+    if (with_fixtures) parses_csx_fixture();
+    if (with_fixtures) patches_sbb_cell_words();
+    if (with_fixtures) patches_sbb_cells();
+    if (with_fixtures) rebuilds_sbb_as_native_v14_with_lod_tail();
+    if (with_fixtures) rebuilds_sbb_item_set_placement();
+    if (with_fixtures) rebuilds_sbb_grows_native_dimensions_for_occupied_cells();
+    if (with_fixtures) patches_sbc_building_record();
+    if (with_fixtures) patches_sbc_building_records();
+    if (with_fixtures) patches_sbc_street_records();
+    if (with_fixtures) patches_sbc_city_block_layers();
+    if (with_fixtures) patches_sbc_portal_blocks();
     native_portal_render_buffer_uses_city_block_name_mesh_and_layer_materials();
     native_portal_render_buffer_renders_unnamed_city_block_as_solid_cell_faces();
     native_portal_render_buffer_renders_unmatched_named_city_block_as_solid_cell_faces();
@@ -3791,14 +3839,14 @@ int main() {
     native_city_render_buffer_does_not_tag_plain_upper_walls_as_windows();
     native_city_render_buffer_tags_buildblock_window_openings_with_wall_material();
     native_city_render_buffer_does_not_apply_exterior_windows_to_interior_cells();
-    rebuilds_sbc_layout_with_new_records();
-    rebuilds_sbc_as_native_v12();
+    if (with_fixtures) rebuilds_sbc_layout_with_new_records();
+    if (with_fixtures) rebuilds_sbc_as_native_v12();
     rejects_lossy_legacy_sbc_upgrade();
-    patches_sbl_word();
-    patches_sbl_block_header();
-    patches_sbl_layer_portal_type();
-    patches_sbl_layer_geometry();
-    patches_sbl_layers_with_native_record_counts();
-    rebuilds_csx_directory();
+    if (with_fixtures) patches_sbl_word();
+    if (with_fixtures) patches_sbl_block_header();
+    if (with_fixtures) patches_sbl_layer_portal_type();
+    if (with_fixtures) patches_sbl_layer_geometry();
+    if (with_fixtures) patches_sbl_layers_with_native_record_counts();
+    if (with_fixtures) rebuilds_csx_directory();
     return 0;
 }

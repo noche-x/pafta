@@ -831,6 +831,89 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
     name_list("Buildblocks", building.block_names, buildblock_library, true);
     name_list("Pieces", building.piece_names, block_names(project), false);
 
+    if (ImGui::CollapsingHeader("Item sets", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::TextDisabled("Names stored in this building. The game reads definitions from data/itemset/*.sis.");
+        for (std::size_t i = 0; i < building.item_set_names.size(); ++i) {
+            const auto label = std::to_string(i) + "  " + building.item_set_names[i];
+            if (ImGui::Selectable(label.c_str(), ui.selected_item_set == i)) ui.selected_item_set = i;
+        }
+        const auto add_name = [&](std::string_view name) {
+            if (lower_name(name).ends_with(".sis")) name.remove_suffix(4);
+            if (name.empty() || name.size() > 63U || name == "." || name == ".." ||
+                name.find_first_of("/\\:") != std::string_view::npos) {
+                status = "An item-set name needs 1-63 bytes and no / \\ or :";
+                return false;
+            }
+            const auto found = std::ranges::find_if(building.item_set_names, [&](const std::string& existing) {
+                return lower_name(existing) == lower_name(name);
+            });
+            if (found != building.item_set_names.end()) {
+                ui.selected_item_set = static_cast<std::size_t>(found - building.item_set_names.begin());
+                return true;
+            }
+            if (building.item_set_names.size() >= 1024U) {
+                status = "A building can have at most 1024 item-set names";
+                return false;
+            }
+            building.item_set_names.emplace_back(name);
+            ui.selected_item_set = building.item_set_names.size() - 1U;
+            mark_building_changed(project, ui);
+            return true;
+        };
+        ImGui::SeparatorText("Add item set");
+        if (project.item_set_catalog.empty()) {
+            ImGui::TextDisabled("No local .sis files found. Enter a name below.");
+        } else {
+            catalog_combo("##item_set_catalog", project.item_set_catalog, ui.item_set_catalog_add);
+            ImGui::SameLine();
+            ImGui::BeginDisabled(building.item_set_names.size() >= 1024U);
+            if (ImGui::Button("Add##item_set_catalog")) add_name(project.item_set_catalog[ui.item_set_catalog_add]);
+            ImGui::EndDisabled();
+        }
+        ImGui::InputTextWithHint("##new_item_set_name", "Other item-set name", ui.new_item_set_name.data(), ui.new_item_set_name.size());
+        ImGui::SameLine();
+        ImGui::BeginDisabled(ui.new_item_set_name[0] == '\0' || building.item_set_names.size() >= 1024U);
+        if (ImGui::Button("Add##typed_item_set") && add_name(ui.new_item_set_name.data())) ui.new_item_set_name.fill(0);
+        ImGui::EndDisabled();
+    }
+
+    if (ui.building_tool == BuildingTool::ItemSet) {
+        ImGui::SeparatorText("Place item set");
+        if (ImGui::RadioButton("Place", !ui.clear_item_set)) ui.clear_item_set = false;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Clear", ui.clear_item_set)) ui.clear_item_set = true;
+        if (!ui.clear_item_set) {
+            catalog_combo("##item_set_to_place", building.item_set_names, ui.selected_item_set);
+            static constexpr std::array<const char*, 4> rotations{"0\xC2\xB0", "90\xC2\xB0", "180\xC2\xB0", "270\xC2\xB0"};
+            int rotation = static_cast<int>(ui.item_set_rotation & 3U);
+            field_label("Rotation");
+            if (ImGui::Combo("##item_set_rotation", &rotation, rotations.data(), 4)) ui.item_set_rotation = static_cast<std::uint32_t>(rotation);
+        }
+        ImGui::TextWrapped("Click a block to %s its item set. Yellow markers show placed sets.", ui.clear_item_set ? "clear" : "place");
+    }
+
+    const auto occupied = occupied_cell_indices(building);
+    if (!occupied.empty()) {
+        const auto& cell = building.cells[occupied[std::min(ui.selected_building_cell, occupied.size() - 1U)]];
+        if (cell.item_set_index != 0U) {
+            if (is_sbb_item_set_payload(cell.item_set_index) &&
+                sbb_item_set_name_index(cell.item_set_index) < building.item_set_names.size()) {
+                const auto name_index = sbb_item_set_name_index(cell.item_set_index);
+                ImGui::Text("Selected block item set: %s (%u\xC2\xB0)",
+                    building.item_set_names[name_index].c_str(),
+                    sbb_item_set_rotation(cell.item_set_index) * 90U);
+                if (ImGui::SmallButton("Use selected block's item set")) {
+                    ui.selected_item_set = name_index;
+                    ui.item_set_rotation = sbb_item_set_rotation(cell.item_set_index);
+                    ui.clear_item_set = false;
+                    ui.building_tool = BuildingTool::ItemSet;
+                }
+            } else {
+                ImGui::Text("Selected block item set: %s", hex_u32(cell.item_set_index).c_str());
+            }
+        } else ImGui::TextDisabled("Selected block item set: none");
+    }
+
     if (ui.building_tool == BuildingTool::PlaceBlock) draw_block_tool_panel(project, ui);
     if (ui.building_tool == BuildingTool::PaintTexture) {
         ImGui::SeparatorText("Paint");

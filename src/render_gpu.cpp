@@ -3039,6 +3039,68 @@ void draw_sbb_scene_for_app(
     (void)selected;
 }
 
+// Item sets as the game poses them (setup_item_sets / entry_pose): each item
+// stands from the cell's floor centre, turned with the set by quarter turns
+// about Y. Sets whose items have no data/item mesh keep a gold diamond guide.
+void draw_building_item_set_guides(const EditorProject& project, const SbbBuilding& building, std::optional<std::uint32_t> floor) {
+    constexpr float unit = 4.0F;
+    constexpr Color color{250, 196, 75, 255};
+    for (const auto& cell : building.cells) {
+        if (cell.item_set_index == 0U || (floor && cell.y != *floor)) continue;
+        const float x = (static_cast<float>(cell.x) - building.anchor_x) * unit + unit * 0.5F;
+        const float y = (static_cast<float>(cell.y) - building.anchor_y) * unit;
+        const float z = (static_cast<float>(cell.z) - building.anchor_z) * unit + unit * 0.5F;
+        const auto name_index = sbb_item_set_name_index(cell.item_set_index);
+        const auto set = name_index < building.item_set_names.size()
+            ? project.item_sets.find(lower_name(building.item_set_names[name_index])) : project.item_sets.end();
+        const float angle = static_cast<float>(sbb_item_set_rotation(cell.item_set_index)) * PI * 0.5F;
+        const float c = std::cos(angle), s = std::sin(angle);
+        const auto turn = [&](Vec3f v) { return Vec3f{v.x * c - v.z * s, v.y, v.x * s + v.z * c}; };
+        bool drawn = false;
+        if (set != project.item_sets.end()) {
+            rlDisableBackfaceCulling();
+            rlBegin(RL_TRIANGLES);
+            for (const auto& item : set->second) {
+                const auto mesh = project.item_meshes.find(lower_name(item.type));
+                if (mesh == project.item_meshes.end()) continue;
+                drawn = true;
+                const auto p = turn(item.pos);
+                const std::array<Vec3f, 3> r{turn(item.rot[0]), turn(item.rot[1]), turn(item.rot[2])};
+                const auto world = [&](std::uint32_t i) {
+                    const auto l = i < mesh->second.vertices.size() ? mesh->second.vertices[i] : Vec3f{};
+                    return Vector3{x + p.x + r[0].x * l.x + r[1].x * l.y + r[2].x * l.z,
+                        y + p.y + r[0].y * l.x + r[1].y * l.y + r[2].y * l.z,
+                        z + p.z + r[0].z * l.x + r[1].z * l.y + r[2].z * l.z};
+                };
+                for (const auto& face : mesh->second.faces) {
+                    if (face.size() < 3) continue;
+                    const auto a = world(face[0]), b = world(face[1]), d = world(face[2]);
+                    // Untextured: shade by how much the face points up.
+                    const auto n = Vector3Normalize(Vector3CrossProduct(Vector3Subtract(b, a), Vector3Subtract(d, a)));
+                    const auto light = static_cast<unsigned char>(120.0F + 100.0F * std::fabs(n.y) + 30.0F * std::fabs(n.x));
+                    rlColor4ub(light, light, static_cast<unsigned char>(light * 0.9F), 255);
+                    for (std::size_t k = 1; k + 1 < face.size(); ++k) {
+                        const auto v1 = world(face[k]), v2 = world(face[k + 1]);
+                        rlVertex3f(a.x, a.y, a.z); rlVertex3f(v1.x, v1.y, v1.z); rlVertex3f(v2.x, v2.y, v2.z);
+                    }
+                }
+            }
+            rlEnd();
+            rlEnableBackfaceCulling();
+        }
+        if (drawn) continue;
+        const float top = y + unit + 0.08F;
+        const Vector3 north{x, top, z - 1.3F};
+        const Vector3 east{x + 1.3F, top, z};
+        const Vector3 south{x, top, z + 1.3F};
+        const Vector3 west{x - 1.3F, top, z};
+        DrawLine3D(north, east, color);
+        DrawLine3D(east, south, color);
+        DrawLine3D(south, west, color);
+        DrawLine3D(west, north, color);
+    }
+}
+
 void invalidate_building_thumbnail(EditorProject& project, std::size_t index) {
     if (index < project.building_thumbnail_ready.size()) {
         project.building_thumbnail_ready[index] = false;

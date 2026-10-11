@@ -1,0 +1,157 @@
+name: Build, test, and package Pafta
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {platform: linux, os: ubuntu-latest, preset: ci, executable: build/ci/map_editor_cpp}
+          - {platform: macos, os: macos-latest, preset: ci, executable: build/ci/map_editor_cpp}
+          - {platform: windows, os: windows-latest, preset: ci-msvc, executable: build/ci-msvc/Release/map_editor_cpp.exe}
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux graphics build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libgl1-mesa-dev libglu1-mesa-dev \
+            libx11-dev libxcursor-dev libxext-dev libxi-dev libxinerama-dev \
+            libxrandr-dev mesa-common-dev xorg-dev
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} --parallel
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
+      - name: Package beta build
+        shell: bash
+        run: |
+          mkdir -p dist/package
+          cp '${{ matrix.executable }}' dist/package/
+          cp -R assets dist/package/
+          (cd dist/package && cmake -E tar cf ../pafta-${{ matrix.platform }}.zip --format=zip map_editor_cpp* assets)
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: pafta-${{ matrix.platform }}
+          path: dist/pafta-${{ matrix.platform }}.zip
+          if-no-files-found: error
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build and coverage dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libasound2-dev libgl1-mesa-dev \
+            libglu1-mesa-dev libx11-dev libxcursor-dev libxext-dev libxi-dev \
+            libxinerama-dev libxrandr-dev mesa-common-dev xorg-dev
+      - name: Test with source coverage
+        run: bash tests/coverage.sh
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: pafta-coverage
+          path: |
+            build/coverage/coverage.txt
+            build/coverage/coverage-export.txt
+            build/coverage/coverage-html/
+          if-no-files-found: error
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Emscripten
+        uses: emscripten-core/setup-emsdk@v15
+        with:
+          version: 6.0.8
+      - name: Configure browser build
+        run: |
+          EM_CACHE="$PWD/build/web/emcache" emcmake cmake -S . -B build/web \
+            -DPLATFORM=Web \
+            -DGRAPHICS=GRAPHICS_API_OPENGL_ES3 \
+            -DMAP_EDITOR_CPP_BUILD_TESTS=OFF \
+            -DMAP_EDITOR_CPP_ENABLE_PROFILER=OFF
+      - name: Build browser editor
+        run: EM_CACHE="$PWD/build/web/emcache" EMCC_BATCH_BUILD=0 cmake --build build/web --target map_editor_web --parallel 2
+      - name: Package browser build
+        run: |
+          mkdir -p dist/site
+          cp build/web/map_editor_web.html dist/site/index.html
+          cp build/web/map_editor_web.js build/web/map_editor_web.wasm dist/site/
+          touch dist/site/.nojekyll
+          test ! -e build/web/map_editor_web.data
+          (cd dist/site && cmake -E tar cf ../pafta-web.zip --format=zip index.html map_editor_web.js map_editor_web.wasm .nojekyll)
+      - name: Upload browser build
+        uses: actions/upload-artifact@v4
+        with:
+          name: pafta-web
+          path: dist/pafta-web.zip
+          if-no-files-found: error
+      - name: Upload Pages files
+        uses: actions/upload-artifact@v4
+        with:
+          name: pafta-web-site
+          path: dist/site/
+          include-hidden-files: true
+          if-no-files-found: error
+
+  pages:
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: [build-test, coverage, web]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pafta-web-site
+          path: dist/site
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: dist/site
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  draft-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-test, coverage, web]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pafta-*
+          path: release-assets
+          merge-multiple: true
+      - name: Create draft beta release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" release-assets/pafta-*.zip --verify-tag --draft --prerelease --generate-notes

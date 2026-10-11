@@ -332,6 +332,13 @@ struct EditorProject {
     std::vector<LoadedAsset<SbbBuilding>> buildings;
     std::vector<LoadedAsset<SblBlockMesh>> blocks;
     std::vector<LoadedAsset<SblTemplate>> buildblocks;
+    // Available loose .sis names. The building stores names and placements;
+    // the game loads the item-set definitions from its data/itemset folder.
+    std::vector<std::string> item_set_catalog;
+    // Item set contents by lower-case name, and the meshes of the item types
+    // they use (data/item/<type>.it3) by lower-case type name.
+    std::unordered_map<std::string, std::vector<SisItem>> item_sets;
+    std::unordered_map<std::string, It3Mesh> item_meshes;
     std::vector<LoadedTexture> textures;
     std::vector<LoadedTexture> material_textures;
     // Derived render inputs, computed once from the loaded assets and reused every
@@ -529,11 +536,12 @@ enum class CitySelectionKind {
 
 // Active tool in the Buildings (template) editor. Select picks a cell, PlaceBlock
 // occupies the cell under the cursor with the chosen block, PaintTexture writes
-// the chosen material onto the picked face.
+// the chosen material onto the picked face, ItemSet places or clears a set on a cell.
 enum class BuildingTool {
     Select,
     PlaceBlock,
     PaintTexture,
+    ItemSet,
     Anchor,
 };
 
@@ -764,6 +772,11 @@ struct EditorUi {
     // A just-placed road's tiles, drawn until the rebuilt city scene shows it.
     std::vector<CityTileCell> road_ghost;
     BuildingTool building_tool{BuildingTool::Select};
+    std::size_t selected_item_set{};
+    std::size_t item_set_catalog_add{};
+    std::uint32_t item_set_rotation{};
+    bool clear_item_set{};
+    std::array<char, 64> new_item_set_name{};
     // Place Block tool configuration (editor.exe-style block panel).
     BlockToolConfig block_config{};
     // Paint Texture tool: the material it writes and which side (exterior/interior
@@ -1082,6 +1095,7 @@ void draw_sbb_scene_for_app(
     GpuBuildingRenderModel& model,
     const SbbCell* selected,
     std::uint32_t guide_floor);
+void draw_building_item_set_guides(const EditorProject& project, const SbbBuilding& building, std::optional<std::uint32_t> floor);
 void draw_city_building_mask(GpuBuildingRenderModel& model, const SbcBuilding& placement);
 void draw_outline_from_mask(RenderTexture2D& mask, Vector2 viewport_size, Color tint);
 void draw_city_road_mask(const EditorProject& project, const MapScene& scene, std::size_t street_index);

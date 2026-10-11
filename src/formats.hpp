@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <initializer_list>
@@ -80,8 +81,10 @@ struct SbbCell {
     // interiorPortalFace +0x10, placedFlag +0x14, texture sets +0x18/+0x28,
     // itemsetPayload +0x38.
     std::array<std::uint32_t, 6> words{};
-    // RE itemsetPayload +0x38; SBB file offset +0x38,
-    // SaveBuilding_SBB_1400548d0.decomp.txt:164-167.
+    // Packed item-set payload, not a plain index: 0 means none; placed sets
+    // use 0x40000000 | (rotation << 24) | name-table index. The renderer reads
+    // two rotation bits and the low 10 index bits. Keep other raw values intact.
+    // Native memory and SBB file offset are both +0x38.
     std::uint32_t item_set_index{};
     bool occupied{};
     SbbCellPayloads payloads;
@@ -102,6 +105,18 @@ struct SbbCell {
 
     bool operator==(const SbbCell&) const = default;
 };
+
+constexpr std::optional<std::uint32_t> sbb_item_set_payload(std::size_t name_index, std::uint32_t rotation) {
+    if (name_index >= 1024U || rotation >= 4U) return std::nullopt;
+    return 0x40000000U | (rotation << 24U) | static_cast<std::uint32_t>(name_index);
+}
+
+constexpr bool is_sbb_item_set_payload(std::uint32_t value) {
+    return (value & ~0x030003ffU) == 0x40000000U;
+}
+
+constexpr std::uint32_t sbb_item_set_name_index(std::uint32_t value) { return value & 0x3ffU; }
+constexpr std::uint32_t sbb_item_set_rotation(std::uint32_t value) { return (value >> 24U) & 3U; }
 
 struct SbbBuilding {
     std::uint32_t version{};
@@ -335,6 +350,21 @@ enum class CsxEntryKind {
     Unknown,
 };
 
+// One item of an item set (data/itemset/*.sis, load_item_set): its item type
+// by name, its position from the cell's floor centre and its rotation rows.
+struct SisItem {
+    std::string type;
+    Vec3f pos;
+    std::array<Vec3f, 3> rot;
+};
+
+// The render mesh of an item (data/item/*.it3, load_it3_file version 3, chunk
+// 0): vertices and faces of three or four vertex indices. UVs are skipped.
+struct It3Mesh {
+    std::vector<Vec3f> vertices;
+    std::vector<std::vector<std::uint32_t>> faces;
+};
+
 struct CsxEntry {
     std::size_t index{};
     CsxEntryKind kind{CsxEntryKind::Unknown};
@@ -360,6 +390,8 @@ SbcMap parse_sbc_file(const std::filesystem::path& path);
 SblTemplate parse_sbl(const std::vector<std::uint8_t>& bytes);
 SblTemplate parse_sbl_file(const std::filesystem::path& path);
 CsxArchive parse_csx(const std::vector<std::uint8_t>& bytes);
+std::vector<SisItem> parse_sis(const std::vector<std::uint8_t>& bytes);
+It3Mesh parse_it3(const std::vector<std::uint8_t>& bytes);
 CsxArchive parse_csx_file(const std::filesystem::path& path);
 void refresh_sbl_block_faces(SblBlockMesh& block);
 std::vector<std::uint8_t> patch_sbb_cell(const std::vector<std::uint8_t>& bytes, const SbbBuilding& building, const SbbCell& cell);

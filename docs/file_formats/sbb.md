@@ -53,7 +53,8 @@ by that many `ascii[64]` values:
 3. item-set names
 
 Piece payload indices select the piece-name table. `cell_type` selects the
-buildblock-name table. `item_set_index` selects the item-set table.
+buildblock-name table. The low 10 bits of the item-set payload select the
+item-set table. The table is indexed from zero; payload zero means no item set.
 
 ## Cell record
 
@@ -68,7 +69,14 @@ Each cell occupies `0x3c` bytes.
 | `0x10` | `u32` | interior portal-face code | native save order; parser and writer |
 | `0x14` | `u32` | placed flags | native save order; parser and writer |
 | `0x18` | `u16[16]` | material slots | parser and writer |
-| `0x38` | `u32` | item-set index | native save order; parser and writer |
+| `0x38` | `u32` | item-set payload | native save order; parser and writer |
+
+The item-set word is a packed payload, despite the parser field name
+`item_set_index`. Placed sets in the shipped buildings use
+`0x40000000 | (rotation << 24) | name_index`. The renderer in `editor.exe`
+reads `(word >> 24) & 3` for quarter-turn rotation and `word & 0x3ff` for
+the name-table index. A zero word clears the placement. Pafta preserves other
+raw values when reading and writing; its item-set tool writes the known form.
 
 Material slots `0..5` cover exterior faces. Slots `8..13` cover interior
 faces. Slots 6, 7, 14, and 15 exist on disk, but their exact native use remains
@@ -116,4 +124,3 @@ byte-for-byte until its layout is proven.
 `rebuild_sbb` emits the parsed header, all four name tables, every `0x3c` cell,
 and the preserved LOD tail. Patch operations update cells in place and leave
 unknown bytes untouched. New strings longer than 64 bytes are truncated.
-

@@ -42,7 +42,7 @@
       window.addEventListener('error', function(event) {
         if (started) return;
         if (event.target instanceof HTMLScriptElement && event.target.src.includes('map_editor_web.') && event.target.src.endsWith('.js')) {
-          fail('The editor script was blocked or could not be downloaded. Allow noche.im in your blocker, then refresh.');
+          fail('The editor script was blocked or could not be downloaded. Allow this site in your blocker, then refresh.');
         } else if (event.error) {
           fail('The editor failed to start: ' + event.message);
         }
