@@ -14,7 +14,7 @@
 #include <rlImGui.h>
 
 #ifndef __EMSCRIPTEN__
-#include <portable-file-dialogs.h>
+#include "file_dialogs.hpp"
 #include <nfd.hpp>
 #endif
 
@@ -4609,7 +4609,7 @@ void draw_csx_editor(bool& open, EditorProject* project) {
     ImGui::InputText("Input file", input_path.data(), input_path.size());
 #ifndef __EMSCRIPTEN__
     if (ImGui::Button("Browse and add...")) action([&] {
-        const auto paths = pfd::open_file("Add archive assets", "", {"Assets", "*.csx *.sbb *.sbl *.png"}, pfd::opt::multiselect).result();
+        const auto paths = dialog_open_archive_assets();
         for (const auto& path : paths) import(path);
     });
     ImGui::SameLine();
@@ -4676,7 +4676,7 @@ void draw_csx_editor(bool& open, EditorProject* project) {
             if (ImGui::Button("Attach material PNG...")) action([&] {
                 std::filesystem::path path{input_path.data()};
 #ifndef __EMSCRIPTEN__
-                const auto paths = pfd::open_file("Material image", "", {"PNG image", "*.png"}).result();
+                const auto paths = dialog_open_material_image();
                 if (paths.empty()) return;
                 path = paths.front();
 #endif
@@ -4705,7 +4705,7 @@ void draw_csx_editor(bool& open, EditorProject* project) {
     if (ImGui::Button(dirty ? "Build CSX *" : "Build CSX")) action([&] {
         std::filesystem::path path{output_path.data()};
 #ifndef __EMSCRIPTEN__
-        if (path.empty()) path = pfd::save_file("Build CSX", "build.csx", {"CSX archive", "*.csx"}).result();
+        if (path.empty()) path = dialog_save_csx();
 #endif
         if (path.empty()) return;
         if (path.extension() != ".csx") path += ".csx";
@@ -4722,7 +4722,7 @@ void draw_csx_editor(bool& open, EditorProject* project) {
     if (ImGui::Button("Extract selected to folder")) action([&] {
         std::filesystem::path folder{output_path.data()};
 #ifndef __EMSCRIPTEN__
-        if (folder.empty()) folder = pfd::select_folder("Extract selected files").result();
+        if (folder.empty()) folder = dialog_extract_folder();
 #endif
         if (folder.empty()) return;
         if (!std::filesystem::is_directory(folder)) throw std::runtime_error("Output must be an existing folder");
@@ -6922,7 +6922,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             });
             status = "Choose a Sub Rosa map folder in the browser picker.";
 #else
-            auto result = pfd::select_folder("Open map folder").result();
+            auto result = dialog_open_map_folder();
             if (!result.empty()) {
                 pending_load_folder = std::filesystem::path{result};
             }

@@ -187,6 +187,7 @@ if(NOT EMSCRIPTEN)
   add_executable(map_editor_cpp
     src/app.cpp
     src/block_editor.cpp
+    src/file_dialogs.cpp
     src/main.cpp
     src/mesh_export.cpp
     src/render_gpu.cpp
