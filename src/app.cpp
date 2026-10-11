@@ -6045,7 +6045,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             const bool erase_hover = ui.tab == EditorTab::City && ui.city_tool == CityTool::Erase;
             const Color hover_tint = erase_hover ? Color{255, 80, 70, 255} : Color{120, 200, 255, 255};
 
-            if (ui.tab == EditorTab::City && project->city) {
+            if (project && ui.tab == EditorTab::City && project->city) {
                 // Outline every selected building (the whole multi-selection).
                 if (ui.city_selection == CitySelectionKind::Building) {
                     if (ui.selected_city_buildings.size() > 1U) {
@@ -6104,7 +6104,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     const auto cell = *ui.hover_piece_voxel;
                     composite_outline([&] { draw_city_piece_mask(*project, cell); }, hover_tint);
                 }
-            } else if (ui.tab == EditorTab::Buildings && !project->buildings.empty()) {
+            } else if (project && ui.tab == EditorTab::Buildings && !project->buildings.empty()) {
                 auto& building = project->buildings[std::min(ui.selected_building, project->buildings.size() - 1U)].data;
                 const auto occupied = occupied_cell_indices(building);
                 if (!occupied.empty()) {
