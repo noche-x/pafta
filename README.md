@@ -1,12 +1,27 @@
 # Pafta
 
-Pafta is a C++23 map editor for Sub Rosa. The repository and build targets still use the name `map_editor_cpp`.
+Pafta (pronounced PAHF-tah) is a C++23 map editor for Sub Rosa.
 
-**Beta software.** The editor, its file support, and its interface are still changing. Nothing described here is a final compatibility promise. Keep a backup of any map you care about before editing it.
+Pafta is in beta. Everything is subject to change at any moment.
 
-## Get started
+## Building
 
-From `map_editor_cpp` in the SRC workspace:
+Every platform needs CMake 3.24 or newer and a C++23 compiler. CMake uses an installed raylib when it finds one; otherwise it fetches raylib 5.5.
+
+### Windows
+
+Install Visual Studio 2022 with the C++ desktop workload, then run from a Developer PowerShell:
+
+```sh
+cmake --preset dev-msvc
+cmake --build --preset dev-msvc --parallel
+ctest --preset dev-msvc
+.\build\dev-msvc\Debug\map_editor_cpp.exe
+```
+
+### macOS
+
+Install the Xcode command-line tools and CMake (for example `brew install cmake`), then:
 
 ```sh
 cmake --preset dev
@@ -15,11 +30,38 @@ ctest --preset dev
 ./build/dev/map_editor_cpp
 ```
 
-Use `dev-msvc` instead of `dev` on Windows. CMake uses an installed raylib when it can find one; otherwise it fetches raylib 5.5. A standalone checkout runs the portable parser, scene, editor-state, and export tests. If `../server/data/test2` exists, CTest also runs the full fixture and command-line edit suite. Set `MAP_EDITOR_CPP_FIXTURE_ROOT` to another SRC workspace root if needed.
+### Linux
+
+Install the X11, OpenGL, ALSA, and GTK 3 development packages. On Ubuntu:
+
+```sh
+sudo apt-get install -y build-essential cmake libasound2-dev libgl1-mesa-dev libglu1-mesa-dev \
+  libgtk-3-dev libx11-dev libxcursor-dev libxext-dev libxi-dev libxinerama-dev \
+  libxrandr-dev mesa-common-dev xorg-dev
+```
+
+Then build with the same commands as macOS.
+
+### Web (Emscripten)
+
+With Emscripten 6.0.8 active:
+
+```sh
+EM_CACHE="$PWD/build/web/emcache" emcmake cmake -S . -B build/web \
+  -DPLATFORM=Web -DGRAPHICS=GRAPHICS_API_OPENGL_ES3 \
+  -DMAP_EDITOR_CPP_BUILD_TESTS=OFF -DMAP_EDITOR_CPP_ENABLE_PROFILER=OFF
+EM_CACHE="$PWD/build/web/emcache" EMCC_BATCH_BUILD=0 cmake --build build/web --target map_editor_web --parallel
+```
+
+Serve `build/web` over HTTP and open `map_editor_web.html`; browsers do not run it from `file://`. A normal browser build contains no map data. [docs/WEB_BUILD.md](docs/WEB_BUILD.md) covers GitHub Pages and local QA builds with a bundled map.
+
+### Tests
+
+A standalone checkout runs the portable parser, scene, editor-state, and export tests. If `../server/data/test2` exists, CTest also runs the full fixture and command-line edit suite. Set `MAP_EDITOR_CPP_FIXTURE_ROOT` to another SRC workspace root if needed.
+
+## Open a map
 
 Drop a map folder onto the window or choose **File → Open Folder**. Pafta reads `city2.sbc`, loose assets under `building/`, `block/`, and `buildblock/`, plus assets in `.csx` archives. The Building editor also lists `.sis` item-set names found in `itemset/` in the map folder or beside it. If the folder has one `.sbc` with another name, the loader can use it; Save still writes `city2.sbc`.
-
-For the browser build, follow [docs/WEB_BUILD.md](docs/WEB_BUILD.md). Serve its output over HTTP. A normal browser build contains no map data.
 
 ## Edit and save
 
@@ -45,11 +87,11 @@ Shift changes free-camera speed. Editing shortcuts pause while you fly or type i
 
 In City, **Select** picks and moves existing roads, buildings, or pieces. **Building** previews a template and places it on mouse release; red means the position conflicts with another object. Drag away before release to cancel that placement. **Road** starts at the first click and adds axis-aligned segments with later clicks. **Piece** places or paints cells from the chosen asset, while **Erase** removes the highlighted object. Esc ends a road chain or cancels a gizmo drag.
 
-In Building, **Select** picks a block, **Add block** fills a neighboring cell, **Paint** applies the chosen material, **Anchor** moves the building anchor, and **Item set** places or clears a set on a clicked block. Add a `.sis` name to the building in Properties, then choose its rotation. While the Item set tool is active, yellow diamonds mark placed sets. Save writes their names and placements into the building data in `test.csx`; it does not copy `.sis` or `.it3` files. The floor control can show one floor or the whole building. The Block and Buildblock editors expose the selected record's fields. **Windows → Map image** opens the top-down map view.
+In Building, **Select** picks a block, **Add block** fills a neighboring cell, **Paint** applies the chosen material, **Anchor** moves the building anchor, and **Item set** places or clears a set on a clicked block. Add a `.sis` name to the building in Properties, then choose its rotation. Placed sets show their items from `item/*.it3`, untextured; a set with no item meshes shows a yellow diamond. Save writes their names and placements into the building data in `test.csx`; it does not copy `.sis` or `.it3` files. The floor control can show one floor or the whole building. The Block and Buildblock editors expose the selected record's fields. **Windows → Map image** opens the top-down map view.
 
 ## File support and limits
 
-Pafta reads `.sbb` building volumes, `.sbc` city maps, `.sbl` blocks and buildblocks, and `.csx` asset archives. It can edit item-set references in buildings but does not edit `.sis` definitions or preview their `.it3` item meshes. The byte layouts, version ranges, writer behavior, and unresolved fields are recorded in [docs/file_formats/](docs/file_formats/README.md).
+Pafta reads `.sbb` building volumes, `.sbc` city maps, `.sbl` blocks and buildblocks, and `.csx` asset archives. It can edit item-set references in buildings and previews their `.it3` item meshes, but does not edit `.sis` definitions. The byte layouts, version ranges, writer behavior, and unresolved fields are recorded in [docs/file_formats/](docs/file_formats/README.md).
 
 Current limits include:
 
@@ -94,4 +136,4 @@ Profiling is optional. Configure with `-DMAP_EDITOR_CPP_ENABLE_PROFILER=ON`, the
 
 ## AI disclosure
 
-AI tools have assisted with parts of Pafta's code, research, and documentation. Their output can be wrong, including plausible explanations of Sub Rosa's binary formats. A passing build or fixture test also does not prove behavior in the game. Contributions that materially use AI should say what the tool helped produce and what the author checked; [CONTRIBUTING.md](CONTRIBUTING.md) explains what to report.
+AI tools have been used with parts of Pafta's code, research, and documentation. Every change made with AI tools has been checked. A passing build or fixture test also does not prove behavior in the game. Contributions that materially use AI should say what the tool helped produce and what the author checked; [CONTRIBUTING.md](CONTRIBUTING.md) explains what to report.
