@@ -1223,14 +1223,20 @@ void add_native_solid_cell_faces(
         }
 
         std::vector<PortalRect> window_rects;
+        // The game gives every buildblock-coded face the window-array texture,
+        // and near sectors skip those faces (_render_buildsectorlist), so up
+        // close an interior piece on that side (a garage door) stands open.
+        bool buildblock_coded = false;
         const auto portal_side = portal_side_for_building_face(side.side);
-        // BuildBuildingBlockRenderBuffers only expands the exterior edge
-        // profile when the cell has no interior block (native
-        // interiorBlock == 0xffff). An interior piece owns that side's
-        // geometry and must not inherit the exterior window mask.
-        if (portal_side.has_value() && cell.interior_block() == 0xffffU) {
+        if (portal_side.has_value()) {
             const auto side_code = city_buildblock_side_code_for_face(cell, east, south, side.side);
-            if (const auto* layer = buildblock_layer_for_side_code(template_file, side_code)) {
+            const auto* layer = buildblock_layer_for_side_code(template_file, side_code);
+            buildblock_coded = layer != nullptr;
+            // BuildBuildingBlockRenderBuffers only expands the exterior edge
+            // profile when the cell has no interior block (native
+            // interiorBlock == 0xffff). An interior piece owns that side's
+            // geometry and must not inherit the exterior window mask.
+            if (layer != nullptr && cell.interior_block() == 0xffffU) {
                 // _generatematerialwindowtexture @9a1a1 builds one texture-array
                 // layer per (wall texture, buildblock, layer): the wall texture,
                 // then alpha 1 over the layer's BOUNDS rectangle; the window and
@@ -1276,7 +1282,7 @@ void add_native_solid_cell_faces(
                 true,
                 top_slope);
         }
-        if (!window_rects.empty()) {
+        if (buildblock_coded) {
             for (auto t = first_triangle; t < buffer.triangles.size(); ++t) buffer.triangles[t].far_only = true;
         }
     }
@@ -3643,6 +3649,24 @@ BuildingRenderBuffer build_native_building_render_buffer(
             : &native_builtin_block_mesh_singleton();
     };
 
+    // InstantiateSbbVolumeIntoWorldAndMetadata places rooms only in cells no
+    // interior piece's footprint already covers (a 2-wide garage door owns
+    // its second cell); pieces reach +x/+z/+y from their own cell.
+    std::unordered_set<std::uint64_t> piece_footprint;
+    const auto footprint_key = [](std::uint64_t x, std::uint64_t y, std::uint64_t z) { return x << 42U | y << 21U | z; };
+    for (const auto& cell : building.cells) {
+        const auto payload = interior_piece_payload(cell);
+        const auto* mesh = payload ? resolved_piece_mesh(payload->index) : nullptr;
+        if (mesh == nullptr) continue;
+        const bool turned = ((payload->word >> 24U) & 1U) != 0U;
+        const auto size_x = turned ? mesh->depth : mesh->width;
+        const auto size_z = turned ? mesh->width : mesh->depth;
+        for (std::uint32_t dy = 0; dy < mesh->height; ++dy)
+            for (std::uint32_t dz = 0; dz < size_z; ++dz)
+                for (std::uint32_t dx = 0; dx < size_x; ++dx)
+                    if ((dx | dy | dz) != 0U) piece_footprint.insert(footprint_key(cell.x + dx, cell.y + dy, cell.z + dz));
+    }
+
     auto cell_origin = [&](const SbbCell& cell) {
         return Vec3{
             (static_cast<float>(cell.x) - static_cast<float>(building.anchor_x)) * unit_size,
@@ -3719,7 +3743,7 @@ BuildingRenderBuffer build_native_building_render_buffer(
             ? resolved_buildblock_templates[cell.cell_type()]
             : (buildblock_templates.empty() ? nullptr : &buildblock_templates.front().template_file);
 
-        if (cell.interior_block() == 0xffffU) {
+        if (cell.interior_block() == 0xffffU && !piece_footprint.contains(footprint_key(cell.x, cell.y, cell.z))) {
             tag(0xffU);
             // InstantiateSbbVolumeIntoWorldAndMetadata @23ac0 packs the room
             // key: side codes N (own +0x0c), E ((x+1) +0x10), S ((z+1) +0x0c),
