@@ -22,6 +22,11 @@
 
 namespace pafta::app_internal {
 
+struct ArchiveFileJobs {
+    std::shared_ptr<const CsxArchive> save_source;
+    std::optional<std::future<std::string>> result;
+};
+
 namespace {
 void checked_name(const std::string& name) {
     if (name.empty() || name.size() > 51 || name == "." || name == ".." ||
@@ -29,7 +34,86 @@ void checked_name(const std::string& name) {
         throw std::runtime_error("Asset name must be 1-51 characters without path separators");
     }
 }
+
+void validate_archive_for_save(const CsxArchive& archive) {
+    const auto& entries = archive.entries;
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        checked_name(entries[i].name);
+        for (std::size_t j = 0; j < i; ++j) {
+            if (entries[j].type == entries[i].type && lower_name(entries[j].name) == lower_name(entries[i].name))
+                throw std::runtime_error("Rename duplicate asset: " + entries[i].name);
+        }
+    }
+}
+
+bool same_archive_source(const CsxArchive& a, const CsxArchive& b) {
+    if (a.magic != b.magic || a.entries.size() != b.entries.size()) return false;
+    for (std::size_t i = 0; i < a.entries.size(); ++i) {
+        const auto& left = a.entries[i];
+        const auto& right = b.entries[i];
+        if (left.kind != right.kind || left.type != right.type || left.name != right.name || left.payload != right.payload) return false;
+    }
+    return true;
+}
+
+std::pair<std::uint32_t, std::uint32_t> texture_parts(const CsxEntry& entry) {
+    const auto image_size = read_le_u32(entry.payload, 0x44);
+    const auto material_size = read_le_u32(entry.payload, 0x48);
+    if (entry.payload.size() < 0x4c || static_cast<std::uint64_t>(image_size) + material_size > entry.payload.size() - 0x4c)
+        throw std::runtime_error("Texture payload is truncated: " + entry.name);
+    return {image_size, material_size};
+}
+
+void extract_entries(const std::vector<CsxEntry>& entries,
+                     const std::function<void(const char*, const std::string&, const std::vector<std::uint8_t>&)>& write) {
+    for (const auto& entry : entries) {
+        checked_name(entry.name);
+        if (entry.kind == CsxEntryKind::Texture) {
+            const auto [image_size, material_size] = texture_parts(entry);
+            write("texture", entry.name + ".png", {entry.payload.begin() + 0x4c, entry.payload.begin() + 0x4c + image_size});
+            if (material_size) write("texturematerial", entry.name + ".png",
+                {entry.payload.begin() + 0x4c + image_size, entry.payload.begin() + 0x4c + image_size + material_size});
+        } else if (entry.kind == CsxEntryKind::Sbb) {
+            write("building", entry.name + ".sbb", normalize_packed_sbb_bytes(entry.payload));
+        } else if (entry.kind == CsxEntryKind::Sbl) {
+            const auto bytes = normalize_packed_sbl_bytes(entry.payload);
+            bool block = true;
+            try {
+                block = parse_sbl(bytes).block.has_value();
+            } catch (const std::exception&) {
+                // Preserve an unreadable source file with the block entries.
+            }
+            write(block ? "block" : "buildblock", entry.name + ".sbl", bytes);
+        } else {
+            write("unknown", entry.name + ".bin", entry.payload);
+        }
+    }
+}
 } // namespace
+
+bool archive_file_jobs_pending(const ArchiveWorkspace& workspace) {
+    return workspace.file_jobs && workspace.file_jobs->result.has_value();
+}
+
+void service_archive_file_jobs(ArchiveWorkspace& workspace) {
+    if (!archive_file_jobs_pending(workspace)) return;
+    auto& jobs = *workspace.file_jobs;
+    if (jobs.result->wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+    try {
+        workspace.message = jobs.result->get();
+        if (jobs.save_source) {
+            if (same_archive_source(workspace.archive, *jobs.save_source)) workspace.dirty = false;
+            else {
+                workspace.dirty = true;
+                workspace.message += " Newer edits remain unsaved.";
+            }
+        }
+    } catch (const std::exception& error) {
+        report_failure(workspace.message, std::string{"Archive operation failed: "} + error.what());
+    }
+    jobs.result.reset();
+    jobs.save_source.reset();
+}
 
 namespace {
 
@@ -167,16 +251,12 @@ void import_project_archive(ArchiveWorkspace& workspace, const EditorProject& pr
 }
 
 void save_archive_to(ArchiveWorkspace& workspace, std::filesystem::path path) {
+#ifndef __EMSCRIPTEN__
+    const auto writing = claim_file_writer();
+#endif
     if (path.empty()) throw std::runtime_error("Choose an archive output path");
     if (lower_extension(path) != ".csx") path += ".csx";
-    const auto& entries = workspace.archive.entries;
-    for (std::size_t i = 0; i < entries.size(); ++i) {
-        checked_name(entries[i].name);
-        for (std::size_t j = 0; j < i; ++j) {
-            if (entries[j].type == entries[i].type && lower_name(entries[j].name) == lower_name(entries[i].name))
-                throw std::runtime_error("Rename duplicate asset: " + entries[i].name);
-        }
-    }
+    validate_archive_for_save(workspace.archive);
     const auto bytes = build_csx(workspace.archive);
 #ifdef __EMSCRIPTEN__
     web_download(path.filename().string(), bytes);
@@ -193,6 +273,7 @@ void save_archive_to(ArchiveWorkspace& workspace, std::filesystem::path path) {
 bool save_archive_workspace(ArchiveWorkspace& workspace) {
     std::filesystem::path folder{workspace.output_path.data()};
 #ifndef __EMSCRIPTEN__
+    if (archive_file_jobs_pending(workspace)) throw std::runtime_error("An archive operation is still running. Wait for it to finish.");
     if (folder.empty()) {
         const auto selected_folder = dialog_pick_folder();
         if (!selected_folder) return false;
@@ -202,8 +283,22 @@ bool save_archive_workspace(ArchiveWorkspace& workspace) {
         std::copy_n(text.data(), std::min(text.size(), workspace.output_path.size() - 1U), workspace.output_path.data());
     }
     if (!std::filesystem::is_directory(folder)) throw std::runtime_error("The map folder does not exist: " + folder.string());
-#endif
+    auto ticket = claim_file_writer();
+    auto source = std::make_shared<const CsxArchive>(workspace.archive);
+    const auto path = folder / "test.csx";
+    if (!workspace.file_jobs) workspace.file_jobs = std::make_shared<ArchiveFileJobs>();
+    auto result = std::async(std::launch::async, [source, path, ticket = std::move(ticket)]() mutable {
+        const auto writing = std::move(ticket);
+        validate_archive_for_save(*source);
+        write_file_bytes(path, build_csx(*source));
+        return "Wrote " + path.string();
+    });
+    workspace.file_jobs->save_source = std::move(source);
+    workspace.file_jobs->result = std::move(result);
+    workspace.message = "Writing test.csx... You can keep editing.";
+#else
     save_archive_to(workspace, folder / "test.csx");
+#endif
     return true;
 }
 
@@ -211,6 +306,7 @@ bool save_archive_workspace(ArchiveWorkspace& workspace) {
 // entries per frame whenever the map's assets change) until you add, remove, or
 // rename something here; after that it keeps your edits until you reload it.
 void draw_csx_editor(ArchiveWorkspace& workspace, bool& open, EditorProject* project, EditorUi& ui, std::string& status) {
+    service_archive_file_jobs(workspace);
     auto& archive = workspace.archive;
     auto& input_path = workspace.input_path;
     auto& output_path = workspace.output_path;
@@ -297,13 +393,6 @@ void draw_csx_editor(ArchiveWorkspace& workspace, bool& open, EditorProject* pro
         }
     }
 
-    const auto texture_parts = [&](const CsxEntry& entry) {
-        const auto image_size = read_le_u32(entry.payload, 0x44);
-        const auto material_size = read_le_u32(entry.payload, 0x48);
-        if (entry.payload.size() < 0x4c || static_cast<std::uint64_t>(image_size) + material_size > entry.payload.size() - 0x4c)
-            throw std::runtime_error("Texture payload is truncated: " + entry.name);
-        return std::pair{image_size, material_size};
-    };
     const auto put = [](auto& bytes, std::size_t at, std::uint32_t value) {
         for (unsigned i = 0; i < 4; ++i) bytes[at + i] = static_cast<std::uint8_t>(value >> (8 * i));
     };
@@ -389,49 +478,34 @@ void draw_csx_editor(ArchiveWorkspace& workspace, bool& open, EditorProject* pro
     // Writes the entries as loose files: textures as PNG (and their material PNG),
     // buildings as .sbb, blocks as .sbl. Asks for a folder on the desktop.
     const auto extract = [&](std::vector<std::size_t> indices) {
+        if (archive_file_jobs_pending(workspace)) throw std::runtime_error("An archive operation is still running. Wait for it to finish.");
         std::filesystem::path folder;
 #ifndef __EMSCRIPTEN__
         const auto selected_folder = dialog_pick_folder(std::filesystem::path{output_path.data()});
         if (!selected_folder) return;
         folder = *selected_folder;
 #endif
-        // Files go where the game reads loose assets: building/%s.sbb, block/%s.sbl,
-        // buildblock/%s.sbl, texture/%s.png, and texturematerial/%s.png.
-        const auto write = [&](const char* subfolder, const std::string& name, const std::vector<std::uint8_t>& bytes) {
-#ifdef __EMSCRIPTEN__
-            web_download(std::string{subfolder} + "_" + name, bytes);
-#else
-            write_file_bytes(folder / subfolder / name, bytes);
-#endif
-        };
+        std::vector<CsxEntry> entries;
+        entries.reserve(indices.size());
         for (const auto i : indices) {
-            if (i >= archive.entries.size()) continue;
-            const auto& entry = archive.entries[i];
-            checked_name(entry.name);
-            if (entry.kind == CsxEntryKind::Texture) {
-                const auto [image_size, material_size] = texture_parts(entry);
-                write("texture", entry.name + ".png", {entry.payload.begin() + 0x4c, entry.payload.begin() + 0x4c + image_size});
-                if (material_size) write("texturematerial", entry.name + ".png",
-                    {entry.payload.begin() + 0x4c + image_size, entry.payload.begin() + 0x4c + image_size + material_size});
-            } else if (entry.kind == CsxEntryKind::Sbb) {
-                write("building", entry.name + ".sbb", normalize_packed_sbb_bytes(entry.payload));
-            } else if (entry.kind == CsxEntryKind::Sbl) {
-                const auto bytes = normalize_packed_sbl_bytes(entry.payload);
-                bool block = true;
-                try {
-                    block = parse_sbl(bytes).block.has_value();
-                } catch (const std::exception&) {
-                    // Unreadable: keep it with the blocks, where archives normally hold .sbl files.
-                }
-                write(block ? "block" : "buildblock", entry.name + ".sbl", bytes);
-            } else {
-                write("unknown", entry.name + ".bin", entry.payload);
-            }
+            if (i < archive.entries.size()) entries.push_back(archive.entries[i]);
         }
 #ifdef __EMSCRIPTEN__
-        message = "Downloads requested for " + std::to_string(indices.size()) + " files";
+        extract_entries(entries, [](const char* subfolder, const std::string& name, const std::vector<std::uint8_t>& bytes) {
+            web_download(std::string{subfolder} + "_" + name, bytes);
+        });
+        message = "Downloads requested for " + std::to_string(entries.size()) + " files";
 #else
-        message = "Extracted " + std::to_string(indices.size()) + " files to " + folder.string();
+        auto ticket = claim_file_writer();
+        if (!workspace.file_jobs) workspace.file_jobs = std::make_shared<ArchiveFileJobs>();
+        workspace.file_jobs->result = std::async(std::launch::async, [entries = std::move(entries), folder, ticket = std::move(ticket)]() mutable {
+            const auto writing = std::move(ticket);
+            extract_entries(entries, [folder](const char* subfolder, const std::string& name, const std::vector<std::uint8_t>& bytes) {
+                write_file_bytes(folder / subfolder / name, bytes);
+            });
+            return "Extracted " + std::to_string(entries.size()) + " files to " + folder.string();
+        });
+        message = "Extracting files... You can keep editing.";
 #endif
     };
     std::vector<std::size_t> all(archive.entries.size());
@@ -805,7 +879,7 @@ void draw_csx_editor(ArchiveWorkspace& workspace, bool& open, EditorProject* pro
     // While a source asset is still broken the list is the stored archive, so writing
     // it would drop every fix and edit made since.
     const bool blocked = project != nullptr && workspace.follows_map && !project->save_blocking_load_errors.empty();
-    ImGui::BeginDisabled(workspace.refill.has_value() || blocked);
+    ImGui::BeginDisabled(workspace.refill.has_value() || blocked || archive_file_jobs_pending(workspace));
     if (ImGui::Button(dirty ? ICON_FA_FLOPPY_DISK " Write test.csx *" : ICON_FA_FLOPPY_DISK " Write test.csx")) {
         file_action([&] { save_archive_workspace(workspace); });
     }
@@ -819,11 +893,11 @@ void draw_csx_editor(ArchiveWorkspace& workspace, bool& open, EditorProject* pro
         }
     }
     ImGui::SameLine();
-    ImGui::BeginDisabled(selected.empty());
+    ImGui::BeginDisabled(selected.empty() || archive_file_jobs_pending(workspace));
     if (ImGui::Button(ICON_FA_FILE_EXPORT " Extract selected...")) file_action([&] { extract(selected); });
     ImGui::EndDisabled();
     ImGui::SameLine();
-    ImGui::BeginDisabled(archive.entries.empty());
+    ImGui::BeginDisabled(archive.entries.empty() || archive_file_jobs_pending(workspace));
     if (ImGui::Button(ICON_FA_FILE_EXPORT " Extract all...")) file_action([&] { extract(all); });
     ImGui::EndDisabled();
     ImGui::SameLine();

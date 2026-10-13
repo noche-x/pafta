@@ -48,6 +48,7 @@ void ImGui_ImplRaylib_UpdateTexture(ImTextureData* tex);
 #endif
 
 namespace pafta::app_internal {
+namespace { std::uint64_t g_generated_texture_bytes{}; }
 
 GfxDebugStats* g_gfx_debug_stats = nullptr;
 RenderSettings g_render_settings;
@@ -633,6 +634,7 @@ void invalidate_city_block_preview_scene(EditorProject& project) {
 
 void service_render_rebuild(EditorProject& project) {
     PAFTA_PROFILE_FUNCTION();
+    project.placement_override_upload_budget = 1;
     if (project.render_buffers_dirty && !project.render_build_in_progress) {
 #ifdef __EMSCRIPTEN__
         start_incremental_render_buffer_rebuild(project);
@@ -682,6 +684,9 @@ void service_render_rebuild(EditorProject& project) {
         project.status = render_build_progress_status(project.render_build_progress);
     } else if (!project.pending_gpu_upload_indices.empty()) {
         project.status = "uploading meshes " + std::to_string(project.pending_gpu_upload_index) + "/" + std::to_string(project.building_render_buffers.size());
+    }
+    if (project.placement_override_build_future || !project.placement_override_uploads.empty()) {
+        refresh_placement_override_models(project);
     }
 }
 
@@ -763,9 +768,6 @@ Color native_material_color(std::uint32_t material, bool selected, bool window_m
     if (window_material) {
         return {170, 190, 201, 220};
     }
-    if (material == 0x100U) {
-        return {0, 0, 0, 191};
-    }
     switch (material % 6U) {
         case 1:
             return {217, 213, 203, 255};
@@ -812,6 +814,7 @@ const Texture2D& generated_game_landscape_color_texture() {
         SetTextureWrap(loaded, TEXTURE_WRAP_REPEAT);
         SetTextureFilter(loaded, TEXTURE_FILTER_TRILINEAR);
         SetTextureFilter(loaded, TEXTURE_FILTER_ANISOTROPIC_16X);
+        g_generated_texture_bytes += gpu_texture_bytes(loaded);
         return loaded;
     }();
     return texture;
@@ -869,6 +872,7 @@ const Texture2D& game_slot0_texture(bool material) {
             SetTextureWrap(*t, TEXTURE_WRAP_REPEAT);
             SetTextureFilter(*t, TEXTURE_FILTER_TRILINEAR);
         }
+        g_generated_texture_bytes += gpu_texture_bytes(color_texture) + gpu_texture_bytes(material_texture);
         return std::array<Texture2D, 2>{color_texture, material_texture};
     }();
     return textures[material ? 1 : 0];
@@ -882,10 +886,7 @@ std::string_view game_surface_texture_name(std::string_view name) {
 }
 
 const Texture2D* texture_for_material(const EditorProject& project, const SbbBuilding& building, std::uint32_t material_id) {
-    if (material_id == 0x100U) {
-        return nullptr;
-    }
-    const auto local_slot = static_cast<std::size_t>(material_id & 0xffU);
+    const auto local_slot = static_cast<std::size_t>(material_id);
     if (local_slot < building.materials.size()) {
         return find_project_texture(project, building.materials[local_slot]);
     }
@@ -893,10 +894,7 @@ const Texture2D* texture_for_material(const EditorProject& project, const SbbBui
 }
 
 const Texture2D* material_texture_for_material(const EditorProject& project, const SbbBuilding& building, std::uint32_t material_id) {
-    if (material_id == 0x100U) {
-        return nullptr;
-    }
-    const auto local_slot = static_cast<std::size_t>(material_id & 0xffU);
+    const auto local_slot = static_cast<std::size_t>(material_id);
     return local_slot < building.materials.size()
         ? find_project_material_texture(project, building.materials[local_slot])
         : nullptr;
@@ -924,12 +922,25 @@ const Texture2D* material_texture_for_buffer_material(const EditorProject& proje
 
 Texture2D default_game_material_texture();
 
+namespace {
+GpuMemoryStats g_gpu_mesh_memory;
+std::uint64_t g_instance_stream_bytes{};
+std::uint64_t g_imgui_stream_bytes{};
+}
+
 void GpuMesh::unload() {
     if (ebo != 0U) glDeleteBuffers(1, &ebo);
     if (vbo != 0U) glDeleteBuffers(1, &vbo);
     if (vao != 0U) glDeleteVertexArrays(1, &vao);
+    if (vertex_bytes != 0U || index_bytes != 0U) {
+        g_gpu_mesh_memory.buffer_bytes -= vertex_bytes + index_bytes;
+        g_gpu_mesh_memory.vertices -= vertex_count;
+        g_gpu_mesh_memory.indices -= index_count;
+        --g_gpu_mesh_memory.meshes;
+    }
     vao = vbo = ebo = 0U;
     vertex_count = index_count = 0U;
+    vertex_bytes = index_bytes = 0U;
     parts.clear();
 }
 
@@ -976,6 +987,12 @@ GpuMesh upload_gpu_vertices(const std::vector<GpuVertex>& vertices, const std::v
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     mesh.vertex_count = static_cast<std::uint32_t>(vertices.size());
     mesh.index_count = static_cast<std::uint32_t>(indices.size());
+    mesh.vertex_bytes = vertices.size() * sizeof(GpuVertex);
+    mesh.index_bytes = indices.size() * sizeof(std::uint32_t);
+    g_gpu_mesh_memory.buffer_bytes += mesh.vertex_bytes + mesh.index_bytes;
+    g_gpu_mesh_memory.vertices += mesh.vertex_count;
+    g_gpu_mesh_memory.indices += mesh.index_count;
+    ++g_gpu_mesh_memory.meshes;
     return mesh;
 }
 
@@ -1038,6 +1055,12 @@ GpuMesh upload_shadow_volume(const std::vector<ShadowVertex>& vertices, const st
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     mesh.vertex_count = static_cast<std::uint32_t>(count);
     mesh.index_count = static_cast<std::uint32_t>(indices.size());
+    mesh.vertex_bytes = vertices.size() * sizeof(ShadowVertex);
+    mesh.index_bytes = indices.size() * sizeof(std::uint32_t);
+    g_gpu_mesh_memory.buffer_bytes += mesh.vertex_bytes + mesh.index_bytes;
+    g_gpu_mesh_memory.vertices += mesh.vertex_count;
+    g_gpu_mesh_memory.indices += mesh.index_count;
+    ++g_gpu_mesh_memory.meshes;
     return mesh;
 }
 
@@ -1056,7 +1079,9 @@ GpuMesh upload_gpu_mesh(const BuildingRenderBuffer& buffer, const std::function<
     std::vector<std::uint32_t> indices;
     indices.reserve(buffer.triangles.size() * 3U);
     std::vector<GpuMeshPart> parts;
-    for (const auto& run : buffer.material_runs) {
+    const auto count = buffer.terrain_chunks.empty() ? buffer.material_runs.size() : buffer.terrain_chunks.size();
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto& run = buffer.terrain_chunks.empty() ? buffer.material_runs[i] : buffer.terrain_chunks[i].run;
         const auto first = static_cast<std::size_t>(run.first_triangle);
         if (first > buffer.triangles.size() || run.triangle_count > buffer.triangles.size() - first) {
             throw std::runtime_error("GPU mesh material run exceeds its triangle buffer");
@@ -1066,6 +1091,12 @@ GpuMesh upload_gpu_mesh(const BuildingRenderBuffer& buffer, const std::function<
         part.first_index = static_cast<std::uint32_t>(indices.size());
         part.material_id = run.material;
         part.window_material = run.city_window_surface;
+        if (!buffer.terrain_chunks.empty()) {
+            const auto& chunk = buffer.terrain_chunks[i];
+            part.has_bounds = true;
+            part.bounds_min = {chunk.bounds_min.x, chunk.bounds_min.y, chunk.bounds_min.z};
+            part.bounds_max = {chunk.bounds_max.x, chunk.bounds_max.y, chunk.bounds_max.z};
+        }
         for (std::size_t t = run.first_triangle; t < end; ++t) {
             const auto& tri = buffer.triangles[t];
             if (tri.indices[0] >= buffer.vertices.size() || tri.indices[1] >= buffer.vertices.size() || tri.indices[2] >= buffer.vertices.size()) {
@@ -1106,6 +1137,45 @@ GpuMesh upload_gpu_mesh(const BuildingRenderBuffer& buffer, const std::function<
     auto mesh = upload_gpu_vertices(vertices, indices);
     mesh.parts = std::move(parts);
     return mesh;
+}
+
+// Retain uploaded vertices and remove stale cells from the index stream. This is
+// cheap enough to show an erase immediately while the full mesh and shadows build.
+template <typename Keep>
+void filter_gpu_cells(GpuBuildingRenderModel& model, const BuildingRenderBuffer& buffer, bool flat_faces, Keep&& keep) {
+    auto& mesh = model.mesh;
+    if (mesh.vao == 0U) return;
+    std::vector<std::uint32_t> indices;
+    indices.reserve(buffer.triangles.size() * 3U);
+    std::size_t part_index = 0;
+    for (const auto& run : buffer.material_runs) {
+        if (run.triangle_count == 0U) continue;
+        auto& part = mesh.parts.at(part_index++);
+        part.first_index = static_cast<std::uint32_t>(indices.size());
+        const auto end = static_cast<std::size_t>(run.first_triangle) + run.triangle_count;
+        for (auto t = static_cast<std::size_t>(run.first_triangle); t < end; ++t) {
+            const auto& triangle = buffer.triangles.at(t);
+            if (!keep(triangle.cell)) continue;
+            if (flat_faces) {
+                const auto first = static_cast<std::uint32_t>(t * 3U);
+                indices.insert(indices.end(), {first, first + 1U, first + 2U});
+            } else {
+                indices.insert(indices.end(), triangle.indices.begin(), triangle.indices.end());
+            }
+        }
+        part.index_count = static_cast<std::uint32_t>(indices.size()) - part.first_index;
+    }
+    rlDrawRenderBatchActive();
+    glBindVertexArray(mesh.vao);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(indices.size() * sizeof(std::uint32_t)), indices.data(), GL_DYNAMIC_DRAW);
+    glBindVertexArray(0);
+    g_gpu_mesh_memory.buffer_bytes -= mesh.index_bytes;
+    g_gpu_mesh_memory.indices -= mesh.index_count;
+    mesh.index_count = static_cast<std::uint32_t>(indices.size());
+    mesh.index_bytes = indices.size() * sizeof(std::uint32_t);
+    g_gpu_mesh_memory.buffer_bytes += mesh.index_bytes;
+    g_gpu_mesh_memory.indices += mesh.index_count;
 }
 
 // Used by building, portal, and city models: the part's textures come from the
@@ -1299,6 +1369,8 @@ void main() { out_color = frag_color * texture(texture0, frag_uv); }
         // and writing over them would make the driver wait.
         glBufferData(GL_ARRAY_BUFFER, list->VtxBuffer.Size * static_cast<GLsizeiptr>(sizeof(ImDrawVert)), list->VtxBuffer.Data, GL_STREAM_DRAW);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, list->IdxBuffer.Size * static_cast<GLsizeiptr>(sizeof(ImDrawIdx)), list->IdxBuffer.Data, GL_STREAM_DRAW);
+        g_imgui_stream_bytes = static_cast<std::uint64_t>(list->VtxBuffer.Size) * sizeof(ImDrawVert) +
+            static_cast<std::uint64_t>(list->IdxBuffer.Size) * sizeof(ImDrawIdx);
         for (const auto& cmd : list->CmdBuffer) {
             const float x0 = (cmd.ClipRect.x - l) * scale.x, y0 = (cmd.ClipRect.y - t) * scale.y;
             const float x1 = (cmd.ClipRect.z - l) * scale.x, y1 = (cmd.ClipRect.w - t) * scale.y;
@@ -1487,6 +1559,7 @@ struct LitShader {
     int unlit_surface_loc{-1};
     int building_surface_loc{-1};
     int terrain_surface_loc{-1};
+    int terrain_distance_loc{-1};
     int light_direction_loc{-1};
     int light_ambient_loc{-1};
     int light_diffuse_loc{-1};
@@ -1552,6 +1625,7 @@ uniform int unlitSurface;
 uniform int modelSurface;
 uniform int buildingSurface;
 uniform int terrainSurface;
+uniform float terrainDrawDistance;
 uniform vec3 lightDirection;
 // subrosa.exe WorldShading @0xa61f0 works these out from the sun's height every
 // frame. The world shader only reads lightdiffuse; the landscape shader reads both.
@@ -1592,6 +1666,7 @@ void main() {
     // of flickering between bright and dark while the camera moves. Close surfaces keep
     // their full-resolution texture.
     float textureDistance = length(viewPosition-fragPosition);
+    if (terrainSurface == 1 && terrainDrawDistance > 0.0 && textureDistance > terrainDrawDistance) discard;
     float mipBias = smoothstep(160.0, 900.0, textureDistance)*0.65;
     // landscape.vert: tex_detail at (x/32, 1-z/32) in world units.
     vec2 surfaceUv = terrainSurface == 1 ? vec2(fragPosition.x/32.0, 1.0-fragPosition.z/32.0) : fragTexCoord.xy;
@@ -1723,6 +1798,7 @@ void main() {
         cache.unlit_surface_loc = GetShaderLocation(cache.shader, "unlitSurface");
         cache.building_surface_loc = GetShaderLocation(cache.shader, "buildingSurface");
         cache.terrain_surface_loc = GetShaderLocation(cache.shader, "terrainSurface");
+        cache.terrain_distance_loc = GetShaderLocation(cache.shader, "terrainDrawDistance");
         cache.light_direction_loc = GetShaderLocation(cache.shader, "lightDirection");
         cache.light_ambient_loc = GetShaderLocation(cache.shader, "lightAmbient");
         cache.light_diffuse_loc = GetShaderLocation(cache.shader, "lightDiffuse");
@@ -1744,6 +1820,7 @@ Texture2D default_game_material_texture() {
         UnloadImage(image);
         SetTextureWrap(loaded, TEXTURE_WRAP_REPEAT);
         SetTextureFilter(loaded, TEXTURE_FILTER_BILINEAR);
+        g_generated_texture_bytes += gpu_texture_bytes(loaded);
         return loaded;
     }();
     return texture;
@@ -1761,7 +1838,10 @@ void set_game_surface_light(float scale) {
     SetShaderValue(shader.shader, shader.light_diffuse_loc, &diffuse.x, SHADER_UNIFORM_VEC3);
 }
 
+namespace { Vector3 g_surface_camera{}; }
+
 void set_game_surface_camera(Vector3 position) {
+    g_surface_camera = position;
     auto& shader = lit_shader();
     if (shader.shader.id != 0U && shader.view_position_loc >= 0) {
         SetShaderValue(shader.shader, shader.view_position_loc, &position.x, SHADER_UNIFORM_VEC3);
@@ -1804,6 +1884,7 @@ struct EnvironmentCubemap {
     // WebGL: blurred levels are drawn here and copied into the cube, because a cube
     // level outside [base, max] makes the framebuffer incomplete.
     GLuint scratch{};
+    unsigned int pixel_bytes{};
     Vector3 camera{};
     Vector3 light{};
     std::uint64_t terrain_fingerprint{};
@@ -1884,9 +1965,19 @@ const OverlayArrays& road_overlay_arrays() {
             glGenerateMipmap(GL_TEXTURE_2D_ARRAY);
         }
         glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+        g_generated_texture_bytes += 11U * (gpu_texture_bytes({result.color, size, size, 8, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8}) +
+            gpu_texture_bytes({result.material, size, size, 8, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8}));
         return result;
     }();
     return arrays;
+}
+
+bool append_gpu_draw_range(GpuMeshPart& range, const GpuMeshPart& next) {
+    if (range.first_index + range.index_count != next.first_index || range.material_id != next.material_id ||
+        range.texture != next.texture || range.material_texture != next.material_texture || range.window_material != next.window_material ||
+        range.color.r != next.color.r || range.color.g != next.color.g || range.color.b != next.color.b || range.color.a != next.color.a) return false;
+    range.index_count += next.index_count;
+    return true;
 }
 
 void draw_gpu_mesh_instances(const GpuMesh& mesh, const std::vector<Matrix>& transforms, GpuSurface surface) {
@@ -1902,6 +1993,15 @@ void draw_gpu_mesh_batch(const std::vector<GpuMeshDraw>& draws, GpuSurface surfa
     rlDrawRenderBatchActive();
     const auto view_projection = MatrixToFloatV(MatrixMultiply(rlGetMatrixModelview(), rlGetMatrixProjection()));
     const bool lit = surface != GpuSurface::Mask && surface != GpuSurface::ShadowVolume;
+    ViewFrustumPlanes terrain_planes{};
+    if (surface == GpuSurface::Terrain) {
+        const auto m = MatrixMultiply(rlGetMatrixModelview(), rlGetMatrixProjection());
+        terrain_planes = {{
+            {m.m3 + m.m0, m.m7 + m.m4, m.m11 + m.m8, m.m15 + m.m12}, {m.m3 - m.m0, m.m7 - m.m4, m.m11 - m.m8, m.m15 - m.m12},
+            {m.m3 + m.m1, m.m7 + m.m5, m.m11 + m.m9, m.m15 + m.m13}, {m.m3 - m.m1, m.m7 - m.m5, m.m11 - m.m9, m.m15 - m.m13},
+            {m.m3 + m.m2, m.m7 + m.m6, m.m11 + m.m10, m.m15 + m.m14}, {m.m3 - m.m2, m.m7 - m.m6, m.m11 - m.m10, m.m15 - m.m14},
+        }};
+    }
     // Made the first time it is used, which flushes raylib's batch and unbinds the
     // program, so do it before binding ours.
     if (lit) road_overlay_arrays();
@@ -1915,6 +2015,7 @@ void draw_gpu_mesh_batch(const std::vector<GpuMeshDraw>& draws, GpuSurface surfa
         glUniformMatrix4fv(shader.view_projection_loc, 1, GL_FALSE, view_projection.v);
         glUniform1i(shader.building_surface_loc, surface == GpuSurface::Building ? 1 : 0);
         glUniform1i(shader.terrain_surface_loc, surface == GpuSurface::Terrain ? 1 : 0);
+        glUniform1f(shader.terrain_distance_loc, g_render_settings.terrain_distance);
         glUniform1i(shader.model_surface_loc, surface == GpuSurface::Model ? 1 : 0);
         glUniform1i(shader.unlit_surface_loc, surface == GpuSurface::Unlit ? 1 : 0);
     } else {
@@ -1932,6 +2033,7 @@ void draw_gpu_mesh_batch(const std::vector<GpuMeshDraw>& draws, GpuSurface surfa
     }
     glBindBuffer(GL_ARRAY_BUFFER, instance_stream());
     glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(columns.size() * sizeof(float16)), columns.data(), GL_STREAM_DRAW);
+    g_instance_stream_bytes = columns.size() * sizeof(float16);
     // World geometry is wound clockwise, as in the game, which draws it with
     // glFrontFace(GL_CW) and back faces culled. With raylib's counter-clockwise front
     // face, that means culling GL_FRONT, and the lit shader flips the normals of the
@@ -1989,9 +2091,20 @@ void draw_gpu_mesh_batch(const std::vector<GpuMeshDraw>& draws, GpuSurface surfa
                 reinterpret_cast<void*>(first_instance * sizeof(float16) + column * 4U * sizeof(float)));
         }
         const auto instances = static_cast<GLsizei>(draw.transforms.size());
-        for (const auto& part : mesh.parts) {
+        const auto terrain_visible = [&](const GpuMeshPart& part) {
+            return !part.has_bounds || terrain_bounds_visible(
+                {part.bounds_min.x, part.bounds_min.y, part.bounds_min.z}, {part.bounds_max.x, part.bounds_max.y, part.bounds_max.z},
+                {g_surface_camera.x, g_surface_camera.y, g_surface_camera.z}, g_render_settings.terrain_distance, terrain_planes);
+        };
+        for (std::size_t i = 0; i < mesh.parts.size();) {
+            auto part = mesh.parts[i++];
             if ((filter == GpuPartFilter::Opaque && part.window_material) || (glass && !part.window_material)) continue;
-            if (part.has_bounds && g_shadow_cull && !shadow_part_visible(*g_shadow_cull, part)) continue;
+            if (surface == GpuSurface::ShadowVolume && part.has_bounds && g_shadow_cull && !shadow_part_visible(*g_shadow_cull, part)) continue;
+            if (surface == GpuSurface::Terrain) {
+                if (!terrain_visible(part)) continue;
+                // A visible sequence is one draw, keeping distant chunks as gaps.
+                while (i < mesh.parts.size() && terrain_visible(mesh.parts[i]) && append_gpu_draw_range(part, mesh.parts[i])) ++i;
+            }
             if (lit) {
                 const auto& shader = lit_shader();
                 const auto material = part.material_texture != 0U ? part.material_texture : default_texture;
@@ -2365,6 +2478,7 @@ void create_environment_cubemap(EnvironmentCubemap& cubemap) {
     constexpr GLenum internal_format = GL_RGBA16F;
     constexpr GLenum type = GL_HALF_FLOAT;
 #endif
+    cubemap.pixel_bytes = internal_format == GL_RGBA16F ? 8U : 4U;
     for (int level = 0; level < kEnvironmentLevels; ++level) {
         const int size = std::max(1, kEnvironmentSize >> level);
         for (int face = 0; face < 6; ++face) {
@@ -2466,7 +2580,7 @@ void update_environment_cubemap(const GpuMesh* terrain, std::uint64_t terrain_fi
             };
             rlSetMatrixModelview(view);
             rlSetMatrixProjection(projection);
-            SetShaderValue(lit.shader, lit.view_position_loc, &camera_position.x, SHADER_UNIFORM_VEC3);
+            set_game_surface_camera(camera_position);
             const int on = 1;
             SetShaderValue(lit.shader, lit.cubemap_pass_loc, &on, SHADER_UNIFORM_INT);
             set_game_surface_light(0.5F);
@@ -2555,8 +2669,8 @@ MaskOutlineShader& mask_outline_shader() {
             "void main() {\n"
             "    float center = texture(texture0, fragTexCoord).a;\n"
             "    float neighbor = 0.0;\n"
-            "    for (int y = -2; y <= 2; ++y) {\n"
-            "        for (int x = -2; x <= 2; ++x) {\n"
+            "    for (int y = -1; y <= 1; ++y) {\n"
+            "        for (int x = -1; x <= 1; ++x) {\n"
             "            if (x == 0 && y == 0) { continue; }\n"
             "            vec2 offset = vec2(float(x), float(y)) * texelSize;\n"
             "            neighbor = max(neighbor, texture(texture0, fragTexCoord + offset).a);\n"
@@ -2624,24 +2738,33 @@ namespace {
 // vertices each. Cached per highlight key until the buffer changes, so a hover
 // outline doesn't search a city-sized mesh every frame.
 const std::vector<Vec3>& mask_triangles(std::uint64_t key, const BuildingRenderBuffer& buffer,
-                                      const std::function<bool(Vec3)>& inside) {
+                                      const std::function<bool(Vec3)>& inside, std::optional<std::uint32_t> source_cell = std::nullopt) {
     auto& entries = buffer.mask_cache;
     for (const auto& entry : entries) {
         if (entry.key == key) return entry.points;
     }
-    if (entries.size() == 8U) entries.erase(entries.begin());
     auto& entry = entries.emplace_back(RenderBufferMask{key, {}});
-    for (const auto& tri : buffer.triangles) {
+    if (buffer.cell_mask_index.empty()) {
+        for (std::size_t i = 0; i < buffer.triangles.size(); ++i)
+            buffer.cell_mask_index[buffer.triangles[i].cell].push_back(static_cast<std::uint32_t>(i));
+    }
+    const auto append = [&](const RenderBufferTriangle& tri) {
         const auto& a = buffer.vertices[tri.indices[0]].position;
         const auto& b = buffer.vertices[tri.indices[1]].position;
         const auto& c = buffer.vertices[tri.indices[2]].position;
-        if (!inside({(a.x + b.x + c.x) / 3.0F, (a.y + b.y + c.y) / 3.0F, (a.z + b.z + c.z) / 3.0F})) continue;
+        if (!inside({(a.x + b.x + c.x) / 3.0F, (a.y + b.y + c.y) / 3.0F, (a.z + b.z + c.z) / 3.0F})) return;
         entry.points.insert(entry.points.end(), {a, b, c});
+    };
+    if (source_cell) {
+        if (const auto found = buffer.cell_mask_index.find(*source_cell); found != buffer.cell_mask_index.end())
+            for (const auto i : found->second) append(buffer.triangles[i]);
+    } else {
+        for (const auto& tri : buffer.triangles) append(tri);
     }
     return entry.points;
 }
 
-// Draws the cached mask triangles, both windings, raised by `offset`. The batch is
+// Draws the cached mask triangles with culling disabled, raised by `offset`. The batch is
 // flushed before culling is turned back on, because DrawTriangle3D draws later.
 bool draw_mask_triangles(const std::vector<Vec3>& points, Vector3 offset) {
     if (points.empty()) return false;
@@ -2652,7 +2775,6 @@ bool draw_mask_triangles(const std::vector<Vec3>& points, Vector3 offset) {
         const auto b = Vector3Add(to_raylib(points[i + 1]), offset);
         const auto c = Vector3Add(to_raylib(points[i + 2]), offset);
         DrawTriangle3D(a, b, c, WHITE);
-        DrawTriangle3D(c, b, a, WHITE);
     }
     rlDrawRenderBatchActive();
     rlEnableBackfaceCulling();
@@ -2682,7 +2804,7 @@ void draw_building_cell_mask(const BuildingRenderBuffer& buffer, const SbbBuildi
     const auto y0 = (static_cast<float>(cell.y) - static_cast<float>(building.anchor_y)) * unit_size;
     const auto z0 = (static_cast<float>(cell.z) - static_cast<float>(building.anchor_z)) * unit_size;
     const auto& points = mask_triangles(mask_key(1, cell.x, cell.y, cell.z), buffer,
-        [&](Vec3 p) { return inside_cell_box(p, x0, y0, z0); });
+        [&](Vec3 p) { return inside_cell_box(p, x0, y0, z0); }, static_cast<std::uint32_t>(cell.index));
     if (!draw_mask_triangles(points, {})) {
         DrawCubeV({x0 + unit_size * 0.5F, y0 + unit_size * 0.5F, z0 + unit_size * 0.5F}, {unit_size, unit_size, unit_size}, WHITE);
     }
@@ -2713,8 +2835,19 @@ void draw_city_piece_mask(const EditorProject& project, CityGridPoint cell) {
     const auto x0 = static_cast<float>(cell.x) * unit_size;
     const auto y0 = static_cast<float>(cell.y) * unit_size;
     const auto z0 = static_cast<float>(cell.z) * unit_size;
+    std::optional<std::uint32_t> source_cell;
+    for (std::size_t p = 0; p < project.portal_render_sources.size(); ++p) {
+        const auto& portal = project.portal_render_sources[p];
+        const auto x = cell.x - sbc_portal_cell_base(portal.fields[1]);
+        const auto y = cell.y - sbc_portal_cell_base(portal.fields[2]);
+        const auto z = cell.z - sbc_portal_cell_base(portal.fields[3]);
+        if (x >= 0 && x < 8 && y >= 0 && y < 8 && z >= 0 && z < 8) {
+            source_cell = static_cast<std::uint32_t>(p * 512 + y * 64 + z * 8 + x);
+            break;
+        }
+    }
     const auto& points = mask_triangles(mask_key(2, cell.x, cell.y, cell.z), project.portal_render_buffer,
-        [&](Vec3 p) { return inside_cell_box(p, x0, y0, z0); });
+        [&](Vec3 p) { return inside_cell_box(p, x0, y0, z0); }, source_cell);
     if (!draw_mask_triangles(points, {0.0F, 0.25F, 0.0F})) {
         DrawCubeV({x0 + unit_size * 0.5F, y0 + 0.25F + unit_size * 0.5F, z0 + unit_size * 0.5F}, {unit_size, unit_size, unit_size}, WHITE);
     }
@@ -3115,16 +3248,19 @@ void draw_block_mesh_textured(const EditorProject& project, const SblBlockMesh& 
         rlSetTexture(texture != nullptr ? texture->id : rlGetTextureIdDefault());
         rlBegin(RL_TRIANGLES);
         for (const auto& face : mesh.faces) {
-            // A face's slot is its material; outside faces clamp to 7 (piece_face_slot).
-            if (face.vertices.size() < 3 || std::min(face.material & 0xffffU, 7U) != slot) continue;
+            if (face.vertices.size() < 3) continue;
             std::vector<Vector3> points;
             std::vector<Vec2f> uvs = face.uvs;
+            auto material = face.material & 0xffffU;
             if (rotation != 0 && face.vertices.size() == 4U) {
                 const auto turned = rotate_block_face_native(mesh, face, rotation);
                 for (const auto& v : turned.vertices) points.push_back({v.x, v.y, v.z});
+                uvs.assign(turned.uvs.begin(), turned.uvs.end());
+                material = turned.material;
             } else {
                 for (const auto& v : face.vertices) points.push_back({v.x, v.y, v.z});
             }
+            if (std::min(material, 7U) != slot) continue;
             for (auto& p : points) p = Vector3Add(origin, Vector3Scale(p, unit));
             const auto n = Vector3Normalize(Vector3CrossProduct(Vector3Subtract(points[1], points[0]), Vector3Subtract(points[2], points[0])));
             // Simple facing light so the shape reads without the game's lighting.
@@ -3150,30 +3286,100 @@ void draw_block_mesh_textured(const EditorProject& project, const SblBlockMesh& 
     rlEnableBackfaceCulling();
 }
 
-const RenderTexture2D* piece_thumbnail(EditorProject& project, const std::string& mesh_name, const std::array<std::string, 8>& textures) {
+// The 3D view draws the lit world in linear HDR, then hdr_composite turns it into
+// screen colours. Thumbnails go through the same composite, unshadowed, so a piece
+// or building looks the same in its thumbnail as in the city.
+void draw_lit_thumbnail(RenderTexture2D target, const std::function<void()>& draw) {
+    auto hdr = load_game_render_texture(target.texture.width, target.texture.height);
+    begin_game_texture_mode(hdr);
+    ClearBackground(Color{4, 4, 6, 255}); // the panel grey after the composite
+    draw();
+    end_game_texture_mode();
+    begin_game_texture_mode(target);
+    auto& tonemap = game_tonemap_shader_cache();
+    const Vector2 resolution{static_cast<float>(target.texture.width), static_cast<float>(target.texture.height)};
+    SetShaderValue(tonemap.shader, tonemap.resolution_loc, &resolution.x, SHADER_UNIFORM_VEC2);
+    const int apply_tonemap =
+#ifdef __EMSCRIPTEN__
+        web_hdr_targets() ? 1 : 0;
+#else
+        1;
+#endif
+    SetShaderValue(tonemap.shader, tonemap.apply_tonemap_loc, &apply_tonemap, SHADER_UNIFORM_INT);
+    BeginShaderMode(tonemap.shader);
+    // White shadow factor: nothing in the thumbnail is in shadow.
+    const Texture2D white{rlGetTextureIdDefault(), 1, 1, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+    SetShaderValueTexture(tonemap.shader, tonemap.shadow_factor_loc, white);
+    SetShaderValueTexture(tonemap.shader, tonemap.direct_light_loc, white);
+    SetShaderValueTexture(tonemap.shader, tonemap.packed_depth_loc, white);
+    DrawTextureRec(hdr.texture, {0.0F, 0.0F, static_cast<float>(hdr.texture.width), -static_cast<float>(hdr.texture.height)}, {0.0F, 0.0F}, WHITE);
+    EndShaderMode();
+    end_game_texture_mode();
+    unload_game_render_texture(hdr);
+}
+
+namespace {
+std::string piece_preview_key(const std::string& mesh_name, const std::array<std::string, 8>& textures, int rotation) {
     std::string key = lower_name(mesh_name);
     for (const auto& texture : textures) key += "|" + lower_name(texture);
-    if (const auto found = project.piece_thumbnails.find(key); found != project.piece_thumbnails.end()) return &found->second;
+    return key + "|" + std::to_string(rotation & 3);
+}
+EditorProject::PiecePreviewModel* piece_preview_model(EditorProject& project, const std::string& mesh_name,
+    const std::array<std::string, 8>& textures, std::int32_t rotation) {
+    const auto key = piece_preview_key(mesh_name, textures, rotation);
+    if (const auto found = project.piece_preview_models.find(key); found != project.piece_preview_models.end()) return &found->second;
     const SblBlockMesh* mesh = &solid_piece_mesh();
     if (!mesh_name.empty()) {
         const auto block = std::ranges::find_if(project.blocks, [&](const auto& asset) { return lower_name(asset.name) == lower_name(mesh_name); });
         if (block == project.blocks.end()) return nullptr;
         mesh = &block->data;
     }
-    if (project.thumbnail_budget <= 0) return nullptr;
-    --project.thumbnail_budget;
-    constexpr float unit = 4.0F;
+    SbcMap map{};
+    map.version = 12;
+    map.city_blocks.push_back({0U, mesh_name, {textures}});
+    SbcPortal portal{};
+    portal.blocks.assign(0x200, 0U);
+    portal.blocks[0] = 0x00010000U | (static_cast<std::uint32_t>(rotation & 3) << 24U);
+    map.portals.push_back(std::move(portal));
+    const auto buffer = build_native_portal_render_buffer(map, mesh_name.empty() ? std::vector<NamedBlockMesh>{}
+        : std::vector<NamedBlockMesh>{{mesh_name, *mesh}});
+    auto gpu = upload_gpu_mesh(buffer, [&](GpuMeshPart& part) {
+        describe_textured_part(part, texture_for_buffer_material(project, buffer, part.material_id),
+            material_texture_for_buffer_material(project, buffer, part.material_id));
+    });
     Vector3 lo{FLT_MAX, FLT_MAX, FLT_MAX}, hi{-FLT_MAX, -FLT_MAX, -FLT_MAX};
-    for (const auto& face : mesh->faces) {
-        for (const auto& v : face.vertices) {
-            lo = Vector3Min(lo, Vector3Scale({v.x, v.y, v.z}, unit));
-            hi = Vector3Max(hi, Vector3Scale({v.x, v.y, v.z}, unit));
-        }
+    for (const auto& vertex : buffer.vertices) {
+        const auto& v = vertex.position;
+        lo = Vector3Min(lo, {v.x, v.y, v.z});
+        hi = Vector3Max(hi, {v.x, v.y, v.z});
     }
     if (lo.x > hi.x) lo = hi = {};
     const auto center = Vector3Scale(Vector3Add(lo, hi), 0.5F);
     const float radius = std::max(1.0F, Vector3Distance(lo, hi) * 0.5F);
-    const float dist = radius * 2.3F;
+    auto& preview = project.piece_preview_models[key];
+    preview.mesh = std::move(gpu);
+    preview.center = center;
+    preview.radius = radius;
+    return &preview;
+}
+} // namespace
+
+void draw_piece_preview(EditorProject& project, const std::string& mesh_name,
+    const std::array<std::string, 8>& textures, Vector3 position, std::int32_t rotation) {
+    if (auto* preview = piece_preview_model(project, mesh_name, textures, rotation))
+        draw_gpu_mesh_instances(preview->mesh, {MatrixTranslate(position.x, position.y, position.z)}, GpuSurface::World);
+}
+
+const RenderTexture2D* piece_thumbnail(EditorProject& project, const std::string& mesh_name,
+    const std::array<std::string, 8>& textures, std::int32_t rotation) {
+    const auto key = piece_preview_key(mesh_name, textures, rotation);
+    if (const auto found = project.piece_thumbnails.find(key); found != project.piece_thumbnails.end()) return &found->second;
+    if (project.thumbnail_budget <= 0) return nullptr;
+    auto* preview = piece_preview_model(project, mesh_name, textures, rotation);
+    if (preview == nullptr) return nullptr;
+    --project.thumbnail_budget;
+    const auto center = preview->center;
+    const float dist = preview->radius * 2.3F;
     Camera3D cam{};
     cam.position = {center.x + dist * 0.7F, center.y + dist * 0.6F, center.z + dist * 0.7F};
     cam.target = center;
@@ -3182,13 +3388,15 @@ const RenderTexture2D* piece_thumbnail(EditorProject& project, const std::string
     cam.projection = CAMERA_PERSPECTIVE;
     auto& target = project.piece_thumbnails[key];
     target = LoadRenderTexture(128, 128);
-    begin_game_texture_mode(target);
-    ClearBackground(Color{32, 36, 41, 255});
-    BeginMode3D(cam);
-    rlEnableDepthTest();
-    draw_block_mesh_textured(project, *mesh, textures, {}, unit, 0, 255);
-    EndMode3D();
-    end_game_texture_mode();
+    draw_lit_thumbnail(target, [&] {
+        BeginMode3D(cam);
+        set_game_surface_camera(cam.position);
+        rlEnableDepthTest();
+        draw_gpu_mesh_instances(preview->mesh, {MatrixIdentity()}, GpuSurface::World);
+        EndMode3D();
+    });
+    GenTextureMipmaps(&target.texture);
+    SetTextureFilter(target.texture, TEXTURE_FILTER_BILINEAR);
     return &target;
 }
 
@@ -3334,17 +3542,16 @@ const RenderTexture2D* building_thumbnail(EditorProject& project, std::size_t in
     cam.fovy = 45.0F;
     cam.projection = CAMERA_PERSPECTIVE;
 
-    begin_game_texture_mode(target);
-    ClearBackground(Color{32, 36, 41, 255});
-    BeginMode3D(cam);
-    set_game_surface_camera(cam.position);
-    rlEnableDepthTest();
-    // Building meshes are relative to the anchor, like the picker and the city.
-    draw_gpu_building_model(model, {}, 0, false);
-    // A faint ground plane gives the building a sense of size and direction.
-    DrawGrid(static_cast<int>(std::max(building.size_x, building.size_y)) + 2, unit_size);
-    EndMode3D();
-    end_game_texture_mode();
+    draw_lit_thumbnail(target, [&] {
+        BeginMode3D(cam);
+        set_game_surface_camera(cam.position);
+        rlEnableDepthTest();
+        // Building meshes are relative to the anchor, like the picker and the city.
+        draw_gpu_building_model(model, {}, 0, false);
+        // A faint ground plane gives the building a sense of size and direction.
+        DrawGrid(static_cast<int>(std::max(building.size_x, building.size_y)) + 2, unit_size);
+        EndMode3D();
+    });
     GenTextureMipmaps(&target.texture);
     SetTextureFilter(target.texture, TEXTURE_FILTER_BILINEAR);
 
@@ -3526,6 +3733,18 @@ void evict_building_near_models(EditorProject& project) {
 void refresh_placement_override_models(EditorProject& project) {
     if (!project.city) {
         project.placement_override_models.clear();
+        project.placement_override_uploads.clear();
+        project.placement_override_upload_cursor = 0;
+        if (project.placement_override_build_future &&
+#ifdef __EMSCRIPTEN__
+            true) {
+            project.placement_override_build_future.reset();
+#else
+            project.placement_override_build_future->wait_for(std::chrono::milliseconds{0}) == std::future_status::ready) {
+            project.placement_override_build_future->get();
+            project.placement_override_build_future.reset();
+#endif
+        }
         return;
     }
     // Wait for the template models to finish loading, because overrides copy them.
@@ -3542,36 +3761,77 @@ void refresh_placement_override_models(EditorProject& project) {
     }
     // A template model that was uploaded again gets a new vao.
     for (const auto& model : project.building_gpu_models) mix(model.mesh.vao);
+    mix(project.city_building_revision);
     // Cells the game's world storage can't hold (GameWorldFit) are hidden too.
     const auto* dropped = project.city_scene_cache_valid ? &project.city_scene_cache.world_fit.building_cells : nullptr;
     // The scene key changes even when different dropped cells have the same count;
     // counts alone can't tell this geometry apart.
     if (dropped != nullptr) mix(project.city_scene_cache_fingerprint);
-    if (fingerprint == project.placement_override_fingerprint) return;
-    project.placement_override_fingerprint = fingerprint;
-    project.placement_override_models.clear();
-
-    std::vector<const SbbBuilding*> buildings(asset_indices.size());
-    for (std::size_t i = 0; i < asset_indices.size(); ++i) {
-        if (asset_indices[i].has_value()) buildings[i] = &project.buildings[*asset_indices[i]].data;
+    if (fingerprint != project.placement_override_fingerprint) {
+        // Placement indices and template geometry can change during a gesture.
+        // Never draw an override prepared for an earlier arrangement.
+        project.placement_override_models.clear();
+        project.placement_override_uploads.clear();
+        project.placement_override_upload_cursor = 0;
     }
-    auto overwritten = overwritten_building_cells(project.city->data, buildings);
-    std::vector<std::size_t> later_placements(overwritten.size());
-    for (std::size_t i = 0; i < overwritten.size(); ++i) {
-        later_placements[i] = overwritten[i].size();
-        if (dropped != nullptr && i < dropped->size()) overwritten[i].insert(overwritten[i].end(), (*dropped)[i].begin(), (*dropped)[i].end());
+    if (project.placement_override_build_future.has_value() &&
+#ifdef __EMSCRIPTEN__
+        true) {
+#else
+        project.placement_override_build_future->wait_for(std::chrono::milliseconds{0}) == std::future_status::ready) {
+#endif
+        auto built = project.placement_override_build_future->get();
+        project.placement_override_build_future.reset();
+        if (project.placement_override_build_target_fingerprint == fingerprint) {
+            project.placement_override_fingerprint = fingerprint;
+            project.placement_override_uploads = std::move(built);
+            project.placement_override_upload_cursor = 0;
+        }
     }
-    for (std::size_t i = 0; i < overwritten.size(); ++i) {
-        if (overwritten[i].empty()) continue;
-        auto building = *buildings[i];
-        for (const auto c : overwritten[i]) building.cells[c].occupied = false;
-        const auto buffer = build_city_building_full_render_buffer(building, block_meshes(project), buildblock_templates(project), BuildingLod::Far);
-        project.placement_override_models.emplace(i, upload_building_render_model(buffer, building, project));
-        const auto& p = project.city->data.buildings[i];
-        append_render_log(project, "placement " + std::to_string(i) + " " + p.name + " at " + std::to_string(p.x) + "," +
-            std::to_string(p.y) + "," + std::to_string(p.z) + ": " + std::to_string(later_placements[i]) +
-            " cells overwritten by later placements, " + std::to_string(overwritten[i].size() - later_placements[i]) +
-            " past the game's world storage");
+    if (!project.placement_override_build_future.has_value() &&
+        project.placement_override_fingerprint != fingerprint && !project.defer_heavy_rebuilds) {
+        SbcMap map;
+        map.buildings = project.city->data.buildings;
+        // Copy each used template once. The worker recreates its placement pointers
+        // over these owned copies, so edits and project unload cannot invalidate them.
+        std::vector<std::optional<SbbBuilding>> owned(project.buildings.size());
+        for (const auto index : asset_indices) {
+            if (index && !owned[*index]) owned[*index] = project.buildings[*index].data;
+        }
+        project.placement_override_build_target_fingerprint = fingerprint;
+        project.placement_override_build_future = std::async(
+#ifdef __EMSCRIPTEN__
+            std::launch::deferred,
+#else
+            std::launch::async,
+#endif
+            [map = std::move(map), owned = std::move(owned), indices = asset_indices,
+             blocks = block_meshes(project), templates = buildblock_templates(project),
+             dropped = dropped == nullptr ? std::vector<std::vector<std::size_t>>{} : *dropped] {
+                PAFTA_PROFILE_THREAD("Placement override rebuild");
+                std::vector<const SbbBuilding*> buildings;
+                buildings.reserve(indices.size());
+                for (const auto index : indices) buildings.push_back(index ? &*owned[*index] : nullptr);
+                return build_placement_override_render_buffers(map, buildings, blocks, templates, dropped);
+            });
+    }
+    if (project.placement_override_fingerprint != fingerprint || project.placement_override_upload_budget <= 0 ||
+        project.placement_override_upload_cursor >= project.placement_override_uploads.size()) return;
+    --project.placement_override_upload_budget;
+    auto& built = project.placement_override_uploads[project.placement_override_upload_cursor++];
+    const auto i = built.placement_index;
+    const auto asset_index = asset_indices.at(i);
+    if (!asset_index) throw std::runtime_error("Placement override lost its building asset before upload");
+    project.placement_override_models.emplace(i,
+        upload_building_render_model(built.buffer, project.buildings[*asset_index].data, project));
+    const auto& p = project.city->data.buildings[i];
+    append_render_log(project, "placement " + std::to_string(i) + " " + p.name + " at " + std::to_string(p.x) + "," +
+        std::to_string(p.y) + "," + std::to_string(p.z) + ": " + std::to_string(built.overwritten_cells) +
+        " cells overwritten by later placements, " + std::to_string(built.dropped_cells) + " past the game's world storage");
+    built.buffer = {};
+    if (project.placement_override_upload_cursor == project.placement_override_uploads.size()) {
+        project.placement_override_uploads.clear();
+        project.placement_override_upload_cursor = 0;
     }
 }
 
@@ -3681,12 +3941,16 @@ void draw_city_shadow_volumes(EditorProject& project, const Camera3D& camera, fl
     const auto road_extrusion = sector_extrusion(static_cast<std::size_t>(project.city_tile_gpu_model.shadow_top / 32.0F));
     set_shadow_volume_light(light, road_extrusion);
     g_shadow_cull = ShadowCull{planes, road_extrusion};
-    draw_gpu_mesh_instances(project.city_tile_gpu_model.shadow_volume, {MatrixIdentity()}, GpuSurface::ShadowVolume);
+    if (!project.city_road_cells_filtered) {
+        draw_gpu_mesh_instances(project.city_tile_gpu_model.shadow_volume, {MatrixIdentity()}, GpuSurface::ShadowVolume);
+    }
     // The game's queued district meshes stretch 32 units (0x2787d4).
     // Vertices are already in world space, so they don't need moving.
     set_shadow_volume_light(light, Vector3Scale(light, -32.0F));
     g_shadow_cull = ShadowCull{planes, Vector3Scale(light, -32.0F)};
-    draw_gpu_mesh_instances(project.portal_gpu_model.shadow_volume, {MatrixIdentity()}, GpuSurface::ShadowVolume);
+    if (!project.portal_cells_filtered) {
+        draw_gpu_mesh_instances(project.portal_gpu_model.shadow_volume, {MatrixIdentity()}, GpuSurface::ShadowVolume);
+    }
     g_shadow_cull.reset();
     if (g_render_settings.street_objects) {
         const auto range = street_object_range();
@@ -3761,6 +4025,18 @@ GpuBuildingRenderModel upload_portal_render_model(const BuildingRenderBuffer& bu
     return model;
 }
 
+std::vector<SbcPortal> portal_cell_sources(const SbcMap& map) {
+    std::vector<SbcPortal> sources;
+    sources.reserve(map.portals.size());
+    for (const auto& portal : map.portals) {
+        SbcPortal source;
+        source.fields = portal.fields;
+        source.blocks = portal.voxel_blocks();
+        sources.push_back(std::move(source));
+    }
+    return sources;
+}
+
 GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool textured, std::optional<std::size_t> selected_portal) {
     PAFTA_PROFILE_FUNCTION();
     // References into the project's cached render inputs (built once at load, not every
@@ -3788,8 +4064,8 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
     }
 
     // Start a worker to rebuild the (possibly large) buffer of all portals when the
-    // pieces change. The old mesh keeps drawing until the new one is ready, so placing a
-    // piece never holds up the frame. Rebuilding every piece is slow, so wait for a paint
+    // pieces change. The old mesh and immediate stamps draw until the worker finishes.
+    // Rebuilding every piece is slow, so wait for a paint
     // stroke to finish instead of rebuilding for every cell it stamps.
     if ((project.portal_render_dirty || project.portal_render_textured != textured) &&
         !project.portal_rebuild_in_progress && !project.defer_heavy_rebuilds) {
@@ -3801,26 +4077,28 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
         project.portal_render_textured = textured;
         project.portal_render_buffer = build_native_portal_render_buffer(project.city->data, blocks, std::nullopt, bb_templates, tex_names, resolve_placement_buildings(project));
         project.portal_gpu_model = upload_portal_render_model(project.portal_render_buffer, project, textured);
+        project.portal_render_sources = portal_cell_sources(project.city->data);
+        project.pending_pieces.clear();
+        project.portal_cells_filtered = false;
+        project.portal_visibility_fingerprint = project.city_scene_current_fingerprint;
         release_shadow_volume(project.portal_render_buffer);
 #else
-        const auto map = project.city->data;
+        auto map = project.city->data;
+        project.portal_build_sources = portal_cell_sources(map);
         const auto blocks_copy = blocks;
         const auto bb_copy = bb_templates;
         const auto tex_copy = tex_names;
-        // The worker owns copies of the placed buildings.
-        std::vector<std::optional<SbbBuilding>> buildings_copy;
-        for (const auto* building : resolve_placement_buildings(project)) {
-            buildings_copy.push_back(building == nullptr ? std::nullopt : std::optional<SbbBuilding>{*building});
-        }
+        auto sources = snapshot_city_buildings(project);
         project.portal_rebuild_in_progress = true;
         project.portal_render_dirty = false;
         project.portal_render_textured = textured;
-        project.portal_rebuild_future = std::async(std::launch::async, [map, blocks_copy, bb_copy, tex_copy,
-                                                                        buildings_copy = std::move(buildings_copy)]() {
+        project.portal_rebuild_future = std::async(std::launch::async, [map = std::move(map), blocks_copy, bb_copy, tex_copy,
+                                                                        sources = std::move(sources)]() {
             PAFTA_PROFILE_THREAD("Portal render rebuild");
             PAFTA_PROFILE_BLOCK("build async portal render buffer");
             std::vector<const SbbBuilding*> buildings;
-            for (const auto& building : buildings_copy) buildings.push_back(building ? &*building : nullptr);
+            buildings.reserve(sources.resolved.size());
+            for (const auto index : sources.resolved) buildings.push_back(index == 0U ? nullptr : &sources.owned->at(index - 1U));
             auto buffer = build_native_portal_render_buffer(map, blocks_copy, std::nullopt, bb_copy, tex_copy, buildings);
             bake_shadow_volume(buffer);
             return buffer;
@@ -3839,9 +4117,39 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
         if (!project.portal_render_dirty && project.portal_render_textured == textured) {
             project.portal_render_buffer = std::move(buffer);
             project.portal_gpu_model = upload_portal_render_model(project.portal_render_buffer, project, textured);
+            project.portal_render_sources = std::move(project.portal_build_sources);
+            project.portal_cells_filtered = false;
+            project.pending_pieces.clear();
+            project.portal_visibility_fingerprint = project.city_scene_current_fingerprint;
             release_shadow_volume(project.portal_render_buffer);
         }
         PAFTA_PROFILE_END_BLOCK;
+    }
+    if (project.portal_visibility_fingerprint != project.city_scene_current_fingerprint) {
+        // Source indices may shift when a whole portal is removed. Match each old
+        // portal by its grid position before checking the individual voxel words.
+        std::vector<bool> keep(project.portal_render_sources.size() * 512U, false);
+        bool filtered = false;
+        for (std::size_t p = 0; p < project.portal_render_sources.size(); ++p) {
+            const auto& old = project.portal_render_sources[p];
+            const auto found = std::ranges::find_if(project.city->data.portals, [&](const SbcPortal& current) {
+                return old.fields[1] == current.fields[1] && old.fields[2] == current.fields[2] && old.fields[3] == current.fields[3];
+            });
+            const auto& words = old.voxel_blocks();
+            for (std::size_t cell = 0; cell < words.size() && cell < 512U; ++cell) {
+                if (words[cell] == 0U) continue;
+                keep[p * 512U + cell] = found != project.city->data.portals.end() &&
+                    cell < found->voxel_blocks().size() && words[cell] == found->voxel_blocks()[cell];
+                filtered = filtered || !keep[p * 512U + cell];
+            }
+        }
+        if (filtered || project.portal_cells_filtered) {
+            filter_gpu_cells(project.portal_gpu_model, project.portal_render_buffer, false,
+                [&](std::uint32_t cell) { return cell < keep.size() && keep[cell]; });
+            project.portal_gpu_model.wire_lines = filtered ? std::vector<RenderLine>{} : project.portal_render_buffer.wire_lines;
+        }
+        project.portal_cells_filtered = filtered;
+        project.portal_visibility_fingerprint = project.city_scene_current_fingerprint;
     }
     return project.portal_gpu_model;
 }
@@ -3891,6 +4199,28 @@ void draw_city_piece_voxels(
     // ground cells sit in the same plane as their stamped ground and flicker against it.
     draw_gpu_building_model(model, {0.0F, 0.25F, 0.0F}, 0, draw_wires);
 
+    std::erase_if(project.pending_pieces, [&](const EditorProject::PendingPiece& pending) {
+        const auto& c = pending.cell;
+        const auto found = std::ranges::find_if(project.city->data.portals, [&](const SbcPortal& p) {
+            return sbc_portal_cell_base(p.fields[1]) <= c[0] && c[0] < sbc_portal_cell_base(p.fields[1]) + 8 &&
+                sbc_portal_cell_base(p.fields[2]) <= c[1] && c[1] < sbc_portal_cell_base(p.fields[2]) + 8 &&
+                sbc_portal_cell_base(p.fields[3]) <= c[2] && c[2] < sbc_portal_cell_base(p.fields[3]) + 8;
+        });
+        if (found == project.city->data.portals.end()) return true;
+        const auto index = static_cast<std::size_t>((c[1] - sbc_portal_cell_base(found->fields[2])) * 64 +
+            (c[2] - sbc_portal_cell_base(found->fields[3])) * 8 + c[0] - sbc_portal_cell_base(found->fields[1]));
+        return index >= found->voxel_blocks().size() || found->voxel_blocks()[index] != pending.word;
+    });
+    for (const auto& pending : project.pending_pieces) {
+        const auto block = pending.word & 0xfffU;
+        const auto layer = ((pending.word >> 16U) & 0x3fU);
+        if (block >= project.city->data.city_blocks.size() || layer == 0) continue;
+        const auto& preset = project.city->data.city_blocks[block];
+        if (layer > preset.layers.size()) continue;
+        draw_piece_preview(project, preset.name, preset.layers[layer - 1U],
+            {pending.cell[0] * 4.0F, pending.cell[1] * 4.0F + 0.25F, pending.cell[2] * 4.0F},
+            static_cast<std::int32_t>((pending.word >> 24U) & 3U));
+    }
     // The caller outlines the selected or hovered voxel (draw_city_piece_mask).
 }
 
@@ -3912,22 +4242,53 @@ Color terrain_material_color(const BuildingRenderBuffer&, std::uint32_t) {
 // Road tiles are lit by the vertex normals of each face, and the terrain by smoothed
 // normals with the landscape shading. Both are in world space and drawn once.
 void draw_uploaded_city_model(GpuBuildingRenderModel& model, bool terrain = false) {
+    // The world has a very small near clip for close block editing. At city-view
+    // distances, a 0.05-unit height gap is smaller than one depth-buffer step.
+    // Bias the terrain back in depth units so floors and roads stay in front.
+    const auto offset_enabled = glIsEnabled(GL_POLYGON_OFFSET_FILL);
+    GLfloat offset_factor = 0.0F, offset_units = 0.0F;
+    if (terrain) {
+        rlDrawRenderBatchActive();
+        glGetFloatv(GL_POLYGON_OFFSET_FACTOR, &offset_factor);
+        glGetFloatv(GL_POLYGON_OFFSET_UNITS, &offset_units);
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(1.0F, 4.0F);
+    }
     set_game_render_depth_output(true);
     draw_gpu_mesh_instances(model.mesh, {MatrixIdentity()}, terrain ? GpuSurface::Terrain : GpuSurface::World);
     set_game_render_depth_output(false);
+    if (terrain) {
+        glPolygonOffset(offset_factor, offset_units);
+        if (offset_enabled == GL_FALSE) glDisable(GL_POLYGON_OFFSET_FILL);
+    }
+}
+
+void draw_road_preview_model(GpuBuildingRenderModel& model) {
+    if (model.empty()) return;
+    // The preview sits exactly on the city's own road, so pull it forward in depth.
+    rlDrawRenderBatchActive();
+    const auto offset_enabled = glIsEnabled(GL_POLYGON_OFFSET_FILL);
+    GLfloat offset_factor = 0.0F, offset_units = 0.0F;
+    glGetFloatv(GL_POLYGON_OFFSET_FACTOR, &offset_factor);
+    glGetFloatv(GL_POLYGON_OFFSET_UNITS, &offset_units);
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(-1.0F, -8.0F);
+    draw_gpu_mesh_instances(model.mesh, {MatrixIdentity()}, GpuSurface::World);
+    glPolygonOffset(offset_factor, offset_units);
+    if (offset_enabled == GL_FALSE) glDisable(GL_POLYGON_OFFSET_FILL);
 }
 
 void unload_city_render_model(GpuBuildingRenderModel& model) {
     model = GpuBuildingRenderModel{};
 }
 
-GpuBuildingRenderModel upload_city_tile_model(const BuildingRenderBuffer& buffer, const EditorProject& project) {
+GpuBuildingRenderModel upload_city_tile_model(const BuildingRenderBuffer& buffer, const EditorProject& project, bool shadows) {
     // The game draws road textures without tint. The colour only stands in for a texture
     // the map folder doesn't have.
     auto model = upload_city_buffer_model(buffer, project, true, [&buffer](std::uint32_t material) {
         return city_tile_material_color(buffer, material);
     });
-    build_shadow_volume(model, buffer, true);
+    if (shadows) build_shadow_volume(model, buffer, true);
     for (auto& part : model.mesh.parts) {
         if (part.texture != 0U) part.color = WHITE;
     }
@@ -3960,6 +4321,7 @@ Texture2D landscape_detail_texture() {
         GenTextureMipmaps(&loaded);
         SetTextureWrap(loaded, TEXTURE_WRAP_REPEAT);
         SetTextureFilter(loaded, TEXTURE_FILTER_TRILINEAR);
+        g_generated_texture_bytes += gpu_texture_bytes(loaded);
         return loaded;
     }();
     return texture;
@@ -3972,6 +4334,66 @@ GpuBuildingRenderModel upload_city_terrain_model(const BuildingRenderBuffer& buf
     // Landscape: the generated detail map times the flat generated colour map.
     for (auto& part : model.mesh.parts) part.texture = landscape_detail_texture().id;
     return model;
+}
+
+void update_city_road_visibility(EditorProject& project) {
+    if (!project.city || project.city_road_visibility_fingerprint == project.city_scene_current_fingerprint) return;
+    const auto& map = project.city->data;
+    const auto& scene = project.city_scene_cache;
+    std::vector<bool> unchanged_nodes(map.intersections.size(), false);
+    for (const auto& node : scene.intersections) {
+        if (node.source_index < unchanged_nodes.size()) {
+            unchanged_nodes[node.source_index] = node.source == map.intersections[node.source_index];
+        }
+    }
+    std::vector<bool> unchanged_roads(map.streets.size(), false);
+    for (const auto& road : scene.roads) {
+        const auto& source = road.source;
+        if (road.source_index >= map.streets.size() || source != map.streets[road.source_index]) continue;
+        const auto from = static_cast<std::size_t>(source.from_intersection);
+        const auto to = static_cast<std::size_t>(source.to_intersection);
+        if (from < unchanged_nodes.size() && to < unchanged_nodes.size()) {
+            unchanged_roads[road.source_index] = unchanged_nodes[from] && unchanged_nodes[to];
+        }
+    }
+    // A changed road also changes the footprint of its two junctions.
+    const auto invalidate_changed_ends = [&](const SbcStreet& road, std::size_t index) {
+        if (index < unchanged_roads.size() && unchanged_roads[index]) return;
+        for (const auto end : {road.from_intersection, road.to_intersection}) {
+            if (end >= 0 && static_cast<std::size_t>(end) < unchanged_nodes.size()) unchanged_nodes[static_cast<std::size_t>(end)] = false;
+        }
+    };
+    for (const auto& road : scene.roads) invalidate_changed_ends(road.source, road.source_index);
+    for (std::size_t i = 0; i < map.streets.size(); ++i) invalidate_changed_ends(map.streets[i], i);
+    std::vector<bool> keep(scene.city_tiles.size(), false);
+    bool filtered = false;
+    for (std::size_t i = 0; i < scene.city_tiles.size(); ++i) {
+        const auto& tile = scene.city_tiles[i];
+        keep[i] = tile.street_index >= 0
+            ? static_cast<std::size_t>(tile.street_index) < unchanged_roads.size() && unchanged_roads[static_cast<std::size_t>(tile.street_index)]
+            : tile.intersection_index >= 0 && static_cast<std::size_t>(tile.intersection_index) < unchanged_nodes.size() && unchanged_nodes[static_cast<std::size_t>(tile.intersection_index)];
+        filtered = filtered || !keep[i];
+    }
+    if (filtered || project.city_road_cells_filtered) {
+        filter_gpu_cells(project.city_tile_gpu_model, scene.city_tile_buffer, true,
+            [&](std::uint32_t cell) { return cell < keep.size() && keep[cell]; });
+    }
+    project.city_road_cells_filtered = filtered;
+    project.city_road_visibility_fingerprint = project.city_scene_current_fingerprint;
+}
+
+bool adopt_city_scene_result(EditorProject& project, MapScene scene, std::uint64_t fingerprint, bool complete) {
+    if (fingerprint != project.city_scene_current_fingerprint) return false;
+    // A late fast result must not replace an already accepted complete result.
+    if (!complete && project.city_scene_cache_valid && project.city_scene_cache_fingerprint == fingerprint) return false;
+    if (complete) project.city_scene_terrain_fingerprint = fingerprint;
+    else scene.terrain = std::move(project.city_scene_cache.terrain);
+    project.city_scene_cache = std::move(scene);
+    project.city_scene_cache_fingerprint = fingerprint;
+    project.city_scene_cache_valid = true;
+    project.city_scene_cache_complete = complete;
+    project.city_scene_gpu_valid = false;
+    return true;
 }
 
 void draw_city_scene(
@@ -4766,24 +5188,110 @@ const Texture2D* map_menu_texture(EditorProject& project, int pixels, const MapM
     return &target.texture;
 }
 
-std::vector<std::uint8_t> map_menu_png(EditorProject& project, int pixels, const MapMenuOptions& options) {
+Image capture_map_menu_image(EditorProject& project, int pixels, const MapMenuOptions& options) {
     const auto* image = city_map_image(project);
     if (image == nullptr) return {};
     auto target = LoadRenderTexture(pixels, pixels);
     compose_map_menu(target, *image, project, options, map_label_font());
     auto shot = LoadImageFromTexture(target.texture);
     UnloadRenderTexture(target);
-    ImageFlipVertical(&shot);
+    return shot;
+}
+
+// Consumes the CPU image. Encoding and image memory cleanup need no GL context.
+std::vector<std::uint8_t> encode_map_menu_png(Image image) {
+    struct ImageOwner {
+        Image image;
+        ~ImageOwner() { UnloadImage(image); }
+    } owner{image};
+    if (image.data == nullptr) throw std::runtime_error("Map image readback failed");
+    ImageFlipVertical(&owner.image);
     int size = 0;
-    auto* bytes = ExportImageToMemory(shot, ".png", &size);
-    UnloadImage(shot);
-    std::vector<std::uint8_t> png(bytes, bytes + std::max(0, size));
-    MemFree(bytes);
-    return png;
+    const std::unique_ptr<unsigned char, decltype(&MemFree)> bytes{ExportImageToMemory(owner.image, ".png", &size), &MemFree};
+    if (!bytes || size <= 0) throw std::runtime_error("Map PNG encoding failed");
+    return {bytes.get(), bytes.get() + size};
+}
+
+std::vector<std::uint8_t> map_menu_png(EditorProject& project, int pixels, const MapMenuOptions& options) {
+    return encode_map_menu_png(capture_map_menu_image(project, pixels, options));
 }
 
 void draw_gpu_building_model_public(GpuBuildingRenderModel& model, Vector3 origin, std::int32_t rotation) {
     draw_gpu_building_model(model, origin, rotation, false);
+}
+
+std::uint64_t gpu_texture_bytes(const Texture2D& texture) {
+    if (texture.id == 0U) return 0;
+    std::uint64_t bytes = 0;
+    int width = texture.width, height = texture.height;
+    for (int mip = 0; mip < std::max(1, texture.mipmaps); ++mip) {
+        bytes += static_cast<std::uint64_t>(GetPixelDataSize(width, height, texture.format));
+        width = std::max(1, width / 2); height = std::max(1, height / 2);
+    }
+    return bytes;
+}
+
+GpuMemoryStats graphics_gpu_memory(const EditorProject* project, const EditorUi& ui, std::span<const RenderTexture2D> targets) {
+    auto stats = g_gpu_mesh_memory;
+    stats.buffer_bytes += g_instance_stream_bytes + g_imgui_stream_bytes;
+    stats.texture_bytes += g_generated_texture_bytes;
+    std::unordered_set<unsigned int> textures, framebuffers;
+    const auto texture = [&](const Texture2D& t, bool target = false) {
+        if (t.id == 0U || !textures.insert(t.id).second) return;
+        (target ? stats.target_bytes : stats.texture_bytes) += gpu_texture_bytes(t);
+    };
+    const auto target = [&](const RenderTexture2D& t) {
+        if (t.id == 0U || !framebuffers.insert(t.id).second) return;
+        texture(t.texture, true);
+        if (t.depth.id != 0U) stats.target_bytes += static_cast<std::uint64_t>(t.texture.width) * t.texture.height * 4U;
+    };
+    for (const auto& t : targets) target(t);
+    for (const auto& [id, resources] : game_render_resources()) {
+        texture(resources.packed_depth, true); texture(resources.shadow_factor, true); texture(resources.direct_light, true);
+        target(resources.display);
+    }
+    for (const auto* view : {&ui.building_preview, &ui.block_preview, &ui.buildblock_preview}) target(view->target);
+    if (project) {
+        for (const auto& t : project->textures) texture(t.texture);
+        for (const auto& t : project->material_textures) texture(t.texture);
+        for (const auto& t : project->building_thumbnails) target(t);
+        for (const auto& t : project->block_thumbnails) target(t);
+        for (const auto& t : project->city_block_thumbnails) target(t);
+        for (const auto& [name, t] : project->piece_thumbnails) target(t);
+        for (const auto& [name, t] : project->item_set_thumbnails) target(t);
+    }
+    for (const auto* t : ImGui::GetPlatformIO().Textures) {
+        if (t->GetTexID() != ImTextureID_Invalid && textures.insert(static_cast<unsigned int>(t->GetTexID())).second)
+            stats.texture_bytes += static_cast<std::uint64_t>(t->Width) * t->Height * t->BytesPerPixel;
+    }
+    const auto& cube = environment_cubemap();
+    if (cube.texture != 0U) {
+        const auto pixel_bytes = cube.pixel_bytes;
+        for (int level = 0; level < kEnvironmentLevels; ++level) {
+            const auto size = std::max(1, kEnvironmentSize >> level);
+            stats.texture_bytes += static_cast<std::uint64_t>(size) * size * 6U * pixel_bytes;
+        }
+        stats.target_bytes += static_cast<std::uint64_t>(kEnvironmentSize) * kEnvironmentSize * 4U;
+        stats.target_bytes += static_cast<std::uint64_t>(kEnvironmentSize / 2) * (kEnvironmentSize / 2) * pixel_bytes;
+    }
+#ifndef __EMSCRIPTEN__
+    static const bool has_driver_memory = [] {
+        GLint count = 0; glGetIntegerv(GL_NUM_EXTENSIONS, &count);
+        for (GLint i = 0; i < count; ++i) {
+            const auto* name = reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, static_cast<GLuint>(i)));
+            if (name != nullptr && std::strcmp(name, "GL_NVX_gpu_memory_info") == 0) return true;
+        }
+        return false;
+    }();
+    if (has_driver_memory) {
+        GLint total = 0, available = 0;
+        // NVX: dedicated VRAM and current unused dedicated VRAM, in KiB.
+        glGetIntegerv(0x9047, &total); glGetIntegerv(0x9049, &available);
+        if (total > 0 && available >= 0) stats.driver_used_total = {
+            static_cast<std::uint64_t>(std::max(0, total - available)) * 1024U, static_cast<std::uint64_t>(total) * 1024U};
+    }
+#endif
+    return stats;
 }
 
 } // namespace pafta::app_internal

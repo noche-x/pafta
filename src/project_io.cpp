@@ -13,6 +13,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -23,6 +24,177 @@
 #include <utility>
 
 namespace pafta::app_internal {
+
+struct FileWriteTicket {};
+
+std::shared_ptr<FileWriteTicket> claim_file_writer() {
+    static std::weak_ptr<FileWriteTicket> active;
+    if (!active.expired()) throw std::runtime_error("A file operation is still running. Wait for it to finish.");
+    auto ticket = std::make_shared<FileWriteTicket>();
+    active = ticket;
+    return ticket;
+}
+
+struct ProjectFileJobs {
+    struct SaveResult {
+        std::unique_ptr<EditorProject> saved;
+        std::string message;
+    };
+    struct SaveJob {
+        std::shared_ptr<const EditorProject> source;
+        std::future<SaveResult> result;
+    };
+    std::optional<SaveJob> save;
+    std::optional<std::future<std::string>> export_file;
+};
+
+namespace {
+void save_map_impl(EditorProject& project, EditorUi& ui, const std::filesystem::path& folder, std::string& status);
+
+// Only parsed source records and file bytes cross into a file worker. An
+// EditorProject's textures, models, render caches, and other jobs never do.
+std::unique_ptr<EditorProject> save_snapshot(const EditorProject& project) {
+    auto snapshot = std::make_unique<EditorProject>();
+    snapshot->root = project.root;
+    snapshot->loose_files_win = project.loose_files_win;
+    snapshot->archive_entries = project.archive_entries;
+    snapshot->generated_city_assets = project.generated_city_assets;
+    snapshot->city_bytes = project.city_bytes;
+    snapshot->city = project.city;
+    snapshot->building_bytes = project.building_bytes;
+    snapshot->block_bytes = project.block_bytes;
+    snapshot->buildblock_bytes = project.buildblock_bytes;
+    snapshot->buildings = project.buildings;
+    snapshot->blocks = project.blocks;
+    snapshot->buildblocks = project.buildblocks;
+    snapshot->save_blocking_load_errors = project.save_blocking_load_errors;
+    snapshot->city_scene_cache_valid = project.city_scene_cache_valid;
+    snapshot->city_scene_cache.world_fit = project.city_scene_cache.world_fit;
+    return snapshot;
+}
+
+bool same_save_sources(const EditorProject& a, const EditorProject& b) {
+    if (a.root != b.root || a.city_bytes != b.city_bytes || a.generated_city_assets != b.generated_city_assets ||
+        a.city.has_value() != b.city.has_value() ||
+        (a.city && (a.city->path != b.city->path || a.city->name != b.city->name || a.city->data != b.city->data)) ||
+        a.block_bytes != b.block_bytes || a.archive_entries.size() != b.archive_entries.size() ||
+        a.save_blocking_load_errors != b.save_blocking_load_errors) return false;
+    const auto same_assets = [](const auto& left, const auto& right) {
+        if (left.size() != right.size()) return false;
+        for (std::size_t i = 0; i < left.size(); ++i) {
+            if (left[i].path != right[i].path || left[i].name != right[i].name || left[i].data != right[i].data ||
+                left[i].dirty != right[i].dirty || left[i].newly_created != right[i].newly_created) return false;
+        }
+        return true;
+    };
+    if (!same_assets(a.buildings, b.buildings) || !same_assets(a.blocks, b.blocks) ||
+        !same_assets(a.buildblocks, b.buildblocks)) return false;
+    for (std::size_t i = 0; i < a.archive_entries.size(); ++i) {
+        const auto& left = a.archive_entries[i];
+        const auto& right = b.archive_entries[i];
+        if (left.kind != right.kind || left.type != right.type || left.name != right.name || left.payload != right.payload) return false;
+    }
+    return true;
+}
+} // namespace
+
+bool project_file_jobs_pending(const EditorProject& project) {
+    return project.file_jobs && (project.file_jobs->save || project.file_jobs->export_file);
+}
+
+bool project_map_save_pending(const EditorProject& project) {
+    return project.file_jobs && project.file_jobs->save.has_value();
+}
+
+void queue_project_file_job(EditorProject& project, std::function<void()> operation, std::string success) {
+#ifndef __EMSCRIPTEN__
+    if (project_file_jobs_pending(project)) throw std::runtime_error("A file operation is still running. Wait for it to finish.");
+    auto ticket = claim_file_writer();
+    if (!project.file_jobs) project.file_jobs = std::make_shared<ProjectFileJobs>();
+    project.file_jobs->export_file = std::async(std::launch::async,
+        [operation = std::move(operation), success = std::move(success), ticket = std::move(ticket)]() mutable {
+            const auto writing = std::move(ticket);
+            operation();
+            return success;
+        });
+#else
+    (void)project;
+    (void)success;
+    operation();
+#endif
+}
+
+void request_map_save(EditorProject& project, EditorUi& ui, const std::filesystem::path& folder, std::string& status) {
+#ifndef __EMSCRIPTEN__
+    try {
+        if (project_file_jobs_pending(project)) throw std::runtime_error("A file operation is still running. Wait for it to finish.");
+        require_complete_project_source(project);
+        commit_pending_edits(project, ui);
+        auto ticket = claim_file_writer();
+        if (!project.file_jobs) project.file_jobs = std::make_shared<ProjectFileJobs>();
+        std::shared_ptr<const EditorProject> source = save_snapshot(project);
+        auto result = std::async(std::launch::async, [source, folder, ticket = std::move(ticket)]() mutable {
+            const auto writing = std::move(ticket);
+            auto saved = save_snapshot(*source);
+            EditorUi worker_ui;
+            std::string message;
+            save_map_impl(*saved, worker_ui, folder, message);
+            return ProjectFileJobs::SaveResult{std::move(saved), std::move(message)};
+        });
+        project.file_jobs->save.emplace(ProjectFileJobs::SaveJob{std::move(source), std::move(result)});
+        status = "Saving map to " + folder.string() + "... You can keep editing.";
+    } catch (const std::exception& error) {
+        report_failure(status, std::string{"Map save failed: "} + error.what());
+    }
+#else
+    save_map_to(project, ui, folder, status);
+#endif
+}
+
+void service_project_file_jobs(EditorProject& project, EditorUi& ui, std::string& status) {
+    if (!project.file_jobs) return;
+    auto& jobs = *project.file_jobs;
+    if (jobs.export_file && jobs.export_file->wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        try {
+            status = jobs.export_file->get();
+        } catch (const std::exception& error) {
+            report_failure(status, std::string{"Export failed: "} + error.what());
+        }
+        jobs.export_file.reset();
+    }
+    if (!jobs.save || jobs.save->result.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+    try {
+        auto result = jobs.save->result.get();
+        status = result.message.empty() ? "Map saved." : std::move(result.message);
+        if (same_save_sources(project, *jobs.save->source)) {
+            auto& saved = *result.saved;
+            const bool upgraded = project.city && saved.city && project.city->data.version != saved.city->data.version;
+            project.city = std::move(saved.city);
+            project.city_bytes = std::move(saved.city_bytes);
+            project.city_promotion_failed = false;
+            project.buildings = std::move(saved.buildings);
+            project.blocks = std::move(saved.blocks);
+            project.block_bytes = std::move(saved.block_bytes);
+            project.buildblocks = std::move(saved.buildblocks);
+            project.generated_city_assets = std::move(saved.generated_city_assets);
+            project.saved_undo_depth = project.undo_stack.size();
+            project.city_baseline = project.city ? std::optional{project.city->data} : std::nullopt;
+            ui.city_dirty = ui.building_dirty = ui.block_dirty = ui.buildblock_dirty = false;
+            if (upgraded) {
+                project.render_buffers_dirty = true;
+                project.placement_assets_dirty = true;
+                invalidate_render_input_cache(project);
+                invalidate_portal_render_models(project);
+            }
+        } else {
+            project.saved_undo_depth.reset();
+            status += " Newer edits remain unsaved.";
+        }
+    } catch (const std::exception& error) {
+        report_failure(status, std::string{"Map save failed: "} + error.what());
+    }
+    jobs.save.reset();
+}
 std::string lower_extension(const std::filesystem::path& path) {
     auto extension = path.extension().string();
     std::ranges::transform(extension, extension.begin(), [](unsigned char value) {
@@ -1018,6 +1190,7 @@ std::optional<EditorProject> load_project_folder(const std::filesystem::path& fo
             project.render_logs.push_back("skipped " + warning);
         }
     }
+    if (project.city) snapshot_city_buildings(project); // prepare worker geometry during loading
     return project;
 }
 
@@ -1192,12 +1365,12 @@ CsxArchive project_archive(const EditorProject& project) {
 }
 
 // Writes one building as a loose .sbb file (the format of the building/ folder).
-void export_building_sbb(const EditorProject& project, std::size_t index, std::string& status) {
+void export_building_sbb(EditorProject& project, std::size_t index, std::string& status) {
     if (index >= project.buildings.size()) return;
     const auto& asset = project.buildings[index];
     try {
-        const auto bytes = rebuild_sbb(asset.data);
 #ifdef __EMSCRIPTEN__
+        const auto bytes = rebuild_sbb(asset.data);
         web_download(asset.name + ".sbb", bytes);
         status = "Download requested: " + asset.name + ".sbb";
 #else
@@ -1205,11 +1378,33 @@ void export_building_sbb(const EditorProject& project, std::size_t index, std::s
         if (!path) return;
         auto output = *path;
         if (lower_extension(output) != ".sbb") output += ".sbb";
-        write_file_bytes(output, bytes);
-        status = "Exported " + output.string();
+        queue_project_file_job(project, [data = asset.data, output] { write_file_bytes(output, rebuild_sbb(data)); },
+            "Exported " + output.string());
+        status = "Exporting " + output.string() + "...";
 #endif
     } catch (const std::exception& error) {
         report_failure(status, std::string{"Building export failed: "} + error.what());
+    }
+}
+
+void export_block_sbl(EditorProject& project, std::size_t index, std::string& status) {
+    if (index >= project.blocks.size()) return;
+    const auto& asset = project.blocks[index];
+    try {
+#ifdef __EMSCRIPTEN__
+        web_download(asset.name + ".sbl", write_sbl_block(asset.data));
+        status = "Download requested: " + asset.name + ".sbl";
+#else
+        const auto path = dialog_save_file(project.root / (asset.name + ".sbl"), "SBL block", "sbl");
+        if (!path) return;
+        auto output = *path;
+        if (lower_extension(output) != ".sbl") output += ".sbl";
+        queue_project_file_job(project, [data = asset.data, output] { write_file_bytes(output, write_sbl_block(data)); },
+            "Exported " + output.string());
+        status = "Exporting " + output.string() + "...";
+#endif
+    } catch (const std::exception& error) {
+        report_failure(status, std::string{"Block export failed: "} + error.what());
     }
 }
 
@@ -1230,7 +1425,7 @@ void save_active_tab(EditorProject& project, EditorUi& ui, std::string& status) 
     // The browser has no folder dialog, so the files are downloaded.
     const auto output = project.root;
 #endif
-    save_map_to(project, ui, output, status);
+    request_map_save(project, ui, output, status);
 }
 
 std::vector<std::string> game_world_fit_problems(const EditorProject& project) {
@@ -1255,93 +1450,102 @@ std::vector<std::string> game_world_fit_problems(const EditorProject& project) {
     return problems;
 }
 
+namespace {
+void save_map_impl(EditorProject& project, EditorUi& ui, const std::filesystem::path& folder, std::string& status) {
+    require_complete_project_source(project);
+    const auto output = folder / "city2.sbc";
+    // An old map keeps its version, and its district grid is copied as it was loaded.
+    const bool legacy = project.city && has_legacy_district_cells(project.city->data);
+    if (legacy && !project.city_bytes) throw std::runtime_error("Legacy city has no loaded bytes to keep its district grid");
+    const auto loaded_version = project.city ? project.city->data.version : 12U;
+    if (!legacy) promote_city(project);
+    const auto archive = project_archive(project);
+    auto city = project.city ? project.city->data : SbcMap{};
+    if (!legacy) city.version = 12;
+    for (auto& placement : city.buildings) {
+        const auto asset = find_building_asset(project, placement.name);
+        if (asset == nullptr) throw std::runtime_error("Missing or ambiguous building: " + placement.name);
+        placement.name = asset->name;
+    }
+    const auto map_bytes = legacy ? rebuild_sbc_layout(*project.city_bytes, city) : rebuild_sbc(city);
+    const auto archive_bytes = build_csx(archive);
+    const auto archive_path = folder / kGameArchiveName;
+    // Buildblocks are loose files. Saving to another folder also writes the unchanged ones.
+    const bool same_folder = std::filesystem::weakly_canonical(output.parent_path()) == project.root;
+    std::vector<std::pair<std::filesystem::path, std::vector<std::uint8_t>>> extra_files;
+    for (const auto& asset : project.buildblocks) {
+        // Buildblocks from the archive move to the loose files the game reads,
+        // even if no edit changed them.
+        if (same_folder && !asset.dirty && lower_extension(asset.path) != ".csx" && std::filesystem::exists(asset.path)) continue;
+        extra_files.emplace_back(output.parent_path() / "buildblock" / (asset.name + ".sbl"), rebuild_sbl_buildblock(asset.data));
+    }
+    // The game also loads asphalt2.png, asphalt2_material.png, and (for the round
+    // map) map.png from the map folder itself (World_LoadMapAndInitializeTerrain
+    // @56980). A map without its own road textures borrows them from another map
+    // in the same data folder.
+    std::string missing_road_textures;
+    for (const char* name : {"asphalt2.png", "asphalt2_material.png", "map.png"}) {
+        // A folder that already has its own copy keeps it.
+        if (std::filesystem::exists(folder / name)) continue;
+        auto source = project.root / name;
+        if (!std::filesystem::exists(source) && std::string_view{name} != "map.png") {
+            source.clear();
+            std::error_code error;
+            for (const auto& sibling : std::filesystem::directory_iterator(project.root.parent_path(), error)) {
+                if (std::filesystem::exists(sibling.path() / name)) {
+                    source = sibling.path() / name;
+                    break;
+                }
+            }
+            if (source.empty()) missing_road_textures += std::string{missing_road_textures.empty() ? "" : ", "} + name;
+        }
+        if (!source.empty() && std::filesystem::exists(source)) extra_files.emplace_back(folder / name, read_file_bytes(source));
+    }
+    // Build every file's bytes before touching any output file.
+#ifndef __EMSCRIPTEN__
+    std::vector<FileWrite> outputs{{archive_path, archive_bytes}};
+    for (const auto& [path, bytes] : extra_files) {
+        outputs.push_back({path, bytes});
+    }
+    outputs.push_back({output, map_bytes});
+    write_files_transaction(outputs);
+#else
+    web_download(archive_path.filename().string(), archive_bytes);
+    for (const auto& [path, bytes] : extra_files) web_download(path.filename().string(), bytes);
+    web_download(output.filename().string(), map_bytes);
+#endif
+    project.city = LoadedAsset<SbcMap>{output, output.stem().string(), std::move(city)};
+    project.city_promotion_failed = false;
+    project.city_bytes = map_bytes;
+    for (auto& asset : project.buildings) asset.dirty = false;
+    for (auto& asset : project.blocks) asset.dirty = false;
+    for (auto& asset : project.buildblocks) asset.dirty = false;
+    ui.city_dirty = ui.building_dirty = ui.block_dirty = ui.buildblock_dirty = false;
+    project.saved_undo_depth = project.undo_stack.size();
+    // Saving tidies up the map; that is not an edit to undo.
+    project.city_baseline = project.city->data;
+    status.clear();
+    if (legacy) {
+        status = "saved in format v" + std::to_string(loaded_version) + ": its legacy district cells have no v12 equivalent";
+    } else if (loaded_version < 12) {
+        status = "saved; map format upgraded from v" + std::to_string(loaded_version) + " to v12";
+    }
+    for (const auto& problem : game_world_fit_problems(project)) {
+        status = (status.empty() ? std::string{"saved"} : status) + ". " + problem;
+    }
+    if (!missing_road_textures.empty()) {
+        status = (status.empty() ? std::string{"saved"} : status) + ". No " + missing_road_textures +
+            " found to copy; the game loads them from the map folder";
+    }
+}
+} // namespace
+
 void save_map_to(EditorProject& project, EditorUi& ui, const std::filesystem::path& folder, std::string& status) {
     try {
-        require_complete_project_source(project);
-        const auto output = folder / "city2.sbc";
-        // An old map keeps its version, and its district grid is copied as it was loaded.
-        const bool legacy = project.city && has_legacy_district_cells(project.city->data);
-        if (legacy && !project.city_bytes) throw std::runtime_error("Legacy city has no loaded bytes to keep its district grid");
-        const auto loaded_version = project.city ? project.city->data.version : 12U;
-        if (!legacy) promote_city(project);
-        const auto archive = project_archive(project);
-        auto city = project.city ? project.city->data : SbcMap{};
-        if (!legacy) city.version = 12;
-        for (auto& placement : city.buildings) {
-            const auto asset = find_building_asset(project, placement.name);
-            if (asset == nullptr) throw std::runtime_error("Missing or ambiguous building: " + placement.name);
-            placement.name = asset->name;
-        }
-        const auto map_bytes = legacy ? rebuild_sbc_layout(*project.city_bytes, city) : rebuild_sbc(city);
-        const auto archive_bytes = build_csx(archive);
-        const auto archive_path = folder / kGameArchiveName;
-        // Buildblocks are loose files. Saving to another folder also writes the unchanged ones.
-        const bool same_folder = std::filesystem::weakly_canonical(output.parent_path()) == project.root;
-        std::vector<std::pair<std::filesystem::path, std::vector<std::uint8_t>>> extra_files;
-        for (const auto& asset : project.buildblocks) {
-            // Buildblocks from the archive move to the loose files the game reads,
-            // even if no edit changed them.
-            if (same_folder && !asset.dirty && lower_extension(asset.path) != ".csx" && std::filesystem::exists(asset.path)) continue;
-            extra_files.emplace_back(output.parent_path() / "buildblock" / (asset.name + ".sbl"), rebuild_sbl_buildblock(asset.data));
-        }
-        // The game also loads asphalt2.png, asphalt2_material.png, and (for the round
-        // map) map.png from the map folder itself (World_LoadMapAndInitializeTerrain
-        // @56980). A map without its own road textures borrows them from another map
-        // in the same data folder.
-        std::string missing_road_textures;
-        for (const char* name : {"asphalt2.png", "asphalt2_material.png", "map.png"}) {
-            // A folder that already has its own copy keeps it.
-            if (std::filesystem::exists(folder / name)) continue;
-            auto source = project.root / name;
-            if (!std::filesystem::exists(source) && std::string_view{name} != "map.png") {
-                source.clear();
-                std::error_code error;
-                for (const auto& sibling : std::filesystem::directory_iterator(project.root.parent_path(), error)) {
-                    if (std::filesystem::exists(sibling.path() / name)) {
-                        source = sibling.path() / name;
-                        break;
-                    }
-                }
-                if (source.empty()) missing_road_textures += std::string{missing_road_textures.empty() ? "" : ", "} + name;
-            }
-            if (!source.empty() && std::filesystem::exists(source)) extra_files.emplace_back(folder / name, read_file_bytes(source));
-        }
-        // Build every file's bytes before touching any output file.
 #ifndef __EMSCRIPTEN__
-        std::vector<FileWrite> outputs{{archive_path, archive_bytes}};
-        for (const auto& [path, bytes] : extra_files) {
-            outputs.push_back({path, bytes});
-        }
-        outputs.push_back({output, map_bytes});
-        write_files_transaction(outputs);
-#else
-        web_download(archive_path.filename().string(), archive_bytes);
-        for (const auto& [path, bytes] : extra_files) web_download(path.filename().string(), bytes);
-        web_download(output.filename().string(), map_bytes);
+        const auto writing = claim_file_writer();
 #endif
-        project.city = LoadedAsset<SbcMap>{output, output.stem().string(), std::move(city)};
-        project.city_promotion_failed = false;
-        project.city_bytes = map_bytes;
-        for (auto& asset : project.buildings) asset.dirty = false;
-        for (auto& asset : project.blocks) asset.dirty = false;
-        for (auto& asset : project.buildblocks) asset.dirty = false;
-        ui.city_dirty = ui.building_dirty = ui.block_dirty = ui.buildblock_dirty = false;
-        project.saved_undo_depth = project.undo_stack.size();
-        // Saving tidies up the map; that is not an edit to undo.
-        project.city_baseline = project.city->data;
-        status.clear();
-        if (legacy) {
-            status = "saved in format v" + std::to_string(loaded_version) + ": its legacy district cells have no v12 equivalent";
-        } else if (loaded_version < 12) {
-            status = "saved; map format upgraded from v" + std::to_string(loaded_version) + " to v12";
-        }
-        for (const auto& problem : game_world_fit_problems(project)) {
-            status = (status.empty() ? std::string{"saved"} : status) + ". " + problem;
-        }
-        if (!missing_road_textures.empty()) {
-            status = (status.empty() ? std::string{"saved"} : status) + ". No " + missing_road_textures +
-                " found to copy; the game loads them from the map folder";
-        }
+        save_map_impl(project, ui, folder, status);
     } catch (const std::exception& error) {
         report_failure(status, std::string{"Map save failed: "} + error.what());
     }

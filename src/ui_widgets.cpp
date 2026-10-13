@@ -61,7 +61,7 @@ std::optional<std::size_t> asset_grid(const char* id, std::size_t count, std::si
             const auto min = ImGui::GetItemRectMin(), max = ImGui::GetItemRectMax();
             if (options.paint) options.paint(i, ImGui::GetWindowDrawList(), min, max);
             if (i == selected) ImGui::GetWindowDrawList()->AddRect(min, max, kSelectedOutline, 3.0F, 0, 3.0F);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", label.c_str());
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) ImGui::SetTooltip("%s\n%s%s", label.c_str(), options.action, i == selected ? " (selected)" : "");
             if (extra) extra(i);
             if (options.labels) ImGui::TextUnformatted(fit_label(label, options.size + style.FramePadding.x * 2.0F).c_str());
             ImGui::EndGroup();

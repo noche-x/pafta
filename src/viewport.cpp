@@ -74,22 +74,25 @@ float adjust_camera_fly_speed(float current_speed, float wheel_delta) {
     return std::clamp(speed, kMinFlySpeed, kMaxFlySpeed);
 }
 
-FlyInput read_fly_input() {
-    // WASD moves where you look (W climbs when you look up), Space and Ctrl go up and
-    // down, Shift slows down, and Z speeds up (Shift+Z slows down even more).
+FlyInput read_fly_input(const EditorUi& ui) {
+    const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+    const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+    // Alex combines the native editor's speed modifiers and level WASD with the
+    // game's Q/Z vertical keys. Blender keeps Pafta's view-relative fly controls.
     return {
         IsKeyDown(KEY_W),
         IsKeyDown(KEY_S),
         IsKeyDown(KEY_A),
         IsKeyDown(KEY_D),
-        IsKeyDown(KEY_SPACE),
-        IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL),
-        IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT),
-        IsKeyDown(KEY_Z),
+        IsKeyDown(ui.blender_mouse ? KEY_SPACE : KEY_Q),
+        ui.blender_mouse ? ctrl : IsKeyDown(KEY_Z),
+        ui.blender_mouse ? shift : ctrl,
+        ui.blender_mouse ? IsKeyDown(KEY_Z) : shift,
+        !ui.blender_mouse,
     };
 }
 
-void update_free_fly_camera(Camera3D& camera, float fly_speed, const FlyInput& input) {
+void update_free_fly_camera(Camera3D& camera, float fly_speed, const FlyInput& input, float delta_seconds) {
     auto forward = normalize_or(Vector3Subtract(camera.target, camera.position), {0.0F, 0.0F, -1.0F});
     const auto mouse_delta = GetMouseDelta();
     if (mouse_delta.x != 0.0F || mouse_delta.y != 0.0F) {
@@ -105,7 +108,7 @@ void update_free_fly_camera(Camera3D& camera, float fly_speed, const FlyInput& i
     }
 
     const auto delta = fly_camera_step({forward.x, forward.y, forward.z}, input,
-        adjust_camera_fly_speed(fly_speed, 0.0F), GetFrameTime());
+        adjust_camera_fly_speed(fly_speed, 0.0F), delta_seconds);
     camera.position = Vector3Add(camera.position, Vector3{delta.x, delta.y, delta.z});
 
     camera.up = kWorldUp;
@@ -225,7 +228,7 @@ void update_orbit_camera(Camera3D& camera, EditorUi& ui, Vector2 viewport_mouse_
 
     // Browsers and trackpads can report several notches in one event. Allow at most one
     // notch per frame, so a single flick can't dive through the scene.
-    const auto wheel = std::clamp(GetMouseWheelMove(), -1.0F, 1.0F);
+    const auto wheel = std::clamp(GetMouseWheelMoveV().y, -1.0F, 1.0F);
     if (viewport_hovered && ui.camera_drag == CameraDrag::None && std::fabs(wheel) > 0.0F &&
         camera.projection == CAMERA_ORTHOGRAPHIC) {
         // Orthographic: zoom by shrinking the view, keeping the point under the cursor.
@@ -283,7 +286,7 @@ void snap_view(Camera3D& camera, EditorUi& ui, Vector3 direction) {
 
 void update_view_snap(Camera3D& camera, EditorUi& ui) {
     if (!ui.view_snap_active) return;
-    ui.view_snap_t = std::min(1.0F, ui.view_snap_t + GetFrameTime() / 0.25F);
+    ui.view_snap_t = std::min(1.0F, ui.view_snap_t + ui.delta_seconds / 0.25F);
     const float e = ui.view_snap_t * ui.view_snap_t * (3.0F - 2.0F * ui.view_snap_t);
     // Turn along the great circle between the two directions.
     const float angle = std::acos(std::clamp(Vector3DotProduct(ui.view_snap_from, ui.view_snap_to), -1.0F, 1.0F));
@@ -474,26 +477,24 @@ void focus_camera_on_city(Camera3D& camera, const EditorProject& project) {
 }
 
 std::optional<CityGridPoint> city_grid_point_under_mouse(const Camera3D& camera, Vector2 viewport_mouse_pos, Vector2 viewport_size) {
+    return city_grid_point_on_plane_under_mouse(camera, viewport_mouse_pos, viewport_size, 0, false);
+}
+
+std::optional<CityGridPoint> city_grid_point_on_plane_under_mouse(
+    const Camera3D& camera, Vector2 viewport_mouse_pos, Vector2 viewport_size, int y, bool cell) {
     const auto ray = get_viewport_mouse_ray(camera, viewport_mouse_pos, viewport_size);
-    if (std::fabs(ray.direction.y) < 0.0001F) {
-        return std::nullopt;
-    }
-
-    const auto distance = -ray.position.y / ray.direction.y;
-    if (distance < 0.0F) {
-        return std::nullopt;
-    }
-
     constexpr auto unit_size = 4.0F;
-    const auto hit = Vector3{
-        ray.position.x + ray.direction.x * distance,
-        0.0F,
-        ray.position.z + ray.direction.z * distance,
+    const auto hit = ray_horizontal_plane_hit(
+        {ray.position.x, ray.position.y, ray.position.z},
+        {ray.direction.x, ray.direction.y, ray.direction.z}, y * unit_size);
+    if (!hit) return std::nullopt;
+    const auto coordinate = [&](float world) {
+        return static_cast<std::int32_t>(cell ? std::floor(world / unit_size) : std::round(world / unit_size));
     };
     return CityGridPoint{
-        static_cast<std::int32_t>(std::lround(hit.x / unit_size)),
-        0,
-        static_cast<std::int32_t>(std::lround(hit.z / unit_size)),
+        coordinate(hit->x),
+        y,
+        coordinate(hit->z),
     };
 }
 

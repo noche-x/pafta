@@ -24,16 +24,21 @@ struct FlyInput {
     bool right{};
     bool up{};
     bool down{};
-    bool slow{};  // Shift
-    bool fast{};  // Z: speeds up, or with Shift slows further
+    bool slow{};  // Blender: Shift. Alex: Ctrl.
+    bool fast{};  // Blender: Z. Alex: Shift.
+    bool alex_controls{};
 };
 
-// Speed multiplier: Shift 1/4, Z 4x, Shift+Z 1/16.
-float fly_speed_multiplier(bool slow, bool fast);
+// Blender: slow 1/4, fast 4x, both 1/16. Alex: slow 1/4, fast 4x, both 16x.
+float fly_speed_multiplier(bool slow, bool fast, bool alex_controls = false);
 
-// One frame of flying: W/S along where you look (including up and down), A/D along
-// the level right direction, and Space/Ctrl straight up and down. Several keys
-// together are normalized, so going diagonally isn't faster.
+// One frame of flying: Blender follows the view, Alex follows its level heading.
+// A/D strafes and the vertical keys move straight up/down. Several keys together
+// are normalized, so going diagonally isn't faster.
 Vec3 fly_camera_step(Vec3 forward, const FlyInput& input, float speed, float seconds);
+
+// The forward ray's hit on a horizontal placement plane, or no hit when parallel
+// to the plane or pointing away from it.
+std::optional<Vec3> ray_horizontal_plane_hit(Vec3 origin, Vec3 direction, float y);
 
 } // namespace pafta

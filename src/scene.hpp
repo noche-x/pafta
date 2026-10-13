@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 namespace pafta {
 
@@ -76,6 +77,7 @@ struct RenderBufferTriangle {
     bool interior{};
     // Building meshes: the SbbBuilding::cells index this face belongs to, and the
     // cell.shorts slot its texture comes from, for picking and painting.
+    // City roads: city_tiles index. Piece meshes: portal index * 512 + voxel index.
     std::uint32_t cell{0xffffffffU};
     std::uint8_t slot{0xffU};
     // Buildings: only in the game's far view. An outside face with a buildblock side
@@ -90,6 +92,13 @@ struct RenderBufferMaterialRun {
     std::uint32_t triangle_count{};
     bool city_window_surface{};
 };
+
+struct TerrainDrawChunk {
+    RenderBufferMaterialRun run;
+    Vec3 bounds_min;
+    Vec3 bounds_max;
+};
+using ViewFrustumPlanes = std::array<std::array<float, 4>, 6>;
 
 struct RenderLine {
     Vec3 from{};
@@ -119,10 +128,12 @@ struct BuildingRenderBuffer {
     std::vector<RenderBufferVertex> vertices;
     std::vector<RenderBufferTriangle> triangles;
     std::vector<RenderBufferMaterialRun> material_runs;
+    std::vector<TerrainDrawChunk> terrain_chunks;
     std::vector<RenderLine> wire_lines;
     // Picking and highlights belong to this geometry. Builders and picking compaction
     // clear these caches when the geometry changes.
     mutable std::vector<RenderBufferMask> mask_cache;
+    mutable std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> cell_mask_index;
     mutable TrianglePickGrid pick_grid;
     // Stencil shadow volume baked by bake_shadow_volume: 9 floats per vertex (position,
     // kind/0/0, face normal) and triangle indices.
@@ -130,6 +141,10 @@ struct BuildingRenderBuffer {
     std::vector<std::uint32_t> shadow_indices;
     float shadow_top{};
 };
+
+// Partition terrain once on the scene worker; the rendering thread skips whole chunks.
+void build_terrain_draw_chunks(BuildingRenderBuffer& buffer);
+bool terrain_bounds_visible(Vec3 lo, Vec3 hi, Vec3 camera, float distance, const ViewFrustumPlanes& planes);
 
 // Bakes the buffer's shadow volume, which works for any light direction (see the
 // shadow volume shader in render_gpu.cpp). CPU work only, safe on worker threads.
@@ -518,6 +533,18 @@ Vec3 native_city_building_render_origin(const SbcBuilding& placement, float unit
 // overwrites.
 std::vector<std::vector<std::size_t>> overwritten_building_cells(
     const SbcMap& map, const std::vector<const SbbBuilding*>& placement_buildings);
+struct PlacementOverrideRenderBuffer {
+    std::size_t placement_index{};
+    BuildingRenderBuffer buffer;
+    std::size_t overwritten_cells{};
+    std::size_t dropped_cells{};
+};
+// CPU work only. The caller owns the snapshot and publishes buffers only when its
+// input revision still matches the live project.
+std::vector<PlacementOverrideRenderBuffer> build_placement_override_render_buffers(
+    const SbcMap& map, const std::vector<const SbbBuilding*>& placement_buildings,
+    const std::vector<NamedBlockMesh>& blocks, const std::vector<NamedBuildblockTemplate>& templates,
+    const std::vector<std::vector<std::size_t>>& dropped_cells);
 Vec3 native_city_building_transform_point(const SbcBuilding& placement, Vec3 local, float unit_size = 4.0F);
 MapScene build_map_scene(const SbcMap& map);
 // placement_buildings[i] gives the loaded .sbb data for map.buildings[i] (nullptr
@@ -527,8 +554,11 @@ MapScene build_map_scene(const SbcMap& map);
 // stamps, the land-use mask, and the block patches.
 // fit_game_world drops what the game's world storage can't hold (GameWorldFit).
 // The one-argument version skips that and keeps all the street geometry.
+// The road-only editing pass excludes terrain and shadow baking, which are built
+// separately on a worker. Its tile geometry is identical to the complete scene.
+enum class MapSceneBuild { Complete, RoadsOnly };
 MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*>& placement_buildings, bool auto_generated = false,
-    bool fit_game_world = true);
+    bool fit_game_world = true, MapSceneBuild detail = MapSceneBuild::Complete);
 
 // A street's slope as the game lays it. Slope blocks only exist for 4..12 cells per
 // level (native_grade_slot_table); outside that range the game leaves holes or
@@ -549,11 +579,26 @@ struct StreetPreview {
 };
 // Lays only map.streets[street_index], for the Road tool's preview.
 StreetPreview preview_city_street(const SbcMap& map, std::size_t street_index, bool auto_generated);
+// A street's identity across an edit: its end points and widths. Indices change
+// when a road is split, so edits compare roads by this.
+std::array<std::int32_t, 8> city_street_signature(const SbcMap& map, const SbcStreet& street);
+// What a road edit (laying a road, moving a junction) does to the road tiles. The
+// tiles are built for both maps the way the city build places them, then compared.
+struct RoadEditTiles {
+    std::vector<CityTileCell> changed;          // new tiles, or tiles that look different
+    std::vector<CityTileCell> shown;            // changed/reshaped road geometry and neighbours, to draw until the scene rebuild completes
+    std::vector<CityTileCell> removed;          // tiles the edit takes away
+    std::vector<CityTileCell> overlaps;         // changed tiles over a road the edit leaves alone
+    std::vector<CityTileCell> under_buildings;  // changed tiles that a building or piece replaces
+};
+RoadEditTiles diff_city_road_tiles(const SbcMap& before, const SbcMap& after,
+    const std::vector<const SbbBuilding*>& placement_buildings, bool auto_generated);
+// The road mesh for these tiles, as the city draws it.
+BuildingRenderBuffer build_city_road_tile_buffer(const std::vector<CityTileCell>& tiles, float unit_size);
 // building_revision changes when loaded SBB data changes outside the map.
 std::uint64_t city_scene_fingerprint(const SbcMap& map, std::uint64_t building_revision = 0);
-// A fingerprint of only the inputs that affect terrain (intersections, building
-// footprints, piece cells). Lets the GPU code upload the heavy terrain mesh again
-// only when the terrain really changed, not after every road or street edit.
+// A fingerprint of only the inputs that affect terrain (street geometry,
+// intersections, building footprints, and piece cells). Street names are excluded.
 std::uint64_t city_terrain_fingerprint(const SbcMap& map, std::uint64_t building_revision = 0);
 std::uint32_t terrain_noise_hash(std::int32_t x, std::int32_t y, std::uint32_t mask);
 float terrain_noise_sample(float x, float z, float frequency_x, float frequency_z);

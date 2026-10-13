@@ -283,7 +283,10 @@ void undo_city(EditorProject& project, EditorUi& ui, std::string& status) {
     invalidate_portal_render_models(project);
     ui.city_selection = CitySelectionKind::None;
     ui.selected_city_buildings.clear();
+    ui.selected_city_streets.clear();
     ui.selected_portals.clear();
+    ui.selected_piece_cells.clear();
+    ui.selected_piece_voxel.reset();
     ui.pending_road_start.reset();
     ui.city_dirty = true;
     status = "undo " + label;
@@ -305,7 +308,10 @@ void redo_city(EditorProject& project, EditorUi& ui, std::string& status) {
     invalidate_portal_render_models(project);
     ui.city_selection = CitySelectionKind::None;
     ui.selected_city_buildings.clear();
+    ui.selected_city_streets.clear();
     ui.selected_portals.clear();
+    ui.selected_piece_cells.clear();
+    ui.selected_piece_voxel.reset();
     ui.pending_road_start.reset();
     ui.city_dirty = true;
     status = "redo " + label;

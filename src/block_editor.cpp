@@ -91,74 +91,75 @@ void map_patch_uvs(SblAuthoredPatch& patch, const auto& mapping) {
 }
 
 void draw_patch_uv_tools(SblAuthoredPatch& patch, bool& changed) {
-    ImGui::SeparatorText("UVs (stored)");
-    if (patch_is_flat(patch)) {
-        auto corners = patch_corners(patch);
-        auto uvs = patch_corner_uvs(patch);
-        static constexpr std::array<const char*, 4> names{"Corner 1 UV", "Corner 2 UV", "Corner 3 UV", "Corner 4 UV"};
-        bool moved = false;
-        for (std::size_t i = 0; i < uvs.size(); ++i) {
-            field_label(names[i]);
-            ImGui::PushID(static_cast<int>(i));
-            std::array<float, 2> uv{uvs[i].u, uvs[i].v};
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            if (ImGui::DragFloat2("##uv", uv.data(), 0.01F, -64.0F, 64.0F, "%.3g")) {
-                uvs[i] = {uv[0], uv[1]};
+    if (ImGui::CollapsingHeader("UVs (stored)", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (patch_is_flat(patch)) {
+            auto corners = patch_corners(patch);
+            auto uvs = patch_corner_uvs(patch);
+            static constexpr std::array<const char*, 4> names{"Corner 1 UV", "Corner 2 UV", "Corner 3 UV", "Corner 4 UV"};
+            bool moved = false;
+            for (std::size_t i = 0; i < uvs.size(); ++i) {
+                field_label(names[i]);
+                ImGui::PushID(static_cast<int>(i));
+                std::array<float, 2> uv{uvs[i].u, uvs[i].v};
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::DragFloat2("##uv", uv.data(), 0.01F, -64.0F, 64.0F, "%.3g")) {
+                    uvs[i] = {uv[0], uv[1]};
+                    moved = true;
+                }
+                ImGui::PopID();
+            }
+            if (ImGui::Button("Fit 0-1")) {
+                uvs = {{{0, 1}, {1, 1}, {1, 0}, {0, 0}}};
                 moved = true;
             }
-            ImGui::PopID();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Stretch the texture once over the whole surface.");
+            ImGui::SameLine();
+            if (ImGui::Button("One per cell")) {
+                // Repeat once per cell of edge length, like projected walls.
+                const auto across = distance(corners[0], corners[1]), up = distance(corners[0], corners[3]);
+                uvs = {{{0, up}, {across, up}, {across, 0}, {0, 0}}};
+                moved = true;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Repeat the texture once per cell, so it matches the walls next to it.");
+            if (moved) {
+                set_patch_quad(patch, corners[0], corners[1], corners[2], corners[3], uvs);
+                changed = true;
+            }
         }
-        if (ImGui::Button("Fit 0-1")) {
-            uvs = {{{0, 1}, {1, 1}, {1, 0}, {0, 0}}};
-            moved = true;
-        }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Stretch the texture once over the whole surface.");
-        ImGui::SameLine();
-        if (ImGui::Button("One per cell")) {
-            // Repeat once per cell of edge length, like projected walls.
-            const auto across = distance(corners[0], corners[1]), up = distance(corners[0], corners[3]);
-            uvs = {{{0, up}, {across, up}, {across, 0}, {0, 0}}};
-            moved = true;
-        }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Repeat the texture once per cell, so it matches the walls next to it.");
-        if (moved) {
-            set_patch_quad(patch, corners[0], corners[1], corners[2], corners[3], uvs);
+        if (ImGui::Button("Rotate 90")) {
+            map_patch_uvs(patch, [](Vec2f uv) { return Vec2f{uv.v, -uv.u}; });
             changed = true;
         }
-    }
-    if (ImGui::Button("Rotate 90")) {
-        map_patch_uvs(patch, [](Vec2f uv) { return Vec2f{uv.v, -uv.u}; });
-        changed = true;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Flip U")) {
-        map_patch_uvs(patch, [](Vec2f uv) { return Vec2f{-uv.u, uv.v}; });
-        changed = true;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Flip V")) {
-        map_patch_uvs(patch, [](Vec2f uv) { return Vec2f{uv.u, -uv.v}; });
-        changed = true;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("x2")) {
-        map_patch_uvs(patch, [](Vec2f uv) { return Vec2f{uv.u * 2.0F, uv.v * 2.0F}; });
-        changed = true;
-    }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Repeat the texture twice as often.");
-    ImGui::SameLine();
-    if (ImGui::Button("/2")) {
-        map_patch_uvs(patch, [](Vec2f uv) { return Vec2f{uv.u * 0.5F, uv.v * 0.5F}; });
-        changed = true;
-    }
-    static std::array<float, 2> offset{};
-    field_label("Shift by");
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 60.0F);
-    ImGui::DragFloat2("##uv_shift", offset.data(), 0.01F, -8.0F, 8.0F, "%.3g");
-    ImGui::SameLine();
-    if (ImGui::Button("Apply##shift")) {
-        map_patch_uvs(patch, [](Vec2f uv) { return Vec2f{uv.u + offset[0], uv.v + offset[1]}; });
-        changed = true;
+        ImGui::SameLine();
+        if (ImGui::Button("Flip U")) {
+            map_patch_uvs(patch, [](Vec2f uv) { return Vec2f{-uv.u, uv.v}; });
+            changed = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Flip V")) {
+            map_patch_uvs(patch, [](Vec2f uv) { return Vec2f{uv.u, -uv.v}; });
+            changed = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("x2")) {
+            map_patch_uvs(patch, [](Vec2f uv) { return Vec2f{uv.u * 2.0F, uv.v * 2.0F}; });
+            changed = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Repeat the texture twice as often.");
+        ImGui::SameLine();
+        if (ImGui::Button("/2")) {
+            map_patch_uvs(patch, [](Vec2f uv) { return Vec2f{uv.u * 0.5F, uv.v * 0.5F}; });
+            changed = true;
+        }
+        static std::array<float, 2> offset{};
+        field_label("Shift by");
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 60.0F);
+        ImGui::DragFloat2("##uv_shift", offset.data(), 0.01F, -8.0F, 8.0F, "%.3g");
+        ImGui::SameLine();
+        if (ImGui::Button("Apply##shift")) {
+            map_patch_uvs(patch, [](Vec2f uv) { return Vec2f{uv.u + offset[0], uv.v + offset[1]}; });
+            changed = true;
+        }
     }
 }
 
@@ -212,8 +213,7 @@ void add_block(EditorProject& project, EditorUi& ui, std::string name, SblBlockM
     refresh_sbl_block_faces(block);
     project.block_bytes.push_back(write_sbl_block(block));
     project.blocks.push_back({project.root / "block" / (name + ".sbl"), std::move(name), std::move(block), true, true});
-    ui.selected_block = project.blocks.size() - 1U;
-    ui.block_element = BlockElementKind::None;
+    select_block_asset(ui, project.blocks.size() - 1U);
     reset_block_thumbnails(project);
     mark_block_changed(project, ui, project.blocks.back().data);
 }
@@ -336,87 +336,87 @@ void draw_patch_properties(SblBlockMesh& block, SblAuthoredPatch& patch, bool& c
     if (patch.normal_flag_b == 0U && (patch.normal_flag_a & 0xf0000U) == 0U) {
         draw_patch_uv_tools(patch, changed);
     } else {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         ImGui::TextWrapped("UVs are projected from the facing: one texture repeat per cell, lined up with the walls. "
                            "Choose Stored UVs to set them yourself.");
-        ImGui::PopStyleColor();
     }
     if (patch_is_flat(patch)) {
-        ImGui::SeparatorText("Corners (cells)");
-        auto corners = patch_corners(patch);
-        static constexpr std::array<const char*, 4> names{"Corner 1", "Corner 2", "Corner 3", "Corner 4"};
-        bool moved = false;
-        for (std::size_t i = 0; i < corners.size(); ++i) {
-            field_label(names[i]);
-            ImGui::PushID(static_cast<int>(i));
-            moved |= drag_vec3("##corner", corners[i]);
-            ImGui::PopID();
+        if (ImGui::CollapsingHeader("Corners (cells)", ImGuiTreeNodeFlags_DefaultOpen)) {
+            auto corners = patch_corners(patch);
+            static constexpr std::array<const char*, 4> names{"Corner 1", "Corner 2", "Corner 3", "Corner 4"};
+            bool moved = false;
+            for (std::size_t i = 0; i < corners.size(); ++i) {
+                field_label(names[i]);
+                ImGui::PushID(static_cast<int>(i));
+                moved |= drag_vec3("##corner", corners[i]);
+                ImGui::PopID();
+            }
+            if (moved) {
+                set_patch_quad(patch, corners[0], corners[1], corners[2], corners[3]);
+                changed = true;
+            }
+            if (ImGui::Button("Fill block side...")) ImGui::OpenPopup("##fill_side");
+            if (ImGui::BeginPopup("##fill_side")) {
+                const float w = static_cast<float>(block.width), h = static_cast<float>(block.height), d = static_cast<float>(block.depth);
+                const auto fill = [&](const char* label, Vec3f a, Vec3f b, Vec3f c, Vec3f e) {
+                    if (ImGui::Selectable(label)) {
+                        set_patch_quad(patch, a, b, c, e);
+                        changed = true;
+                    }
+                };
+                fill("-Z side", {0, 0, 0}, {0, h, 0}, {w, h, 0}, {w, 0, 0});
+                fill("+Z side", {w, 0, d}, {w, h, d}, {0, h, d}, {0, 0, d});
+                fill("-X side", {0, 0, d}, {0, h, d}, {0, h, 0}, {0, 0, 0});
+                fill("+X side", {w, 0, 0}, {w, h, 0}, {w, h, d}, {w, 0, d});
+                fill("Top", {0, h, 0}, {0, h, d}, {w, h, d}, {w, h, 0});
+                fill("Bottom", {0, 0, 0}, {w, 0, 0}, {w, 0, d}, {0, 0, d});
+                fill("Ramp (rises toward +Z)", {0, 0, 0}, {0, h, d}, {w, h, d}, {w, 0, 0});
+                ImGui::EndPopup();
+            }
         }
-        if (moved) {
-            set_patch_quad(patch, corners[0], corners[1], corners[2], corners[3]);
+    }
+    if (ImGui::CollapsingHeader("Curve", ImGuiTreeNodeFlags_DefaultOpen)) {
+        int orders[2]{static_cast<int>(patch.column_order), static_cast<int>(patch.row_order)};
+        field_label("Degree (u, v)");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::SliderInt2("##orders", orders, 1, 3)) {
+            patch.column_order = static_cast<std::uint32_t>(orders[0]);
+            patch.row_order = static_cast<std::uint32_t>(orders[1]);
             changed = true;
         }
-        if (ImGui::Button("Fill block side...")) ImGui::OpenPopup("##fill_side");
-        if (ImGui::BeginPopup("##fill_side")) {
-            const float w = static_cast<float>(block.width), h = static_cast<float>(block.height), d = static_cast<float>(block.depth);
-            const auto fill = [&](const char* label, Vec3f a, Vec3f b, Vec3f c, Vec3f e) {
-                if (ImGui::Selectable(label)) {
-                    set_patch_quad(patch, a, b, c, e);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("1 flat, 2 curved through the middle points, 3 a full cubic curve.");
+        int tess[2]{static_cast<int>(patch.column_tess), static_cast<int>(patch.row_tess)};
+        field_label("Pieces (u, v)");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::SliderInt2("##tess", tess, 1, 32)) {
+            patch.column_tess = static_cast<std::uint32_t>(tess[0]);
+            patch.row_tess = static_cast<std::uint32_t>(tess[1]);
+            changed = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("How many quads the game cuts the surface into. More = smoother curves, more triangles.");
+        if (ImGui::TreeNode("Control points (4 x 4)")) {
+            for (std::size_t i = 0; i < patch.control_points.size(); ++i) {
+                ImGui::PushID(static_cast<int>(i));
+                auto& point = patch.control_points[i];
+                ImGui::Text("%zu,%zu", i / 4U, i % 4U);
+                ImGui::SameLine(48.0F);
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.62F);
+                std::array<float, 3> p{point.position.x, point.position.y, point.position.z};
+                if (ImGui::DragFloat3("##p", p.data(), 0.01F, -64.0F, 128.0F, "%.3g")) {
+                    point.position = {p[0], p[1], p[2]};
                     changed = true;
                 }
-            };
-            fill("-Z side", {0, 0, 0}, {0, h, 0}, {w, h, 0}, {w, 0, 0});
-            fill("+Z side", {w, 0, d}, {w, h, d}, {0, h, d}, {0, 0, d});
-            fill("-X side", {0, 0, d}, {0, h, d}, {0, h, 0}, {0, 0, 0});
-            fill("+X side", {w, 0, 0}, {w, h, 0}, {w, h, d}, {w, 0, d});
-            fill("Top", {0, h, 0}, {0, h, d}, {w, h, d}, {w, h, 0});
-            fill("Bottom", {0, 0, 0}, {w, 0, 0}, {w, 0, d}, {0, 0, d});
-            fill("Ramp (rises toward +Z)", {0, 0, 0}, {0, h, d}, {w, h, d}, {w, 0, 0});
-            ImGui::EndPopup();
-        }
-    }
-    ImGui::SeparatorText("Curve");
-    int orders[2]{static_cast<int>(patch.column_order), static_cast<int>(patch.row_order)};
-    field_label("Degree (u, v)");
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::SliderInt2("##orders", orders, 1, 3)) {
-        patch.column_order = static_cast<std::uint32_t>(orders[0]);
-        patch.row_order = static_cast<std::uint32_t>(orders[1]);
-        changed = true;
-    }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("1 flat, 2 curved through the middle points, 3 a full cubic curve.");
-    int tess[2]{static_cast<int>(patch.column_tess), static_cast<int>(patch.row_tess)};
-    field_label("Pieces (u, v)");
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::SliderInt2("##tess", tess, 1, 32)) {
-        patch.column_tess = static_cast<std::uint32_t>(tess[0]);
-        patch.row_tess = static_cast<std::uint32_t>(tess[1]);
-        changed = true;
-    }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("How many quads the game cuts the surface into. More = smoother curves, more triangles.");
-    if (ImGui::TreeNode("Control points (4 x 4)")) {
-        for (std::size_t i = 0; i < patch.control_points.size(); ++i) {
-            ImGui::PushID(static_cast<int>(i));
-            auto& point = patch.control_points[i];
-            ImGui::Text("%zu,%zu", i / 4U, i % 4U);
-            ImGui::SameLine(48.0F);
-            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.62F);
-            std::array<float, 3> p{point.position.x, point.position.y, point.position.z};
-            if (ImGui::DragFloat3("##p", p.data(), 0.01F, -64.0F, 128.0F, "%.3g")) {
-                point.position = {p[0], p[1], p[2]};
-                changed = true;
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                std::array<float, 2> uv{point.u, point.v};
+                if (ImGui::DragFloat2("##uv", uv.data(), 0.01F, -64.0F, 64.0F, "%.3g")) {
+                    point.u = uv[0];
+                    point.v = uv[1];
+                    changed = true;
+                }
+                ImGui::PopID();
             }
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            std::array<float, 2> uv{point.u, point.v};
-            if (ImGui::DragFloat2("##uv", uv.data(), 0.01F, -64.0F, 64.0F, "%.3g")) {
-                point.u = uv[0];
-                point.v = uv[1];
-                changed = true;
-            }
-            ImGui::PopID();
+            ImGui::TreePop();
         }
-        ImGui::TreePop();
     }
 }
 
@@ -425,27 +425,29 @@ void draw_box_properties(SblBlockLight& box, bool& changed) {
     changed |= slot_combo("##box_slot", box.scalars[0]);
     ImGui::TextDisabled("Box textures are always projected from each side's facing.");
     auto [lo, hi] = box_bounds(box);
-    ImGui::SeparatorText("Bounds (cells)");
-    field_label("From");
-    bool resized = drag_vec3("##box_lo", lo);
-    field_label("To");
-    resized |= drag_vec3("##box_hi", hi);
-    if (resized) {
-        set_box_bounds(box, lo, hi);
-        changed = true;
-    }
-    ImGui::SeparatorText("Sides");
-    // The block's own side checkboxes use the same names, so these get their own ID scope.
-    ImGui::PushID("box_sides");
-    for (std::size_t bit = 0; bit < kBoxSideNames.size(); ++bit) {
-        bool on = (box.final_value & (1U << bit)) != 0U;
-        if (ImGui::Checkbox(kBoxSideNames[bit], &on)) {
-            box.final_value = on ? box.final_value | (1U << bit) : box.final_value & ~(1U << bit);
+    if (ImGui::CollapsingHeader("Bounds (cells)", ImGuiTreeNodeFlags_DefaultOpen)) {
+        field_label("From");
+        bool resized = drag_vec3("##box_lo", lo);
+        field_label("To");
+        resized |= drag_vec3("##box_hi", hi);
+        if (resized) {
+            set_box_bounds(box, lo, hi);
             changed = true;
         }
-        if (bit % 2U == 0U) ImGui::SameLine(160.0F);
     }
-    ImGui::PopID();
+    if (ImGui::CollapsingHeader("Sides", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // The block's own side checkboxes use the same names, so these get their own ID scope.
+        ImGui::PushID("box_sides");
+        for (std::size_t bit = 0; bit < kBoxSideNames.size(); ++bit) {
+            bool on = (box.final_value & (1U << bit)) != 0U;
+            if (ImGui::Checkbox(kBoxSideNames[bit], &on)) {
+                box.final_value = on ? box.final_value | (1U << bit) : box.final_value & ~(1U << bit);
+                changed = true;
+            }
+            if (bit % 2U == 0U) ImGui::SameLine(160.0F);
+        }
+        ImGui::PopID();
+    }
     if (ImGui::TreeNode("Corners (8)")) {
         for (std::size_t i = 0; i < box.points.size(); ++i) {
             ImGui::PushID(static_cast<int>(i));
@@ -488,6 +490,7 @@ void draw_block_inspector(EditorProject& project, EditorUi& ui, std::string& sta
         delete_block(project, ui, status);
         return;
     }
+    if (ImGui::Button(ICON_FA_FILE_EXPORT " Export .sbl...")) export_block_sbl(project, ui.selected_block, status);
 
     auto& asset = project.blocks[ui.selected_block];
     bool changed = false;
@@ -501,120 +504,126 @@ void draw_block_inspector(EditorProject& project, EditorUi& ui, std::string& sta
     if (ImGui::IsItemActive()) ImGui::TextDisabled("Press Enter to rename. Buildings and pieces using it follow.");
     ImGui::TextDisabled("Used %zu times", block_users(project, asset.name));
 
-    ImGui::SeparatorText("View");
-    int mode = ui.block_vertex_mode ? 0 : 1;
-    if (ImGui::RadioButton("Points##block_mode", &mode, 0)) {
-        ui.block_vertex_mode = true;
-        if (ui.block_selected_vertices.empty() && ui.block_element != BlockElementKind::None) {
-            ui.block_selected_vertices = element_vertices(*block, ui.block_element, ui.block_element_index);
-        }
-    }
-    ImGui::SameLine();
-    if (ImGui::RadioButton("Surfaces##block_mode", &mode, 1)) ui.block_vertex_mode = false;
-    ImGui::SameLine();
-    ImGui::TextDisabled("(Tab)");
-    ImGui::Checkbox("Textured##block_textured", &ui.block_textured);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show each face with the texture picked for its slot below.");
-    if (ui.block_textured && ImGui::TreeNode("Slot textures##block_slots")) {
-        ImGui::TextDisabled("Preview only: the building cell that places a block picks its real textures.");
-        texture_slots(project, "block_slot_textures", ui.block_slot_textures);
-        ImGui::TreePop();
-    }
-
-    ImGui::SeparatorText("Box");
-    int size[3]{static_cast<int>(block->width), static_cast<int>(block->height), static_cast<int>(block->depth)};
-    field_label("Size (cells)");
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::SliderInt3("##block_size", size, 1, 16)) {
-        block->width = static_cast<std::uint32_t>(size[0]);
-        block->height = static_cast<std::uint32_t>(size[1]);
-        block->depth = static_cast<std::uint32_t>(size[2]);
-        changed = true;
-    }
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-    ImGui::TextWrapped("Generated sides: one quad per cell, built by the game from the size.");
-    ImGui::PopStyleColor();
-    for (std::size_t side = 0; side < kExteriorSideNames.size(); ++side) {
-        bool on = block->exterior_flags[side] != 0U;
-        if (ImGui::Checkbox(kExteriorSideNames[side], &on)) {
-            block->exterior_flags[side] = on ? 1U : 0U;
-            changed = true;
-        }
-        if (side % 2U == 0U) ImGui::SameLine(160.0F);
-    }
-
-    ImGui::SeparatorText("Surfaces");
-    if (ImGui::Button(ICON_FA_PLUS " Patch")) {
-        add_block_patch(project, ui);
-        block = &project.blocks[ui.selected_block].data;
-    }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("A free surface: flat quad by default, curved with a higher degree.");
-    ImGui::SameLine();
-    if (ImGui::Button(ICON_FA_PLUS " Box")) {
-        add_block_box(project, ui);
-        block = &project.blocks[ui.selected_block].data;
-    }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("An extra box from 8 corners, each side a quad; good for tables, posts, steps.");
-
-    if (ImGui::BeginListBox("##block_elements", ImVec2(-FLT_MIN, 6.0F * ImGui::GetTextLineHeightWithSpacing()))) {
-        for (std::size_t i = 0; i < block->authored_patches.size(); ++i) {
-            const auto& patch = block->authored_patches[i];
-            const auto label = "Patch " + std::to_string(i + 1U) + (patch_is_flat(patch) ? "  flat" : "  curved") +
-                "  slot " + std::to_string(patch.normal_flag_a & 0xffffU);
-            if (ImGui::Selectable((label + "##p" + std::to_string(i)).c_str(), ui.block_element == BlockElementKind::Patch && ui.block_element_index == i)) {
-                ui.block_element = BlockElementKind::Patch;
-                ui.block_element_index = i;
-                ui.block_selected_vertices = element_vertices(*block, ui.block_element, i);
+    if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {
+        int mode = ui.block_vertex_mode ? 0 : 1;
+        if (ImGui::RadioButton("Points##block_mode", &mode, 0)) {
+            ui.block_vertex_mode = true;
+            if (ui.block_selected_vertices.empty() && ui.block_element != BlockElementKind::None) {
+                ui.block_selected_vertices = element_vertices(*block, ui.block_element, ui.block_element_index);
             }
-        }
-        for (std::size_t i = 0; i < block->lights.size(); ++i) {
-            const auto label = "Box " + std::to_string(i + 1U) + "  slot " + std::to_string(block->lights[i].scalars[0] & 0xffffU);
-            if (ImGui::Selectable((label + "##b" + std::to_string(i)).c_str(), ui.block_element == BlockElementKind::Box && ui.block_element_index == i)) {
-                ui.block_element = BlockElementKind::Box;
-                ui.block_element_index = i;
-                ui.block_selected_vertices = element_vertices(*block, ui.block_element, i);
-            }
-        }
-        ImGui::EndListBox();
-    }
-
-    const bool patch_selected = ui.block_element == BlockElementKind::Patch && ui.block_element_index < block->authored_patches.size();
-    const bool box_selected = ui.block_element == BlockElementKind::Box && ui.block_element_index < block->lights.size();
-    if (patch_selected || box_selected) {
-        if (ImGui::Button(ICON_FA_COPY " Copy")) {
-            duplicate_block_element(project, ui);
-            block = &project.blocks[ui.selected_block].data;
         }
         ImGui::SameLine();
-        if (ImGui::Button(ICON_FA_TRASH " Remove")) {
-            delete_block_element(project, ui);
-            return;
+        if (ImGui::RadioButton("Surfaces##block_mode", &mode, 1)) ui.block_vertex_mode = false;
+        ImGui::SameLine();
+        ImGui::TextDisabled("(Tab)");
+        ImGui::Checkbox("Textured##block_textured", &ui.block_textured);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show each face with the texture picked for its slot below.");
+        if (ui.block_textured && ImGui::TreeNode("Slot textures##block_slots")) {
+            ImGui::TextDisabled("Preview only: the building cell that places a block picks its real textures.");
+            texture_slots(project, "block_slot_textures", ui.block_slot_textures);
+            ImGui::TreePop();
         }
-        if (patch_selected) {
-            ImGui::SameLine();
-            if (ImGui::Button("Flip")) {
-                auto& points = block->authored_patches[ui.block_element_index].control_points;
-                for (std::size_t row = 0; row < 4; ++row) {
-                    std::swap(points[row * 4], points[row * 4 + 3]);
-                    std::swap(points[row * 4 + 1], points[row * 4 + 2]);
-                }
+        if (ui.block_paint_faces) {
+            int slot = static_cast<int>(ui.block_paint_slot);
+            field_label("Paint slot");
+            if (ImGui::SliderInt("##block_paint_slot", &slot, 0, 7, "slot %d")) ui.block_paint_slot = static_cast<std::uint32_t>(slot);
+            draw_block_paint_texture(project, ui);
+            ImGui::TextWrapped("Click a patch or box to assign this texture slot. A box shares one slot across its faces. Generated sides use fixed slots.");
+        }
+
+    }
+    if (ImGui::CollapsingHeader("Box", ImGuiTreeNodeFlags_DefaultOpen)) {
+        int size[3]{static_cast<int>(block->width), static_cast<int>(block->height), static_cast<int>(block->depth)};
+        field_label("Size (cells)");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::SliderInt3("##block_size", size, 1, 16)) {
+            block->width = static_cast<std::uint32_t>(size[0]);
+            block->height = static_cast<std::uint32_t>(size[1]);
+            block->depth = static_cast<std::uint32_t>(size[2]);
+            changed = true;
+        }
+        ImGui::TextWrapped("Generated sides: one quad per cell, built by the game from the size.");
+        for (std::size_t side = 0; side < kExteriorSideNames.size(); ++side) {
+            bool on = block->exterior_flags[side] != 0U;
+            if (ImGui::Checkbox(kExteriorSideNames[side], &on)) {
+                block->exterior_flags[side] = on ? 1U : 0U;
                 changed = true;
             }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Turn the surface to face the other way.");
+            if (side % 2U == 0U) ImGui::SameLine(160.0F);
         }
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-        ImGui::TextWrapped(ui.block_vertex_mode
-            ? "Points: click a point (Shift adds), drag one to move it, or drag a box on empty space. Ctrl+A picks all, Alt+A none. "
-              "G moves, S scales, R rotates (X/Y/Z lock an axis, click or Enter keeps, Esc cancels, Shift skips snapping). "
-              "Arrow keys and PgUp/PgDn nudge 1/8 cell. Tab switches to whole surfaces."
-            : "Surfaces: drag an arrow to move, a white cube to resize a box, an orange dot to move a point. "
-              "G moves, S scales, R rotates (X/Y/Z lock an axis, click or Enter keeps, Esc cancels, Shift skips snapping). "
-              "Arrow keys and PgUp/PgDn nudge 1/8 cell. Tab switches to points.");
-        ImGui::PopStyleColor();
-        if (patch_selected) draw_patch_properties(*block, block->authored_patches[ui.block_element_index], changed);
-        else draw_box_properties(block->lights[ui.block_element_index], changed);
-    } else {
-        ImGui::TextDisabled("Click a surface in the view, or pick one above.");
+    }
+
+    if (ImGui::CollapsingHeader("Surfaces", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::Button(ICON_FA_PLUS " Patch")) {
+            add_block_patch(project, ui);
+            block = &project.blocks[ui.selected_block].data;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("A free surface: flat quad by default, curved with a higher degree.");
+        ImGui::SameLine();
+        if (ImGui::Button(ICON_FA_PLUS " Box")) {
+            add_block_box(project, ui);
+            block = &project.blocks[ui.selected_block].data;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("An extra box from 8 corners, each side a quad; good for tables, posts, steps.");
+
+        if (ImGui::BeginListBox("##block_elements", ImVec2(-FLT_MIN, 6.0F * ImGui::GetTextLineHeightWithSpacing()))) {
+            for (std::size_t i = 0; i < block->authored_patches.size(); ++i) {
+                const auto& patch = block->authored_patches[i];
+                const auto label = "Patch " + std::to_string(i + 1U) + (patch_is_flat(patch) ? "  flat" : "  curved") +
+                    "  slot " + std::to_string(patch.normal_flag_a & 0xffffU);
+                if (ImGui::Selectable((label + "##p" + std::to_string(i)).c_str(), ui.block_element == BlockElementKind::Patch && ui.block_element_index == i)) {
+                    ui.block_element = BlockElementKind::Patch;
+                    ui.block_element_index = i;
+                    ui.block_selected_vertices = element_vertices(*block, ui.block_element, i);
+                }
+            }
+            for (std::size_t i = 0; i < block->lights.size(); ++i) {
+                const auto label = "Box " + std::to_string(i + 1U) + "  slot " + std::to_string(block->lights[i].scalars[0] & 0xffffU);
+                if (ImGui::Selectable((label + "##b" + std::to_string(i)).c_str(), ui.block_element == BlockElementKind::Box && ui.block_element_index == i)) {
+                    ui.block_element = BlockElementKind::Box;
+                    ui.block_element_index = i;
+                    ui.block_selected_vertices = element_vertices(*block, ui.block_element, i);
+                }
+            }
+            ImGui::EndListBox();
+        }
+
+        const bool patch_selected = ui.block_element == BlockElementKind::Patch && ui.block_element_index < block->authored_patches.size();
+        const bool box_selected = ui.block_element == BlockElementKind::Box && ui.block_element_index < block->lights.size();
+        if (patch_selected || box_selected) {
+            if (ImGui::Button(ICON_FA_COPY " Copy")) {
+                duplicate_block_element(project, ui);
+                block = &project.blocks[ui.selected_block].data;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button(ICON_FA_TRASH " Remove")) {
+                delete_block_element(project, ui);
+                return;
+            }
+            if (patch_selected) {
+                ImGui::SameLine();
+                if (ImGui::Button("Flip")) {
+                    auto& points = block->authored_patches[ui.block_element_index].control_points;
+                    for (std::size_t row = 0; row < 4; ++row) {
+                        std::swap(points[row * 4], points[row * 4 + 3]);
+                        std::swap(points[row * 4 + 1], points[row * 4 + 2]);
+                    }
+                    changed = true;
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Turn the surface to face the other way.");
+            }
+            ImGui::TextWrapped(ui.block_vertex_mode
+                ? "Points: click a point (Shift adds), drag one to move it, or drag a box on empty space. Ctrl+A picks all, Alt+A none. "
+                  "G moves, S scales, R rotates (X/Y/Z lock an axis, click or Enter keeps, Esc cancels, Shift skips snapping). "
+                  "Arrow keys and PgUp/PgDn nudge 1/8 cell. Tab switches to whole surfaces."
+                : "Surfaces: drag an arrow to move, a white cube to resize a box, an orange dot to move a point. "
+                  "G moves, S scales, R rotates (X/Y/Z lock an axis, click or Enter keeps, Esc cancels, Shift skips snapping). "
+                  "Arrow keys and PgUp/PgDn nudge 1/8 cell. Tab switches to points.");
+            if (patch_selected) draw_patch_properties(*block, block->authored_patches[ui.block_element_index], changed);
+            else draw_box_properties(block->lights[ui.block_element_index], changed);
+        } else {
+            ImGui::TextDisabled("Click a surface in the view, or pick one above.");
+        }
     }
     if (changed) mark_block_changed(project, ui, *block);
 }
@@ -685,7 +694,7 @@ Vec3f* vertex_ptr(SblBlockMesh& block, const BlockVertexRef& ref) {
     if (ref.kind == BlockElementKind::Patch && ref.element < block.authored_patches.size() &&
         ref.point < block.authored_patches[ref.element].control_points.size()) {
         return &block.authored_patches[ref.element].control_points[ref.point].position;
-    }
+        }
     if (ref.kind == BlockElementKind::Box && ref.element < block.lights.size() && ref.point < 8U) {
         return &block.lights[ref.element].points[ref.point];
     }
@@ -830,7 +839,7 @@ std::optional<Vector2> to_screen(const Camera3D& camera, Vec3f p, Vector2 viewpo
     if (camera.projection == CAMERA_PERSPECTIVE &&
         Vector3DotProduct(Vector3Subtract(world, camera.position), Vector3Subtract(camera.target, camera.position)) <= 0.0F) {
         return std::nullopt;
-    }
+        }
     return GetWorldToScreenEx(world, camera, static_cast<int>(viewport_size.x), static_cast<int>(viewport_size.y));
 }
 
@@ -999,7 +1008,46 @@ void select_element(SblBlockMesh& block, EditorUi& ui, BlockElementKind kind, st
 
 } // namespace
 
+void select_block_asset(EditorUi& ui, std::size_t index) {
+    ui.selected_block = ui.browser_block = ui.block_selection_block = index;
+    ui.block_element = BlockElementKind::None;
+    ui.block_element_index = 0;
+    ui.block_selected_vertices.clear();
+    ui.block_hover_vertex.reset();
+    ui.block_transform = BlockTransform::None;
+    ui.block_transform_preview.reset();
+    ui.block_transform_drag = false;
+    ui.block_transform_handle = ui.block_hover_handle = -1;
+}
+
+void select_city_piece_mesh(EditorProject& project, EditorUi& ui) {
+    if (ui.city_tool == CityTool::Piece && !ui.place_piece_solid && !project.blocks.empty()) {
+        select_block_asset(ui, std::min(ui.place_piece_mesh, project.blocks.size() - 1U));
+    } else if (project.city && ui.city_selection == CitySelectionKind::Piece && ui.selected_piece_voxel) {
+        const auto preset = static_cast<std::size_t>(ui.selected_piece_word & 0xfffU);
+        if (preset >= project.city->data.city_blocks.size()) return;
+        const auto& name = project.city->data.city_blocks[preset].name;
+        const auto asset = std::ranges::find_if(project.blocks, [&](const auto& a) { return lower_name(a.name) == lower_name(name); });
+        if (asset != project.blocks.end()) select_block_asset(ui, static_cast<std::size_t>(asset - project.blocks.begin()));
+    }
+}
+
+void draw_block_paint_texture(EditorProject& project, EditorUi& ui) {
+    if (std::ranges::all_of(ui.block_slot_textures, &std::string::empty) && !project.textures.empty()) {
+        ui.block_slot_textures.fill(project.textures.front().name);
+    }
+    const auto& name = ui.block_slot_textures[ui.block_paint_slot];
+    const auto found = std::ranges::find_if(project.textures, [&](const auto& t) { return lower_name(t.name) == lower_name(name); });
+    if (found != project.textures.end()) {
+        ImGui::Image(ImTextureID(found->texture.id), ImVec2(32.0F, 32.0F));
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) ImGui::SetTooltip("Preview for slot %u: %s. Choose its texture in Assets > Textures.", ui.block_paint_slot, name.c_str());
+        ImGui::SameLine();
+    }
+    ImGui::TextWrapped("Paint slot %u: %s", ui.block_paint_slot, name.empty() ? "unassigned" : name.c_str());
+}
+
 void add_block_patch(EditorProject& project, EditorUi& ui) {
+    end_block_transform(project, ui, false);
     auto* block = selected_block(project, ui);
     if (block == nullptr) return;
     SblAuthoredPatch patch{};
@@ -1013,6 +1061,7 @@ void add_block_patch(EditorProject& project, EditorUi& ui) {
 }
 
 void add_block_box(EditorProject& project, EditorUi& ui) {
+    end_block_transform(project, ui, false);
     auto* block = selected_block(project, ui);
     if (block == nullptr) return;
     SblBlockLight box{};
@@ -1020,6 +1069,20 @@ void add_block_box(EditorProject& project, EditorUi& ui) {
     set_box_bounds(box, {0.25F, 0.0F, 0.25F}, {0.75F, 0.5F, 0.75F});
     block->lights.push_back(box);
     select_element(*block, ui, BlockElementKind::Box, block->lights.size() - 1U);
+    mark_block_changed(project, ui, *block);
+}
+
+void paint_block_element(EditorProject& project, EditorUi& ui, std::uint32_t slot) {
+    auto* block = selected_block(project, ui);
+    if (block == nullptr || slot > 7U) return;
+    std::uint32_t* material = nullptr;
+    if (ui.block_element == BlockElementKind::Patch && ui.block_element_index < block->authored_patches.size()) {
+        material = &block->authored_patches[ui.block_element_index].normal_flag_a;
+    } else if (ui.block_element == BlockElementKind::Box && ui.block_element_index < block->lights.size()) {
+        material = &block->lights[ui.block_element_index].scalars[0];
+    }
+    if (material == nullptr || (*material & 0xffffU) == slot) return;
+    *material = (*material & ~0xffffU) | slot;
     mark_block_changed(project, ui, *block);
 }
 
@@ -1040,6 +1103,11 @@ void block_editor_press(EditorProject& project, EditorUi& ui, const Camera3D& ca
     if (ui.block_transform != BlockTransform::None) {
         // A click confirms a G/S/R transform.
         end_block_transform(project, ui, true);
+        return;
+    }
+    if (ui.block_paint_faces) {
+        pick_block_element(project, ui, get_viewport_mouse_ray(camera, mouse, viewport_size));
+        paint_block_element(project, ui, ui.block_paint_slot);
         return;
     }
     if (const auto handle = handle_under_mouse(*block, ui, camera, mouse, viewport_size)) {
@@ -1094,11 +1162,7 @@ void block_editor_update(EditorProject& project, EditorUi& ui, const Camera3D& c
         return;
     }
     // Another block was opened: its points are not the old selection.
-    if (ui.block_selection_block != ui.selected_block) {
-        ui.block_selection_block = ui.selected_block;
-        ui.block_selected_vertices.clear();
-        ui.block_element = BlockElementKind::None;
-    }
+    if (ui.block_selection_block != ui.selected_block) select_block_asset(ui, ui.selected_block);
     const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
     if (ui.box_select_active && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
         ui.box_select_active = false;
@@ -1127,6 +1191,11 @@ void block_editor_update(EditorProject& project, EditorUi& ui, const Camera3D& c
     }
     const bool typing = ImGui::GetIO().WantTextInput;
     const bool command = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL) || IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER);
+    if (ui.block_paint_faces && ui.block_transform == BlockTransform::None) {
+        ui.block_hover_handle = -1;
+        ui.block_hover_vertex.reset();
+        return;
+    }
     if (ui.block_transform == BlockTransform::None) {
         const auto handle = hovered ? handle_under_mouse(*block, ui, camera, mouse, viewport_size) : std::nullopt;
         ui.block_hover_handle = handle ? handle->id : -1;
@@ -1219,7 +1288,7 @@ void draw_block_editor_view(EditorProject& project, const EditorUi& ui) {
 
 // Drawn after the finished scene, so the handles stay visible through the block.
 void draw_block_editor_handles(EditorProject& project, const EditorUi& ui, const Camera3D& camera) {
-    if (project.blocks.empty()) return;
+    if (project.blocks.empty() || ui.block_paint_faces) return;
     auto& real = project.blocks[std::min(ui.selected_block, project.blocks.size() - 1U)].data;
     auto& block = ui.block_transform_preview ? const_cast<SblBlockMesh&>(*ui.block_transform_preview) : real;
     if (ui.block_vertex_mode) {

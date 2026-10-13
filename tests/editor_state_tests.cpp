@@ -2,6 +2,7 @@
 #include "editor_state.hpp"
 
 #include <cstdint>
+#include <cmath>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -42,11 +43,42 @@ void test_building_grid_expansion() {
         "supported expansion did not preserve the anchor-relative cell position");
 }
 
+void test_control_presets() {
+    const auto near = [](float a, float b) { return std::abs(a - b) < 0.001F; };
+    const pafta::Vec3 forward{0.0F, 1.0F, -1.0F};
+    const auto blender = pafta::fly_camera_step(forward, {.forward = true}, 10.0F, 1.0F);
+    require(blender.y > 0.0F && near(blender.y, -blender.z), "Blender flying did not follow the view");
+    const auto alex = pafta::fly_camera_step(forward, {.forward = true, .alex_controls = true}, 10.0F, 1.0F);
+    require(near(alex.y, 0.0F) && near(alex.z, -10.0F), "Alex WASD did not stay level");
+    const auto lift = pafta::fly_camera_step(forward, {.up = true, .alex_controls = true}, 10.0F, 1.0F);
+    require(near(lift.y, 10.0F) && near(lift.z, 0.0F), "Alex vertical movement followed the view");
+    require(near(pafta::fly_speed_multiplier(false, true, true), 4.0F) &&
+        near(pafta::fly_speed_multiplier(true, false, true), 0.25F) &&
+        near(pafta::fly_speed_multiplier(true, true, true), 16.0F), "Alex native editor speed modifiers changed");
+    require(near(pafta::fly_speed_multiplier(true, true), 0.0625F), "Blender slowest movement changed");
+    const auto diagonal = pafta::fly_camera_step(forward,
+        {.forward = true, .right = true, .up = true, .alex_controls = true}, 10.0F, 1.0F);
+    require(near(std::sqrt(diagonal.x * diagonal.x + diagonal.y * diagonal.y + diagonal.z * diagonal.z), 10.0F),
+        "Alex diagonal flying changed the configured speed");
+}
+
+void test_locked_placement_plane() {
+    const auto hit = pafta::ray_horizontal_plane_hit({10.0F, 20.0F, 30.0F}, {1.0F, -2.0F, 3.0F}, 4.0F);
+    require(hit && hit->x == 18.0F && hit->y == 4.0F && hit->z == 54.0F,
+        "placement ray did not intersect the locked Y plane");
+    require(!pafta::ray_horizontal_plane_hit({0, 20, 0}, {1, 0, 0}, 4), "parallel placement ray hit a plane");
+    require(!pafta::ray_horizontal_plane_hit({0, 20, 0}, {0, 1, 0}, 4), "placement plane behind the camera was accepted");
+    const auto upward = pafta::ray_horizontal_plane_hit({0, -8, 0}, {0, 1, 0}, -4);
+    require(upward && upward->y == -4, "negative locked Y levels did not work");
+}
+
 } // namespace
 
 int main() {
     try {
         test_building_grid_expansion();
+        test_control_presets();
+        test_locked_placement_plane();
         std::cout << "Editor state tests passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -52,7 +52,7 @@ struct GpuMeshPart {
     unsigned int material_texture{};  // metallic/roughness map
     Color color{WHITE};
     bool window_material{};
-    // World-space bounds of one part of a chunked shadow volume, for view culling.
+    // World-space bounds of terrain or shadow chunks, for view/distance culling.
     bool has_bounds{};
     Vector3 bounds_min{};
     Vector3 bounds_max{};
@@ -68,6 +68,8 @@ struct GpuMesh {
     unsigned int ebo{};
     std::uint32_t vertex_count{};
     std::uint32_t index_count{};
+    std::uint64_t vertex_bytes{};
+    std::uint64_t index_bytes{};
     std::vector<GpuMeshPart> parts;
 
     GpuMesh() = default;
@@ -82,6 +84,8 @@ struct GpuMesh {
             ebo = std::exchange(other.ebo, 0U);
             vertex_count = std::exchange(other.vertex_count, 0U);
             index_count = std::exchange(other.index_count, 0U);
+            vertex_bytes = std::exchange(other.vertex_bytes, 0U);
+            index_bytes = std::exchange(other.index_bytes, 0U);
             parts = std::move(other.parts);
         }
         return *this;
@@ -177,11 +181,15 @@ struct GfxDebugDrawCounter {
     std::uint64_t draw_calls{};
 };
 
-struct GfxDebugUploadStats {
-    std::uint64_t uploaded_vertices{};
-    std::uint64_t uploaded_indices{};
-    std::uint64_t uploaded_bytes{};
-    std::uint64_t chunks{};
+struct GpuMemoryStats {
+    std::uint64_t buffer_bytes{};
+    std::uint64_t texture_bytes{};
+    std::uint64_t target_bytes{};
+    std::uint64_t meshes{};
+    std::uint64_t vertices{};
+    std::uint64_t indices{};
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> driver_used_total;
+    std::uint64_t total_bytes() const { return buffer_bytes + texture_bytes + target_bytes; }
 };
 
 struct GfxDebugCounts {
@@ -195,26 +203,44 @@ struct GfxDebugCounts {
 
 struct GfxDebugStats {
     static constexpr std::size_t history_size = 120;
+    static constexpr double sample_interval = 0.5;
     std::array<float, history_size> frame_time_history{};
+    std::array<float, history_size> frame_peak_history{};
+    double frame_time_sum{};
+    std::size_t sample_frames{};
+    float frame_peak{};
+    double sample_started{-1.0};
+    bool gpu_memory_refresh_due{true};
     std::size_t frame_time_index{};
     std::size_t frame_time_count{};
     std::array<GfxDebugDrawCounter, static_cast<std::size_t>(GfxDebugDrawCategory::Count)> draw{};
     std::array<double, static_cast<std::size_t>(GfxDebugTimingPhase::Count)> phase_ms{};
     std::array<double, static_cast<std::size_t>(GfxDebugTimingPhase::Count)> phase_avg_ms{};
-    GfxDebugUploadStats uploads{};
+    GpuMemoryStats gpu_memory{};
     GfxDebugCounts counts{};
 
     void reset_frame() {
         draw = {};
         phase_ms = {};
-        uploads = {};
         counts = {};
     }
 
-    void push_frame_time(float ms) {
-        frame_time_history[frame_time_index] = ms;
+    bool push_frame_time(float ms, double now) {
+        if (sample_started < 0.0) sample_started = now;
+        frame_time_sum += ms;
+        ++sample_frames;
+        frame_peak = std::max(frame_peak, ms);
+        if (now - sample_started + 1e-9 < sample_interval) return false;
+        frame_time_history[frame_time_index] = static_cast<float>(frame_time_sum / sample_frames);
+        frame_peak_history[frame_time_index] = frame_peak;
         frame_time_index = (frame_time_index + 1U) % frame_time_history.size();
         frame_time_count = std::min(frame_time_count + 1U, frame_time_history.size());
+        frame_time_sum = 0;
+        sample_frames = 0;
+        frame_peak = 0;
+        sample_started = now;
+        gpu_memory_refresh_due = true;
+        return true;
     }
 
     void add_draw(GfxDebugDrawCategory category, std::uint64_t triangles, std::uint64_t vertices, std::uint64_t draw_calls) {
@@ -267,6 +293,7 @@ struct RenderSettings {
     bool interiors_selected_only{false};
     std::vector<std::size_t> interior_placements;
     float building_distance{0.0F}; // 0 = draw every placement
+    float terrain_distance{0.0F};
     bool half_textures{false};     // halve texture resolution at load
     bool street_objects{true};     // traffic lights and street signs
     bool live_reflections{true};   // recapture the sky reflection as the camera moves
@@ -331,7 +358,10 @@ struct ShadowVertex {
 };
 static_assert(sizeof(ShadowVertex) == 20);
 
+struct ArchiveFileJobs;
+
 struct ArchiveWorkspace {
+    std::shared_ptr<ArchiveFileJobs> file_jobs;
     CsxArchive archive{0xc5f17e01U, 0, 0, {}};
     std::array<char, 1024> input_path{};
     // The map folder test.csx is written to (the game only reads that name).
@@ -376,7 +406,12 @@ struct FailedAsset {
     bool imported{};
 };
 
+struct ProjectFileJobs;
+struct FileWriteTicket;
+
 struct EditorProject {
+    // File workers own copies of CPU source data. GPU resources stay here.
+    std::shared_ptr<ProjectFileJobs> file_jobs;
     std::filesystem::path root;
     // Files that failed to load, with their bytes, for "Try auto-fixing".
     std::vector<FailedAsset> failed_assets;
@@ -468,10 +503,23 @@ struct EditorProject {
     };
     std::unordered_map<std::size_t, NearBuildingJob> building_near_jobs;
     std::uint64_t placement_override_fingerprint{};
+    std::uint64_t placement_override_build_target_fingerprint{};
+    std::optional<std::future<std::vector<PlacementOverrideRenderBuffer>>> placement_override_build_future;
+    std::vector<PlacementOverrideRenderBuffer> placement_override_uploads;
+    std::size_t placement_override_upload_cursor{};
+    int placement_override_upload_budget{};
     bool placement_assets_dirty{true};
+    // Immutable building geometry shared by scene workers. Placements resolve into
+    // this snapshot; moving/stamping roads and pieces does not copy SBB cells again.
+    std::shared_ptr<const std::vector<SbbBuilding>> city_building_sources;
+    std::unordered_map<std::string, std::size_t> city_building_source_names;
+    std::uint64_t city_building_source_revision{};
+    std::size_t city_building_source_asset_count{};
     MapScene city_scene_cache;
     std::uint64_t city_scene_cache_fingerprint{};
+    std::uint64_t city_scene_terrain_fingerprint{};
     bool city_scene_cache_valid{false};
+    bool city_scene_cache_complete{false};
     // Rebuilding the city scene in the background. build_map_scene (roads, terrain,
     // and footprint stamps) runs on a worker thread so editing never holds up the
     // frame. The last good scene keeps drawing until the new one is ready.
@@ -479,6 +527,12 @@ struct EditorProject {
     std::uint64_t city_scene_build_generation{};
     std::uint64_t city_scene_build_target_fingerprint{};
     std::optional<std::future<MapScene>> city_scene_build_future;
+    // Road geometry does not wait for the terrain heightfield or shadow bake.
+    std::optional<std::future<MapScene>> city_roads_build_future;
+    std::uint64_t city_roads_build_target_fingerprint{};
+    std::uint64_t city_road_visibility_fingerprint{};
+    bool city_road_cells_filtered{};
+    bool city_tile_gpu_shadows_valid{};
     // GPU meshes for the city's road and curb tiles and terrain, uploaded once per
     // scene rebuild instead of sending every triangle in immediate mode each frame.
     GpuBuildingRenderModel city_tile_gpu_model;
@@ -500,6 +554,10 @@ struct EditorProject {
     // new buffer is ready and uploaded on the main thread.
     bool portal_rebuild_in_progress{};
     std::optional<std::future<BuildingRenderBuffer>> portal_rebuild_future;
+    std::vector<SbcPortal> portal_build_sources;
+    std::vector<SbcPortal> portal_render_sources;
+    std::uint64_t portal_visibility_fingerprint{};
+    bool portal_cells_filtered{};
     bool render_build_in_progress{};
     std::uint64_t render_build_generation{};
     std::optional<std::future<RenderBuildResult>> render_build_future;
@@ -528,6 +586,33 @@ struct EditorProject {
     std::unordered_map<std::string, RenderTexture2D> item_set_thumbnails;
     // Piece previews: a block mesh (empty = the solid cube) with eight slot textures, keyed by those names.
     std::unordered_map<std::string, RenderTexture2D> piece_thumbnails;
+    struct PiecePreviewModel { GpuMesh mesh; Vector3 center{}; float radius{1.0F}; };
+    std::unordered_map<std::string, PiecePreviewModel> piece_preview_models;
+    struct PendingPiece { std::array<std::int32_t, 3> cell; std::uint32_t word; };
+    std::vector<PendingPiece> pending_pieces;
+    // The road edit preview (laying a road or moving a junction): what the edit does to
+    // the road tiles and its road mesh, kept until the edit or the map changes.
+    struct RoadEditPreview {
+        std::uint64_t key{};
+        std::uint64_t after_hash{};
+        std::vector<CityTileCell> display_tiles;
+        RoadEditTiles tiles;
+        GpuBuildingRenderModel model;
+        std::vector<StreetPreview> streets;           // new or reshaped roads
+        std::vector<std::string> changed_roads;       // existing roads the edit splits or reshapes
+        std::vector<CityTileCell> changed_road_tiles; // those roads' tiles before the edit
+    } road_edit_preview;
+    struct RoadPlacementPlan {
+        std::uint64_t request{};
+        SbcMap roads;
+        std::optional<std::array<std::int32_t, 3>> next_start;
+        std::optional<std::size_t> last_street;
+    } road_placement_plan;
+    struct PendingRoads {
+        std::uint64_t fingerprint{};
+        std::vector<CityTileCell> tiles;
+        GpuBuildingRenderModel model;
+    } pending_roads;
     // The Pieces tab preview comes from one city-block definition and the current
     // block-mesh catalog. Keep it between frames and rebuild it after edits.
     CityBlockPreviewScene cached_city_block_preview_scene;
@@ -608,6 +693,11 @@ enum class CitySelectionKind {
     Road,
     Node,
     Piece,
+};
+
+struct CityAnyPick {
+    CitySelectionKind kind{CitySelectionKind::None};
+    std::size_t index{};
 };
 
 // The active tool in the Buildings (template) editor. Select picks a cell,
@@ -787,6 +877,7 @@ struct EditorUi {
     bool map_export_requested{};
     bool show_shortcuts_window{};
     bool show_preferences_window{};
+    bool show_about_window{};
     bool show_graphics_debug{};
     // Which workspace windows are open. Saved in the preferences, so a window you
     // closed stays closed.
@@ -848,6 +939,8 @@ struct EditorUi {
     // The block view's textures: one project texture per material slot 0..7 (a block's
     // faces name slots; the building cell that places it picks the real textures).
     bool block_textured{true};
+    bool block_paint_faces{};
+    std::uint32_t block_paint_slot{};
     std::array<std::string, 8> block_slot_textures{};
     std::size_t selected_block_field{};
     std::size_t selected_block_patch{};
@@ -863,6 +956,11 @@ struct EditorUi {
     // "only the single active selection".
     std::vector<std::size_t> selected_city_buildings;
     std::vector<std::size_t> selected_portals;
+    std::vector<std::size_t> selected_city_streets;
+    std::vector<CityGridPoint> selected_piece_cells;
+    bool box_select_buildings{true};
+    bool box_select_pieces{true};
+    bool box_select_roads{true};
     // Box selection: while dragging with the Select tool, everything whose screen point
     // is inside the rectangle gets selected. box_select_active is set on press, and the
     // start and current points are in viewport pixels.
@@ -876,8 +974,11 @@ struct EditorUi {
     std::string placement_conflict;
     std::string road_preview_info;  // set by draw_road_lay_preview, shown by draw_coordinate_readout
     std::vector<CityTileCell> road_preview_cells;  // the road tiles draw_road_lay_preview drew
-    // A road's tiles just after it is laid, drawn until the rebuilt city scene shows it.
-    std::vector<CityTileCell> road_ghost;
+    // Dragging a road junction with the Select tool: the junction, the press point in
+    // viewport pixels, and the grid point it would move to (previewed until release).
+    std::optional<std::size_t> node_drag;
+    Vector2 node_drag_mouse{};
+    std::optional<CityGridPoint> node_drag_target;
     BuildingTool building_tool{BuildingTool::Select};
     std::size_t selected_item_set{};
     std::size_t item_set_catalog_add{};
@@ -952,12 +1053,14 @@ struct EditorUi {
     // Both false only shows the editor-style node and segment overlays.
     bool render_roads{true};
     bool render_terrain{true};
+    float terrain_distance{0.0F};
     // Performance settings (Preferences): see RenderSettings.
     bool near_lod{true};
     // Draw rooms only for the selected city buildings, at any distance.
     bool interiors_selected_only{false};
     // Opening a map: loose folders beat test.csx when both have an asset.
     bool loose_files_win{false};
+    bool remember_load_order{};
     // Middle drag orbits and Shift+middle drag pans, like Blender.
     bool blender_mouse{true};
     // The folder Export mesh writes to; empty asks the first time.
@@ -987,7 +1090,11 @@ struct EditorUi {
     // from above.
     bool building_hide_roofs{false};
     int building_view_floor{0};
-    float camera_fly_speed{48.0F};
+    std::array<float, 5> camera_fly_speeds{48.0F, 48.0F, 48.0F, 48.0F, 48.0F};
+    bool controls_chosen{};
+    float delta_seconds{1.0F / 60.0F};
+    bool place_height_locked{};
+    int place_height_y{};
     // Orbiting (Alt + left drag) or panning (middle drag) in progress, and its pivot.
     CameraDrag camera_drag{CameraDrag::None};
     int camera_drag_button{};
@@ -1095,9 +1202,20 @@ const Texture2D* map_menu_texture(EditorProject& project, int pixels, const MapM
 // The same screen drawn `pixels` square, as PNG bytes. Empty when there is no map
 // image yet.
 std::vector<std::uint8_t> map_menu_png(EditorProject& project, int pixels, const MapMenuOptions& options);
+Image capture_map_menu_image(EditorProject& project, int pixels, const MapMenuOptions& options);
+// Consumes image; safe on a worker after capture_map_menu_image returns.
+std::vector<std::uint8_t> encode_map_menu_png(Image image);
 void draw_map_image_window(EditorProject& project, EditorUi& ui);
 void draw_shortcuts_window(EditorUi& ui);
+std::string gfx_debug_format_count(std::uint64_t value);
+std::uint64_t gpu_texture_bytes(const Texture2D& texture);
+GpuMemoryStats graphics_gpu_memory(const EditorProject* project, const EditorUi& ui, std::span<const RenderTexture2D> targets);
+void draw_graphics_debug_window(bool& open, GfxDebugStats& stats);
 void draw_preferences_window(EditorUi& ui);
+float& camera_fly_speed(EditorUi& ui);
+void draw_controls_setup(EditorUi& ui);
+std::optional<CityGridPoint> city_grid_point_on_plane_under_mouse(
+    const Camera3D& camera, Vector2 mouse, Vector2 size, int y, bool cell);
 void unload_preview_views(EditorUi& ui);
 // Game limits found from the sizes of subrosa.exe's arrays. Draws red or yellow
 // lines for anything at or over a limit, and returns the number of problems.
@@ -1132,7 +1250,8 @@ struct GridOptions {
     bool labels{false};                    // a name under each thumbnail
     std::array<char, 128>* search{};       // a search box drawn elsewhere; null draws one above the grid
     // Draws over an item's button (for previews that aren't textures).
-    std::function<void(std::size_t, ImDrawList*, ImVec2, ImVec2)> paint;
+    std::function<void(std::size_t, ImDrawList*, ImVec2, ImVec2)> paint{};
+    const char* action{"Click to select"};
 };
 // A wrapping grid of thumbnails with a search box; returns the index clicked.
 // `extra(i)` runs right after each item (for its context menu).
@@ -1150,6 +1269,14 @@ bool texture_button(const EditorProject& project, const char* id, std::string& t
 bool texture_slots(const EditorProject& project, const char* id, std::array<std::string, 8>& names,
     const std::array<const char*, 8>* slot_labels = nullptr);
 void draw_properties_window(EditorProject* project, EditorUi& ui, std::string& status);
+void box_select_city(EditorProject& project, EditorUi& ui, const Camera3D& camera,
+    Vector2 a, Vector2 b, Vector2 viewport_size, bool additive);
+void select_city_thing(EditorProject& project, EditorUi& ui, const CityAnyPick& picked, bool additive,
+    const Vec3& ray_origin, const Vec3& ray_dir, std::string& status);
+void erase_city_thing_under_cursor(EditorProject& project, EditorUi& ui, const MapScene& scene,
+    const Vec3& ray_origin, const Vec3& ray_dir, std::string& status);
+void delete_box_selection(EditorProject& project, EditorUi& ui);
+void nudge_box_selection(EditorProject& project, EditorUi& ui, int dx, int dy, int dz, std::string& status);
 void toggle_in_selection(std::vector<std::size_t>& set, std::size_t index);
 void focus_current_selection(EditorProject& project, EditorUi& ui, Camera3D& camera);
 void begin_city_action(EditorProject& project, EditorUi& ui, std::string label);
@@ -1160,6 +1287,7 @@ Matrix city_placement_matrix(const SbcBuilding& placement);
 // Instanced draws of `model` at every transform in `transforms`, lit by the game
 // surface shader (or the flat mask shader). The caller owns the MRT state.
 enum class GpuSurface { World, Building, Terrain, Model, Unlit, Mask, ShadowVolume };
+bool append_gpu_draw_range(GpuMeshPart& range, const GpuMeshPart& next);
 void draw_gpu_mesh_instances(const GpuMesh& mesh, const std::vector<Matrix>& transforms, GpuSurface surface);
 // The game's near-view switch distance (_render_buildsectorlist: sector centre
 // within sqrt(36864) = 192 units).
@@ -1188,8 +1316,16 @@ void undo_city(EditorProject& project, EditorUi& ui, std::string& status);
 void redo_city(EditorProject& project, EditorUi& ui, std::string& status);
 // Writes building `index` as a loose .sbb (asks where on the desktop, downloads in
 // the browser).
-void export_building_sbb(const EditorProject& project, std::size_t index, std::string& status);
+void export_building_sbb(EditorProject& project, std::size_t index, std::string& status);
+void export_block_sbl(EditorProject& project, std::size_t index, std::string& status);
 void save_map_to(EditorProject& project, EditorUi& ui, const std::filesystem::path& folder, std::string& status);
+void request_map_save(EditorProject& project, EditorUi& ui, const std::filesystem::path& folder, std::string& status);
+void service_project_file_jobs(EditorProject& project, EditorUi& ui, std::string& status);
+bool project_file_jobs_pending(const EditorProject& project);
+bool project_map_save_pending(const EditorProject& project);
+void queue_project_file_job(EditorProject& project, std::function<void()> operation, std::string success);
+// Claim on the UI thread; keep the ticket alive until the file worker finishes.
+std::shared_ptr<FileWriteTicket> claim_file_writer();
 // Records finished edits as undo steps; call once per frame. Skips frames where a
 // drag or widget edit is still going, so each gesture becomes one step.
 void commit_pending_edits(EditorProject& project, const EditorUi& ui);
@@ -1291,8 +1427,15 @@ void draw_city_piece_voxels(
     std::optional<std::size_t> selected_portal = std::nullopt,
     bool draw_wires = false,
     bool isolate_selected = false);
-GpuBuildingRenderModel upload_city_tile_model(const BuildingRenderBuffer& buffer, const EditorProject& project);
+GpuBuildingRenderModel upload_city_tile_model(const BuildingRenderBuffer& buffer, const EditorProject& project, bool shadows = true);
 GpuBuildingRenderModel upload_city_terrain_model(const BuildingRenderBuffer& buffer, const EditorProject& project);
+struct PlacedBuildingSnapshot {
+    std::shared_ptr<const std::vector<SbbBuilding>> owned;
+    std::vector<std::size_t> resolved; // index+1; zero means the asset is missing
+};
+PlacedBuildingSnapshot snapshot_city_buildings(EditorProject& project);
+void update_city_road_visibility(EditorProject& project);
+bool adopt_city_scene_result(EditorProject& project, MapScene scene, std::uint64_t fingerprint, bool complete);
 void unload_city_render_model(GpuBuildingRenderModel& model);
 void draw_city_scene(
     EditorProject& project,
@@ -1324,8 +1467,8 @@ float adjust_camera_fly_speed(float current_speed, float wheel_delta);
 Ray get_viewport_mouse_ray(const Camera3D& camera, Vector2 viewport_mouse_pos, Vector2 viewport_size);
 Vector2 get_viewport_mouse_position(Vector2 viewport_pos, Vector2 viewport_size);
 void focus_camera_on_city(Camera3D& camera, const EditorProject& project);
-FlyInput read_fly_input();
-void update_free_fly_camera(Camera3D& camera, float fly_speed, const FlyInput& input);
+FlyInput read_fly_input(const EditorUi& ui);
+void update_free_fly_camera(Camera3D& camera, float fly_speed, const FlyInput& input, float delta_seconds);
 // Alt + left drag orbits around the point under the cursor, middle drag pans, and
 // the wheel zooms toward the cursor. `scene` gives the terrain for the pivot.
 void update_orbit_camera(Camera3D& camera, EditorUi& ui, Vector2 viewport_mouse_pos, Vector2 viewport_size,
@@ -1389,6 +1532,8 @@ void project_archive_finish(CsxArchive& archive);
 void import_project_archive(ArchiveWorkspace& workspace, const EditorProject& project);
 void save_archive_to(ArchiveWorkspace& workspace, std::filesystem::path path);
 bool save_archive_workspace(ArchiveWorkspace& workspace);
+void service_archive_file_jobs(ArchiveWorkspace& workspace);
+bool archive_file_jobs_pending(const ArchiveWorkspace& workspace);
 void draw_csx_editor(ArchiveWorkspace& workspace, bool& open, EditorProject* project, EditorUi& ui, std::string& status);
 
 std::optional<std::filesystem::path> dropped_folder();
@@ -1404,6 +1549,9 @@ void delete_city_building(EditorProject& project, EditorUi& ui);
 void nudge_city_street_width(EditorProject& project, EditorUi& ui, int side, int delta);
 void duplicate_city_street(EditorProject& project, EditorUi& ui);
 void append_city_road_point(EditorProject& project, EditorUi& ui, CityGridPoint point);
+std::uint64_t road_edit_hash(const SbcMap& map);
+const SbcMap& prepare_city_road_plan(EditorProject& project, const EditorUi& ui, CityGridPoint point);
+bool commit_prepared_city_road(EditorProject& project, EditorUi& ui, CityGridPoint point);
 struct RoadLay {
     std::optional<CityGridPoint> next_start;  // where the chain continues; empty ends it
     std::optional<std::size_t> last_street;   // the last segment added
@@ -1431,6 +1579,16 @@ void rebuild_single_building_render(EditorProject& project, std::size_t index);
 const RenderTexture2D* city_block_thumbnail(EditorProject& project, std::size_t index);
 // The Piece tool brush's mesh name; empty for the solid cube (app.cpp).
 std::string piece_brush_mesh_name(const EditorProject& project, const EditorUi& ui);
+// Moves junction `node` by dx/dz cells. Roads stay straight: a road across the move
+// carries its far junction along (and that junction's roads across the move, and so
+// on); roads along the move stretch or shrink. Returns false, leaving the map as it
+// was, when a road would shrink to less than two cells or turn around.
+bool move_city_junction(SbcMap& map, std::size_t node, std::int32_t dx, std::int32_t dz);
+// Draws the road preview mesh in front of the city's road at the same place.
+void draw_road_preview_model(GpuBuildingRenderModel& model);
+// The map's piece (city block, layer) with this mesh and textures; added if missing.
+std::optional<std::pair<std::size_t, std::size_t>> find_or_add_city_block(SbcMap& map, const std::string& name,
+    const std::array<std::string, 8>& layer);
 // The game's solid cube piece ("nblock"): a 1x1x1 block with all six sides.
 const SblBlockMesh& solid_piece_mesh();
 // A block mesh with a texture per material slot 0..7 (a slot with no texture gets a
@@ -1438,7 +1596,9 @@ const SblBlockMesh& solid_piece_mesh();
 void draw_block_mesh_textured(const EditorProject& project, const SblBlockMesh& mesh, const std::array<std::string, 8>& textures,
     Vector3 origin, float unit, std::int32_t rotation, unsigned char alpha);
 // A cached preview of a piece: mesh name (empty = solid cube) plus slot textures.
-const RenderTexture2D* piece_thumbnail(EditorProject& project, const std::string& mesh_name, const std::array<std::string, 8>& textures);
+void draw_piece_preview(EditorProject& project, const std::string& mesh_name,
+    const std::array<std::string, 8>& textures, Vector3 position, std::int32_t rotation);
+const RenderTexture2D* piece_thumbnail(EditorProject& project, const std::string& mesh_name, const std::array<std::string, 8>& textures, std::int32_t rotation = 0);
 // Block-mesh thumbnail, drawn when first needed (ui_windows.cpp); nullptr until
 // ready.
 const RenderTexture2D* block_thumbnail(EditorProject& project, std::size_t index);
@@ -1460,7 +1620,11 @@ void block_select_all(EditorProject& project, EditorUi& ui, bool select);
 void draw_block_editor_view(EditorProject& project, const EditorUi& ui);
 void draw_block_editor_handles(EditorProject& project, const EditorUi& ui, const Camera3D& camera);
 void pick_block_element(EditorProject& project, EditorUi& ui, Ray ray);
+void select_block_asset(EditorUi& ui, std::size_t index);
+void select_city_piece_mesh(EditorProject& project, EditorUi& ui);
+void draw_block_paint_texture(EditorProject& project, EditorUi& ui);
 void add_block_patch(EditorProject& project, EditorUi& ui);
+void paint_block_element(EditorProject& project, EditorUi& ui, std::uint32_t slot);
 void add_block_box(EditorProject& project, EditorUi& ui);
 // The 3D block editor's mouse and keys. Call press on a left click in the view; it
 // confirms a transform, grabs a handle, or selects. Call update every frame.
@@ -1470,7 +1634,7 @@ void start_block_transform(EditorProject& project, EditorUi& ui, BlockTransform 
 void frame_block_camera(const EditorProject& project, const EditorUi& ui, Camera3D& camera);
 void draw_buildblock_inspector(EditorProject& project, EditorUi& ui, std::string& status);
 void draw_struct_inspector_header(const char* file_type, const char* struct_name, const std::string& record_name);
-void draw_struct_section(const char* name);
+bool draw_struct_section(const char* name);
 std::string hex_u32(std::uint32_t value);
 
 } // namespace pafta::app_internal

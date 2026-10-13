@@ -82,24 +82,24 @@
     {
       "name": "dev",
       "configurePreset": "dev",
-      "targets": ["pafta", "pafta_tests", "binary_export_tests", "editor_state_tests", "mesh_export_tests", "editor_workflow_tests"]
+      "targets": ["pafta", "pafta_tests", "binary_export_tests", "editor_state_tests", "mesh_export_tests", "editor_workflow_tests", "selection_tests", "project_file_jobs_tests"]
     },
     {
       "name": "dev-msvc",
       "configurePreset": "dev-msvc",
       "configuration": "Debug",
-      "targets": ["pafta", "pafta_tests", "binary_export_tests", "editor_state_tests", "mesh_export_tests", "editor_workflow_tests"]
+      "targets": ["pafta", "pafta_tests", "binary_export_tests", "editor_state_tests", "mesh_export_tests", "editor_workflow_tests", "selection_tests", "project_file_jobs_tests"]
     },
     {
       "name": "ci",
       "configurePreset": "ci",
-      "targets": ["pafta", "pafta_tests", "binary_export_tests", "editor_state_tests", "mesh_export_tests", "editor_workflow_tests"]
+      "targets": ["pafta", "pafta_tests", "binary_export_tests", "editor_state_tests", "mesh_export_tests", "editor_workflow_tests", "selection_tests", "project_file_jobs_tests"]
     },
     {
       "name": "ci-msvc",
       "configurePreset": "ci-msvc",
       "configuration": "Release",
-      "targets": ["pafta", "pafta_tests", "binary_export_tests", "editor_state_tests", "mesh_export_tests", "editor_workflow_tests"]
+      "targets": ["pafta", "pafta_tests", "binary_export_tests", "editor_state_tests", "mesh_export_tests", "editor_workflow_tests", "selection_tests", "project_file_jobs_tests"]
     },
     {
       "name": "quality",

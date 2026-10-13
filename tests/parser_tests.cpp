@@ -1819,6 +1819,13 @@ pafta::SbcMap native_patch_block_map(std::array<std::int32_t, 4> sbc_levels) {
 void city_terrain_patches_hardcoded_intersection_blocks() {
     const auto scene = pafta::build_map_scene(native_patch_block_map({5, 5, 5, 9}));
 
+    const auto roads = pafta::build_map_scene(native_patch_block_map({5, 5, 5, 9}), {}, false, false, pafta::MapSceneBuild::RoadsOnly);
+    assert(!roads.terrain.has_value());
+    assert(roads.city_tile_buffer.shadow_vertices.empty());
+    assert(roads.city_tile_fingerprint == scene.city_tile_fingerprint);
+    assert(roads.city_tile_buffer.triangles.size() == scene.city_tile_buffer.triangles.size());
+    for (const auto& triangle : roads.city_tile_buffer.triangles) assert(triangle.cell < roads.city_tiles.size());
+
     assert(scene.terrain.has_value());
     assert(scene.terrain->mesh.triangles.size() > 0U);
     assert(close_to(scene.terrain->mesh.vertices.front().position.x, -4096.0F));
@@ -1972,6 +1979,51 @@ void overlapping_city_placements_let_the_later_one_win() {
     assert(overwritten[1].empty());
     assert(overwritten[0].size() == 1U);
     assert(overwritten[0][0] == 2U);
+}
+
+void placement_override_buffers_match_native_filtered_source() {
+    pafta::SbbBuilding building;
+    building.size_x = building.extent_x = 3;
+    building.size_y = building.extent_y = 1;
+    building.size_z = building.extent_z = 1;
+    for (std::uint32_t x = 0; x < 3U; ++x) {
+        pafta::SbbCell cell;
+        cell.index = x;
+        cell.x = x;
+        cell.occupied = true;
+        cell.exterior_block() = 0x40000000U;
+        building.cells.push_back(cell);
+    }
+    pafta::SbcMap map;
+    map.buildings.push_back({0U, "a", 100, 8, 100, 0});
+    map.buildings.push_back({1U, "a", 102, 8, 100, 0});
+    const auto built = pafta::build_placement_override_render_buffers(map, {&building, &building}, {}, {}, {{0U}, {1U}});
+    assert(built.size() == 2U);
+    assert(built[0].placement_index == 0U && built[0].overwritten_cells == 1U && built[0].dropped_cells == 1U);
+    assert(built[1].placement_index == 1U && built[1].overwritten_cells == 0U && built[1].dropped_cells == 1U);
+    for (std::size_t placement = 0; placement < 2U; ++placement) {
+        auto reference = building;
+        // First plot: later placement covers cell 2, world storage drops cell 0.
+        // Second plot: world storage drops its middle cell.
+        for (auto& cell : reference.cells) cell.occupied = placement == 0U ? cell.index == 1U : cell.index != 1U;
+        auto expected = pafta::build_city_building_full_render_buffer(reference, {}, {}, pafta::BuildingLod::Far);
+        pafta::bake_shadow_volume(expected);
+        const auto& actual = built[placement].buffer;
+        assert(!actual.triangles.empty() && actual.vertices.size() == expected.vertices.size());
+        assert(actual.triangles.size() == expected.triangles.size());
+        for (std::size_t v = 0; v < actual.vertices.size(); ++v) {
+            const auto& a = actual.vertices[v];
+            const auto& e = expected.vertices[v];
+            assert(a.position.x == e.position.x && a.position.y == e.position.y && a.position.z == e.position.z);
+            assert(a.u == e.u && a.v == e.v && a.layer == e.layer);
+        }
+        for (std::size_t t = 0; t < actual.triangles.size(); ++t) {
+            assert(actual.triangles[t].indices == expected.triangles[t].indices);
+            assert(actual.triangles[t].material == expected.triangles[t].material && actual.triangles[t].cell == expected.triangles[t].cell);
+        }
+        assert(actual.shadow_vertices == expected.shadow_vertices && actual.shadow_indices == expected.shadow_indices);
+    }
+    for (const auto& cell : building.cells) assert(cell.occupied);
 }
 
 void city_terrain_inside_patch_conforms_to_building_footprints() {
@@ -3179,7 +3231,19 @@ void native_portal_render_buffer_uses_city_block_name_mesh_and_layer_materials()
     assert(buffer.triangles.size() == 2U);
     assert(buffer.material_names.size() == 1U);
     assert(buffer.material_names[0] == "south");
+    for (const auto& triangle : buffer.triangles) assert(triangle.cell == 0U);
     assert(has_buffer_vertex(buffer, 64.0F, 96.0F, 132.0F, 0.0F, 0.0F));
+
+    auto shifted = map;
+    shifted.portals[0].blocks[0] = 0U;
+    pafta::SbcPortal second{};
+    second.fields = {0, 3, 3, 4};
+    second.blocks.assign(512U, 0U);
+    second.blocks[5] = 0x00010000U;
+    shifted.portals.push_back(std::move(second));
+    const auto tagged = pafta::build_native_portal_render_buffer(shifted, {pafta::NamedBlockMesh{"portalmesh", mesh}});
+    assert(tagged.triangles.size() == 2U);
+    for (const auto& triangle : tagged.triangles) assert(triangle.cell == 512U + 5U);
 }
 
 void native_portal_render_buffer_renders_unnamed_city_block_as_solid_cell_faces() {
@@ -3758,8 +3822,10 @@ void compacts_pick_vertices_without_changing_face_ownership() {
     buffer.mask_cache.push_back({1, {{0, 0, 0}}});
     buffer.pick_grid.ready = true;
     buffer.pick_grid.items = {0};
+    buffer.cell_mask_index[7] = {0};
     pafta::keep_pick_data_only(buffer);
     assert(buffer.mask_cache.empty());
+    assert(buffer.cell_mask_index.empty());
     assert(!buffer.pick_grid.ready && buffer.pick_grid.items.empty());
     assert(buffer.vertices.size() == 2);
     assert((buffer.triangles[0].indices == std::array<std::uint32_t, 3>{0, 0, 1}));
@@ -3816,7 +3882,15 @@ void city_scene_fingerprint_changes_only_with_scene_inputs() {
     auto widened = map;
     ++widened.streets[0].left_width;
     assert(pafta::city_scene_fingerprint(widened) != base);
-    assert(pafta::city_terrain_fingerprint(widened) == terrain_base);
+    assert(pafta::city_terrain_fingerprint(widened) != terrain_base);
+
+    auto removed = map;
+    removed.streets.clear();
+    assert(pafta::city_terrain_fingerprint(removed) != terrain_base);
+
+    auto reversed = map;
+    std::swap(reversed.streets[0].from_intersection, reversed.streets[0].to_intersection);
+    assert(pafta::city_terrain_fingerprint(reversed) != terrain_base);
 
     auto renamed_street = map;
     renamed_street.streets[0].name = "Broadway";
@@ -3926,6 +4000,7 @@ int main(int argc, char** argv) {
     city_terrain_inside_patch_conforms_to_piece_cells();
     city_terrain_inside_patch_conforms_to_building_footprints();
     overlapping_city_placements_let_the_later_one_win();
+    placement_override_buffers_match_native_filtered_source();
     fly_camera_moves_along_the_view();
     city_scene_fingerprint_sees_every_voxel();
     city_road_tile_heights_follow_native_slope_region();

@@ -37,7 +37,8 @@ std::optional<std::array<std::uint32_t, 3>> shift_sbb_grid_for_cell(
         static_cast<std::uint32_t>(y + sy), static_cast<std::uint32_t>(z + sz)};
 }
 
-float fly_speed_multiplier(bool slow, bool fast) {
+float fly_speed_multiplier(bool slow, bool fast, bool alex_controls) {
+    if (alex_controls && fast) return slow ? 16.0F : 4.0F;
     if (slow) {
         return fast ? 1.0F / 16.0F : 0.25F;
     }
@@ -48,6 +49,9 @@ Vec3 fly_camera_step(Vec3 forward, const FlyInput& input, float speed, float sec
     const auto length = [](Vec3 vector) {
         return std::sqrt(vector.x * vector.x + vector.y * vector.y + vector.z * vector.z);
     };
+    // The native editor moves WASD in its horizontal plane. Blender-style fly
+    // follows the view instead, so looking up and pressing W climbs.
+    if (input.alex_controls) forward.y = 0.0F;
     const auto forward_length = length(forward);
     if (forward_length <= 0.0F) {
         return {};
@@ -72,8 +76,15 @@ Vec3 fly_camera_step(Vec3 forward, const FlyInput& input, float speed, float sec
     if (move_length <= 1e-6F) {
         return {};
     }
-    const auto step = speed * fly_speed_multiplier(input.slow, input.fast) * seconds / move_length;
+    const auto step = speed * fly_speed_multiplier(input.slow, input.fast, input.alex_controls) * seconds / move_length;
     return {move.x * step, move.y * step, move.z * step};
+}
+
+std::optional<Vec3> ray_horizontal_plane_hit(Vec3 origin, Vec3 direction, float y) {
+    if (std::abs(direction.y) < 0.0001F) return std::nullopt;
+    const auto distance = (y - origin.y) / direction.y;
+    if (distance < 0.0F) return std::nullopt;
+    return Vec3{origin.x + direction.x * distance, y, origin.z + direction.z * distance};
 }
 
 } // namespace pafta

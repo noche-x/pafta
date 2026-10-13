@@ -339,6 +339,20 @@ if(PAFTA_BUILD_TESTS AND NOT EMSCRIPTEN)
   endif()
   add_test(NAME editor_workflow_tests COMMAND editor_workflow_tests)
 
+  add_executable(selection_tests tests/selection_tests.cpp)
+  target_link_libraries(selection_tests PRIVATE pafta_app)
+  if(PAFTA_ENABLE_COVERAGE)
+    pafta_enable_coverage(selection_tests)
+  endif()
+  add_test(NAME selection_tests COMMAND selection_tests)
+
+  add_executable(project_file_jobs_tests tests/project_file_jobs_tests.cpp)
+  target_link_libraries(project_file_jobs_tests PRIVATE pafta_app)
+  if(PAFTA_ENABLE_COVERAGE)
+    pafta_enable_coverage(project_file_jobs_tests)
+  endif()
+  add_test(NAME project_file_jobs_tests COMMAND project_file_jobs_tests)
+
   add_executable(mesh_export_tests tests/mesh_export_tests.cpp src/mesh_export.cpp src/tinygltf_impl.cpp)
   target_include_directories(mesh_export_tests SYSTEM PRIVATE "${tinygltf_SOURCE_DIR}")
   target_link_libraries(mesh_export_tests PRIVATE pafta_core imgui_rlimgui raylib)
@@ -440,7 +454,7 @@ if(PAFTA_BUILD_FUZZERS)
 endif()
 
 foreach(target pafta_core pafta_app pafta pafta_web pafta_tests binary_export_tests
-    editor_state_tests editor_workflow_tests mesh_export_tests fuzz_sbb fuzz_sbc fuzz_sbl fuzz_csx)
+    editor_state_tests editor_workflow_tests selection_tests project_file_jobs_tests mesh_export_tests fuzz_sbb fuzz_sbc fuzz_sbl fuzz_csx)
   if(TARGET ${target})
     if(PAFTA_ENABLE_SANITIZERS)
       target_compile_options(${target} PRIVATE -fsanitize=address,undefined

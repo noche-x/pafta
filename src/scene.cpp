@@ -18,6 +18,8 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <map>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -42,6 +44,17 @@ std::uint32_t terrain_noise_hash(std::int32_t x, std::int32_t y, std::uint32_t m
 }
 
 namespace {
+
+// Geometry keeps its source cell after material sorting. The renderer can hide
+// deleted cells by updating indices while a replacement mesh builds on a worker.
+struct RenderCellTag {
+    BuildingRenderBuffer& buffer;
+    std::size_t first_triangle;
+    std::uint32_t cell;
+    ~RenderCellTag() {
+        for (auto t = first_triangle; t < buffer.triangles.size(); ++t) buffer.triangles[t].cell = cell;
+    }
+};
 
 // -----------------------------------------------------------------------------
 // Portal rectangle helpers
@@ -1323,6 +1336,8 @@ BuildingRenderBuffer build_city_block_solid_preview_buffer() {
 void sort_triangles_into_native_material_runs(BuildingRenderBuffer& buffer) {
     // Picking grids store triangle numbers, which sorting changes.
     buffer.mask_cache.clear();
+    buffer.cell_mask_index.clear();
+    buffer.terrain_chunks.clear();
     buffer.pick_grid = {};
     std::stable_sort(buffer.triangles.begin(), buffer.triangles.end(), [](const RenderBufferTriangle& left, const RenderBufferTriangle& right) {
         if (left.material != right.material) {
@@ -1867,6 +1882,31 @@ std::vector<std::vector<std::size_t>> overwritten_building_cells(
     return overwritten;
 }
 
+std::vector<PlacementOverrideRenderBuffer> build_placement_override_render_buffers(
+    const SbcMap& map, const std::vector<const SbbBuilding*>& placement_buildings,
+    const std::vector<NamedBlockMesh>& blocks, const std::vector<NamedBuildblockTemplate>& templates,
+    const std::vector<std::vector<std::size_t>>& dropped_cells) {
+    PAFTA_PROFILE_FUNCTION();
+    auto overwritten = overwritten_building_cells(map, placement_buildings);
+    std::vector<PlacementOverrideRenderBuffer> built;
+    for (std::size_t i = 0; i < overwritten.size(); ++i) {
+        const auto later_count = overwritten[i].size();
+        const auto dropped_count = i < dropped_cells.size() ? dropped_cells[i].size() : 0U;
+        if (later_count == 0U && dropped_count == 0U) continue;
+        const auto* source = placement_buildings.at(i);
+        if (source == nullptr) throw std::runtime_error("Placement override has hidden cells but no building asset: " + map.buildings[i].name);
+        auto building = *source;
+        for (const auto cell : overwritten[i]) building.cells.at(cell).occupied = false;
+        if (i < dropped_cells.size()) {
+            for (const auto cell : dropped_cells[i]) building.cells.at(cell).occupied = false;
+        }
+        auto buffer = build_city_building_full_render_buffer(building, blocks, templates, BuildingLod::Far);
+        bake_shadow_volume(buffer);
+        built.push_back({i, std::move(buffer), later_count, dropped_count});
+    }
+    return built;
+}
+
 namespace {
 
 // A street's length between the junction footprints, its change in level, and how
@@ -1968,7 +2008,7 @@ void place_native_street_tiles(
         const auto k = delta > 0 ? run_pos : run_len - 1 - run_pos;
         const auto top_center = static_cast<float>(height) * 4.0F + 0.25F + (static_cast<float>(k) + 0.5F) * step;
 
-        if (along == 0 || along == seg_len - 1 || !in_slope) {
+        if (!in_slope) {
             place(coord, left_curb, height + 1, curb, kFacesZero, CityTileKind::Curb);
             place(coord, right_curb, height + 1, curb, kFacesZero, CityTileKind::Curb);
         } else {
@@ -2025,10 +2065,10 @@ void place_native_street_tiles(
         ? to.ext_x_neg > 0 && (to.ext_z_pos > 0 || to.ext_z_neg > 0)
         : to.ext_z_neg > 0 && (to.ext_x_pos > 0 || to.ext_x_neg > 0);
     for (auto cross = center - street.left_width; cross < center + street.right_width; ++cross) {
-        if (from_cap) {
+        if (from_cap && slope_start > 0) {
             place(start, cross, from.level, kNativeSolidBlock, last_faces, CityTileKind::Road);
         }
-        if (to_cap) {
+        if (to_cap && slope_end < seg_len) {
             place(along_x ? to.gx - to.ext_x_neg - 1 : to.gz - to.ext_z_neg - 1, cross, to.level,
                 kNativeSolidBlock, last_faces, CityTileKind::Road);
         }
@@ -2054,11 +2094,21 @@ void place_native_intersection_tiles(CityTileMap& tiles, const NativeCityInterse
     const auto z_row_end = intersection.gz + intersection.ext_z_pos;  // inclusive
     const auto x_row_begin = intersection.gx - intersection.ext_x_neg - 1;
     const auto x_row_end = intersection.gx + intersection.ext_x_pos;  // inclusive
+    const auto place_curb = [&](std::int32_t x, std::int32_t z) {
+        // A ramp can reach the junction with no flat cell left. Its side mesh
+        // already joins the curb; an extra flat corner plate floats over it.
+        for (const auto y : {curb_level, curb_level - 1}) {
+            const auto found = tiles.find({x, y, z});
+            if (found != tiles.end() && found->second.kind == CityTileKind::Curb &&
+                (found->second.slope_x != 0.0F || found->second.slope_z != 0.0F)) return;
+        }
+        set_city_tile(tiles, x, curb_level, z, curb, kFacesZero, CityTileKind::Curb);
+        tag(x, curb_level, z);
+    };
     if (intersection.street_south < 0) {
         const auto x = intersection.gx + intersection.ext_x_pos;
         for (auto z = z_row_begin; z <= z_row_end; ++z) {
-            set_city_tile(tiles, x, curb_level, z, curb, kFacesZero, CityTileKind::Curb);
-            tag(x, curb_level, z);
+            place_curb(x, z);
         }
     }
     if (intersection.street_north < 0) {
@@ -2066,22 +2116,19 @@ void place_native_intersection_tiles(CityTileMap& tiles, const NativeCityInterse
         // -x extent.
         const auto x = intersection.gx - intersection.ext_x_pos - 1;
         for (auto z = z_row_begin; z <= z_row_end; ++z) {
-            set_city_tile(tiles, x, curb_level, z, curb, kFacesZero, CityTileKind::Curb);
-            tag(x, curb_level, z);
+            place_curb(x, z);
         }
     }
     if (intersection.street_west < 0) {
         const auto z = intersection.gz + intersection.ext_z_pos;
         for (auto x = x_row_begin; x <= x_row_end; ++x) {
-            set_city_tile(tiles, x, curb_level, z, curb, kFacesZero, CityTileKind::Curb);
-            tag(x, curb_level, z);
+            place_curb(x, z);
         }
     }
     if (intersection.street_east < 0) {
         const auto z = intersection.gz - intersection.ext_z_neg - 1;
         for (auto x = x_row_begin; x <= x_row_end; ++x) {
-            set_city_tile(tiles, x, curb_level, z, curb, kFacesZero, CityTileKind::Curb);
-            tag(x, curb_level, z);
+            place_curb(x, z);
         }
     }
 }
@@ -2233,32 +2280,47 @@ void parallel_rows(std::int32_t rows, F&& row) {
 // patched samples are stored. Everything else is the island height, worked out when
 // asked (a full grid for a long map would be tens of millions of samples).
 struct CityHeightfield {
+    static constexpr std::int32_t patch_side = 64;
+    using Patch = std::array<float, patch_side * patch_side>;
     std::int32_t min_x{};
     std::int32_t min_z{};
     std::int32_t count_x{};
     std::int32_t count_z{};
     bool city_map{true};
-    std::unordered_map<std::size_t, float> patched;
+    // Patches write contiguous rectangles. Store 64x64 sample pages instead of
+    // allocating one hash node per sample (millions on a normal city map).
+    std::unordered_map<std::size_t, Patch> patched;
 
     bool contains(std::int32_t x, std::int32_t z) const {
         return x >= min_x && z >= min_z && x < min_x + count_x && z < min_z + count_z;
     }
 
-    std::size_t index(std::int32_t x, std::int32_t z) const {
-        return static_cast<std::size_t>(z - min_z) * static_cast<std::size_t>(count_x) +
-            static_cast<std::size_t>(x - min_x);
+    std::size_t patch_index(std::int32_t x, std::int32_t z) const {
+        const auto columns = (count_x + patch_side - 1) / patch_side;
+        return static_cast<std::size_t>((z - min_z) / patch_side) * static_cast<std::size_t>(columns) +
+            static_cast<std::size_t>((x - min_x) / patch_side);
+    }
+
+    std::size_t sample_index(std::int32_t x, std::int32_t z) const {
+        return static_cast<std::size_t>((z - min_z) % patch_side) * patch_side +
+            static_cast<std::size_t>((x - min_x) % patch_side);
     }
 
     float get(std::int32_t x, std::int32_t z) const {
         if (!contains(x, z)) return 0.0F;
-        const auto found = patched.find(index(x, z));
-        return found != patched.end() ? found->second
-            : native_like_city_terrain_height(static_cast<float>(x), static_cast<float>(z), city_map);
+        const auto found = patched.find(patch_index(x, z));
+        if (found != patched.end()) {
+            const auto height = found->second[sample_index(x, z)];
+            if (!std::isnan(height)) return height;
+        }
+        return native_like_city_terrain_height(static_cast<float>(x), static_cast<float>(z), city_map);
     }
 
     void set(std::int32_t x, std::int32_t z, float height) {
         if (contains(x, z)) {
-            patched[index(x, z)] = height;
+            auto [entry, inserted] = patched.try_emplace(patch_index(x, z));
+            if (inserted) entry->second.fill(std::numeric_limits<float>::quiet_NaN());
+            entry->second[sample_index(x, z)] = height;
         }
     }
 };
@@ -2666,8 +2728,63 @@ private:
     std::size_t size_{};
 };
 
+void build_terrain_draw_chunks(BuildingRenderBuffer& buffer) {
+    constexpr float chunk_size = 128.0F;
+    buffer.terrain_chunks.clear();
+    std::vector<std::size_t> bucket_for_triangle(buffer.triangles.size());
+    std::size_t covered = 0;
+    for (const auto& run : buffer.material_runs) {
+        std::unordered_map<std::uint64_t, std::size_t> buckets;
+        for (std::size_t i = run.first_triangle; i < static_cast<std::size_t>(run.first_triangle) + run.triangle_count; ++i) {
+            const auto& triangle = buffer.triangles.at(i);
+            const auto& a = buffer.vertices.at(triangle.indices[0]).position;
+            const auto& b = buffer.vertices.at(triangle.indices[1]).position;
+            const auto& c = buffer.vertices.at(triangle.indices[2]).position;
+            const auto x = static_cast<std::int32_t>(std::floor((a.x + b.x + c.x) / (3.0F * chunk_size)));
+            const auto z = static_cast<std::int32_t>(std::floor((a.z + b.z + c.z) / (3.0F * chunk_size)));
+            const auto key = static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 32U | static_cast<std::uint32_t>(z);
+            const auto [it, inserted] = buckets.emplace(key, buffer.terrain_chunks.size());
+            if (inserted) buffer.terrain_chunks.push_back({{run.material, 0, 0, run.city_window_surface}, a, a});
+            auto& chunk = buffer.terrain_chunks[it->second];
+            for (const auto p : {a, b, c}) {
+                chunk.bounds_min = {std::min(chunk.bounds_min.x, p.x), std::min(chunk.bounds_min.y, p.y), std::min(chunk.bounds_min.z, p.z)};
+                chunk.bounds_max = {std::max(chunk.bounds_max.x, p.x), std::max(chunk.bounds_max.y, p.y), std::max(chunk.bounds_max.z, p.z)};
+            }
+            ++chunk.run.triangle_count;
+            bucket_for_triangle[i] = it->second;
+            ++covered;
+        }
+    }
+    if (covered != buffer.triangles.size()) throw std::runtime_error("Terrain material runs do not cover its triangles");
+    std::vector<std::size_t> next;
+    std::uint32_t first = 0;
+    for (auto& chunk : buffer.terrain_chunks) {
+        chunk.run.first_triangle = first;
+        next.push_back(first);
+        first += chunk.run.triangle_count;
+    }
+    std::vector<RenderBufferTriangle> ordered(buffer.triangles.size());
+    for (std::size_t i = 0; i < buffer.triangles.size(); ++i) ordered[next[bucket_for_triangle[i]]++] = buffer.triangles[i];
+    buffer.triangles = std::move(ordered);
+}
+
+bool terrain_bounds_visible(Vec3 lo, Vec3 hi, Vec3 camera, float distance, const ViewFrustumPlanes& planes) {
+    if (distance > 0.0F) {
+        const auto dx = std::max({lo.x - camera.x, 0.0F, camera.x - hi.x});
+        const auto dy = std::max({lo.y - camera.y, 0.0F, camera.y - hi.y});
+        const auto dz = std::max({lo.z - camera.z, 0.0F, camera.z - hi.z});
+        if (dx * dx + dy * dy + dz * dz > distance * distance) return false;
+    }
+    for (const auto& p : planes) {
+        const Vec3 corner{p[0] >= 0.0F ? hi.x : lo.x, p[1] >= 0.0F ? hi.y : lo.y, p[2] >= 0.0F ? hi.z : lo.z};
+        if (p[0] * corner.x + p[1] * corner.y + p[2] * corner.z + p[3] < 0.0F) return false;
+    }
+    return true;
+}
+
 void keep_pick_data_only(BuildingRenderBuffer& buffer) {
     buffer.mask_cache.clear();
+    buffer.cell_mask_index.clear();
     buffer.pick_grid = {};
     struct PositionHash {
         std::size_t operator()(const Vec3& p) const {
@@ -2696,6 +2813,7 @@ void keep_pick_data_only(BuildingRenderBuffer& buffer) {
     buffer.vertices = std::move(vertices);
     buffer.triangles.shrink_to_fit();
     std::vector<RenderBufferMaterialRun>().swap(buffer.material_runs);
+    std::vector<TerrainDrawChunk>().swap(buffer.terrain_chunks);
     std::vector<RenderLine>().swap(buffer.wire_lines);
     release_shadow_volume(buffer);
 }
@@ -2953,7 +3071,9 @@ BuildingRenderBuffer build_city_tile_render_buffer(const std::vector<CityTileCel
             solids.insert({tile.x, tile.y, tile.z});
         }
     }
-    for (const auto& tile : tiles) {
+    for (std::size_t tile_index = 0; tile_index < tiles.size(); ++tile_index) {
+        const auto& tile = tiles[tile_index];
+        const RenderCellTag tag{buffer, buffer.triangles.size(), static_cast<std::uint32_t>(tile_index)};
         const Vec3 origin{
             static_cast<float>(tile.x) * unit_size,
             static_cast<float>(tile.y) * unit_size + 0.25F,
@@ -3212,9 +3332,8 @@ std::optional<CityTerrain> build_city_terrain(
         row = {};
     }
 
-    // One material run, so the terrain mesh can be uploaded as one GPU chunk (it is
-    // all one grass material) instead of drawn a triangle at a time.
     sort_triangles_into_native_material_runs(terrain.mesh);
+    build_terrain_draw_chunks(terrain.mesh);
     return terrain;
 }
 
@@ -4047,6 +4166,8 @@ BuildingRenderBuffer build_native_portal_render_buffer(
             if (word == 0U) {
                 continue;
             }
+            const RenderCellTag tag{buffer, buffer.triangles.size(),
+                static_cast<std::uint32_t>(portal_index * 512U + voxel_index)};
             const auto city_block_index = static_cast<std::size_t>(word & 0xfffU);
 
             auto layer_index = static_cast<std::size_t>((word >> 16U) & 0x3fU);
@@ -4647,9 +4768,8 @@ std::uint64_t city_scene_fingerprint(const SbcMap& map, std::uint64_t building_r
 
 std::uint64_t city_terrain_fingerprint(const SbcMap& map, std::uint64_t building_revision) {
     // Part of city_scene_fingerprint, covering only what changes the terrain mesh:
-    // intersection positions (corner heights), building footprints, and piece or
-    // portal cells (footprint stamps). Streets and road widths are left out, so road and
-    // street edits skip the slow terrain upload.
+    // street geometry and intersection positions (corner heights and road masks),
+    // building footprints, and piece cells. A street's name does not affect it.
     std::uint64_t hash = 1469598103934665603ULL;
     // An FNV variant that works a word at a time. This runs every frame over every
     // piece voxel and only needs to notice changes, so it doesn't have to be byte-wise
@@ -4664,6 +4784,13 @@ std::uint64_t city_terrain_fingerprint(const SbcMap& map, std::uint64_t building
         mix(it.x);
         mix(it.y);
         mix(it.z);
+    }
+    mix(static_cast<std::int64_t>(map.streets.size()));
+    for (const auto& street : map.streets) {
+        mix(street.from_intersection);
+        mix(street.to_intersection);
+        mix(street.left_width);
+        mix(street.right_width);
     }
     mix(static_cast<std::int64_t>(map.buildings.size()));
     for (const auto& building : map.buildings) {
@@ -4710,8 +4837,184 @@ StreetPreview preview_city_street(const SbcMap& map, std::size_t street_index, b
     return preview;
 }
 
+std::array<std::int32_t, 8> city_street_signature(const SbcMap& map, const SbcStreet& street) {
+    if (street.from_intersection < 0 || street.to_intersection < 0 ||
+        static_cast<std::size_t>(std::max(street.from_intersection, street.to_intersection)) >= map.intersections.size()) {
+        return {};
+    }
+    const auto& a = map.intersections[static_cast<std::size_t>(street.from_intersection)];
+    const auto& b = map.intersections[static_cast<std::size_t>(street.to_intersection)];
+    return {a.x, a.y, a.z, b.x, b.y, b.z, street.left_width, street.right_width};
+}
+
+RoadEditTiles diff_city_road_tiles(const SbcMap& before, const SbcMap& after,
+    const std::vector<const SbbBuilding*>& placement_buildings, bool auto_generated) {
+    const auto old_graph = build_native_city_graph(before);
+    const auto new_graph = build_native_city_graph(after);
+    using NodeKey = std::array<std::int32_t, 3>;
+    using NodeShape = std::array<std::int32_t, 8>;
+    const auto node_shapes = [](const NativeCityGraph& graph) {
+        std::map<NodeKey, NodeShape> shapes;
+        for (const auto& n : graph.intersections) shapes[{n.gx, n.level, n.gz}] = {
+            n.ext_x_pos, n.ext_x_neg, n.ext_z_pos, n.ext_z_neg,
+            n.street_north >= 0, n.street_south >= 0, n.street_east >= 0, n.street_west >= 0};
+        return shapes;
+    };
+    const auto old_nodes = node_shapes(old_graph), new_nodes = node_shapes(new_graph);
+    std::set<NodeKey> changed_nodes;
+    for (const auto& [key, shape] : old_nodes) {
+        const auto n = new_nodes.find(key);
+        if (n == new_nodes.end() || n->second != shape) changed_nodes.insert(key);
+    }
+    for (const auto& [key, shape] : new_nodes) {
+        const auto n = old_nodes.find(key);
+        if (n == old_nodes.end() || n->second != shape) changed_nodes.insert(key);
+    }
+    std::set<std::array<std::int32_t, 8>> old_ids, new_ids;
+    for (const auto& road : before.streets) old_ids.insert(city_street_signature(before, road));
+    for (const auto& road : after.streets) new_ids.insert(city_street_signature(after, road));
+    using Area = std::array<std::int32_t, 4>;
+    const auto street_area = [](const NativeCityGraph& graph, const NativeCityStreet& street) -> Area {
+        const auto& a = graph.intersections[street.a];
+        const auto& b = graph.intersections[street.b];
+        return {std::min(a.gx - a.ext_x_neg - 1, b.gx - b.ext_x_neg - 1),
+            std::min(a.gz - a.ext_z_neg - 1, b.gz - b.ext_z_neg - 1),
+            std::max(a.gx + a.ext_x_pos + 1, b.gx + b.ext_x_pos + 1),
+            std::max(a.gz + a.ext_z_pos + 1, b.gz + b.ext_z_pos + 1)};
+    };
+    const auto affected = [&](const SbcMap& map, const NativeCityGraph& graph, const NativeCityStreet& street, const auto& other_ids) {
+        const auto& a = graph.intersections[street.a];
+        const auto& b = graph.intersections[street.b];
+        return !other_ids.contains(city_street_signature(map, map.streets[street.source_index])) ||
+            changed_nodes.contains({a.gx, a.level, a.gz}) || changed_nodes.contains({b.gx, b.level, b.gz});
+    };
+    std::vector<Area> areas;
+    const auto add_areas = [&](const SbcMap& map, const NativeCityGraph& graph, const auto& other_ids) {
+        for (const auto& street : graph.streets) if (affected(map, graph, street, other_ids)) areas.push_back(street_area(graph, street));
+        for (const auto& n : graph.intersections) if (changed_nodes.contains({n.gx, n.level, n.gz})) {
+            areas.push_back({n.gx - n.ext_x_neg - 1, n.gz - n.ext_z_neg - 1, n.gx + n.ext_x_pos + 1, n.gz + n.ext_z_pos + 1});
+        }
+    };
+    add_areas(before, old_graph, new_ids);
+    add_areas(after, new_graph, old_ids);
+    const auto nearby = [&](Area a) {
+        return std::ranges::any_of(areas, [&](Area b) { return a[0] <= b[2] && b[0] <= a[2] && a[1] <= b[3] && b[1] <= a[3]; });
+    };
+    const auto tiles_of = [&](const SbcMap& map, const NativeCityGraph& graph, const auto& other_ids) {
+        CityCornerStampMap stamps;
+        stamps.disabled = true;
+        CityTileMap tiles;
+        std::set<std::int32_t> nodes;
+        for (const auto& street : graph.streets) {
+            // Unchanged crossing streets still matter for overlap warnings. Include
+            // their local context using the same area set on both sides of the diff.
+            if (!affected(map, graph, street, other_ids) && !nearby(street_area(graph, street))) continue;
+            place_native_street_tiles(tiles, stamps, graph, street, auto_generated);
+            nodes.insert(street.a); nodes.insert(street.b);
+        }
+        // Junctions also overwrite the ends of unchanged roads. Include their
+        // local tiles without rebuilding the rest of the network.
+        for (std::size_t i = 0; i < graph.intersections.size(); ++i) {
+            const auto& n = graph.intersections[i];
+            if (changed_nodes.contains({n.gx, n.level, n.gz})) nodes.insert(static_cast<std::int32_t>(i));
+        }
+        for (const auto i : nodes) place_native_intersection_tiles(tiles, graph.intersections[i], i);
+        std::unordered_map<CityTileKey, CityTileCell, CityTileKeyHash> out;
+        for (const auto& [key, value] : tiles) out.emplace(key, CityTileCell{key.x, key.y, key.z,
+            value.base_y, value.slope_x, value.slope_z, value.kind, value.street_index, value.block, value.faces, value.intersection_index});
+        return out;
+    };
+    const auto old_tiles = tiles_of(before, old_graph, new_ids);
+    const auto new_tiles = tiles_of(after, new_graph, old_ids);
+    // Roads the edit leaves alone, by their index after the edit.
+    std::map<std::array<std::int32_t, 8>, std::int32_t> kept;
+    for (std::size_t i = 0; i < after.streets.size(); ++i) kept.emplace(city_street_signature(after, after.streets[i]), static_cast<std::int32_t>(i));
+    std::set<std::array<std::int32_t, 8>> old_signatures;
+    for (const auto& street : before.streets) old_signatures.insert(city_street_signature(before, street));
+    std::erase_if(kept, [&](const auto& entry) { return !old_signatures.contains(entry.first); });
+
+    const auto same = [](const CityTileCell& a, const CityTileCell& b) {
+        return a.kind == b.kind && a.block == b.block && a.faces == b.faces && a.base_y == b.base_y &&
+            a.slope_x == b.slope_x && a.slope_z == b.slope_z;
+    };
+    RoadEditTiles diff;
+    std::unordered_set<CityTileKey, CityTileKeyHash> shown;
+    for (const auto& [key, tile] : new_tiles) {
+        const auto old = old_tiles.find(key);
+        if (old != old_tiles.end() && same(old->second, tile)) continue;
+        diff.changed.push_back(tile);
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    const CityTileKey near{key.x + dx, key.y + dy, key.z + dz};
+                    if (new_tiles.contains(near) && shown.insert(near).second) diff.shown.push_back(new_tiles.at(near));
+                }
+            }
+        }
+        // Junction tiles take over the ends of the roads that meet there; that is how
+        // the game joins roads, not an overlap.
+        if (old == old_tiles.end() || old->second.street_index < 0 || tile.intersection_index >= 0 ||
+            static_cast<std::size_t>(old->second.street_index) >= before.streets.size()) continue;
+        // The tile belonged to a road that stays as it is, and now another road owns it.
+        const auto owner = kept.find(city_street_signature(before, before.streets[static_cast<std::size_t>(old->second.street_index)]));
+        if (owner != kept.end() && owner->second != tile.street_index) diff.overlaps.push_back(tile);
+    }
+    for (const auto& [key, tile] : old_tiles) {
+        if (!new_tiles.contains(key)) diff.removed.push_back(tile);
+    }
+    for (const auto& [key, tile] : new_tiles) {
+        const bool reshaped_road = tile.street_index >= 0 && static_cast<std::size_t>(tile.street_index) < after.streets.size() &&
+            !old_ids.contains(city_street_signature(after, after.streets[static_cast<std::size_t>(tile.street_index)]));
+        const bool reshaped_node = tile.intersection_index >= 0 && static_cast<std::size_t>(tile.intersection_index) < new_graph.intersections.size() &&
+            changed_nodes.contains({new_graph.intersections[tile.intersection_index].gx, new_graph.intersections[tile.intersection_index].level,
+                new_graph.intersections[tile.intersection_index].gz});
+        if ((reshaped_road || reshaped_node) && shown.insert(key).second) diff.shown.push_back(tile);
+    }
+    std::unordered_map<CityTileKey, const SbcPortal*, CityTileKeyHash> portals;
+    for (const auto& portal : before.portals) portals[{portal.fields[1], portal.fields[2], portal.fields[3]}] = &portal;
+    const auto sector = [](std::int32_t n) { return static_cast<std::int32_t>((static_cast<std::int64_t>(n) - (n < 0 ? 7 : 0)) / 8); };
+    for (const auto& tile : diff.changed) {
+        bool replaced = false;
+        if (const auto p = portals.find({sector(tile.x), sector(tile.y), sector(tile.z)}); p != portals.end()) {
+            const auto& words = p->second->voxel_blocks();
+            const auto i = static_cast<std::size_t>((tile.y - sector(tile.y) * 8) * 64 +
+                (tile.z - sector(tile.z) * 8) * 8 + tile.x - sector(tile.x) * 8);
+            replaced = i < words.size() && words[i] != 0;
+        }
+        for (std::size_t bi = 0; !replaced && bi < before.buildings.size() && bi < placement_buildings.size(); ++bi) {
+            const auto* building = placement_buildings[bi];
+            if (building == nullptr) continue;
+            const auto& placement = before.buildings[bi];
+            const auto origin = native_city_building_render_origin(placement, 4.0F);
+            const auto local = native_city_rotate_local({tile.x * 4.0F + 2.0F - origin.x, 0.0F,
+                tile.z * 4.0F + 2.0F - origin.z}, -placement.rotation);
+            const auto x = static_cast<std::int32_t>(std::floor(local.x / 4.0F)) + static_cast<std::int32_t>(building->anchor_x);
+            const auto z = static_cast<std::int32_t>(std::floor(local.z / 4.0F)) + static_cast<std::int32_t>(building->anchor_z);
+            const auto y = tile.y - placement.y + static_cast<std::int32_t>(building->anchor_y);
+            if (x < 0 || z < 0 || y < 0 || x > static_cast<std::int32_t>(building->size_x) ||
+                z > static_cast<std::int32_t>(building->size_y) || y >= static_cast<std::int32_t>(building->size_z)) continue;
+            const auto index = static_cast<std::size_t>(x) + (building->size_x + 1U) *
+                (static_cast<std::size_t>(z) + (building->size_y + 1U) * static_cast<std::size_t>(y));
+            const auto matches = [&](const SbbCell& cell) { return cell.x == static_cast<std::uint32_t>(x) &&
+                cell.y == static_cast<std::uint32_t>(y) && cell.z == static_cast<std::uint32_t>(z); };
+            if (index < building->cells.size() && matches(building->cells[index])) replaced = building->cells[index].exterior_block() != 0;
+            else {
+                // Parser output is dense; authored/test buildings can be sparse.
+                const auto cell = std::ranges::find_if(building->cells, matches);
+                replaced = cell != building->cells.end() && cell->exterior_block() != 0;
+            }
+        }
+        if (replaced) diff.under_buildings.push_back(tile);
+    }
+    return diff;
+}
+
+BuildingRenderBuffer build_city_road_tile_buffer(const std::vector<CityTileCell>& tiles, float unit_size) {
+    return build_city_tile_render_buffer(tiles, unit_size);
+}
+
 MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*>& placement_buildings, bool auto_generated,
-    bool fit_game_world) {
+    bool fit_game_world, MapSceneBuild detail) {
     PAFTA_PROFILE_FUNCTION();
     MapScene scene;
     // The game's build order (World_LoadMapAndInitializeTerrain @56980): the street
@@ -4744,9 +5047,9 @@ MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*
 #else
         std::launch::async,
 #endif
-        [&tiles = std::as_const(scene.city_tiles), unit = scene.unit_size] {
+        [&tiles = std::as_const(scene.city_tiles), unit = scene.unit_size, detail] {
             auto buffer = build_city_tile_render_buffer(tiles, unit);
-            bake_shadow_volume(buffer);
+            if (detail == MapSceneBuild::Complete) bake_shadow_volume(buffer);
             return buffer;
         });
     stamp_city_portal_cells(corner_stamps, map);
@@ -4768,7 +5071,7 @@ MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*
         scene.map_labels.push_back({street.name_index, (static_cast<float>((a.gx + b.gx) * 2) - 896.0F) * 0.125F, y});
     }
     expand_native_city_extents(graph);
-    scene.terrain = build_city_terrain(map, graph, corner_stamps, scene.city_tiles, scene.unit_size);
+    if (detail == MapSceneBuild::Complete) scene.terrain = build_city_terrain(map, graph, corner_stamps, scene.city_tiles, scene.unit_size);
     for (const auto& street : graph.streets) {
         if (street.a < 0 || street.b < 0 || street.source_index < 0) {
             continue;

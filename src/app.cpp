@@ -176,6 +176,12 @@ std::string key_label(int key) {
 #endif
 }
 
+std::string gfx_debug_format_count(std::uint64_t value) {
+    auto text = std::to_string(value);
+    for (auto i = text.size(); i > 3U; i -= 3U) text.insert(i - 3U, ",");
+    return text;
+}
+
 std::string gfx_debug_format_bytes(std::uint64_t bytes) {
     std::ostringstream stream;
     stream.setf(std::ios::fixed);
@@ -190,30 +196,8 @@ std::string gfx_debug_format_bytes(std::uint64_t bytes) {
     return stream.str();
 }
 
-void accumulate_gpu_model_upload_stats(GfxDebugStats& stats, const GpuBuildingRenderModel& model) {
-    stats.uploads.uploaded_vertices += model.mesh.vertex_count;
-    stats.uploads.uploaded_indices += model.mesh.index_count;
-    stats.uploads.uploaded_bytes += model.uploaded_bytes;
-    stats.uploads.chunks += model.mesh.parts.size();
-}
-
 void refresh_gfx_debug_counts(GfxDebugStats& stats, const EditorProject* project) {
-    if (project == nullptr) {
-        return;
-    }
-
-    if (project->city.has_value()) {
-        stats.counts.buildings = project->city->data.buildings.size();
-    } else {
-        stats.counts.buildings = project->buildings.size();
-    }
-
-    for (const auto& model : project->building_gpu_models) {
-        accumulate_gpu_model_upload_stats(stats, model);
-    }
-    accumulate_gpu_model_upload_stats(stats, project->portal_gpu_model);
-    accumulate_gpu_model_upload_stats(stats, project->portal_preview_gpu_model);
-    accumulate_gpu_model_upload_stats(stats, project->building_floor_preview_gpu_model);
+    if (project) stats.counts.buildings = project->city ? project->city->data.buildings.size() : project->buildings.size();
 }
 
 const char* gfx_draw_category_name(GfxDebugDrawCategory category) {
@@ -273,7 +257,7 @@ void draw_graphics_debug_window(bool& open, GfxDebugStats& stats) {
         return;
     }
 
-    ImGui::SetNextWindowSize(ImVec2(460, 560), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(620, 720), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Graphics Debug", &open)) {
         ImGui::End();
         return;
@@ -281,7 +265,10 @@ void draw_graphics_debug_window(bool& open, GfxDebugStats& stats) {
 
     const auto total = stats.total_draw();
     const auto total_frame_ms = stats.phase_ms[static_cast<std::size_t>(GfxDebugTimingPhase::TotalFrame)];
-    ImGui::Text("FPS %d | frame %.2f ms", GetFPS(), GetFrameTime() * 1000.0F);
+    const auto latest = (stats.frame_time_index + GfxDebugStats::history_size - 1U) % GfxDebugStats::history_size;
+    const auto average = stats.frame_time_count == 0 ? 0.0F : stats.frame_time_history[latest];
+    ImGui::Text("FPS %.0f | average %.2f ms | peak %.2f ms", average > 0 ? 1000.0F / average : 0.0F,
+        average, stats.frame_time_count == 0 ? 0.0F : stats.frame_peak_history[latest]);
 
     std::array<float, GfxDebugStats::history_size> ordered_history{};
     const auto count = stats.frame_time_count;
@@ -290,75 +277,97 @@ void draw_graphics_debug_window(bool& open, GfxDebugStats& stats) {
             stats.frame_time_history.size();
         ordered_history[i] = stats.frame_time_history[source];
     }
-    ImGui::PlotLines("frame ms", ordered_history.data(), static_cast<int>(count), 0, nullptr, 0.0F, 50.0F, ImVec2(-FLT_MIN, 64.0F));
-
-    ImGui::SeparatorText("Draw Stats");
-    ImGui::Text("Total: %llu tris | %llu verts | %llu calls",
-        static_cast<unsigned long long>(total.triangles),
-        static_cast<unsigned long long>(total.vertices),
-        static_cast<unsigned long long>(total.draw_calls));
-    if (ImGui::BeginTable("draw_breakdown", 4, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg)) {
-        ImGui::TableSetupColumn("Category");
-        ImGui::TableSetupColumn("Tris", ImGuiTableColumnFlags_WidthFixed, 82.0F);
-        ImGui::TableSetupColumn("Verts", ImGuiTableColumnFlags_WidthFixed, 82.0F);
-        ImGui::TableSetupColumn("Calls", ImGuiTableColumnFlags_WidthFixed, 68.0F);
-        ImGui::TableHeadersRow();
-        for (std::size_t i = 0; i < static_cast<std::size_t>(GfxDebugDrawCategory::Count); ++i) {
-            const auto category = static_cast<GfxDebugDrawCategory>(i);
-            const auto& counter = stats.draw[i];
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(gfx_draw_category_name(category));
-            ImGui::TableNextColumn();
-            ImGui::Text("%llu", static_cast<unsigned long long>(counter.triangles));
-            ImGui::TableNextColumn();
-            ImGui::Text("%llu", static_cast<unsigned long long>(counter.vertices));
-            ImGui::TableNextColumn();
-            ImGui::Text("%llu", static_cast<unsigned long long>(counter.draw_calls));
+    const float graph_max = std::max(20.0F, *std::max_element(ordered_history.begin(), ordered_history.end()) * 1.1F);
+    ImGui::PlotLines("##frame_ms", ordered_history.data(), static_cast<int>(count), 0, "0.5 s averages | 60 s history", 0.0F, graph_max, ImVec2(-FLT_MIN, 80.0F));
+    if (ImGui::IsItemHovered()) {
+        if (count == 0) ImGui::SetTooltip("One point every 0.5 seconds, retaining about one minute.");
+        else {
+            const auto lo = ImGui::GetItemRectMin(), hi = ImGui::GetItemRectMax();
+            const auto fraction = std::clamp((ImGui::GetMousePos().x - lo.x) / std::max(1.0F, hi.x - lo.x), 0.0F, 0.999F);
+            const auto point = static_cast<std::size_t>(fraction * count);
+            const auto source = (stats.frame_time_index + stats.history_size - count + point) % stats.history_size;
+            ImGui::SetTooltip("About %.1f s ago\nAverage %.2f ms | slowest frame %.2f ms\nEach point covers a 0.5-second interval.",
+                (count - 1U - point) * GfxDebugStats::sample_interval, ordered_history[point], stats.frame_peak_history[source]);
         }
-        ImGui::EndTable();
     }
 
-    ImGui::SeparatorText("GPU Upload");
-    ImGui::Text("%llu chunks | %llu verts | %llu indices | %s",
-        static_cast<unsigned long long>(stats.uploads.chunks),
-        static_cast<unsigned long long>(stats.uploads.uploaded_vertices),
-        static_cast<unsigned long long>(stats.uploads.uploaded_indices),
-        gfx_debug_format_bytes(stats.uploads.uploaded_bytes).c_str());
-
-    ImGui::SeparatorText("Timing");
-    if (ImGui::BeginTable("timing_breakdown", 4, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg)) {
-        ImGui::TableSetupColumn("Phase");
-        ImGui::TableSetupColumn("ms", ImGuiTableColumnFlags_WidthFixed, 72.0F);
-        ImGui::TableSetupColumn("avg", ImGuiTableColumnFlags_WidthFixed, 72.0F);
-        ImGui::TableSetupColumn("%", ImGuiTableColumnFlags_WidthFixed, 54.0F);
-        ImGui::TableHeadersRow();
-        for (std::size_t i = 0; i < static_cast<std::size_t>(GfxDebugTimingPhase::Count); ++i) {
-            const auto phase = static_cast<GfxDebugTimingPhase>(i);
-            const auto ms = stats.phase_ms[i];
-            const auto pct = total_frame_ms > 0.0 ? (ms / total_frame_ms) * 100.0 : 0.0;
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(gfx_timing_phase_name(phase));
-            ImGui::TableNextColumn();
-            ImGui::Text("%.2f", ms);
-            ImGui::TableNextColumn();
-            ImGui::Text("%.2f", stats.phase_avg_ms[i]);
-            ImGui::TableNextColumn();
-            ImGui::Text("%.0f", pct);
+    if (ImGui::CollapsingHeader("Draw Stats", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Text("Total: %s tris | %s verts | %s calls",
+            gfx_debug_format_count(total.triangles).c_str(),
+            gfx_debug_format_count(total.vertices).c_str(),
+            gfx_debug_format_count(total.draw_calls).c_str());
+        if (ImGui::BeginTable("draw_breakdown", 4, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg)) {
+            ImGui::TableSetupColumn("Category");
+            ImGui::TableSetupColumn("Tris", ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize("99,999,999").x + 8.0F);
+            ImGui::TableSetupColumn("Verts", ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize("99,999,999").x + 8.0F);
+            ImGui::TableSetupColumn("Calls", ImGuiTableColumnFlags_WidthFixed, 68.0F);
+            ImGui::TableHeadersRow();
+            for (std::size_t i = 0; i < static_cast<std::size_t>(GfxDebugDrawCategory::Count); ++i) {
+                const auto category = static_cast<GfxDebugDrawCategory>(i);
+                const auto& counter = stats.draw[i];
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(gfx_draw_category_name(category));
+                ImGui::TableNextColumn();
+                ImGui::Text("%s", gfx_debug_format_count(counter.triangles).c_str());
+                ImGui::TableNextColumn();
+                ImGui::Text("%s", gfx_debug_format_count(counter.vertices).c_str());
+                ImGui::TableNextColumn();
+                ImGui::Text("%s", gfx_debug_format_count(counter.draw_calls).c_str());
+            }
+            ImGui::EndTable();
         }
-        ImGui::EndTable();
-    }
 
-    ImGui::SeparatorText("Counts");
-    ImGui::Text("Buildings %llu | City tiles %llu | Poles %llu",
-        static_cast<unsigned long long>(stats.counts.buildings),
-        static_cast<unsigned long long>(stats.counts.city_tiles),
-        static_cast<unsigned long long>(stats.counts.traffic_light_poles));
-    ImGui::Text("Terrain samples %llu | vertices %llu",
-        static_cast<unsigned long long>(stats.counts.terrain_samples),
-        static_cast<unsigned long long>(stats.counts.terrain_vertices));
-    ImGui::Text("Total scene triangles %llu", static_cast<unsigned long long>(stats.counts.total_scene_triangles));
+    }
+    if (ImGui::CollapsingHeader("GPU memory", ImGuiTreeNodeFlags_DefaultOpen)) {
+        const auto& memory = stats.gpu_memory;
+        ImGui::Text("Pafta GPU allocations (estimate): %s", gfx_debug_format_bytes(memory.total_bytes()).c_str());
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Tracked mesh buffers, loaded textures, previews, fonts and render targets.\nExcludes driver padding, swapchain and driver-held copies. This is GPU allocation size, including shared-memory GPUs.");
+        ImGui::Text("Buffers %s | Textures %s | Targets %s", gfx_debug_format_bytes(memory.buffer_bytes).c_str(),
+            gfx_debug_format_bytes(memory.texture_bytes).c_str(), gfx_debug_format_bytes(memory.target_bytes).c_str());
+        ImGui::Text("%s meshes | %s vertices | %s indices", gfx_debug_format_count(memory.meshes).c_str(),
+            gfx_debug_format_count(memory.vertices).c_str(), gfx_debug_format_count(memory.indices).c_str());
+        if (memory.driver_used_total) {
+            ImGui::Text("Driver VRAM: %s / %s", gfx_debug_format_bytes(memory.driver_used_total->first).c_str(),
+                gfx_debug_format_bytes(memory.driver_used_total->second).c_str());
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Global usage reported by the graphics driver, including other applications.");
+        } else ImGui::TextDisabled("Driver VRAM: not reported");
+    }
+    if (ImGui::CollapsingHeader("Timing", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::BeginTable("timing_breakdown", 4, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg)) {
+            ImGui::TableSetupColumn("Phase");
+            ImGui::TableSetupColumn("ms", ImGuiTableColumnFlags_WidthFixed, 72.0F);
+            ImGui::TableSetupColumn("avg", ImGuiTableColumnFlags_WidthFixed, 72.0F);
+            ImGui::TableSetupColumn("%", ImGuiTableColumnFlags_WidthFixed, 54.0F);
+            ImGui::TableHeadersRow();
+            for (std::size_t i = 0; i < static_cast<std::size_t>(GfxDebugTimingPhase::Count); ++i) {
+                const auto phase = static_cast<GfxDebugTimingPhase>(i);
+                const auto ms = stats.phase_ms[i];
+                const auto pct = total_frame_ms > 0.0 ? (ms / total_frame_ms) * 100.0 : 0.0;
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(gfx_timing_phase_name(phase));
+                ImGui::TableNextColumn();
+                ImGui::Text("%.2f", ms);
+                ImGui::TableNextColumn();
+                ImGui::Text("%.2f", stats.phase_avg_ms[i]);
+                ImGui::TableNextColumn();
+                ImGui::Text("%.0f", pct);
+            }
+            ImGui::EndTable();
+        }
+
+    }
+    if (ImGui::CollapsingHeader("Counts", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Text("Buildings %s | City tiles %s | Poles %s",
+            gfx_debug_format_count(stats.counts.buildings).c_str(),
+            gfx_debug_format_count(stats.counts.city_tiles).c_str(),
+            gfx_debug_format_count(stats.counts.traffic_light_poles).c_str());
+        ImGui::Text("Terrain samples %s | vertices %s",
+            gfx_debug_format_count(stats.counts.terrain_samples).c_str(),
+            gfx_debug_format_count(stats.counts.terrain_vertices).c_str());
+        ImGui::Text("Total scene triangles %s", gfx_debug_format_count(stats.counts.total_scene_triangles).c_str());
+    }
     ImGui::End();
 }
 
@@ -401,6 +410,8 @@ void ensure_render_input_cache(EditorProject& project) {
 
 void invalidate_render_input_cache(EditorProject& project) {
     project.render_input_cache_valid = false;
+    project.piece_preview_models.clear();
+    project.road_edit_preview.key = 0;
 }
 
 const std::vector<NamedBlockMesh>& block_meshes(EditorProject& project) {
@@ -543,14 +554,15 @@ std::filesystem::path default_export_path(const EditorProject& project, const Ed
 }
 
 // A mesh export that is running. Geometry is built on a worker from copies of the
-// inputs, texture PNGs are read back on this (the GL) thread a few each frame,
-// and the glTF and bin files are written on a worker. A popup shows progress.
+// inputs, one texture is read back on the GL thread each frame, and PNG/glTF
+// writes use workers. The progress window leaves the editor usable.
 struct MeshExportTask {
     struct Built {
         GltfExportPtr job;
         ExportResult error;
     };
     std::string what;
+    std::shared_ptr<FileWriteTicket> file_writer_ticket;
     std::shared_ptr<std::atomic<std::size_t>> steps_done = std::make_shared<std::atomic<std::size_t>>(0U);
     std::size_t steps_total{1};
     std::future<Built> build;
@@ -568,6 +580,7 @@ std::optional<MeshExportTask> start_mesh_export(EditorProject& project, const Ed
         return std::nullopt;
     }
     MeshExportTask task;
+    task.file_writer_ticket = claim_file_writer();
     auto done = task.steps_done;
     auto blocks = block_meshes(project);
     auto templates = buildblock_templates(project);
@@ -687,13 +700,6 @@ void service_mesh_export(std::optional<MeshExportTask>& task, const EditorProjec
     const auto ready = [](auto& future) {
         return future.valid() && future.wait_for(std::chrono::milliseconds{0}) == std::future_status::ready;
     };
-    const auto close_progress = [] {
-        if (ImGui::IsPopupOpen("Exporting") &&
-            ImGui::BeginPopupModal("Exporting", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
-            ImGui::CloseCurrentPopup();
-            ImGui::EndPopup();
-        }
-    };
     std::string stage;
     float fraction = 0.0F;
     try {
@@ -709,9 +715,8 @@ void service_mesh_export(std::optional<MeshExportTask>& task, const EditorProjec
         }
         if (task->job && !task->write.valid()) {
             // Reading textures back needs the GL thread, so spend part of each frame on it.
-            const auto start = std::chrono::steady_clock::now();
-            while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds{8} &&
-                   write_next_gltf_texture(*task->job, project)) {}
+            // One readback per frame; PNG encoding and disk writes use workers.
+            write_next_gltf_texture(*task->job, project);
             const auto total = gltf_export_texture_count(*task->job);
             const auto written = gltf_export_textures_done(*task->job);
             if (written >= total) {
@@ -727,7 +732,6 @@ void service_mesh_export(std::optional<MeshExportTask>& task, const EditorProjec
                 if (!result.ok) throw std::runtime_error(result.message);
                 status = result.message;
                 task.reset();
-                close_progress();
                 return;
             }
             stage = "Writing file";
@@ -735,57 +739,70 @@ void service_mesh_export(std::optional<MeshExportTask>& task, const EditorProjec
         }
     } catch (const std::exception& error) {
         task.reset();
-        close_progress();
         report_failure(status, std::string{"Export failed: "} + error.what());
         return;
     }
-    if (!ImGui::IsPopupOpen("Exporting")) ImGui::OpenPopup("Exporting");
-    ImGui::SetNextWindowSize(ImVec2(420.0F, 0.0F));
-    if (ImGui::BeginPopupModal("Exporting", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
+    ImGui::SetNextWindowSize(ImVec2(420.0F, 0.0F), ImGuiCond_Appearing);
+    if (ImGui::Begin("Export progress", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDocking)) {
         ImGui::Text("Exporting %s", task->what.c_str());
         ImGui::TextDisabled("%s", stage.c_str());
         ImGui::ProgressBar(fraction, ImVec2(-1.0F, 0.0F));
-        ImGui::EndPopup();
     }
+    ImGui::End();
 }
 #endif
 
-// Starts rebuilding the city scene in the background (roads, terrain, and the
-// footprint stamps) for the given fingerprint. The worker owns copies of the map
-// and the .sbb data, so the main thread can't change or free anything it uses
-// halfway through. GPU uploads stay on the main thread (see the caller).
-void start_city_scene_rebuild(EditorProject& project, std::uint64_t fingerprint) {
+// Workers share immutable SBB geometry; only asset edits replace that snapshot.
+// The old snapshot remains alive until every worker using it has completed.
+PlacedBuildingSnapshot snapshot_city_buildings(EditorProject& project) {
+    const auto& placements = project.city->data.buildings;
+    const bool refresh = !project.city_building_sources || project.city_building_source_revision != project.city_building_revision ||
+        project.city_building_source_asset_count != project.buildings.size() || std::ranges::any_of(placements, [&](const auto& p) {
+            return !project.city_building_source_names.contains(lower_name(p.name));
+        });
+    if (refresh) {
+        auto owned = std::make_shared<std::vector<SbbBuilding>>();
+        std::unordered_map<std::string, std::size_t> names;
+        for (const auto& p : placements) {
+            const auto key = lower_name(p.name);
+            if (names.contains(key)) continue;
+            if (const auto* asset = find_building_asset(project, p.name)) {
+                owned->push_back(asset->data);
+                names.emplace(key, owned->size());
+            } else names.emplace(key, 0U);
+        }
+        project.city_building_sources = std::move(owned);
+        project.city_building_source_names = std::move(names);
+        project.city_building_source_revision = project.city_building_revision;
+        project.city_building_source_asset_count = project.buildings.size();
+    }
+    PlacedBuildingSnapshot snapshot{project.city_building_sources, {}};
+    snapshot.resolved.reserve(placements.size());
+    for (const auto& p : placements) snapshot.resolved.push_back(project.city_building_source_names.at(lower_name(p.name)));
+    return snapshot;
+}
+
+// Rebuild roads/terrain from an owned map and the immutable SBB snapshot.
+// GPU uploads remain on the rendering thread.
+void start_city_scene_rebuild(EditorProject& project, std::uint64_t fingerprint, bool roads_only = false) {
     PAFTA_PROFILE_FUNCTION();
     if (!project.city) {
         return;
     }
     auto map_copy = project.city->data;
-    // Copy each building asset once. The worker rebuilds its pointers over its own
-    // copies, so they can't dangle. resolved[i] is placement i's index into `owned`
-    // plus one, or 0 when it has no .sbb.
-    auto owned = std::make_shared<std::vector<SbbBuilding>>();
-    std::vector<std::size_t> resolved;
-    resolved.reserve(project.city->data.buildings.size());
-    std::unordered_map<const LoadedAsset<SbbBuilding>*, std::size_t> copied;
-    for (const auto& placement : project.city->data.buildings) {
-        const auto* asset = find_building_asset(project, placement.name);
-        if (asset == nullptr) {
-            resolved.push_back(0U);
-            continue;
-        }
-        auto [it, inserted] = copied.emplace(asset, owned->size() + 1U);
-        if (inserted) owned->push_back(asset->data);
-        resolved.push_back(it->second);
-    }
+    auto sources = snapshot_city_buildings(project);
 
     // v10 district cells under a building are replaced by it, so the portal buffer
     // has to follow building changes.
-    if (project.city->data.city_blocks.empty()) invalidate_portal_render_models(project);
-    project.city_scene_build_in_progress = true;
-    project.city_scene_build_target_fingerprint = fingerprint;
+    if (!roads_only && project.city->data.city_blocks.empty()) invalidate_portal_render_models(project);
+    if (roads_only) project.city_roads_build_target_fingerprint = fingerprint;
+    else {
+        project.city_scene_build_in_progress = true;
+        project.city_scene_build_target_fingerprint = fingerprint;
+    }
     const auto generation = ++project.city_scene_build_generation;
-    auto build_scene = [map = std::move(map_copy), owned, resolved = std::move(resolved), generation,
-                        auto_generated = project_is_auto_generated(project)]() {
+    auto build_scene = [map = std::move(map_copy), owned = std::move(sources.owned), resolved = std::move(sources.resolved), generation,
+                        auto_generated = project_is_auto_generated(project), roads_only]() {
             PAFTA_PROFILE_THREAD("City scene rebuild");
             PAFTA_PROFILE_BLOCK("build async map scene");
             std::vector<const SbbBuilding*> placement_buildings;
@@ -794,16 +811,22 @@ void start_city_scene_rebuild(EditorProject& project, std::uint64_t fingerprint)
                 placement_buildings.push_back(resolved[i] != 0U ? &(*owned)[resolved[i] - 1U] : nullptr);
             }
             (void)generation;
-            return build_map_scene(map, placement_buildings, auto_generated);
+            return build_map_scene(map, placement_buildings, auto_generated, true,
+                roads_only ? MapSceneBuild::RoadsOnly : MapSceneBuild::Complete);
         };
 #ifdef __EMSCRIPTEN__
-    project.city_scene_cache = build_scene();
+    auto scene = build_scene();
+    if (roads_only) scene.terrain = std::move(project.city_scene_cache.terrain);
+    else project.city_scene_terrain_fingerprint = fingerprint;
+    project.city_scene_cache = std::move(scene);
     project.city_scene_cache_fingerprint = fingerprint;
     project.city_scene_cache_valid = true;
+    project.city_scene_cache_complete = !roads_only;
     project.city_scene_gpu_valid = false;
     project.city_scene_build_in_progress = false;
 #else
-    project.city_scene_build_future = std::async(std::launch::async, std::move(build_scene));
+    if (roads_only) project.city_roads_build_future = std::async(std::launch::async, std::move(build_scene));
+    else project.city_scene_build_future = std::async(std::launch::async, std::move(build_scene));
 #endif
 }
 
@@ -1774,13 +1797,62 @@ RoadLay lay_city_road(SbcMap& map, CityGridPoint start_point, CityGridPoint poin
     return laid;
 }
 
+bool move_city_junction(SbcMap& map, std::size_t node, std::int32_t dx, std::int32_t dz) {
+    if (node >= map.intersections.size()) return false;
+    auto moved = map.intersections;
+    const auto valid = [&](const SbcStreet& street) {
+        return street.from_intersection >= 0 && street.to_intersection >= 0 &&
+            static_cast<std::size_t>(std::max(street.from_intersection, street.to_intersection)) < map.intersections.size();
+    };
+    for (const bool along_x : {true, false}) {
+        const auto delta = along_x ? dx : dz;
+        if (delta == 0) continue;
+        // The junctions that move: this one, and every junction joined to it by a road
+        // across the move (a road along Z for a move along X).
+        std::vector<bool> moving(map.intersections.size(), false);
+        std::vector<std::size_t> queue{node};
+        moving[node] = true;
+        while (!queue.empty()) {
+            const auto current = queue.back();
+            queue.pop_back();
+            for (const auto& street : map.streets) {
+                if (!valid(street)) continue;
+                const auto a = static_cast<std::size_t>(street.from_intersection), b = static_cast<std::size_t>(street.to_intersection);
+                if (a != current && b != current) continue;
+                const auto& pa = moved[a];
+                const auto& pb = moved[b];
+                if (along_x ? pa.x != pb.x : pa.z != pb.z) continue;
+                const auto other = a == current ? b : a;
+                if (!moving[other]) {
+                    moving[other] = true;
+                    queue.push_back(other);
+                }
+            }
+        }
+        const auto before = moved;
+        for (std::size_t i = 0; i < moved.size(); ++i) {
+            if (moving[i]) (along_x ? moved[i].x : moved[i].z) += delta;
+        }
+        // Roads along the move stretch or shrink; none may vanish or turn around.
+        for (const auto& street : map.streets) {
+            if (!valid(street)) continue;
+            const auto a = static_cast<std::size_t>(street.from_intersection), b = static_cast<std::size_t>(street.to_intersection);
+            const auto old_span = along_x ? before[b].x - before[a].x : before[b].z - before[a].z;
+            const auto new_span = along_x ? moved[b].x - moved[a].x : moved[b].z - moved[a].z;
+            if (old_span != 0 && (std::abs(new_span) < 2 || (old_span > 0) != (new_span > 0))) return false;
+        }
+    }
+    map.intersections = std::move(moved);
+    return true;
+}
+
 // Ends the current chain of roads (Esc, or a change of mode or selection).
 void end_road_chain(EditorUi& ui) {
     ui.pending_road_start.reset();
 }
 
 std::int32_t floor_div8(std::int32_t value) {
-    return value >= 0 ? value / 8 : -((7 - value) / 8);
+    return value >= 0 ? value / 8 : -static_cast<std::int32_t>((7LL - value) / 8);
 }
 
 std::size_t local_portal_index(CityGridPoint point) {
@@ -1831,6 +1903,14 @@ std::optional<std::pair<std::size_t, std::size_t>> find_or_add_city_block(SbcMap
             if (candidate.layers[l] == layer) return std::pair{block, l};
         }
     }
+    // A new texture set for a mesh the map already has becomes another layer of it,
+    // the way city2.sbc groups a piece's variants.
+    for (std::size_t block = 0; block < map.city_blocks.size(); ++block) {
+        auto& candidate = map.city_blocks[block];
+        if (lower_name(candidate.name) != lower_name(name) || candidate.layers.size() >= 63U) continue;
+        candidate.layers.push_back(layer);
+        return std::pair{block, candidate.layers.size() - 1U};
+    }
     if (map.city_blocks.size() >= 4096) return std::nullopt;
     map.city_blocks.push_back({map.city_blocks.size(), name, {layer}});
     return std::pair{map.city_blocks.size() - 1U, std::size_t{0}};
@@ -1852,7 +1932,12 @@ void set_city_piece_voxel(EditorProject& project, EditorUi& ui, CityGridPoint po
     if (portal.blocks.size() < 0x200) {
         portal.blocks.resize(0x200);
     }
-    portal.blocks[local_portal_index(point)] = encode_city_piece_word(ui);
+    const auto word = encode_city_piece_word(ui);
+    portal.blocks[local_portal_index(point)] = word;
+    const std::array<std::int32_t, 3> cell{point.x, point.y, point.z};
+    const auto pending = std::ranges::find_if(project.pending_pieces, [&](const auto& p) { return p.cell == cell; });
+    if (pending == project.pending_pieces.end()) project.pending_pieces.push_back({cell, word});
+    else pending->word = word;
     invalidate_portal_render_models(project);
     ui.city_dirty = true;
 }
@@ -1945,7 +2030,7 @@ void select_city_piece(EditorProject& project, EditorUi& ui, const CityPiecePick
 }
 
 void delete_city_street(EditorProject& project, EditorUi& ui) {
-    if (!project.city || project.city->data.streets.size() <= 1U) {
+    if (!project.city || project.city->data.streets.empty()) {
         return;
     }
 
@@ -1954,8 +2039,8 @@ void delete_city_street(EditorProject& project, EditorUi& ui) {
     map.streets.erase(map.streets.begin() + static_cast<std::ptrdiff_t>(ui.selected_city_street));
     reindex_city_streets(map);
     remove_unused_city_intersections(map);
-    ui.selected_city_intersection = std::min(ui.selected_city_intersection, map.intersections.size() - 1U);
-    ui.selected_city_street = std::min(ui.selected_city_street, map.streets.size() - 1U);
+    ui.selected_city_intersection = map.intersections.empty() ? 0U : std::min(ui.selected_city_intersection, map.intersections.size() - 1U);
+    ui.selected_city_street = map.streets.empty() ? 0U : std::min(ui.selected_city_street, map.streets.size() - 1U);
     ui.city_dirty = true;
 }
 
@@ -2055,6 +2140,7 @@ void mark_block_changed(EditorProject& project, EditorUi& ui, SblBlockMesh& bloc
         if (i < project.block_thumbnail_ready.size()) project.block_thumbnail_ready[i] = false;
         // Piece previews that use this mesh are drawn again when next shown.
         const auto prefix = lower_name(project.blocks[i].name) + "|";
+        std::erase_if(project.piece_preview_models, [&](const auto& entry) { return entry.first.starts_with(prefix); });
         std::erase_if(project.piece_thumbnails, [&](auto& entry) {
             if (!entry.first.starts_with(prefix)) return false;
             if (entry.second.id != 0U) UnloadRenderTexture(entry.second);
@@ -2070,25 +2156,31 @@ void mark_block_changed(EditorProject& project, EditorUi& ui, SblBlockMesh& bloc
 
 // Saves the map screen (the map image and street names) as a PNG.
 void export_map_image(EditorProject& project, const EditorUi& ui, std::string& status) {
-    const auto png = map_menu_png(project, ui.map_export_size, ui.map_menu);
-    if (png.empty()) {
-        report_failure(status, "Map image export failed: the city is still being built");
-        return;
-    }
     const auto name = project.root.filename().string() + "_map.png";
-#ifdef __EMSCRIPTEN__
-    web_download(name, png);
-    status = "downloaded " + name;
-#else
     try {
+#ifdef __EMSCRIPTEN__
+        const auto png = map_menu_png(project, ui.map_export_size, ui.map_menu);
+        if (png.empty()) throw std::runtime_error("the city is still being built");
+        web_download(name, png);
+        status = "Download requested: " + name;
+#else
         const auto output = dialog_save_file(project.root / name, "PNG image", "png");
         if (!output) return;
-        write_file_bytes(*output, png);
-        status = "exported " + output->filename().string();
+        auto pixels = capture_map_menu_image(project, ui.map_export_size, ui.map_menu);
+        if (!IsImageValid(pixels)) throw std::runtime_error("the city is still being built");
+        try {
+            queue_project_file_job(project, [pixels, path = *output] {
+                write_file_bytes(path, encode_map_menu_png(pixels));
+            }, "Exported " + output->filename().string());
+        } catch (...) {
+            UnloadImage(pixels);
+            throw;
+        }
+        status = "Exporting map image in background";
+#endif
     } catch (const std::exception& error) {
         report_failure(status, std::string{"Map image export failed: "} + error.what());
     }
-#endif
 }
 
 void save_map_to(EditorProject& project, EditorUi& ui, const std::filesystem::path& folder, std::string& status);
@@ -2189,11 +2281,6 @@ GizmoLayout building_gizmo_layout(const SbcBuilding& placement, const Camera3D& 
 // What a click would select in the city view. A building or piece the ray passes
 // through is in front of the road or ground below it, so those win over the
 // ground. Among ground hits, the road and node picker already picks the closest.
-struct CityAnyPick {
-    CitySelectionKind kind{CitySelectionKind::None};
-    std::size_t index{};
-};
-
 CityAnyPick pick_city_any(EditorProject& project, const MapScene& scene, const Vec3& ro, const Vec3& rd) {
     if (!project.city) {
         return {};
@@ -2284,9 +2371,7 @@ void toggle_in_selection(std::vector<std::size_t>& set, std::size_t index) {
     }
 }
 
-// Applies a pick from the Select tool. Buildings and piece portals can be multi-
-// selected (additive = Shift or Ctrl): a plain click selects only that thing, and an
-// additive click adds or removes it. Roads and nodes are selected one at a time.
+// A plain click replaces the selection; Shift/Ctrl toggles the clicked object.
 // The single active index (selected_city_building / selected_portal) follows the
 // last click.
 void select_city_thing(
@@ -2297,6 +2382,13 @@ void select_city_thing(
     const Vec3& ray_origin,
     const Vec3& ray_dir,
     std::string& status) {
+    if (!additive || picked.kind == CitySelectionKind::Node) {
+        ui.selected_city_buildings.clear();
+        ui.selected_piece_cells.clear();
+        ui.selected_city_streets.clear();
+        ui.selected_portals.clear();
+        ui.selected_piece_voxel.reset();
+    }
     switch (picked.kind) {
         case CitySelectionKind::Building: {
             ui.city_selection = CitySelectionKind::Building;
@@ -2307,7 +2399,10 @@ void select_city_thing(
             } else {
                 ui.selected_city_buildings = {picked.index};
             }
-            ui.selected_portals.clear();
+            if (ui.selected_city_buildings.empty()) ui.city_selection = CitySelectionKind::None;
+            else if (std::ranges::find(ui.selected_city_buildings, picked.index) == ui.selected_city_buildings.end()) {
+                ui.selected_city_building = ui.selected_city_buildings.back();
+            }
             break;
         }
         case CitySelectionKind::Piece: {
@@ -2315,11 +2410,28 @@ void select_city_thing(
                 select_city_piece(project, ui, *p, status);
                 ui.city_selection = CitySelectionKind::Piece;
                 if (additive) {
-                    toggle_in_selection(ui.selected_portals, p->portal_index);
+                    const auto cell = *ui.selected_piece_voxel;
+                    const auto old = std::ranges::find(ui.selected_piece_cells, cell);
+                    if (old == ui.selected_piece_cells.end()) ui.selected_piece_cells.push_back(cell);
+                    else ui.selected_piece_cells.erase(old);
                 } else {
-                    ui.selected_portals = {p->portal_index};
+                    ui.selected_piece_cells = {*ui.selected_piece_voxel};
                 }
-                ui.selected_city_buildings.clear();
+                ui.selected_portals.clear();
+                for (const auto& cell : ui.selected_piece_cells) {
+                    const std::array<std::int32_t, 4> fields{0, floor_div8(cell.x), floor_div8(cell.y), floor_div8(cell.z)};
+                    const auto& portals = project.city->data.portals;
+                    const auto portal = std::ranges::find_if(portals, [&](const auto& entry) { return entry.fields == fields; });
+                    if (portal == portals.end()) continue;
+                    const auto index = static_cast<std::size_t>(portal - portals.begin());
+                    if (std::ranges::find(ui.selected_portals, index) == ui.selected_portals.end()) ui.selected_portals.push_back(index);
+                }
+                if (ui.selected_piece_cells.empty()) {
+                    ui.selected_piece_voxel.reset();
+                    ui.city_selection = CitySelectionKind::None;
+                } else if (std::ranges::find(ui.selected_piece_cells, *ui.selected_piece_voxel) == ui.selected_piece_cells.end()) {
+                    ui.selected_piece_voxel.reset();
+                }
             }
             break;
         }
@@ -2327,8 +2439,12 @@ void select_city_thing(
             ui.city_selection = CitySelectionKind::Road;
             ui.city_library_roads = true;
             ui.selected_city_street = picked.index;
-            ui.selected_city_buildings.clear();
-            ui.selected_portals.clear();
+            if (additive) toggle_in_selection(ui.selected_city_streets, picked.index);
+            else ui.selected_city_streets = {picked.index};
+            if (ui.selected_city_streets.empty()) ui.city_selection = CitySelectionKind::None;
+            else if (std::ranges::find(ui.selected_city_streets, picked.index) == ui.selected_city_streets.end()) {
+                ui.selected_city_street = ui.selected_city_streets.back();
+            }
             break;
         case CitySelectionKind::Node:
             ui.city_selection = CitySelectionKind::Node;
@@ -2345,99 +2461,282 @@ void select_city_thing(
             }
             break;
     }
+    if (ui.city_selection == CitySelectionKind::None) {
+        if (!ui.selected_city_buildings.empty()) {
+            ui.selected_city_building = ui.selected_city_buildings.back();
+            ui.city_selection = CitySelectionKind::Building;
+        } else if (!ui.selected_piece_cells.empty()) {
+            ui.selected_piece_voxel = ui.selected_piece_cells.back();
+            ui.selected_portal = ui.selected_portals.back();
+            ui.city_selection = CitySelectionKind::Piece;
+        } else if (!ui.selected_city_streets.empty()) {
+            ui.selected_city_street = ui.selected_city_streets.back();
+            ui.city_selection = CitySelectionKind::Road;
+        }
+    }
 }
 
-// Box select: every building and piece voxel whose screen point is inside the
-// rectangle gets selected. With additive, the old selection stays; otherwise the
-// box replaces it. Buildings and piece portals can't be selected together, so a box
-// that catches both picks the buildings (the usual case).
-void box_select_city(
-    EditorProject& project,
-    EditorUi& ui,
-    const Camera3D& camera,
-    Vector2 a,
-    Vector2 b,
-    Vector2 viewport_size,
-    bool additive) {
-    if (!project.city) {
-        return;
-    }
-    const float min_x = std::min(a.x, b.x);
-    const float max_x = std::max(a.x, b.x);
-    const float min_y = std::min(a.y, b.y);
-    const float max_y = std::max(a.y, b.y);
-    const auto width = static_cast<int>(std::max(1.0F, viewport_size.x));
-    const auto height = static_cast<int>(std::max(1.0F, viewport_size.y));
-    const auto in_box = [&](Vector3 p) {
-        const auto s = GetWorldToScreenEx(p, camera, width, height);
-        return std::isfinite(s.x) && std::isfinite(s.y) &&
-            s.x >= min_x && s.x <= max_x && s.y >= min_y && s.y <= max_y;
+// Box selection keeps each category, including legacy district voxels.
+void box_select_city(EditorProject& project, EditorUi& ui, const Camera3D& camera,
+    Vector2 a, Vector2 b, Vector2 viewport_size, bool additive) {
+    if (!project.city) return;
+    const auto& map = project.city->data;
+    const float min_x = std::min(a.x, b.x), max_x = std::max(a.x, b.x);
+    const float min_y = std::min(a.y, b.y), max_y = std::max(a.y, b.y);
+    const auto forward = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+    const auto project_point = [&](Vector3 point) -> std::optional<Vector2> {
+        if (Vector3DotProduct(Vector3Subtract(point, camera.position), forward) <= 0.0F) return std::nullopt;
+        const auto screen = GetWorldToScreenEx(point, camera,
+            static_cast<int>(std::max(1.0F, viewport_size.x)), static_cast<int>(std::max(1.0F, viewport_size.y)));
+        if (!std::isfinite(screen.x) || !std::isfinite(screen.y)) return std::nullopt;
+        return screen;
     };
-
-    constexpr float unit = 4.0F;
-    std::vector<std::size_t> buildings;
-    for (std::size_t i = 0; i < project.city->data.buildings.size(); ++i) {
-        const auto o = native_city_building_render_origin(project.city->data.buildings[i], unit);
-        if (in_box({o.x, o.y + unit, o.z})) {
-            buildings.push_back(i);
-        }
+    const auto inside = [&](Vector2 point) {
+        return point.x >= min_x && point.x <= max_x && point.y >= min_y && point.y <= max_y;
+    };
+    const auto in_box = [&](Vector3 point) {
+        const auto screen = project_point(point);
+        return screen && inside(*screen);
+    };
+    const auto add = [](auto& values, const auto& value) {
+        if (std::ranges::find(values, value) == values.end()) values.push_back(value);
+    };
+    if (!additive) {
+        ui.selected_city_buildings.clear();
+        ui.selected_city_streets.clear();
+        ui.selected_portals.clear();
+        ui.selected_piece_cells.clear();
+        ui.selected_piece_voxel.reset();
     }
-    if (!buildings.empty()) {
-        if (!additive) {
-            ui.selected_city_buildings.clear();
+    constexpr float unit = 4.0F;
+    if (ui.box_select_buildings) for (std::size_t i = 0; i < map.buildings.size(); ++i) {
+        const auto& placement = map.buildings[i];
+        auto point = native_city_building_render_origin(placement, unit);
+        if (const auto* asset = find_building_asset(project, placement.name)) {
+            const auto bounds = city_building_bounds(placement, asset->data, unit);
+            point = {(bounds.min.x + bounds.max.x) * 0.5F, (bounds.min.y + bounds.max.y) * 0.5F,
+                (bounds.min.z + bounds.max.z) * 0.5F};
         }
-        for (const auto idx : buildings) {
-            if (std::find(ui.selected_city_buildings.begin(), ui.selected_city_buildings.end(), idx) == ui.selected_city_buildings.end()) {
-                ui.selected_city_buildings.push_back(idx);
+        if (in_box({point.x, point.y, point.z})) add(ui.selected_city_buildings, i);
+    }
+    if (ui.box_select_pieces) for (std::size_t pi = 0; pi < map.portals.size(); ++pi) {
+        const auto& portal = map.portals[pi];
+        const auto& voxels = portal.voxel_blocks();
+        for (std::size_t bi = 0; bi < std::min<std::size_t>(voxels.size(), 512U); ++bi) {
+            if (voxels[bi] == 0U) continue;
+            const CityGridPoint cell{sbc_portal_cell_base(portal.fields[1]) + static_cast<int>(bi & 7U),
+                sbc_portal_cell_base(portal.fields[2]) + static_cast<int>((bi / 64U) & 7U),
+                sbc_portal_cell_base(portal.fields[3]) + static_cast<int>((bi / 8U) & 7U)};
+            if (in_box({(cell.x + 0.5F) * unit, (cell.y + 0.5F) * unit, (cell.z + 0.5F) * unit})) {
+                add(ui.selected_piece_cells, cell);
+                add(ui.selected_portals, pi);
             }
         }
+    }
+    // Clip each projected road segment against the selection rectangle. Its ends
+    // can both be outside while the road crosses the box.
+    if (ui.box_select_roads) for (std::size_t i = 0; i < map.streets.size(); ++i) {
+        const auto& street = map.streets[i];
+        if (street.from_intersection < 0 || street.to_intersection < 0 ||
+            static_cast<std::size_t>(street.from_intersection) >= map.intersections.size() ||
+            static_cast<std::size_t>(street.to_intersection) >= map.intersections.size()) continue;
+        const auto point = [&](int index) {
+            const auto& node = map.intersections[static_cast<std::size_t>(index)];
+            return project_point({node.x * unit, node.y * unit, node.z * unit});
+        };
+        const auto start = point(street.from_intersection), end = point(street.to_intersection);
+        if (!start || !end) continue;
+        float enter = 0.0F, leave = 1.0F;
+        const auto clip = [&](float direction, float distance) {
+            if (std::abs(direction) < 1e-8F) return distance >= 0.0F;
+            const float t = distance / direction;
+            if (direction < 0.0F) enter = std::max(enter, t); else leave = std::min(leave, t);
+            return enter <= leave;
+        };
+        const auto delta = Vector2Subtract(*end, *start);
+        if (clip(-delta.x, start->x - min_x) && clip(delta.x, max_x - start->x) &&
+            clip(-delta.y, start->y - min_y) && clip(delta.y, max_y - start->y)) add(ui.selected_city_streets, i);
+    }
+    ui.city_selection = CitySelectionKind::None;
+    if (!ui.selected_city_buildings.empty()) {
         ui.selected_city_building = ui.selected_city_buildings.back();
         ui.city_selection = CitySelectionKind::Building;
-        ui.selected_portals.clear();
-        return;
-    }
-
-    // No buildings caught: try piece voxels (portal blocks).
-    std::vector<std::size_t> portals;
-    for (std::size_t pi = 0; pi < project.city->data.portals.size(); ++pi) {
-        const auto& portal = project.city->data.portals[pi];
-        bool any = false;
-        for (std::size_t bi = 0; bi < portal.blocks.size() && bi < 0x200U; ++bi) {
-            if (portal.blocks[bi] == 0U) {
-                continue;
-            }
-            const Vector3 c{
-                (static_cast<float>(sbc_portal_cell_base(portal.fields[1]) + static_cast<std::int32_t>(bi & 7U)) + 0.5F) * unit,
-                (static_cast<float>(sbc_portal_cell_base(portal.fields[2]) + static_cast<std::int32_t>((bi / 0x40U) & 7U)) + 0.5F) * unit,
-                (static_cast<float>(sbc_portal_cell_base(portal.fields[3]) + static_cast<std::int32_t>((bi / 8U) & 7U)) + 0.5F) * unit,
-            };
-            if (in_box(c)) {
-                any = true;
-                break;
-            }
-        }
-        if (any) {
-            portals.push_back(pi);
-        }
-    }
-    if (!portals.empty()) {
-        if (!additive) {
-            ui.selected_portals.clear();
-        }
-        for (const auto idx : portals) {
-            if (std::find(ui.selected_portals.begin(), ui.selected_portals.end(), idx) == ui.selected_portals.end()) {
-                ui.selected_portals.push_back(idx);
-            }
-        }
+    } else if (!ui.selected_piece_cells.empty()) {
         ui.selected_portal = ui.selected_portals.back();
         ui.city_selection = CitySelectionKind::Piece;
-        ui.selected_piece_voxel.reset();
-        ui.selected_city_buildings.clear();
-    } else if (!additive) {
-        ui.city_selection = CitySelectionKind::None;
-        ui.selected_city_buildings.clear();
-        ui.selected_portals.clear();
+    } else if (!ui.selected_city_streets.empty()) {
+        ui.selected_city_street = ui.selected_city_streets.back();
+        ui.city_selection = CitySelectionKind::Road;
     }
+}
+
+void delete_box_selection(EditorProject& project, EditorUi& ui) {
+    if (!project.city) return;
+    auto& map = project.city->data;
+    for (const auto& cell : ui.selected_piece_cells) {
+        const std::array<std::int32_t, 4> fields{0, floor_div8(cell.x), floor_div8(cell.y), floor_div8(cell.z)};
+        const auto portal = std::ranges::find_if(map.portals, [&](const auto& p) { return p.fields == fields; });
+        if (portal == map.portals.end()) continue;
+        auto& voxels = portal->blocks.empty() ? portal->legacy_blocks : portal->blocks;
+        const auto index = local_portal_index(cell);
+        if (index < voxels.size()) voxels[index] = 0;
+    }
+    const auto erase_indices = [](auto& records, auto indices) {
+        std::sort(indices.begin(), indices.end(), std::greater<>());
+        indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+        for (const auto i : indices) if (i < records.size()) records.erase(records.begin() + static_cast<std::ptrdiff_t>(i));
+    };
+    erase_indices(map.buildings, ui.selected_city_buildings);
+    erase_indices(map.streets, ui.selected_city_streets);
+    reindex_city_buildings(map);
+    reindex_city_streets(map);
+    remove_unused_city_intersections(map);
+    invalidate_portal_render_models(project);
+    ui.selected_city_buildings.clear();
+    ui.selected_city_streets.clear();
+    ui.selected_portals.clear();
+    ui.selected_piece_cells.clear();
+    ui.selected_piece_voxel.reset();
+    ui.city_selection = CitySelectionKind::None;
+    ui.city_dirty = true;
+}
+
+void nudge_box_selection(EditorProject& project, EditorUi& ui, int dx, int dy, int dz, std::string& status) {
+    if (!project.city || (dx == 0 && dy == 0 && dz == 0)) return;
+    auto map = project.city->data;
+    const auto moved_point = [&](CityGridPoint point) -> std::optional<CityGridPoint> {
+        const std::int64_t x = static_cast<std::int64_t>(point.x) + dx;
+        const std::int64_t y = static_cast<std::int64_t>(point.y) + dy;
+        const std::int64_t z = static_cast<std::int64_t>(point.z) + dz;
+        const auto fits = [](std::int64_t value) {
+            return value >= std::numeric_limits<std::int32_t>::min() && value <= std::numeric_limits<std::int32_t>::max();
+        };
+        if (!fits(x) || !fits(y) || !fits(z)) return std::nullopt;
+        return CityGridPoint{static_cast<std::int32_t>(x), static_cast<std::int32_t>(y), static_cast<std::int32_t>(z)};
+    };
+    const auto move_record = [&](auto& record) {
+        const auto point = moved_point({record.x, record.y, record.z});
+        if (!point) return false;
+        record.x = point->x; record.y = point->y; record.z = point->z;
+        return true;
+    };
+    for (const auto i : ui.selected_city_buildings) {
+        if (i >= map.buildings.size() || !move_record(map.buildings[i])) {
+            status = "Selection move failed: a building coordinate is out of range";
+            return;
+        }
+    }
+    std::vector<std::size_t> nodes;
+    for (const auto i : ui.selected_city_streets) {
+        if (i >= map.streets.size()) { status = "Selection move failed: a road is missing"; return; }
+        for (const auto node : {map.streets[i].from_intersection, map.streets[i].to_intersection}) {
+            if (node < 0 || static_cast<std::size_t>(node) >= map.intersections.size()) {
+                status = "Selection move failed: a road endpoint is missing";
+                return;
+            }
+            const auto index = static_cast<std::size_t>(node);
+            if (std::ranges::find(nodes, index) == nodes.end()) nodes.push_back(index);
+        }
+    }
+    for (const auto i : nodes) if (!move_record(map.intersections[i])) {
+        status = "Selection move failed: a road coordinate is out of range";
+        return;
+    }
+    for (const auto i : ui.selected_city_buildings) {
+        const auto* asset = find_building_asset(project, map.buildings[i].name);
+        if (asset == nullptr) continue;
+        auto bounds = city_building_bounds(map.buildings[i], asset->data, 4.0F);
+        bounds.min = Vector3AddValue(bounds.min, 0.5F);
+        bounds.max = Vector3SubtractValue(bounds.max, 0.5F);
+        for (std::size_t other = 0; other < map.buildings.size(); ++other) {
+            if (std::ranges::find(ui.selected_city_buildings, other) != ui.selected_city_buildings.end()) continue;
+            const auto* other_asset = find_building_asset(project, map.buildings[other].name);
+            if (other_asset != nullptr && CheckCollisionBoxes(bounds, city_building_bounds(map.buildings[other], other_asset->data, 4.0F))) {
+                status = "Selection move failed: overlaps building " + map.buildings[other].name;
+                return;
+            }
+        }
+    }
+    const auto portal_of = [&](CityGridPoint cell) -> SbcPortal* {
+        const std::array<std::int32_t, 4> fields{0, floor_div8(cell.x), floor_div8(cell.y), floor_div8(cell.z)};
+        const auto found = std::ranges::find_if(map.portals, [&](const auto& portal) { return portal.fields == fields; });
+        return found == map.portals.end() ? nullptr : &*found;
+    };
+    struct PieceMove {
+        CityGridPoint from, to;
+        std::uint32_t word{}, items{};
+        std::array<std::uint16_t, 8> textures{};
+    };
+    std::vector<PieceMove> pieces;
+    for (const auto& cell : ui.selected_piece_cells) {
+        const auto to = moved_point(cell);
+        const auto* source = portal_of(cell);
+        const auto index = local_portal_index(cell);
+        if (!to || source == nullptr || index >= source->voxel_blocks().size() || source->voxel_blocks()[index] == 0U) {
+            status = "Selection move failed: a piece is missing or its destination is out of range";
+            return;
+        }
+        const auto safe_sector = [](std::int32_t value) {
+            const auto base = static_cast<std::int64_t>(floor_div8(value)) * 8;
+            return base >= static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::min()) + 1 &&
+                base <= static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max()) - 8;
+        };
+        if (!safe_sector(to->x) || !safe_sector(to->y) || !safe_sector(to->z)) {
+            status = "Selection move failed: a piece destination exceeds the safe sector range";
+            return;
+        }
+        PieceMove move{cell, *to, source->voxel_blocks()[index]};
+        if (index < source->itemsets.size()) move.items = source->itemsets[index];
+        for (std::size_t slot = 0; slot < 8U; ++slot) {
+            if (index * 8U + slot < source->textures.size()) move.textures[slot] = source->textures[index * 8U + slot];
+        }
+        pieces.push_back(move);
+    }
+    // Clear the sources first, so adjacent selected voxels can move into each other.
+    for (const auto& piece : pieces) {
+        auto* source = portal_of(piece.from);
+        const auto index = local_portal_index(piece.from);
+        auto& voxels = source->blocks.empty() ? source->legacy_blocks : source->blocks;
+        voxels[index] = 0U;
+        if (index < source->itemsets.size()) source->itemsets[index] = 0U;
+        for (std::size_t slot = 0; slot < 8U; ++slot) {
+            if (index * 8U + slot < source->textures.size()) source->textures[index * 8U + slot] = 0U;
+        }
+    }
+    std::vector<CityGridPoint> moved_cells;
+    std::vector<std::size_t> portals;
+    for (const auto& piece : pieces) {
+        auto& target = find_or_create_portal(map, piece.to);
+        if (map.version < 11U && target.legacy_blocks.empty()) {
+            target.legacy_blocks = std::move(target.blocks);
+            target.textures.resize(4096U);
+        }
+        auto& voxels = map.version < 11U ? target.legacy_blocks : target.blocks;
+        voxels.resize(512U);
+        const auto index = local_portal_index(piece.to);
+        if (voxels[index] != 0U) {
+            status = "Selection move failed: the destination already has a piece";
+            return;
+        }
+        voxels[index] = piece.word;
+        if (map.version > 9U) { target.itemsets.resize(512U); target.itemsets[index] = piece.items; }
+        if (map.version < 11U) {
+            target.textures.resize(4096U);
+            for (std::size_t slot = 0; slot < 8U; ++slot) target.textures[index * 8U + slot] = piece.textures[slot];
+        }
+        moved_cells.push_back(piece.to);
+        const auto portal = static_cast<std::size_t>(&target - map.portals.data());
+        if (std::ranges::find(portals, portal) == portals.end()) portals.push_back(portal);
+    }
+    begin_city_action(project, ui, "move selection");
+    project.city->data = std::move(map);
+    ui.selected_piece_cells = std::move(moved_cells);
+    ui.selected_portals = std::move(portals);
+    if (ui.selected_piece_voxel && !ui.selected_piece_cells.empty()) ui.selected_piece_voxel = ui.selected_piece_cells.back();
+    if (!ui.selected_portals.empty()) ui.selected_portal = ui.selected_portals.back();
+    invalidate_portal_render_models(project);
+    ui.city_dirty = true;
+    status = "moved selection";
 }
 
 // Deletes the one thing the Erase hover highlights (pick_city_any): a building, a
@@ -2454,6 +2753,13 @@ void erase_city_thing_under_cursor(
         return;
     }
     const auto picked = pick_city_any(project, scene, ro, rd);
+    if (picked.kind != CitySelectionKind::Building && picked.kind != CitySelectionKind::Road && picked.kind != CitySelectionKind::Piece) return;
+    ui.selected_city_buildings.clear();
+    ui.selected_city_streets.clear();
+    ui.selected_piece_cells.clear();
+    ui.selected_portals.clear();
+    ui.selected_piece_voxel.reset();
+    ui.city_selection = CitySelectionKind::None;
     if (picked.kind == CitySelectionKind::Building) {
         ui.selected_city_building = picked.index;
         ui.selected_city_buildings = {picked.index};
@@ -3018,7 +3324,7 @@ void draw_coordinate_readout(EditorProject& project, const EditorUi& ui, const C
             add_point("Cursor", hit->point, IM_COL32(120, 200, 255, 255));
         }
         // The road the next click lays: '+' when the game can build its slope, '!' when it can't.
-        if (ui.city_tool == CityTool::Road && !ui.road_preview_info.empty()) {
+        if ((ui.city_tool == CityTool::Road || ui.node_drag_target) && !ui.road_preview_info.empty()) {
             const auto color = ui.road_preview_info[0] == '+' ? IM_COL32(150, 255, 165, 255) : IM_COL32(255, 115, 100, 255);
             std::string_view rest{ui.road_preview_info};
             rest.remove_prefix(1);
@@ -3062,6 +3368,13 @@ void draw_coordinate_readout(EditorProject& project, const EditorUi& ui, const C
 std::optional<CityGridPoint> raised(std::optional<CityGridPoint> point, int dy) {
     if (point) point->y += dy;
     return point;
+}
+
+std::optional<CityGridPoint> city_placement_point_under_mouse(EditorProject& project, const EditorUi& ui,
+    const Camera3D& camera, Vector2 mouse, Vector2 size, bool cell) {
+    if (ui.place_height_locked) return city_grid_point_on_plane_under_mouse(camera, mouse, size, ui.place_height_y, cell);
+    return raised(cell ? city_surface_cell_under_mouse(project, camera, mouse, size)
+        : city_surface_point_under_mouse(project, camera, mouse, size), ui.place_height_offset);
 }
 
 // Moves road junctions up or down one cell level at a time.
@@ -3150,15 +3463,181 @@ void draw_road_tiles(const std::vector<CityTileCell>& tiles, float unit, Color f
     }
 }
 
+// Road geometry only: the prepared plan omits unrelated building and piece data.
+// Preview invalidation also includes city_scene_current_fingerprint for that data.
+std::uint64_t road_edit_hash(const SbcMap& map) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    const auto mix = [&](std::int64_t value) { hash = (hash ^ static_cast<std::uint64_t>(value)) * 1099511628211ULL; };
+    for (const auto& node : map.intersections) { mix(node.x); mix(node.y); mix(node.z); }
+    for (const auto& street : map.streets) { mix(street.from_intersection); mix(street.to_intersection); mix(street.left_width); mix(street.right_width); }
+    return hash;
+}
+
+// Wire boxes around road cells, for tiles that conflict with something.
+void draw_road_cell_boxes(const std::vector<CityTileCell>& tiles, float unit, Color color) {
+    for (const auto& tile : tiles) {
+        DrawCubeWiresV({(static_cast<float>(tile.x) + 0.5F) * unit, tile.base_y + unit * 0.5F, (static_cast<float>(tile.z) + 0.5F) * unit},
+            {unit * 1.02F, unit * 1.02F, unit * 1.02F}, color);
+    }
+}
+
+// Draws a road edit (`after` is the city map with the edit made) as it will look:
+// the changed road tiles with the city's own road mesh, tinted green when the game
+// builds it cleanly and red when not. Existing roads the edit splits or reshapes
+// are tinted yellow, and tiles it takes away dark red. Returns the readout text,
+// starting with '+' when fine or '!' when not.
+std::uint64_t road_plan_request(const EditorProject& project, const EditorUi& ui, CityGridPoint point) {
+    auto hash = road_edit_hash(project.city->data);
+    const auto mix = [&](std::int32_t value) { hash = (hash ^ static_cast<std::uint32_t>(value)) * 1099511628211ULL; };
+    const auto start = *ui.pending_road_start;
+    for (const auto v : {start.x, start.y, start.z, point.x, point.y, point.z, ui.new_road_width}) mix(v);
+    return hash;
+}
+
+const SbcMap& prepare_city_road_plan(EditorProject& project, const EditorUi& ui, CityGridPoint point) {
+    auto& plan = project.road_placement_plan;
+    const auto request = road_plan_request(project, ui, point);
+    if (plan.request == request) return plan.roads;
+    plan = {};
+    plan.request = request;
+    const auto& map = project.city->data;
+    plan.roads.version = map.version;
+    plan.roads.intersections = map.intersections;
+    plan.roads.streets = map.streets;
+    const auto laid = lay_city_road(plan.roads, *ui.pending_road_start, point, ui.new_road_width, project_is_auto_generated(project));
+    if (laid.next_start) plan.next_start = {laid.next_start->x, laid.next_start->y, laid.next_start->z};
+    plan.last_street = laid.last_street;
+    return plan.roads;
+}
+
+bool commit_prepared_city_road(EditorProject& project, EditorUi& ui, CityGridPoint point) {
+    if (!project.city || !ui.pending_road_start) return false;
+    auto& plan = project.road_placement_plan;
+    if (plan.request != road_plan_request(project, ui, point)) return false;
+    auto& map = project.city->data;
+    const bool changed = map.streets != plan.roads.streets || map.intersections != plan.roads.intersections;
+    map.streets = std::move(plan.roads.streets);
+    map.intersections = std::move(plan.roads.intersections);
+    if (plan.next_start) ui.pending_road_start = CityGridPoint{(*plan.next_start)[0], (*plan.next_start)[1], (*plan.next_start)[2]};
+    else ui.pending_road_start.reset();
+    if (plan.last_street) ui.selected_city_street = *plan.last_street;
+    ui.city_dirty = ui.city_dirty || changed;
+    plan.request = 0;
+    auto& preview = project.road_edit_preview;
+    if (changed && preview.after_hash == road_edit_hash(map)) {
+        project.pending_roads.fingerprint = preview.after_hash;
+        project.pending_roads.tiles = std::move(preview.display_tiles);
+        project.pending_roads.model = std::move(preview.model);
+        preview.key = 0;
+    }
+    return true;
+}
+
+std::string draw_road_edit_preview(EditorProject& project, EditorUi& ui, const SbcMap& after, std::string info) {
+    const auto& before = project.city->data;
+    const bool auto_generated = project_is_auto_generated(project);
+    const float unit = project.city_scene_cache_valid ? project.city_scene_cache.unit_size : 4.0F;
+    auto& preview = project.road_edit_preview;
+    const auto key = (road_edit_hash(before) * 31U ^ road_edit_hash(after)) ^ project.city_scene_current_fingerprint;
+    if (key != preview.key) {
+        preview = {};
+        preview.key = key;
+        preview.after_hash = road_edit_hash(after);
+        preview.tiles = diff_city_road_tiles(before, after, resolve_placement_buildings(project), auto_generated);
+        // Prepare the committed display too. The click transfers this GPU model;
+        // it does not build or upload a road mesh.
+        std::map<std::array<std::int32_t, 3>, CityTileCell> display;
+        if (project.pending_roads.fingerprint == road_edit_hash(before)) {
+            for (const auto& tile : project.pending_roads.tiles) display[{tile.x, tile.y, tile.z}] = tile;
+        }
+        for (const auto& tile : preview.tiles.removed) display.erase({tile.x, tile.y, tile.z});
+        for (const auto& tile : preview.tiles.shown) display[{tile.x, tile.y, tile.z}] = tile;
+        for (const auto& [cell, tile] : display) preview.display_tiles.push_back(tile);
+        if (!preview.display_tiles.empty()) {
+            preview.model = upload_city_tile_model(build_city_road_tile_buffer(preview.display_tiles, unit), project, false);
+        }
+        std::set<std::array<std::int32_t, 8>> old_roads, new_roads;
+        for (const auto& street : before.streets) old_roads.insert(city_street_signature(before, street));
+        for (const auto& street : after.streets) new_roads.insert(city_street_signature(after, street));
+        for (std::size_t i = 0; i < after.streets.size(); ++i) {
+            if (!old_roads.contains(city_street_signature(after, after.streets[i]))) preview.streets.push_back(preview_city_street(after, i, auto_generated));
+        }
+        for (std::size_t i = 0; i < before.streets.size(); ++i) {
+            if (new_roads.contains(city_street_signature(before, before.streets[i]))) continue;
+            preview.changed_roads.push_back("#" + std::to_string(i) + " " + before.streets[i].name);
+            for (const auto& tile : preview_city_street(before, i, auto_generated).cells) {
+                if (tile.street_index == static_cast<std::int32_t>(i)) preview.changed_road_tiles.push_back(tile);
+            }
+        }
+    }
+    ui.road_preview_cells = preview.tiles.changed;
+    if (preview.streets.empty() && preview.tiles.changed.empty()) return {};
+
+    const auto in_world = [](const StreetPreview& p) {
+        return std::ranges::all_of(p.cells, [](const CityTileCell& c) { return city_cell_in_game_world(c.x, c.y, c.z); });
+    };
+    const auto bad = std::ranges::find_if(preview.streets, [&](const StreetPreview& p) { return !p.run.slope_ok() || !in_world(p); });
+    const bool ok = bad == preview.streets.end() && preview.tiles.overlaps.empty() && preview.tiles.under_buildings.empty();
+
+    draw_road_preview_model(preview.model);
+    const Color fill = ok ? Color{120, 230, 130, 45} : Color{240, 80, 70, 70};
+    const Color edge = ok ? Color{150, 255, 160, 255} : Color{255, 110, 100, 255};
+    draw_road_tiles(preview.tiles.changed, unit, fill, Color{fill.r, fill.g, fill.b, 25}, edge);
+    draw_road_tiles(preview.changed_road_tiles, unit, Color{240, 200, 70, 60}, Color{240, 200, 70, 30}, Color{255, 220, 90, 255});
+    draw_road_tiles(preview.tiles.removed, unit, Color{120, 30, 30, 120}, Color{120, 30, 30, 60}, Color{200, 60, 60, 255});
+    draw_road_cell_boxes(preview.tiles.overlaps, unit, Color{255, 80, 70, 255});
+    draw_road_cell_boxes(preview.tiles.under_buildings, unit, Color{255, 150, 60, 255});
+
+    if (!preview.streets.empty()) {
+        const auto& shown = bad != preview.streets.end() ? *bad
+            : *std::ranges::max_element(preview.streets, {}, [](const StreetPreview& p) { return p.run.length; });
+        const auto& run = shown.run;
+        const auto climb = std::abs(run.climb);
+        if (info.empty()) info = "Road " + std::to_string(std::max(0, run.length)) + " cells";
+        if (climb == 0) info += ", flat";
+        else info += ", " + std::string(run.climb > 0 ? "climbs " : "drops ") + std::to_string(climb) + (climb == 1 ? " level" : " levels") +
+            ", " + std::to_string(run.cells_per_level) + " cells per level";
+        if (!in_world(shown)) info += "\nOutside the game's map area: the game will not draw this road.";
+        if (!run.slope_ok()) {
+            if (run.length <= 0) info += "\nThe junctions overlap: no room for a road.";
+            else if (run.cells_per_level * climb > run.length) info += "\nThe slope does not fit: the road ends in a step. Lengthen it.";
+            else if (run.cells_per_level < 4) info += "\nToo steep: the game has no slope block for this. Needs " + std::to_string(4 * climb) + "+ cells.";
+            else info += "\nToo shallow: the game has no slope block for this. Keep it under " + std::to_string(13 * climb) + " cells or climb more.";
+        }
+    }
+    if (!preview.tiles.overlaps.empty()) {
+        info += "\nRuns over another road on " + std::to_string(preview.tiles.overlaps.size()) + " cells (red boxes): the roads will look broken.";
+    }
+    if (!preview.tiles.under_buildings.empty()) {
+        info += "\n" + std::to_string(preview.tiles.under_buildings.size()) + " road cells are under a building or piece (orange boxes); the game removes them.";
+    }
+    if (!preview.changed_roads.empty()) {
+        info += "\nChanges " + std::to_string(preview.changed_roads.size()) + (preview.changed_roads.size() == 1 ? " existing road" : " existing roads") + " (yellow):";
+        for (std::size_t i = 0; i < std::min<std::size_t>(preview.changed_roads.size(), 4U); ++i) info += " " + preview.changed_roads[i];
+        if (preview.changed_roads.size() > 4U) info += " ...";
+    }
+    return (ok ? "+" : "!") + info;
+}
+
 // Draws the road the next click will lay and returns its description for the
 // coordinate readout (this runs in the 3D pass, outside the ImGui frame).
-std::string draw_road_lay_preview(const EditorProject& project, EditorUi& ui, std::optional<CityGridPoint> cursor) {
+std::string draw_road_lay_preview(EditorProject& project, EditorUi& ui, std::optional<CityGridPoint> cursor) {
     ui.road_preview_cells.clear();
-    if (ui.city_tool != CityTool::Road || !project.city) {
-        return {};
-    }
+    if (!project.city) return {};
     const auto& map = project.city->data;
     const auto unit = project.city_scene_cache_valid ? project.city_scene_cache.unit_size : 4.0F;
+
+    // Dragging a junction (Select tool) previews the move.
+    if (ui.node_drag && ui.node_drag_target && *ui.node_drag < map.intersections.size()) {
+        const auto& node = map.intersections[*ui.node_drag];
+        const auto dx = ui.node_drag_target->x - node.x, dz = ui.node_drag_target->z - node.z;
+        if (dx == 0 && dz == 0) return {};
+        SbcMap moved;
+        moved.version = map.version; moved.intersections = map.intersections; moved.streets = map.streets;
+        if (!move_city_junction(moved, *ui.node_drag, dx, dz)) return "!Move junction: a road would shrink to nothing or turn around.";
+        return draw_road_edit_preview(project, ui, moved, "Move junction by " + std::to_string(dx) + ", " + std::to_string(dz) + " cells");
+    }
+    if (ui.city_tool != CityTool::Road) return {};
     const auto ground = [&](std::int32_t gx, std::int32_t gz, std::int32_t fallback_level) {
         const auto base = project.city_scene_cache_valid && project.city_scene_cache.terrain.has_value()
             ? terrain_height_at(*project.city_scene_cache.terrain, static_cast<float>(gx) * unit, static_cast<float>(gz) * unit)
@@ -3185,60 +3664,9 @@ std::string draw_road_lay_preview(const EditorProject& project, EditorUi& ui, st
     DrawSphere(start_pos, unit * 0.8F, Color{120, 230, 130, 235});
     if (!cursor.has_value()) return {};
 
-    // Lay the road on a copy of the map with the Road tool's own code, then draw the
-    // tiles the city build places for every road it adds or changes (a road it starts
-    // on, ends on, or crosses is split there).
-    auto map_copy = map;
-    const bool auto_generated = project_is_auto_generated(project);
-    lay_city_road(map_copy, start, *cursor, ui.new_road_width, auto_generated);
-    const auto ends = [](const SbcMap& m, const SbcStreet& street) {
-        if (street.from_intersection < 0 || street.to_intersection < 0 ||
-            static_cast<std::size_t>(std::max(street.from_intersection, street.to_intersection)) >= m.intersections.size()) {
-            return std::array<std::int32_t, 8>{};
-        }
-        const auto& a = m.intersections[static_cast<std::size_t>(street.from_intersection)];
-        const auto& b = m.intersections[static_cast<std::size_t>(street.to_intersection)];
-        return std::array<std::int32_t, 8>{a.x, a.y, a.z, b.x, b.y, b.z, street.left_width, street.right_width};
-    };
-    std::set<std::array<std::int32_t, 8>> unchanged;
-    for (const auto& street : map.streets) unchanged.insert(ends(map, street));
-    std::vector<StreetPreview> previews;
-    for (std::size_t i = 0; i < map_copy.streets.size(); ++i) {
-        if (!unchanged.contains(ends(map_copy, map_copy.streets[i]))) previews.push_back(preview_city_street(map_copy, i, auto_generated));
-    }
-    if (previews.empty()) return {};
-
-    // The first road the game can't build decides the message; otherwise the longest.
-    const auto in_world = [](const StreetPreview& p) {
-        return std::ranges::all_of(p.cells, [](const CityTileCell& c) { return city_cell_in_game_world(c.x, c.y, c.z); });
-    };
-    const auto bad = std::ranges::find_if(previews, [&](const StreetPreview& p) { return !p.run.slope_ok() || !in_world(p); });
-    const auto& shown = bad != previews.end() ? *bad
-        : *std::ranges::max_element(previews, {}, [](const StreetPreview& p) { return p.run.length; });
-    const bool ok = bad == previews.end();
-    const Color fill = ok ? Color{120, 230, 130, 110} : Color{240, 80, 70, 130};
-    const Color edge = ok ? Color{150, 255, 160, 255} : Color{255, 110, 100, 255};
-    // Curbs are left out so the road surface is easy to see.
-    for (const auto& preview : previews) {
-        ui.road_preview_cells.insert(ui.road_preview_cells.end(), preview.cells.begin(), preview.cells.end());
-    }
-    draw_road_tiles(ui.road_preview_cells, unit, fill, Color{fill.r, fill.g, fill.b, 55}, edge);
-
-    const auto& run = shown.run;
-    const auto climb = std::abs(run.climb);
-    std::string info = "Road " + std::to_string(std::max(0, run.length)) + " cells";
-    if (climb == 0) info += ", flat";
-    else info += ", " + std::string(run.climb > 0 ? "climbs " : "drops ") + std::to_string(climb) + (climb == 1 ? " level" : " levels") +
-        ", " + std::to_string(run.cells_per_level) + " cells per level";
-    if (previews.size() > 1) info += " (" + std::to_string(previews.size()) + " road pieces change)";
-    if (!in_world(shown)) info += "\nOutside the game's map area: the game will not draw this road.";
-    if (!run.slope_ok()) {
-        if (run.length <= 0) info += "\nThe junctions overlap: no room for a road.";
-        else if (run.cells_per_level * climb > run.length) info += "\nThe slope does not fit: the road ends in a step. Lengthen it.";
-        else if (run.cells_per_level < 4) info += "\nToo steep: the game has no slope block for this. Needs " + std::to_string(4 * climb) + "+ cells.";
-        else info += "\nToo shallow: the game has no slope block for this. Keep it under " + std::to_string(13 * climb) + " cells or climb more.";
-    }
-    return (ok ? "+" : "!") + info;
+    // Lay the road on a copy of the map with the Road tool's own code, then preview
+    // what that does to the road tiles.
+    return draw_road_edit_preview(project, ui, prepare_city_road_plan(project, ui, *cursor), {});
 }
 
 struct FocusTarget {
@@ -3355,7 +3783,7 @@ void update_focus_animation(EditorUi& ui, Camera3D& camera) {
     if (!ui.focus_animating) {
         return;
     }
-    ui.focus_t += GetFrameTime() / std::max(ui.focus_duration, 0.01F);
+    ui.focus_t += ui.delta_seconds / std::max(ui.focus_duration, 0.01F);
     const auto raw = std::clamp(ui.focus_t, 0.0F, 1.0F);
     const auto e = raw * raw * (3.0F - 2.0F * raw); // smoothstep
     const auto lerp = [e](Vector3 a, Vector3 b) {
@@ -3518,7 +3946,10 @@ void handle_editor_hotkeys(
         const bool placement_tool = ui.city_tool == CityTool::Road || ui.city_tool == CityTool::Piece ||
             ui.city_tool == CityTool::Building;
         if (placement_tool && (nudge_up || nudge_down)) {
-            ui.place_height_offset = std::clamp(ui.place_height_offset + (nudge_up ? 1 : -1), -32, 32);
+            auto& height = ui.place_height_locked ? ui.place_height_y : ui.place_height_offset;
+            height = std::clamp(height + (nudge_up ? 1 : -1), ui.place_height_locked ? -512 : -32,
+                ui.place_height_locked ? 512 : 32);
+            save_preferences(ui);
             nudge_up = nudge_down = false;
         }
         const bool rotate = !brush_tool && ui.city_selection == CitySelectionKind::Building && action_pressed(ui, EditorAction::RotateSelection);
@@ -3539,11 +3970,27 @@ void handle_editor_hotkeys(
             ui.selected_city_building = ui.selected_city_buildings.back();
             ui.city_selection = CitySelectionKind::Building;
             ui.selected_portals.clear();
+            ui.selected_piece_cells.clear();
+            ui.selected_city_streets.clear();
+            ui.selected_piece_voxel.reset();
         }
         if (action_pressed(ui, EditorAction::DeselectAll)) {
             ui.city_selection = CitySelectionKind::None;
             ui.selected_city_buildings.clear();
             ui.selected_portals.clear();
+            ui.selected_piece_cells.clear();
+            ui.selected_city_streets.clear();
+        }
+        if (erase && (!ui.selected_piece_cells.empty() || !ui.selected_city_streets.empty())) {
+            delete_box_selection(project, ui);
+            return;
+        }
+        const bool box_group = !ui.selected_piece_cells.empty() || !ui.selected_city_streets.empty();
+        if (box_group && (nudge_left || nudge_right || nudge_forward || nudge_back || nudge_up || nudge_down)) {
+            nudge_box_selection(project, ui, static_cast<int>(nudge_right) - static_cast<int>(nudge_left),
+                static_cast<int>(nudge_up) - static_cast<int>(nudge_down),
+                static_cast<int>(nudge_back) - static_cast<int>(nudge_forward), status);
+            return;
         }
         // Edit keys act on the current selection (Select tool), whatever the tool.
         if (ui.city_selection == CitySelectionKind::Building && !project.city->data.buildings.empty()) {
@@ -3560,6 +4007,11 @@ void handle_editor_hotkeys(
                    !project.city->data.streets.empty()) {
             if (nudge_up) nudge_city_junction_level(project, ui, 1);
             if (nudge_down) nudge_city_junction_level(project, ui, -1);
+            if (ui.city_selection == CitySelectionKind::Node && (nudge_left || nudge_right || nudge_forward || nudge_back)) {
+                const auto dx = (nudge_right ? 1 : 0) - (nudge_left ? 1 : 0), dz = (nudge_back ? 1 : 0) - (nudge_forward ? 1 : 0);
+                if (move_city_junction(project.city->data, ui.selected_city_intersection, dx, dz)) ui.city_dirty = true;
+                else status = "can't move the junction there: a road would shrink to nothing or turn around";
+            }
             if (IsKeyPressed(KEY_LEFT_BRACKET)) nudge_city_street_width(project, ui, 0, -1);
             if (IsKeyPressed(KEY_RIGHT_BRACKET)) nudge_city_street_width(project, ui, 0, 1);
             if (IsKeyPressed(KEY_SEMICOLON)) nudge_city_street_width(project, ui, 1, -1);
@@ -3676,7 +4128,8 @@ void draw_viewport_context_menu(EditorProject& project, EditorUi& ui, Camera3D& 
                     }
                     if (ImGui::MenuItem(ICON_FA_TRASH " Delete", shortcut(EditorAction::DeleteSelection).c_str())) {
                         begin_city_action(project, ui, "delete building");
-                        delete_city_building(project, ui);
+                        if (!ui.selected_piece_cells.empty() || !ui.selected_city_streets.empty()) delete_box_selection(project, ui);
+                        else delete_city_building(project, ui);
                     }
                     ImGui::Separator();
                     bool selected_only = ui.near_lod && ui.interiors_selected_only;
@@ -3698,7 +4151,8 @@ void draw_viewport_context_menu(EditorProject& project, EditorUi& ui, Camera3D& 
                 }
                 if (ImGui::MenuItem(ICON_FA_TRASH " Delete", shortcut(EditorAction::DeleteSelection).c_str())) {
                     begin_city_action(project, ui, "delete road");
-                    delete_city_street(project, ui);
+                    if (!ui.selected_piece_cells.empty() || !ui.selected_city_streets.empty()) delete_box_selection(project, ui);
+                    else delete_city_street(project, ui);
                 }
                 break;
             case CitySelectionKind::Node:
@@ -3718,7 +4172,8 @@ void draw_viewport_context_menu(EditorProject& project, EditorUi& ui, Camera3D& 
                 if (ImGui::MenuItem(ICON_FA_CROSSHAIRS " Frame", shortcut(EditorAction::FocusSelection).c_str())) focus_current_selection(project, ui, camera);
                 if (ImGui::MenuItem(ICON_FA_TRASH " Delete", shortcut(EditorAction::DeleteSelection).c_str())) {
                     begin_city_action(project, ui, "delete piece");
-                    delete_selected_city_piece(project, ui);
+                    if (!ui.selected_piece_cells.empty() || !ui.selected_city_streets.empty()) delete_box_selection(project, ui);
+                    else delete_selected_city_piece(project, ui);
                 }
                 break;
             case CitySelectionKind::None:
@@ -3938,7 +4393,7 @@ std::vector<BackgroundJob> background_jobs(const EditorProject& project, bool ci
         if (project.city_scene_build_in_progress) {
             jobs.push_back({"Rebuilding roads and terrain"});
         } else if (city_view && project.city_scene_cache_valid &&
-                   project.city_scene_cache_fingerprint != project.city_scene_current_fingerprint) {
+                   (!project.city_scene_cache_complete || project.city_scene_cache_fingerprint != project.city_scene_current_fingerprint)) {
             jobs.push_back({project.defer_heavy_rebuilds ? "Roads and terrain: rebuild after this edit"
                                                          : "Roads and terrain: rebuild queued"});
         } else if (city_view && project.city_scene_cache_valid && !project.city_scene_gpu_valid) {
@@ -3950,6 +4405,11 @@ std::vector<BackgroundJob> background_jobs(const EditorProject& project, bool ci
             jobs.push_back({"Rebuilding pieces"});
         } else if (city_view && project.portal_render_dirty) {
             jobs.push_back({project.defer_heavy_rebuilds ? "Pieces: rebuild after this edit" : "Pieces: rebuild queued"});
+        }
+        if (project.placement_override_build_future) jobs.push_back({"Rebuilding overlapping buildings"});
+        if (!project.placement_override_uploads.empty()) {
+            jobs.push_back({"Uploading overlapping buildings", ratio(project.placement_override_upload_cursor,
+                project.placement_override_uploads.size())});
         }
     }
     if (project.pregenerating) {
@@ -4039,7 +4499,7 @@ int run_editor_app() {
     std::string notified_action;
 
     RenderTexture2D viewport_texture = load_game_render_texture(1280, 800);
-    RenderTexture2D building_outline_mask_texture = LoadRenderTexture(1280, 800);
+    RenderTexture2D building_outline_mask_texture = LoadRenderTexture(640, 400);
     Vector2 last_viewport_size = { 1280, 800 };
 
     GfxDebugStats gfx_debug_stats;
@@ -4053,6 +4513,10 @@ int run_editor_app() {
     bool open_unsaved_prompt = false;
     bool unsaved_prompt_for_open = false;
     bool open_project_approved = false;
+    bool finish_open_after_save = false;
+    bool finish_close_after_save = false;
+    bool finish_close_after_archive = false;
+    bool close_after_file_jobs = false;
     std::optional<EditorProject> project_to_open;
 
     // Opening or dropping a map queues it to replace the current one. On desktop,
@@ -4060,6 +4524,8 @@ int run_editor_app() {
     // current project stays here until the new one is fully loaded and unsaved edits
     // are dealt with.
     std::optional<std::filesystem::path> pending_load_folder;
+    std::optional<std::filesystem::path> load_choice_folder;
+    bool load_choice_approved = false;
 #ifndef __EMSCRIPTEN__
     std::optional<std::future<std::pair<std::optional<EditorProject>, std::string>>> load_future;
     auto load_stage = std::make_shared<std::atomic<int>>(0);
@@ -4095,6 +4561,8 @@ int run_editor_app() {
 #endif
     if (const char* env = std::getenv("PAFTA_AUTOLOAD")) {
         pending_load_folder = std::filesystem::path{env};
+        ui.controls_chosen = true;
+        load_choice_approved = true;
     }
 #ifdef __EMSCRIPTEN__
 #ifdef PAFTA_WEB_PRELOAD_ROOT
@@ -4129,13 +4597,19 @@ int run_editor_app() {
 #endif
     // How many more frames to redraw the 3D view after the last change (see redraw_3d).
     int redraw_frames = 60;
+    auto previous_update_time = std::chrono::steady_clock::now();
     while (running) {
+        const auto update_time = std::chrono::steady_clock::now();
+        ui.delta_seconds = std::clamp(std::chrono::duration<float>(update_time - previous_update_time).count(), 0.0F, 0.1F);
+        previous_update_time = update_time;
         PAFTA_PROFILE_BLOCK("editor frame");
         gfx_debug_stats.reset_frame();
-        gfx_debug_stats.push_frame_time(GetFrameTime() * 1000.0F);
+        gfx_debug_stats.push_frame_time(GetFrameTime() * 1000.0F, GetTime());
         gfx_debug_stats.add_phase_ms(GfxDebugTimingPhase::TotalFrame, GetFrameTime() * 1000.0);
         g_gfx_debug_stats = &gfx_debug_stats;
         g_render_settings.building_distance = ui.building_distance;
+        if (g_render_settings.terrain_distance != ui.terrain_distance) invalidate_environment_cubemap();
+        g_render_settings.terrain_distance = ui.terrain_distance;
         g_render_settings.half_textures = ui.half_textures;
         g_render_settings.near_lod = ui.near_lod;
         // Selected-only interiors: the placements whose rooms are drawn at any distance.
@@ -4180,6 +4654,7 @@ int run_editor_app() {
         // NewFrame works out the current mouse and capture state from the last layout,
         // before camera movement and editing use it.
         rlImGuiBegin();
+        draw_controls_setup(ui);
 
         // The OS close button and Alt+F4 trigger WindowShouldClose(). Send that through the
         // same check as the Exit menu instead of quitting right away.
@@ -4193,6 +4668,7 @@ int run_editor_app() {
         // Tab switches asked for by the tab bar, shortcuts, or tool windows.
         if (ui.requested_tab.has_value()) {
             const auto next = *ui.requested_tab;
+            if (project && next == EditorTab::Blocks && ui.tab == EditorTab::City) select_city_piece_mesh(*project, ui);
             ui.requested_tab.reset();
             if (next != ui.tab) {
                 // Each mode keeps its own camera, so switching back returns to where
@@ -4222,17 +4698,45 @@ int run_editor_app() {
             }
         }
         if (project) {
+            service_project_file_jobs(*project, ui, status);
             project->thumbnail_budget = 2;
+        }
+        service_archive_file_jobs(archive_workspace);
+        const bool file_jobs_pending = (project && project_file_jobs_pending(*project)) || archive_file_jobs_pending(archive_workspace);
+        if (close_after_file_jobs && !file_jobs_pending
+#ifndef __EMSCRIPTEN__
+            && !mesh_export_task
+#endif
+        ) {
+            close_after_file_jobs = false;
+            close_requested = true;
+        }
+        if (finish_close_after_archive && !archive_file_jobs_pending(archive_workspace)) {
+            finish_close_after_archive = false;
+            if (!archive_workspace.dirty) close_requested = true;
+            else open_archive_close_prompt = true;
+        }
+        if ((finish_open_after_save || finish_close_after_save) && project && !project_file_jobs_pending(*project)) {
+            if (!has_unsaved_changes(ui)) {
+                if (finish_open_after_save) open_project_approved = true;
+                if (finish_close_after_save) close_requested = true;
+            } else {
+                unsaved_prompt_for_open = finish_open_after_save;
+                open_unsaved_prompt = true;
+            }
+            finish_open_after_save = finish_close_after_save = false;
         }
 
         if (auto folder = dropped_folder()) {
             pending_load_folder = std::move(*folder);
+            load_choice_approved = false;
         }
 #ifdef __EMSCRIPTEN__
         if (g_web_uploaded_folder.has_value()) {
             if (pending_load_folder) release_web_project(*pending_load_folder);
             pending_load_folder = std::move(g_web_uploaded_folder);
             g_web_uploaded_folder.reset();
+            load_choice_approved = false;
         }
 #endif
 
@@ -4242,7 +4746,26 @@ int run_editor_app() {
         static Vector2 viewport_origin = {0, 0};
         static bool is_viewport_hovered = false;
         const auto* scene_window = ImGui::FindWindowByName("##SceneCanvas");
-        is_viewport_hovered = scene_window != nullptr && ImGui::GetCurrentContext()->HoveredWindow == scene_window;
+        is_viewport_hovered = ui.controls_chosen && scene_window != nullptr &&
+            ImGui::GetCurrentContext()->HoveredWindow == scene_window &&
+            !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId);
+        // The window that receives a press owns the entire drag, even if the
+        // pointer moves across the viewport or another panel before release.
+        static bool viewport_pointer_owned = false;
+        const bool pointer_pressed = IsMouseButtonPressed(MOUSE_BUTTON_LEFT) ||
+            IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) || IsMouseButtonPressed(MOUSE_BUTTON_MIDDLE);
+        if (pointer_pressed) viewport_pointer_owned = is_viewport_hovered;
+        const bool pointer_held = IsMouseButtonDown(MOUSE_BUTTON_LEFT) ||
+            IsMouseButtonDown(MOUSE_BUTTON_RIGHT) || IsMouseButtonDown(MOUSE_BUTTON_MIDDLE);
+        if (pointer_held && !viewport_pointer_owned) is_viewport_hovered = false;
+        // A click in the viewport hands the keyboard back from a text field.
+        // NewFrame's capture flags still describe the field until the next frame.
+        if (is_viewport_hovered && pointer_pressed) {
+            ImGui::ClearActiveID();
+            ImGui::FocusWindow(const_cast<ImGuiWindow*>(scene_window));
+            io.WantCaptureKeyboard = false;
+            io.WantTextInput = false;
+        }
         viewport_mouse_pos = get_viewport_mouse_position(viewport_origin, last_viewport_size);
         const bool show_3d_viewport = true;
 
@@ -4261,7 +4784,7 @@ int run_editor_app() {
         }
         if (IsCursorHidden()) {
             right_click_moved += Vector2Length(GetMouseDelta());
-            const auto fly = read_fly_input();
+            const auto fly = read_fly_input(ui);
             if (fly.forward || fly.back || fly.left || fly.right || fly.up || fly.down) right_click_moved += 100.0F;
         }
         if (IsMouseButtonReleased(MOUSE_BUTTON_RIGHT) && IsCursorHidden()) {
@@ -4272,9 +4795,11 @@ int run_editor_app() {
             ui.view_snap_active = false;
             // Flying by hand cancels any focus glide so the two never fight. While flying,
             // the wheel sets the flying speed; otherwise it zooms.
-            ui.camera_fly_speed = adjust_camera_fly_speed(ui.camera_fly_speed, GetMouseWheelMove());
+            const auto previous_speed = camera_fly_speed(ui);
+            camera_fly_speed(ui) = adjust_camera_fly_speed(previous_speed, GetMouseWheelMoveV().y);
+            if (camera_fly_speed(ui) != previous_speed) save_preferences(ui);
             ui.focus_animating = false;
-            update_free_fly_camera(camera, ui.camera_fly_speed, read_fly_input());
+            update_free_fly_camera(camera, camera_fly_speed(ui), read_fly_input(ui), ui.delta_seconds);
         } else {
             const MapScene* pivot_scene = project && ui.tab == EditorTab::City ? &project->city_scene_cache : nullptr;
             update_orbit_camera(camera, ui, viewport_mouse_pos, last_viewport_size, is_viewport_hovered, pivot_scene);
@@ -4308,18 +4833,18 @@ int run_editor_app() {
                 camera.position = Vector3Add(camera.position, flown);
                 camera.target = Vector3Add(camera.target, flown);
                 const auto before = camera.position;
-                update_free_fly_camera(camera, ui.camera_fly_speed, input);
+                update_free_fly_camera(camera, camera_fly_speed(ui), input, ui.delta_seconds);
                 flown = Vector3Add(flown, Vector3Subtract(camera.position, before));
-                fly_seconds += GetFrameTime();
+                fly_seconds += ui.delta_seconds;
                 const auto f = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
                 std::printf("fly: moved %.2f,%.2f,%.2f |%.2f| in %.3fs at speed %.1f forward %.3f,%.3f,%.3f\n",
-                    flown.x, flown.y, flown.z, Vector3Length(flown), fly_seconds, ui.camera_fly_speed, f.x, f.y, f.z);
+                    flown.x, flown.y, flown.z, Vector3Length(flown), fly_seconds, camera_fly_speed(ui), f.x, f.y, f.z);
             }
         }
 
         if (project) {
             project->defer_heavy_rebuilds = IsMouseButtonDown(MOUSE_BUTTON_LEFT) || ui.gizmo_active != GizmoAxis::None;
-commit_pending_edits(*project, ui);
+            commit_pending_edits(*project, ui);
         }
 #ifdef __EMSCRIPTEN__
         {
@@ -4350,21 +4875,32 @@ commit_pending_edits(*project, ui);
         std::optional<SbcBuilding> ghost_building;
         // Size in pixels of the 3D render target (the panel size times the render scale).
         const Vector2 render_size{static_cast<float>(viewport_texture.texture.width), static_cast<float>(viewport_texture.texture.height)};
+        // The GL context is current throughout this frame. Service CPU results and
+        // bounded uploads even when the active mode has no 3D viewport.
+        if (project) {
+            GfxDebugScopedTimer timer{gfx_debug_stats, GfxDebugTimingPhase::SceneRenderBufferBuild};
+            service_render_rebuild(*project);
+        }
         // When idle, a view that hasn't changed keeps its last frame instead of being
         // redrawn. Any input, background work, or map change since the last scene build
         // keeps it redrawing, and so does a short wait after them.
         {
-            bool input = GetMouseDelta().x != 0.0F || GetMouseDelta().y != 0.0F || GetMouseWheelMove() != 0.0F ||
+            bool input = GetMouseDelta().x != 0.0F || GetMouseDelta().y != 0.0F || (GetMouseWheelMoveV().x != 0.0F || GetMouseWheelMoveV().y != 0.0F) ||
                 IsMouseButtonDown(MOUSE_BUTTON_LEFT) || IsMouseButtonDown(MOUSE_BUTTON_RIGHT) || IsMouseButtonDown(MOUSE_BUTTON_MIDDLE) ||
                 IsWindowResized();
             for (int key = KEY_SPACE; key <= KEY_KB_MENU && !input; ++key) input = IsKeyDown(key);
             bool working = project && (project->render_build_in_progress || !project->pending_gpu_upload_indices.empty() ||
                 project->city_scene_build_in_progress || !project->city_scene_gpu_valid ||
                 project->city_scene_current_fingerprint != project->city_scene_cache_fingerprint ||
-                !project->building_near_jobs.empty() || project->portal_rebuild_future.has_value() || !ui.road_ghost.empty());
+                !project->building_near_jobs.empty() || project->portal_rebuild_future.has_value() ||
+                project->city_roads_build_future.has_value() || project->placement_override_build_future.has_value() ||
+                !project->placement_override_uploads.empty() || !project->pending_roads.tiles.empty());
+            working = working || (project && ui.tab == EditorTab::City &&
+                (!project->city_scene_cache_complete || project->city_scene_terrain_fingerprint != project->city_scene_current_fingerprint));
 #ifndef __EMSCRIPTEN__
             working = working || load_future.has_value() || mesh_export_task.has_value();
 #endif
+            working = working || (project && project_file_jobs_pending(*project)) || archive_file_jobs_pending(archive_workspace);
             if (input || working || bench_frames > 0 || screenshot_path.has_value()) redraw_frames = 60;
 #ifndef __EMSCRIPTEN__
             // Settled and nothing running: sleep until the next input event instead of
@@ -4400,10 +4936,6 @@ commit_pending_edits(*project, ui);
             {
                 GfxDebugScopedTimer draw_3d_timer{gfx_debug_stats, GfxDebugTimingPhase::Draw3D};
                 if (project) {
-                    {
-                        GfxDebugScopedTimer timer{gfx_debug_stats, GfxDebugTimingPhase::SceneRenderBufferBuild};
-service_render_rebuild(*project);
-                    }
                     if (ui.tab == EditorTab::City && project->city) {
                         const auto* selected_building = project->city->data.buildings.empty()
                             ? nullptr
@@ -4414,6 +4946,13 @@ service_render_rebuild(*project);
                         }
                         const auto scene_fingerprint = city_scene_fingerprint(project->city->data, project->city_building_revision);
                         project->city_scene_current_fingerprint = scene_fingerprint;
+                        // Hide erased or changed road cells on this frame. A small
+                        // road-only worker supplies additions without waiting for land.
+                        update_city_road_visibility(*project);
+                        if ((!project->city_scene_cache_valid || project->city_scene_cache_fingerprint != scene_fingerprint) &&
+                            !project->city_roads_build_future.has_value()) {
+                            start_city_scene_rebuild(*project, scene_fingerprint, true);
+                        }
                         // Any change to a building, road, or piece changes the fingerprint, and a
                         // rebuild remakes the whole city's roads and terrain. Wait for the
                         // gesture to end and the map to stay still for a moment, so a drag or a
@@ -4426,12 +4965,22 @@ service_render_rebuild(*project);
                         }
                         const bool scene_settled = !project->defer_heavy_rebuilds && GetTime() - pending_since > 0.2;
                         if ((!project->city_scene_cache_valid ||
-                             (project->city_scene_cache_fingerprint != scene_fingerprint && scene_settled)) &&
+                             ((!project->city_scene_cache_complete || project->city_scene_terrain_fingerprint != scene_fingerprint) && scene_settled)) &&
                                    !project->city_scene_build_in_progress) {
                             // The map changed: rebuild the scene (roads, terrain, and
                             // footprint stamps) on a worker thread. The last good scene
                             // keeps drawing until the new one is ready.
-start_city_scene_rebuild(*project, scene_fingerprint);
+                            start_city_scene_rebuild(*project, scene_fingerprint);
+                        }
+
+                        if (project->city_roads_build_future.has_value() &&
+                            project->city_roads_build_future->wait_for(std::chrono::milliseconds{0}) == std::future_status::ready) {
+                            auto built = project->city_roads_build_future->get();
+                            project->city_roads_build_future.reset();
+                            if (adopt_city_scene_result(*project, std::move(built), project->city_roads_build_target_fingerprint, false)) {
+                                project->pending_roads = {};
+                                project->road_edit_preview.key = 0;
+                            }
                         }
 
                         // Use a finished background rebuild if it still matches the
@@ -4442,12 +4991,9 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                             auto built = project->city_scene_build_future->get();
                             project->city_scene_build_future.reset();
                             project->city_scene_build_in_progress = false;
-                            if (project->city_scene_build_target_fingerprint == scene_fingerprint) {
-                                project->city_scene_cache = std::move(built);
-                                ui.road_ghost.clear();
-                                project->city_scene_cache_fingerprint = scene_fingerprint;
-                                project->city_scene_cache_valid = true;
-                                project->city_scene_gpu_valid = false;
+                            if (adopt_city_scene_result(*project, std::move(built), project->city_scene_build_target_fingerprint, true)) {
+                                project->pending_roads = {};
+                                project->road_edit_preview.key = 0;
                             }
                         }
                         if (project->city_scene_cache_valid && !project->city_scene_gpu_valid) {
@@ -4456,17 +5002,22 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                             // and the heavy terrain mesh when its inputs
                             // (intersections, buildings, pieces) changed.
                             PAFTA_PROFILE_BLOCK("upload city scene gpu models");
-                            if (project->city_tile_gpu_fingerprint != project->city_scene_cache.city_tile_fingerprint) {
+                            const bool road_shadows_ready = !project->city_scene_cache.city_tile_buffer.shadow_vertices.empty();
+                            if (project->city_tile_gpu_fingerprint != project->city_scene_cache.city_tile_fingerprint ||
+                                (!project->city_tile_gpu_shadows_valid && road_shadows_ready) || project->city_road_cells_filtered) {
                                 unload_city_render_model(project->city_tile_gpu_model);
                                 project->city_tile_gpu_model =
-                                    upload_city_tile_model(project->city_scene_cache.city_tile_buffer, *project);
+                                    upload_city_tile_model(project->city_scene_cache.city_tile_buffer, *project, road_shadows_ready);
                                 release_shadow_volume(project->city_scene_cache.city_tile_buffer);
-                                release_free_memory();
                                 project->city_tile_gpu_fingerprint = project->city_scene_cache.city_tile_fingerprint;
+                                project->city_tile_gpu_shadows_valid = road_shadows_ready;
+                                project->city_road_cells_filtered = false;
+                                project->city_road_visibility_fingerprint = scene_fingerprint;
                             }
 
                             const auto terrain_fp = city_terrain_fingerprint(project->city->data, project->city_building_revision);
-                            if (!project->terrain_gpu_valid || terrain_fp != project->terrain_gpu_fingerprint) {
+                            if (project->city_scene_terrain_fingerprint == scene_fingerprint &&
+                                (!project->terrain_gpu_valid || terrain_fp != project->terrain_gpu_fingerprint)) {
                                 unload_city_render_model(project->terrain_gpu_model);
                                 if (project->city_scene_cache.terrain.has_value()) {
                                     project->terrain_gpu_model =
@@ -4554,8 +5105,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                         // below, and Select and Erase use the hover pick instead.
                         const auto needs_city_cursor = ui.city_tool == CityTool::Road || ui.city_tool == CityTool::Building;
                         const std::optional<CityGridPoint> city_cursor = needs_city_cursor
-                            ? raised(city_surface_point_under_mouse(*project, camera, viewport_mouse_pos, last_viewport_size),
-                                ui.place_height_offset)
+                            ? city_placement_point_under_mouse(*project, ui, camera, viewport_mouse_pos, last_viewport_size, false)
                             : std::nullopt;
                         // Glow for selected or hovered nodes (roads get the outline instead).
 
@@ -4577,21 +5127,18 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                             draw_city_edit_grid(*city_cursor, city_scene, Color{235, 190, 78, 255}, false);
                         }
                         if (ui.city_tool == CityTool::Piece) {
-                            if (const auto cell = raised(city_surface_cell_under_mouse(*project, camera, viewport_mouse_pos, last_viewport_size),
-                                    ui.place_height_offset)) {
-                                const auto& mesh = project->blocks.empty() || ui.place_piece_solid
-                                    ? solid_piece_mesh()
-                                    : project->blocks[std::min(ui.place_piece_mesh, project->blocks.size() - 1U)].data;
+                            if (const auto cell = city_placement_point_under_mouse(*project, ui, camera, viewport_mouse_pos, last_viewport_size, true)) {
                                 // The piece as it will look: its mesh with the brush's textures.
-                                draw_block_mesh_textured(*project, mesh, ui.place_piece_textures,
+                                draw_piece_preview(*project, piece_brush_mesh_name(*project, ui), ui.place_piece_textures,
                                     {cell->x * city_scene.unit_size, cell->y * city_scene.unit_size + 0.25F, cell->z * city_scene.unit_size},
-                                    city_scene.unit_size, static_cast<std::int32_t>(ui.selected_piece_rotation & 3U), 210);
+                                    static_cast<std::int32_t>(ui.selected_piece_rotation & 3U));
                                 draw_piece_ghost(nullptr, *cell, static_cast<std::int32_t>(ui.selected_piece_rotation & 3U));
                                 draw_city_edit_grid(*cell, city_scene, Color{91, 166, 206, 255}, true);
                             }
                         }
                         ui.road_preview_info = draw_road_lay_preview(*project, ui, city_cursor);
-                        draw_road_tiles(ui.road_ghost, city_scene.unit_size, Color{220, 220, 225, 120}, Color{220, 220, 225, 60}, Color{235, 235, 240, 200});
+                        if (project->pending_roads.fingerprint != road_edit_hash(project->city->data)) project->pending_roads = {};
+                        if (ui.road_preview_info.empty()) draw_road_preview_model(project->pending_roads.model);
 
                     } else if (ui.tab == EditorTab::Buildings && !project->buildings.empty()) {
                         ui.selected_building = std::min(ui.selected_building, project->buildings.size() - 1U);
@@ -4690,7 +5237,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
 
             if (project && ui.tab == EditorTab::City && project->city) {
                 // Outline every selected building (the whole multi-selection).
-                if (ui.city_selection == CitySelectionKind::Building) {
+                if (ui.city_selection == CitySelectionKind::Building || !ui.selected_city_buildings.empty()) {
                     if (ui.selected_city_buildings.size() > 1U) {
                         // One mask pass for the whole multi-selection, then one
                         // outline pass, instead of a full mask and outline for every
@@ -4716,11 +5263,14 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                             ui.placement_conflict.empty() ? Color{235, 190, 78, 255} : Color{230, 70, 60, 255});
                     }
                 }
-                // Road outline: the selected road (if a road is selected) and the
-                // hover, with the same outline look as buildings.
-                if (ui.city_selection == CitySelectionKind::Road && !project->city->data.streets.empty()) {
-                    const auto sel = std::min(ui.selected_city_street, project->city->data.streets.size() - 1U);
-                    composite_outline([&] { draw_city_road_mask(*project, project->city_scene_cache, sel); }, select_tint);
+                if (!ui.selected_city_streets.empty()) {
+                    composite_outline([&] {
+                        for (const auto street : ui.selected_city_streets)
+                            draw_city_road_mask(*project, project->city_scene_cache, street);
+                    }, select_tint);
+                } else if (ui.city_selection == CitySelectionKind::Road && !project->city->data.streets.empty()) {
+                    composite_outline([&] { draw_city_road_mask(*project, project->city_scene_cache,
+                        std::min(ui.selected_city_street, project->city->data.streets.size() - 1U)); }, select_tint);
                 }
                 if (ui.hover_city_street.has_value()) {
                     const auto h = *ui.hover_city_street;
@@ -4738,7 +5288,11 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     const auto h = *ui.hover_city_intersection;
                     composite_outline([&] { draw_city_intersection_mask(project->city_scene_cache, h); }, hover_tint);
                 }
-                if (ui.city_selection == CitySelectionKind::Piece && ui.selected_piece_voxel.has_value()) {
+                if (!ui.selected_piece_cells.empty()) {
+                    composite_outline([&] {
+                        for (const auto& cell : ui.selected_piece_cells) draw_city_piece_mask(*project, cell);
+                    }, select_tint);
+                } else if (ui.city_selection == CitySelectionKind::Piece && ui.selected_piece_voxel.has_value()) {
                     const auto cell = *ui.selected_piece_voxel;
                     composite_outline([&] { draw_city_piece_mask(*project, cell); }, select_tint);
                 }
@@ -4842,6 +5396,12 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                                 ui.gizmo_start_buildings.emplace_back(index, project->city->data.buildings[index]);
                         if (std::none_of(ui.gizmo_start_buildings.begin(), ui.gizmo_start_buildings.end(), [&](const auto& saved) { return saved.first == ui.selected_city_building; }))
                             ui.gizmo_start_buildings.emplace_back(ui.selected_city_building, placement);
+                    } else if (clicked.kind == CitySelectionKind::Node && !IsKeyDown(KEY_LEFT_SHIFT) && !IsKeyDown(KEY_LEFT_CONTROL)) {
+                        // Grabbing a junction selects it and starts dragging it.
+                        select_city_thing(*project, ui, clicked, false, ray_origin, ray_dir, status);
+                        ui.node_drag = clicked.index;
+                        ui.node_drag_mouse = viewport_mouse_pos;
+                        ui.node_drag_target.reset();
                     } else {
                         // Maybe start a box select. On release we decide: a tiny drag
                         // counts as a single click (pick what is under the cursor), and a
@@ -4855,8 +5415,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     ui.place_click_start = viewport_mouse_pos;
                 } else if (ui.city_tool == CityTool::Piece) {
                     // Starts the drag stroke, which stays on this cell's layer.
-                    if (const auto cell = raised(city_surface_cell_under_mouse(*project, camera, viewport_mouse_pos, last_viewport_size),
-                            ui.place_height_offset)) {
+                    if (const auto cell = city_placement_point_under_mouse(*project, ui, camera, viewport_mouse_pos, last_viewport_size, true)) {
                         set_city_piece_voxel(*project, ui, *cell);
                         ui.drag_stamp_cell = *cell;
                     }
@@ -4962,14 +5521,50 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             }
         }
 
+        // Junction drag (Select tool): the cursor on the junction's level sets where it
+        // goes, the road preview shows the result, and letting go applies it. Esc cancels.
+        if (ui.node_drag && project && project->city) {
+            auto& map = project->city->data;
+            if (*ui.node_drag >= map.intersections.size() || IsKeyPressed(KEY_ESCAPE)) {
+                ui.node_drag.reset();
+                ui.node_drag_target.reset();
+            } else if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                if (ui.node_drag_target || Vector2Distance(viewport_mouse_pos, ui.node_drag_mouse) > 4.0F) {
+                    const auto& node = map.intersections[*ui.node_drag];
+                    const float unit = project->city_scene_cache_valid ? project->city_scene_cache.unit_size : 4.0F;
+                    const auto ray = get_viewport_mouse_ray(camera, viewport_mouse_pos, last_viewport_size);
+                    if (const auto hit = ray_horizontal_plane_hit({ray.position.x, ray.position.y, ray.position.z},
+                            {ray.direction.x, ray.direction.y, ray.direction.z}, static_cast<float>(node.y + 1) * unit)) {
+                        ui.node_drag_target = CityGridPoint{static_cast<std::int32_t>(std::lround(hit->x / unit)), node.y,
+                            static_cast<std::int32_t>(std::lround(hit->z / unit))};
+                    }
+                }
+            } else {
+                if (ui.node_drag_target) {
+                    const auto& node = map.intersections[*ui.node_drag];
+                    const auto dx = ui.node_drag_target->x - node.x, dz = ui.node_drag_target->z - node.z;
+                    if (dx != 0 || dz != 0) {
+                        begin_city_action(*project, ui, "move junction");
+                        if (move_city_junction(map, *ui.node_drag, dx, dz)) {
+                            invalidate_portal_render_models(*project);
+                            ui.city_dirty = true;
+                        } else {
+                            status = "can't move the junction there: a road would shrink to nothing or turn around";
+                        }
+                    }
+                }
+                ui.node_drag.reset();
+                ui.node_drag_target.reset();
+            }
+        }
+
         // Building and Road placement happen on release, and only if the cursor
         // stayed still. Dragging away from a misclick cancels it.
         if (ui.place_click_pending && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
             ui.place_click_pending = false;
             if (show_3d_viewport && project && project->city && ui.tab == EditorTab::City && is_viewport_hovered &&
                 !IsCursorHidden() && Vector2Distance(viewport_mouse_pos, ui.place_click_start) < 6.0F) {
-                const auto city_cursor = raised(city_surface_point_under_mouse(*project, camera, viewport_mouse_pos, last_viewport_size),
-                    ui.place_height_offset);
+                const auto city_cursor = city_placement_point_under_mouse(*project, ui, camera, viewport_mouse_pos, last_viewport_size, false);
                 if (ui.city_tool == CityTool::Building) {
                     // Place the chosen building template at the cursor.
                     if (city_cursor.has_value()) {
@@ -4977,23 +5572,10 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                         place_city_building_from_template(*project, ui, *city_cursor);
                     }
                 } else if (ui.city_tool == CityTool::Road) {
-                    // Carry on from an existing node when the ray hits one, otherwise
-                    // lay a segment to the cursor's cell.
-                    const auto pick_ray = get_viewport_mouse_ray(camera, viewport_mouse_pos, last_viewport_size);
-                    const Vec3 ray_origin{pick_ray.position.x, pick_ray.position.y, pick_ray.position.z};
-                    const Vec3 ray_dir{pick_ray.direction.x, pick_ray.direction.y, pick_ray.direction.z};
-                    begin_city_action(*project, ui, "lay road");
-                    const auto picked_node = pick_city_intersection(project->city->data, project->city_scene_cache, ray_origin, ray_dir);
-                    const auto streets_before = project->city->data.streets.size();
-                    if (picked_node.has_value()) {
-                        const auto& node = project->city->data.intersections[*picked_node];
-                        append_city_road_point(*project, ui, {node.x, node.y, node.z});
-                    } else if (city_cursor.has_value()) {
-                        append_city_road_point(*project, ui, *city_cursor);
-                    }
-                    // Show the new road until the rebuilt scene draws it.
-                    if (project->city->data.streets.size() != streets_before) {
-                        ui.road_ghost.insert(ui.road_ghost.end(), ui.road_preview_cells.begin(), ui.road_preview_cells.end());
+                    // Commit the same snapped cursor and prepared road the preview used.
+                    if (city_cursor) {
+                        begin_city_action(*project, ui, "lay road");
+                        if (!commit_prepared_city_road(*project, ui, *city_cursor)) append_city_road_point(*project, ui, *city_cursor);
                     }
                 }
             }
@@ -5044,8 +5626,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 } else if (ui.drag_stamp_cell.has_value()) {
                     // A stroke stays on its first cell's layer, so dragging over the
                     // pieces it just placed doesn't stack new ones on top.
-                    cursor = raised(city_surface_cell_under_mouse(*project, camera, viewport_mouse_pos, last_viewport_size),
-                        ui.place_height_offset);
+                    cursor = city_placement_point_under_mouse(*project, ui, camera, viewport_mouse_pos, last_viewport_size, true);
                     if (cursor.has_value() && cursor->y != ui.drag_stamp_cell->y) cursor.reset();
                 }
                 if (cursor.has_value() && (!ui.drag_stamp_cell.has_value() || !(*ui.drag_stamp_cell == *cursor))) {
@@ -5124,28 +5705,18 @@ start_city_scene_rebuild(*project, scene_fingerprint);
 
 
         if (ImGui::BeginMainMenuBar()) {
-            ImGui::TextDisabled("Pafta v" PAFTA_VERSION);
+            if (ImGui::BeginMenu("Pafta")) {
+                if (ImGui::MenuItem("About Pafta")) ui.show_about_window = true;
+                ImGui::EndMenu();
+            }
             if (ImGui::BeginMenu("File")) {
                 // Made with the shortcut formatter, so macOS shows Cmd.
                 if (ImGui::MenuItem(ICON_FA_FOLDER_OPEN " Open map folder...", shortcut_label(Shortcut{KEY_O, true, false, false}).c_str())) open_folder_requested = true;
-                // Which copy wins when a map has an asset both loose and in test.csx.
-                if (ImGui::BeginMenu(ICON_FA_LAYER_GROUP " When loading, prefer")) {
-                    bool changed = false;
-                    if (ImGui::MenuItem("test.csx archive first", nullptr, !ui.loose_files_win)) { ui.loose_files_win = false; changed = true; }
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Archive copies replace loose files with the same name (what the game does).");
-                    if (ImGui::MenuItem("Loose folders first", nullptr, ui.loose_files_win)) { ui.loose_files_win = true; changed = true; }
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Files in building/, block/, buildblock/, and texture/ replace\narchive copies with the same name.");
-                    if (changed) save_preferences(ui);
-                    if (project) {
-                        ImGui::Separator();
-                        const bool differs = project->loose_files_win != ui.loose_files_win;
-                        if (ImGui::MenuItem(ICON_FA_ROTATE " Reopen this map", nullptr, false, differs)) pending_load_folder = project->root;
-                        if (!differs && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-                            ImGui::SetTooltip("The open map already uses this choice.");
-                        }
-                    }
-                    ImGui::EndMenu();
+                if (ImGui::MenuItem("Ask for load order before opening", nullptr, !ui.remember_load_order)) {
+                    ui.remember_load_order = !ui.remember_load_order;
+                    save_preferences(ui);
                 }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) ImGui::SetTooltip("Ask before loading, or reuse the order chosen in the Open map dialog.");
                 ImGui::Separator();
                 if (ImGui::MenuItem(ICON_FA_FLOPPY_DISK " Save map...", action_shortcut_label(ui, EditorAction::Save).c_str(), false, project.has_value())) save_active_tab(*project, ui, status);
                 ImGui::MenuItem(ICON_FA_BOX_ARCHIVE " CSX archive...", nullptr, &show_csx_editor);
@@ -5171,7 +5742,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 }
 #ifndef __EMSCRIPTEN__
                 // Mesh export and quitting are desktop only; in the browser you close the tab.
-                if (ImGui::MenuItem(ICON_FA_FILE_EXPORT " Export mesh...", nullptr, false, project != std::nullopt)) {
+                if (ImGui::MenuItem(ICON_FA_FILE_EXPORT " Export mesh...", nullptr, false, project.has_value() && !mesh_export_task)) {
                     export_mesh_requested = true;
                 }
                 ImGui::Separator();
@@ -5258,14 +5829,20 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 const bool building_selected = city_edit && ui.city_selection == CitySelectionKind::Building && !project->city->data.buildings.empty();
                 const bool road_selected = city_edit && (ui.city_selection == CitySelectionKind::Road || ui.city_selection == CitySelectionKind::Node) &&
                     !project->city->data.streets.empty();
+                const bool box_selected = city_edit && (!ui.selected_piece_cells.empty() || !ui.selected_city_streets.empty());
+                const bool piece_selected = city_edit && ui.city_selection == CitySelectionKind::Piece && ui.selected_piece_voxel.has_value();
                 ImGui::Separator();
                 if (ImGui::MenuItem(ICON_FA_COPY " Duplicate", action_shortcut_label(ui, EditorAction::DuplicateSelection).c_str(), false, building_selected || road_selected)) {
                     begin_city_action(*project, ui, building_selected ? "duplicate building" : "duplicate road");
                     if (building_selected) duplicate_city_building(*project, ui); else duplicate_city_street(*project, ui);
                 }
-                if (ImGui::MenuItem(ICON_FA_TRASH " Delete", action_shortcut_label(ui, EditorAction::DeleteSelection).c_str(), false, building_selected || road_selected)) {
-                    begin_city_action(*project, ui, building_selected ? "delete building" : "delete road");
-                    if (building_selected) delete_city_building(*project, ui); else delete_city_street(*project, ui);
+                if (ImGui::MenuItem(ICON_FA_TRASH " Delete", action_shortcut_label(ui, EditorAction::DeleteSelection).c_str(), false,
+                        building_selected || road_selected || box_selected || piece_selected)) {
+                    begin_city_action(*project, ui, "delete selection");
+                    if (box_selected) delete_box_selection(*project, ui);
+                    else if (building_selected) delete_city_building(*project, ui);
+                    else if (piece_selected) delete_selected_city_piece(*project, ui);
+                    else delete_city_street(*project, ui);
                 }
                 if (ImGui::MenuItem(ICON_FA_ARROWS_ROTATE " Rotate", action_shortcut_label(ui, EditorAction::RotateSelection).c_str(), false, building_selected)) {
                     begin_city_action(*project, ui, "rotate building");
@@ -5278,10 +5855,18 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     ui.selected_city_building = 0;
                     ui.selected_city_buildings.resize(project->city->data.buildings.size());
                     std::iota(ui.selected_city_buildings.begin(), ui.selected_city_buildings.end(), std::size_t{0});
+                    ui.selected_portals.clear();
+                    ui.selected_piece_cells.clear();
+                    ui.selected_city_streets.clear();
+                    ui.selected_piece_voxel.reset();
                 }
                 if (ImGui::MenuItem(ICON_FA_XMARK " Deselect", nullptr, false, city_edit && ui.city_selection != CitySelectionKind::None)) {
                     ui.city_selection = CitySelectionKind::None;
                     ui.selected_city_buildings.clear();
+                    ui.selected_portals.clear();
+                    ui.selected_piece_cells.clear();
+                    ui.selected_city_streets.clear();
+                    ui.selected_piece_voxel.reset();
                 }
                 ImGui::Separator();
                 if (ImGui::MenuItem(ICON_FA_GEAR " Preferences...", action_shortcut_label(ui, EditorAction::WindowPreferences).c_str())) ui.show_preferences_window = true;
@@ -5414,6 +5999,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             }
         }
         ImGui::End();
+        ImGuiID scene_dock_id = 0;
         {
             const auto* dock_viewport = ImGui::GetMainViewport();
             // A dockspace over the whole work area. The scene canvas sits in the central
@@ -5447,9 +6033,15 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 ImGui::DockBuilderDockWindow("###Shortcuts", right);
                 ImGui::DockBuilderDockWindow("###Preferences", right);
                 ImGui::DockBuilderFinish(dock_id);
+                scene_dock_id = center;
+            } else if (const auto* center = ImGui::DockBuilderGetCentralNode(dock_id)) {
+                scene_dock_id = center->ID;
             }
         }
         if (show_3d_viewport) {
+            // A saved floating canvas can sit behind the dockspace and hide the
+            // entire rendered view. The scene belongs to the current central node.
+            if (scene_dock_id != 0) ImGui::SetNextWindowDockID(scene_dock_id, ImGuiCond_Always);
             constexpr ImGuiWindowFlags scene_flags = ImGuiWindowFlags_NoDecoration |
                 ImGuiWindowFlags_NoScrollWithMouse |
                 ImGuiWindowFlags_NoBringToFrontOnFocus |
@@ -5473,7 +6065,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     unload_game_render_texture(viewport_texture);
                     UnloadRenderTexture(building_outline_mask_texture);
                     viewport_texture = load_game_render_texture(width, height);
-                    building_outline_mask_texture = LoadRenderTexture(width, height);
+                    building_outline_mask_texture = LoadRenderTexture(std::max(1, width / 2), std::max(1, height / 2));
                     last_viewport_size = {static_cast<float>(static_cast<int>(size.x)), static_cast<float>(static_cast<int>(size.y))};
                     last_render_scale = render_scale;
                     last_viewport_resize = GetTime();
@@ -5521,8 +6113,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                             const auto index = *static_cast<const std::size_t*>(payload->Data);
                             const auto image_min = ImGui::GetItemRectMin();
                             const auto mouse = ImGui::GetMousePos();
-                            const auto point = city_surface_point_under_mouse(*project, camera,
-                                {mouse.x - image_min.x, mouse.y - image_min.y}, {size.x, size.y});
+                            const auto point = city_placement_point_under_mouse(*project, ui, camera,
+                                {mouse.x - image_min.x, mouse.y - image_min.y}, {size.x, size.y}, false);
                             if (index < project->buildings.size() && point) {
                                 begin_city_action(*project, ui, "drop building");
                                 ui.place_building_template = index;
@@ -5581,6 +6173,56 @@ start_city_scene_rebuild(*project, scene_fingerprint);
         }
         draw_shortcuts_window(ui);
         draw_preferences_window(ui);
+        if (ui.show_about_window) {
+            ImGui::SetNextWindowSize(ImVec2(420.0F, 0.0F), ImGuiCond_Appearing);
+            if (ImGui::Begin("About Pafta", &ui.show_about_window,
+                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking)) {
+                ImGui::TextUnformatted("Pafta v" PAFTA_VERSION);
+                ImGui::TextUnformatted("Sub Rosa map editor");
+                ImGui::Separator();
+                ImGui::TextUnformatted("Created by noche");
+                if (ImGui::Button("noche on GitHub")) OpenURL("https://github.com/noche-x");
+                ImGui::SameLine();
+                if (ImGui::Button("Pafta repository")) OpenURL("https://github.com/noche-x/pafta");
+                ImGui::TextWrapped("Built with raylib, Dear ImGui, rlImGui, tinygltf, nativefiledialog-extended, Font Awesome and DejaVu Sans Mono.");
+                ImGui::Separator();
+                if (ImGui::CollapsingHeader("Licenses", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::TextUnformatted("Pafta: GPL-2.0-only");
+                    ImGui::TextWrapped("raylib, rlImGui and nativefiledialog-extended: zlib; Dear ImGui and tinygltf: MIT; Font Awesome and DejaVu retain their font licenses.");
+                    if (ImGui::Button("Full third-party notices")) OpenURL("https://github.com/noche-x/pafta/blob/main/THIRD_PARTY_NOTICES.md");
+                }
+                ImGui::TextWrapped("Third-party credits and licenses are included with Pafta.");
+                if (ImGui::Button("Close")) ui.show_about_window = false;
+            }
+            ImGui::End();
+        }
+        if (pending_load_folder && ui.controls_chosen && ui.remember_load_order) load_choice_approved = true;
+        if (pending_load_folder && ui.controls_chosen && !load_choice_folder && !load_choice_approved) {
+            load_choice_folder = std::move(pending_load_folder);
+            pending_load_folder.reset();
+            ImGui::OpenPopup("Open map");
+        }
+        if (load_choice_folder && ImGui::BeginPopupModal("Open map", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("Open %s", load_choice_folder->filename().string().c_str());
+            ImGui::TextUnformatted("If an asset is both in a folder and in test.csx, which copy should win?");
+            if (ImGui::RadioButton("test.csx archive (game load order)", !ui.loose_files_win)) ui.loose_files_win = false;
+            if (ImGui::RadioButton("Loose building, block, buildblock and texture files", ui.loose_files_win)) ui.loose_files_win = true;
+            ImGui::Checkbox("Do not ask again", &ui.remember_load_order);
+            if (ImGui::Button("Open")) {
+                pending_load_folder = std::move(load_choice_folder);
+                load_choice_folder.reset();
+                load_choice_approved = true;
+                save_preferences(ui);
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) {
+                release_web_project(*load_choice_folder);
+                load_choice_folder.reset();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
         // Cleared after every window has drawn, so floating windows reset too.
         ui.reset_layout = false;
 
@@ -5653,6 +6295,11 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             std::chrono::duration<double, std::milli>(imgui_end - imgui_begin).count());
         refresh_gfx_debug_counts(gfx_debug_stats, project.has_value() ? &*project : nullptr);
         gfx_debug_stats.counts.total_scene_triangles = gfx_debug_stats.total_draw().triangles;
+        if (ui.show_graphics_debug && gfx_debug_stats.gpu_memory_refresh_due) {
+            const std::array targets{viewport_texture, building_outline_mask_texture};
+            gfx_debug_stats.gpu_memory = graphics_gpu_memory(project ? &*project : nullptr, ui, targets);
+            gfx_debug_stats.gpu_memory_refresh_due = false;
+        }
         draw_graphics_debug_window(ui.show_graphics_debug, gfx_debug_stats);
 
         if (open_folder_requested) {
@@ -5663,7 +6310,10 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             status = "Choose a Sub Rosa map folder in the browser picker.";
 #else
             try {
-                if (const auto folder = dialog_pick_folder()) pending_load_folder = *folder;
+                if (const auto folder = dialog_pick_folder()) {
+                    pending_load_folder = *folder;
+                    load_choice_approved = false;
+                }
             } catch (const std::exception& error) {
                 report_failure(status, std::string{"Open map failed: "} + error.what());
             }
@@ -5724,28 +6374,29 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             }
 
             ImGui::Spacing();
-            ImGui::SeparatorText("Save to");
-            ImGui::SetNextItemWidth(420.0F);
-            ImGui::InputText("##export_path", export_path_text.data(), export_path_text.size());
-#ifndef __EMSCRIPTEN__
-            ImGui::SameLine();
-            // The native dialog runs after the popup has finished drawing.
-            if (ImGui::Button("Browse...")) export_browse_requested = true;
-#endif
-            ImGui::TextDisabled("A .gltf file; its textures are written next to it.");
-            ImGui::Separator();
-            ImGui::BeginDisabled(export_path_text[0] == '\0');
-            if (ImGui::Button("Export", ImVec2(120, 0))) {
-                run_export_after_popup = true;
-                ImGui::CloseCurrentPopup();
+            if (ImGui::CollapsingHeader("Save to", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::SetNextItemWidth(420.0F);
+                ImGui::InputText("##export_path", export_path_text.data(), export_path_text.size());
+    #ifndef __EMSCRIPTEN__
+                ImGui::SameLine();
+                // The native dialog runs after the popup has finished drawing.
+                if (ImGui::Button("Browse...")) export_browse_requested = true;
+    #endif
+                ImGui::TextDisabled("A .gltf file; its textures are written next to it.");
+                ImGui::Separator();
+                ImGui::BeginDisabled(export_path_text[0] == '\0');
+                if (ImGui::Button("Export", ImVec2(120, 0))) {
+                    run_export_after_popup = true;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
             }
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            if (ImGui::Button("Cancel", ImVec2(120, 0))) {
-                ImGui::CloseCurrentPopup();
             }
-            ImGui::EndPopup();
-        }
 
 #ifndef __EMSCRIPTEN__
         if (export_browse_requested) {
@@ -5783,6 +6434,14 @@ start_city_scene_rebuild(*project, scene_fingerprint);
 
         // Deal with a waiting close request. No unsaved changes: quit now. Unsaved
         // changes: show the save prompt (once) and keep running until the user answers.
+        if (close_requested && ((project && project_file_jobs_pending(*project)) || archive_file_jobs_pending(archive_workspace)
+#ifndef __EMSCRIPTEN__
+            || mesh_export_task.has_value()
+#endif
+        )) {
+            close_after_file_jobs = true;
+            close_requested = false;
+        }
         if (close_requested && archive_workspace.dirty) {
             open_archive_close_prompt = true;
             close_requested = false;
@@ -5796,7 +6455,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             if (ImGui::Button("Save archive")) {
                 try {
                     if (save_archive_workspace(archive_workspace)) {
-                        close_requested = true;
+                        if (archive_file_jobs_pending(archive_workspace)) finish_close_after_archive = true;
+                        else close_requested = true;
                         ImGui::CloseCurrentPopup();
                     }
                 } catch (const std::exception& error) {
@@ -5827,7 +6487,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
         }
         // Keep the current project until its replacement has loaded successfully
         // and the user has dealt with any edits, including ones made while loading.
-        if (project_to_open && !open_project_approved && !ImGui::IsPopupOpen("Unsaved Changes")) {
+        if (project_to_open && !open_project_approved && !finish_open_after_save && !ImGui::IsPopupOpen("Unsaved Changes")) {
             if (project && has_unsaved_changes(ui)) {
                 unsaved_prompt_for_open = true;
                 open_unsaved_prompt = true;
@@ -5848,18 +6508,25 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 if (project) {
                     save_all_dirty(*project, ui, status);
                 }
-                if (!has_unsaved_changes(ui)) {
+                if (project && project_map_save_pending(*project)) {
+                    finish_open_after_save = unsaved_prompt_for_open;
+                    finish_close_after_save = !unsaved_prompt_for_open;
+                    ImGui::CloseCurrentPopup();
+                } else if (!has_unsaved_changes(ui)) {
                     if (unsaved_prompt_for_open) open_project_approved = true;
                     else running = false;
                     ImGui::CloseCurrentPopup();
                 }
             }
             ImGui::SameLine();
+            const bool files_busy = (project && project_file_jobs_pending(*project)) || archive_file_jobs_pending(archive_workspace);
+            ImGui::BeginDisabled(files_busy);
             if (ImGui::Button(unsaved_prompt_for_open ? "Discard & Open" : "Discard & Exit", ImVec2(120, 0))) {
                 if (unsaved_prompt_for_open) open_project_approved = true;
                 else running = false;
                 ImGui::CloseCurrentPopup();
             }
+            ImGui::EndDisabled();
             ImGui::SameLine();
             if (ImGui::Button("Cancel", ImVec2(120, 0))) {
                 if (unsaved_prompt_for_open && project_to_open) {
@@ -5939,7 +6606,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
 
         // Parse the new map without changing the current project. On desktop,
         // workers do the CPU work; textures are uploaded here on the GL thread.
-        if (pending_load_folder && !project_to_open
+        if (pending_load_folder && load_choice_approved && ui.controls_chosen && !project_to_open
 #ifndef __EMSCRIPTEN__
             && !load_future
 #endif
@@ -5947,6 +6614,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             PAFTA_PROFILE_BLOCK("load pending project");
             const auto folder = *pending_load_folder;
             pending_load_folder.reset();
+            load_choice_approved = false;
             try {
 #ifndef __EMSCRIPTEN__
                 load_stage->store(0);
@@ -5993,7 +6661,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
 #endif
         // An export's geometry belongs to the current map, and its texture readbacks
         // must finish on that same map before it is replaced.
-        if (project_to_open && open_project_approved
+        if (project_to_open && open_project_approved && (!project || !project_file_jobs_pending(*project))
 #ifndef __EMSCRIPTEN__
             && !mesh_export_task
 #endif
@@ -6010,6 +6678,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             ui.city_selection = CitySelectionKind::None;
             ui.selected_city_buildings.clear();
             ui.selected_portals.clear();
+            ui.selected_piece_cells.clear();
+            ui.selected_city_streets.clear();
             ui.selected_materials.clear();
             ui.selected_piece_voxel.reset();
             ui.pending_road_start.reset();
