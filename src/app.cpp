@@ -1819,32 +1819,35 @@ std::uint32_t encode_city_piece_word(const EditorUi& ui) {
         (static_cast<std::uint32_t>(ui.selected_piece_rotation & 3U) << 24U);
 }
 
-// The city block with this mesh name (empty means the game's solid "nblock" cube)
-// and one layer of these textures. Added if no record matches.
-std::optional<std::size_t> find_or_add_city_block(SbcMap& map, const std::string& name, const std::array<std::string, 8>& layer) {
-    const auto block = std::ranges::find_if(map.city_blocks, [&](const SbcCityBlock& candidate) {
-        return candidate.name == name && candidate.layers.size() == 1 && candidate.layers[0] == layer;
-    });
-    if (block != map.city_blocks.end()) return static_cast<std::size_t>(block - map.city_blocks.begin());
+// The map's piece (city block and layer) with this mesh name (empty means the game's
+// solid "nblock" cube) and these eight textures. Added if none matches.
+std::optional<std::pair<std::size_t, std::size_t>> find_or_add_city_block(SbcMap& map, const std::string& name,
+    const std::array<std::string, 8>& layer) {
+    for (std::size_t block = 0; block < map.city_blocks.size(); ++block) {
+        const auto& candidate = map.city_blocks[block];
+        if (lower_name(candidate.name) != lower_name(name)) continue;
+        // The word stores the layer in 6 bits as layer + 1.
+        for (std::size_t l = 0; l < std::min<std::size_t>(candidate.layers.size(), 63U); ++l) {
+            if (candidate.layers[l] == layer) return std::pair{block, l};
+        }
+    }
     if (map.city_blocks.size() >= 4096) return std::nullopt;
     map.city_blocks.push_back({map.city_blocks.size(), name, {layer}});
-    return map.city_blocks.size() - 1U;
+    return std::pair{map.city_blocks.size() - 1U, std::size_t{0}};
+}
+
+std::string piece_brush_mesh_name(const EditorProject& project, const EditorUi& ui) {
+    if (ui.place_piece_solid || project.blocks.empty()) return {};
+    return project.blocks[std::min(ui.place_piece_mesh, project.blocks.size() - 1U)].name;
 }
 
 void set_city_piece_voxel(EditorProject& project, EditorUi& ui, CityGridPoint point) {
     if (!project.city || project.city->data.version < 11 || (project.blocks.empty() && !ui.place_piece_solid)) return;
     auto& map = project.city->data;
-    std::string name;
-    if (!ui.place_piece_solid) {
-        ui.place_piece_mesh = std::min(ui.place_piece_mesh, project.blocks.size() - 1);
-        name = project.blocks[ui.place_piece_mesh].name;
-    }
-    std::array<std::string, 8> layer{};
-    if (!project.textures.empty()) layer.fill(project.textures[std::min(ui.place_piece_texture, project.textures.size() - 1)].name);
-    const auto block = find_or_add_city_block(map, name, layer);
+    const auto block = find_or_add_city_block(map, piece_brush_mesh_name(project, ui), ui.place_piece_textures);
     if (!block) return;
-    ui.selected_city_block = *block;
-    ui.selected_city_block_layer = 0;
+    ui.selected_city_block = block->first;
+    ui.selected_city_block_layer = block->second;
     auto& portal = find_or_create_portal(project.city->data, point);
     if (portal.blocks.size() < 0x200) {
         portal.blocks.resize(0x200);
@@ -1866,7 +1869,8 @@ void repaint_city_piece(EditorProject& project, EditorUi& ui, const std::array<s
         status = "the map already has 4096 city blocks";
         return;
     }
-    const auto word = (ui.selected_piece_word & 0x03000000U) | (1U << 16U) | static_cast<std::uint32_t>(*block & 0xfffU);
+    const auto word = (ui.selected_piece_word & 0x03000000U) | (static_cast<std::uint32_t>(block->second + 1U) << 16U) |
+        static_cast<std::uint32_t>(block->first & 0xfffU);
     auto& portal = find_or_create_portal(map, *ui.selected_piece_voxel);
     if (portal.blocks.size() < 0x200) portal.blocks.resize(0x200);
     portal.blocks[local_portal_index(*ui.selected_piece_voxel)] = word;
@@ -2049,6 +2053,13 @@ void mark_block_changed(EditorProject& project, EditorUi& ui, SblBlockMesh& bloc
         project.blocks[i].dirty = true;
         if (i < project.block_bytes.size()) project.block_bytes[i] = write_sbl_block(block);
         if (i < project.block_thumbnail_ready.size()) project.block_thumbnail_ready[i] = false;
+        // Piece previews that use this mesh are drawn again when next shown.
+        const auto prefix = lower_name(project.blocks[i].name) + "|";
+        std::erase_if(project.piece_thumbnails, [&](auto& entry) {
+            if (!entry.first.starts_with(prefix)) return false;
+            if (entry.second.id != 0U) UnloadRenderTexture(entry.second);
+            return true;
+        });
     }
     project.render_buffers_dirty = true;
     // Editing block data makes the cached block mesh catalog out of date.
@@ -3522,6 +3533,18 @@ void handle_editor_hotkeys(
         if (edit_key && ui.city_selection != CitySelectionKind::None) {
             begin_city_action(project, ui, "edit selection");
         }
+        if (action_pressed(ui, EditorAction::SelectAll) && !project.city->data.buildings.empty()) {
+            ui.selected_city_buildings.resize(project.city->data.buildings.size());
+            for (std::size_t i = 0; i < ui.selected_city_buildings.size(); ++i) ui.selected_city_buildings[i] = i;
+            ui.selected_city_building = ui.selected_city_buildings.back();
+            ui.city_selection = CitySelectionKind::Building;
+            ui.selected_portals.clear();
+        }
+        if (action_pressed(ui, EditorAction::DeselectAll)) {
+            ui.city_selection = CitySelectionKind::None;
+            ui.selected_city_buildings.clear();
+            ui.selected_portals.clear();
+        }
         // Edit keys act on the current selection (Select tool), whatever the tool.
         if (ui.city_selection == CitySelectionKind::Building && !project.city->data.buildings.empty()) {
             if (nudge_left) nudge_city_building(project, ui, -1, 0, 0, 0);
@@ -3578,8 +3601,10 @@ void handle_editor_hotkeys(
                 ui.selected_building_cell = (ui.selected_building_cell + 1U) % occupied.size();
             }
         }
-    } else if (ui.tab == EditorTab::Blocks && !project.blocks.empty() && ui.block_element != BlockElementKind::None) {
-        // The selected patch or box: the arrows move it 1/8 of a cell (Shift: a whole cell).
+    } else if (ui.tab == EditorTab::Blocks && !project.blocks.empty()) {
+        if (action_pressed(ui, EditorAction::SelectAll)) block_select_all(project, ui, true);
+        if (action_pressed(ui, EditorAction::DeselectAll)) block_select_all(project, ui, false);
+        // The selected points, patch, or box: the arrows move them 1/8 of a cell (Shift: a whole cell).
         const float step = shift ? 1.0F : 0.125F;
         Vec3f delta{};
         if (action_pressed(ui, EditorAction::NudgeLeft)) delta.x -= step;
@@ -3589,8 +3614,10 @@ void handle_editor_hotkeys(
         if (action_pressed(ui, EditorAction::NudgeUp)) delta.y += step;
         if (action_pressed(ui, EditorAction::NudgeDown)) delta.y -= step;
         if (delta.x != 0.0F || delta.y != 0.0F || delta.z != 0.0F) nudge_block_element(project, ui, delta);
-        if (action_pressed(ui, EditorAction::DuplicateSelection)) duplicate_block_element(project, ui);
-        if (action_pressed(ui, EditorAction::DeleteSelection)) delete_block_element(project, ui);
+        if (ui.block_element != BlockElementKind::None) {
+            if (action_pressed(ui, EditorAction::DuplicateSelection)) duplicate_block_element(project, ui);
+            if (action_pressed(ui, EditorAction::DeleteSelection)) delete_block_element(project, ui);
+        }
     } else if (ui.tab == EditorTab::Buildblocks && !project.buildblocks.empty()) {
         ui.selected_buildblock = std::min(ui.selected_buildblock, project.buildblocks.size() - 1U);
         const auto& buildblock = project.buildblocks[ui.selected_buildblock].data;
@@ -3793,6 +3820,10 @@ void free_project_thumbnails(EditorProject& project) {
         if (rt.id != 0U) UnloadRenderTexture(rt);
     }
     project.item_set_thumbnails.clear();
+    for (auto& [key, rt] : project.piece_thumbnails) {
+        if (rt.id != 0U) UnloadRenderTexture(rt);
+    }
+    project.piece_thumbnails.clear();
     for (auto& rt : project.building_thumbnails) {
         if (rt.id != 0U) {
             UnloadRenderTexture(rt);
@@ -4512,7 +4543,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                             draw_city_piece_voxels(*project, ui.portal_preview_textured, selected_portal);
                         }
                         GfxDebugScopedTimer timer{gfx_debug_stats, GfxDebugTimingPhase::PoleDraw};
-                        if (g_render_settings.street_objects) draw_city_traffic_light_poles(*project, city_scene);
+                        if (g_render_settings.street_objects) draw_city_traffic_light_poles(*project, city_scene, camera.position);
                         if (ui.render_shadows) {
                             draw_city_shadow_volumes(*project, camera, ui.building_distance > 0.0F
                                 ? std::min(ui.shadow_distance, ui.building_distance) : ui.shadow_distance);
@@ -4548,10 +4579,14 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                         if (ui.city_tool == CityTool::Piece) {
                             if (const auto cell = raised(city_surface_cell_under_mouse(*project, camera, viewport_mouse_pos, last_viewport_size),
                                     ui.place_height_offset)) {
-                                const auto* mesh = project->blocks.empty() || ui.place_piece_solid
-                                    ? nullptr
-                                    : &project->blocks[std::min(ui.place_piece_mesh, project->blocks.size() - 1U)].data;
-                                draw_piece_ghost(mesh, *cell, static_cast<std::int32_t>(ui.selected_piece_rotation & 3U));
+                                const auto& mesh = project->blocks.empty() || ui.place_piece_solid
+                                    ? solid_piece_mesh()
+                                    : project->blocks[std::min(ui.place_piece_mesh, project->blocks.size() - 1U)].data;
+                                // The piece as it will look: its mesh with the brush's textures.
+                                draw_block_mesh_textured(*project, mesh, ui.place_piece_textures,
+                                    {cell->x * city_scene.unit_size, cell->y * city_scene.unit_size + 0.25F, cell->z * city_scene.unit_size},
+                                    city_scene.unit_size, static_cast<std::int32_t>(ui.selected_piece_rotation & 3U), 210);
+                                draw_piece_ghost(nullptr, *cell, static_cast<std::int32_t>(ui.selected_piece_rotation & 3U));
                                 draw_city_edit_grid(*cell, city_scene, Color{91, 166, 206, 255}, true);
                             }
                         }
@@ -5195,6 +5230,10 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     // Only the new (empty) building needs a mesh; nothing else changed.
                     rebuild_single_building_render(*project, ui.selected_building);
                     camera = default_camera();
+                }
+                if (ImGui::MenuItem(ICON_FA_CUBE " New block")) {
+                    create_new_block(*project, ui, status);
+                    ui.tab = EditorTab::Blocks;
                 }
                 if (ImGui::MenuItem(ICON_FA_TABLE_CELLS " New buildblock")) {
                     SblTemplate model{}; model.version = 1;

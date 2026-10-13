@@ -1277,24 +1277,46 @@ void save_map_to(EditorProject& project, EditorUi& ui, const std::filesystem::pa
         const auto archive_path = folder / kGameArchiveName;
         // Buildblocks are loose files. Saving to another folder also writes the unchanged ones.
         const bool same_folder = std::filesystem::weakly_canonical(output.parent_path()) == project.root;
-        std::vector<std::pair<std::filesystem::path, std::vector<std::uint8_t>>> buildblock_files;
+        std::vector<std::pair<std::filesystem::path, std::vector<std::uint8_t>>> extra_files;
         for (const auto& asset : project.buildblocks) {
             // Buildblocks from the archive move to the loose files the game reads,
             // even if no edit changed them.
             if (same_folder && !asset.dirty && lower_extension(asset.path) != ".csx" && std::filesystem::exists(asset.path)) continue;
-            buildblock_files.emplace_back(output.parent_path() / "buildblock" / (asset.name + ".sbl"), rebuild_sbl_buildblock(asset.data));
+            extra_files.emplace_back(output.parent_path() / "buildblock" / (asset.name + ".sbl"), rebuild_sbl_buildblock(asset.data));
+        }
+        // The game also loads asphalt2.png, asphalt2_material.png, and (for the round
+        // map) map.png from the map folder itself (World_LoadMapAndInitializeTerrain
+        // @56980). A map without its own road textures borrows them from another map
+        // in the same data folder.
+        std::string missing_road_textures;
+        for (const char* name : {"asphalt2.png", "asphalt2_material.png", "map.png"}) {
+            // A folder that already has its own copy keeps it.
+            if (std::filesystem::exists(folder / name)) continue;
+            auto source = project.root / name;
+            if (!std::filesystem::exists(source) && std::string_view{name} != "map.png") {
+                source.clear();
+                std::error_code error;
+                for (const auto& sibling : std::filesystem::directory_iterator(project.root.parent_path(), error)) {
+                    if (std::filesystem::exists(sibling.path() / name)) {
+                        source = sibling.path() / name;
+                        break;
+                    }
+                }
+                if (source.empty()) missing_road_textures += std::string{missing_road_textures.empty() ? "" : ", "} + name;
+            }
+            if (!source.empty() && std::filesystem::exists(source)) extra_files.emplace_back(folder / name, read_file_bytes(source));
         }
         // Build every file's bytes before touching any output file.
 #ifndef __EMSCRIPTEN__
         std::vector<FileWrite> outputs{{archive_path, archive_bytes}};
-        for (const auto& [path, bytes] : buildblock_files) {
+        for (const auto& [path, bytes] : extra_files) {
             outputs.push_back({path, bytes});
         }
         outputs.push_back({output, map_bytes});
         write_files_transaction(outputs);
 #else
         web_download(archive_path.filename().string(), archive_bytes);
-        for (const auto& [path, bytes] : buildblock_files) web_download(path.filename().string(), bytes);
+        for (const auto& [path, bytes] : extra_files) web_download(path.filename().string(), bytes);
         web_download(output.filename().string(), map_bytes);
 #endif
         project.city = LoadedAsset<SbcMap>{output, output.stem().string(), std::move(city)};
@@ -1315,6 +1337,10 @@ void save_map_to(EditorProject& project, EditorUi& ui, const std::filesystem::pa
         }
         for (const auto& problem : game_world_fit_problems(project)) {
             status = (status.empty() ? std::string{"saved"} : status) + ". " + problem;
+        }
+        if (!missing_road_textures.empty()) {
+            status = (status.empty() ? std::string{"saved"} : status) + ". No " + missing_road_textures +
+                " found to copy; the game loads them from the map folder";
         }
     } catch (const std::exception& error) {
         report_failure(status, std::string{"Map save failed: "} + error.what());

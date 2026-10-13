@@ -563,8 +563,11 @@ bool select_building_cell_from_viewport(
     // The block whose drawn face is under the cursor, not the cell the ray starts in.
     // The edit view's mesh records each face's cell.
     (void)unit_size;
-    (void)floor;
-    const auto picked = pick_building_face(project.building_floor_preview_render_buffer, ray_origin, ray_dir);
+    auto picked = pick_building_face(project.building_floor_preview_render_buffer, ray_origin, ray_dir);
+    // Item sets aren't in the face mesh, so test them separately and keep the nearer hit.
+    if (const auto item = pick_building_item_set(project, building, floor, ray); item && (!picked || item->second < picked->t)) {
+        picked = BuildingFacePick{.cell_index = building.cells[item->first].index, .t = item->second};
+    }
     if (!picked.has_value()) {
         status = "nothing under the cursor";
         return false;

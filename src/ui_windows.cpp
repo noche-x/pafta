@@ -71,6 +71,8 @@ constexpr std::array<ShortcutInfo, static_cast<std::size_t>(EditorAction::Count)
     {"window_tools", "Window: Asset drawer", {0, false, false, false}},
     {"window_library", "Window: Outliner", {0, false, false, false}},
     {"window_properties", "Window: Properties", {0, false, false, false}},
+    {"select_all", "Select all (city buildings, block points)", {KEY_A, true, false, false}},
+    {"deselect_all", "Select none", {KEY_A, false, false, true}},
 }};
 
 std::size_t index_of(EditorAction action) {
@@ -870,7 +872,8 @@ bool draw_interior_mode(EditorUi& ui) {
     if (!ImGui::Combo("##interior_mode", &mode, modes, 3)) {
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Up close: like the game, buildings within 192 units show their rooms through open\n"
-                              "doors and see-through windows. Selected only: the selected city buildings show their\n"
+                              "doors and see-through windows, and traffic lights and street signs past 192 units are hidden.\n"
+                              "Selected only: the selected city buildings show their\n"
                               "rooms at any distance and every other building keeps its shell.");
         }
         return false;
@@ -1026,40 +1029,21 @@ void draw_building_browser_window(EditorProject& project, EditorUi& ui) {
 
     const float preview_width = std::clamp(ImGui::GetContentRegionAvail().x * 0.42F, 220.0F, 420.0F);
     if (ImGui::BeginChild("##bb_grid", ImVec2(ImGui::GetContentRegionAvail().x - preview_width - 8.0F, 0.0F), true)) {
-        constexpr float cell = 96.0F;
-        const int per_row = std::max(1, static_cast<int>(ImGui::GetContentRegionAvail().x / (cell + 12.0F)));
-        int shown = 0;
-        const auto key = lower_name(search.data());
-        for (std::size_t i = 0; i < project.buildings.size(); ++i) {
-            if (!key.empty() && lower_name(project.buildings[i].name).find(key) == std::string::npos) continue;
-            if (shown % per_row != 0) ImGui::SameLine();
-            ++shown;
-            ImGui::PushID(static_cast<int>(i));
-            ImGui::BeginGroup();
-            const auto* thumb = building_thumbnail(project, i);
-            const bool selected = ui.browser_building == i;
-            if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.26F, 0.59F, 0.98F, 0.9F));
-            bool clicked = false;
-            if (thumb != nullptr && thumb->texture.id != 0U) {
-                clicked = ImGui::ImageButton("##thumb", ImTextureID(thumb->texture.id), ImVec2(cell, cell), ImVec2(0.0F, 1.0F), ImVec2(1.0F, 0.0F));
-            } else {
-                clicked = ImGui::Button("...", ImVec2(cell + 6.0F, cell + 6.0F));
-            }
-            if (selected) ImGui::PopStyleColor();
-            if (clicked) ui.browser_building = i;
-            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) edit_building(project, ui, i);
-            if (ImGui::BeginDragDropSource()) {
-                ImGui::SetDragDropPayload("MAP_BUILDING", &i, sizeof(i));
-                ImGui::TextUnformatted(project.buildings[i].name.c_str());
-                ImGui::EndDragDropSource();
-            }
-            // Keep the grid width fixed and show the full name on hover.
-            ImGui::TextUnformatted(fit_label(project.buildings[i].name, cell).c_str());
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", project.buildings[i].name.c_str());
-            ImGui::EndGroup();
-            ImGui::PopID();
-        }
-        if (shown == 0) ImGui::TextDisabled("No building matches.");
+        const auto picked = asset_grid("##bb_items", project.buildings.size(), ui.browser_building, {.size = 96.0F, .labels = true, .search = &search},
+            [&](std::size_t i) { return project.buildings[i].name; },
+            [&](std::size_t i) {
+                const auto* t = building_thumbnail(project, i);
+                return Thumb{t != nullptr ? t->texture.id : 0U, true};
+            },
+            [&](std::size_t i) {
+                if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) edit_building(project, ui, i);
+                if (ImGui::BeginDragDropSource()) {
+                    ImGui::SetDragDropPayload("MAP_BUILDING", &i, sizeof(i));
+                    ImGui::TextUnformatted(project.buildings[i].name.c_str());
+                    ImGui::EndDragDropSource();
+                }
+            });
+        if (picked) ui.browser_building = *picked;
     }
     ImGui::EndChild();
     ImGui::SameLine();
@@ -1121,45 +1105,26 @@ void draw_block_browser_window(EditorProject& project, EditorUi& ui) {
 
     const float preview_width = std::clamp(ImGui::GetContentRegionAvail().x * 0.42F, 220.0F, 420.0F);
     if (ImGui::BeginChild("##blk_grid", ImVec2(ImGui::GetContentRegionAvail().x - preview_width - 8.0F, 0.0F), true)) {
-        constexpr float cell = 80.0F;
-        const int per_row = std::max(1, static_cast<int>(ImGui::GetContentRegionAvail().x / (cell + 12.0F)));
-        int shown = 0;
-        const auto key = lower_name(search.data());
-        for (std::size_t i = 0; i < project.blocks.size(); ++i) {
-            if (!key.empty() && lower_name(project.blocks[i].name).find(key) == std::string::npos) continue;
-            if (shown % per_row != 0) ImGui::SameLine();
-            ++shown;
-            ImGui::PushID(static_cast<int>(i));
-            ImGui::BeginGroup();
-            const auto* thumb = block_thumbnail(project, i);
-            const bool selected = ui.browser_block == i;
-            if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.26F, 0.59F, 0.98F, 0.9F));
-            bool clicked = false;
-            if (thumb != nullptr && thumb->texture.id != 0U) {
-                clicked = ImGui::ImageButton("##thumb", ImTextureID(thumb->texture.id), ImVec2(cell, cell), ImVec2(0.0F, 1.0F), ImVec2(1.0F, 0.0F));
-            } else {
-                clicked = ImGui::Button("...", ImVec2(cell + 6.0F, cell + 6.0F));
-            }
-            if (selected) ImGui::PopStyleColor();
-            if (clicked) {
-                ui.browser_block = i;
-                ui.selected_block = i;
-                ui.place_piece_mesh = i;
-                ui.place_piece_solid = false;
-            }
-            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && project.city) {
-                ui.place_piece_mesh = i;
-                ui.place_piece_solid = false;
-                ui.city_tool = CityTool::Piece;
-                ui.requested_tab = EditorTab::City;
-            }
-            // Keep the grid width fixed and show the full name on hover.
-            ImGui::TextUnformatted(fit_label(project.blocks[i].name, cell).c_str());
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", project.blocks[i].name.c_str());
-            ImGui::EndGroup();
-            ImGui::PopID();
+        const auto picked = asset_grid("##blk_items", project.blocks.size(), ui.browser_block, {.size = 80.0F, .labels = true, .search = &search},
+            [&](std::size_t i) { return project.blocks[i].name; },
+            [&](std::size_t i) {
+                const auto* t = block_thumbnail(project, i);
+                return Thumb{t != nullptr ? t->texture.id : 0U, true};
+            },
+            [&](std::size_t i) {
+                if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && project.city) {
+                    ui.place_piece_mesh = i;
+                    ui.place_piece_solid = false;
+                    ui.city_tool = CityTool::Piece;
+                    ui.requested_tab = EditorTab::City;
+                }
+            });
+        if (picked) {
+            ui.browser_block = *picked;
+            ui.selected_block = *picked;
+            ui.place_piece_mesh = *picked;
+            ui.place_piece_solid = false;
         }
-        if (shown == 0) ImGui::TextDisabled("No block matches.");
     }
     ImGui::EndChild();
     ImGui::SameLine();

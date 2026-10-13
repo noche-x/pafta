@@ -27,6 +27,8 @@ constexpr std::array<const char*, 6> kBoxSideNames{"Bottom (-Y)", "+Z side", "-X
 // Header side flags, in file order (build_exterior_block_faces).
 constexpr std::array<const char*, 6> kExteriorSideNames{"Bottom (-Y)", "Top (+Y)", "+Z side", "-X side", "-Z side", "+X side"};
 
+std::vector<BlockVertexRef> element_vertices(const SblBlockMesh& block, BlockElementKind kind, std::size_t index);
+
 SblBlockMesh* selected_block(EditorProject& project, EditorUi& ui) {
     if (project.blocks.empty()) return nullptr;
     ui.selected_block = std::min(ui.selected_block, project.blocks.size() - 1U);
@@ -433,6 +435,8 @@ void draw_box_properties(SblBlockLight& box, bool& changed) {
         changed = true;
     }
     ImGui::SeparatorText("Sides");
+    // The block's own side checkboxes use the same names, so these get their own ID scope.
+    ImGui::PushID("box_sides");
     for (std::size_t bit = 0; bit < kBoxSideNames.size(); ++bit) {
         bool on = (box.final_value & (1U << bit)) != 0U;
         if (ImGui::Checkbox(kBoxSideNames[bit], &on)) {
@@ -441,6 +445,7 @@ void draw_box_properties(SblBlockLight& box, bool& changed) {
         }
         if (bit % 2U == 0U) ImGui::SameLine(160.0F);
     }
+    ImGui::PopID();
     if (ImGui::TreeNode("Corners (8)")) {
         for (std::size_t i = 0; i < box.points.size(); ++i) {
             ImGui::PushID(static_cast<int>(i));
@@ -456,14 +461,16 @@ void draw_box_properties(SblBlockLight& box, bool& changed) {
 
 } // namespace
 
+void create_new_block(EditorProject& project, EditorUi& ui, std::string& status) {
+    SblBlockMesh block{};
+    block.width = block.height = block.depth = 1;
+    block.exterior_flags.fill(1);
+    add_block(project, ui, unique_block_name(project, "new_block"), std::move(block));
+    status = "created " + project.blocks.back().name;
+}
+
 void draw_block_inspector(EditorProject& project, EditorUi& ui, std::string& status) {
-    if (ImGui::Button(ICON_FA_PLUS " New block")) {
-        SblBlockMesh block{};
-        block.width = block.height = block.depth = 1;
-        block.exterior_flags.fill(1);
-        add_block(project, ui, unique_block_name(project, "new_block"), std::move(block));
-        status = "created " + project.blocks.back().name;
-    }
+    if (ImGui::Button(ICON_FA_PLUS " New block")) create_new_block(project, ui, status);
     auto* block = selected_block(project, ui);
     if (block == nullptr) {
         ImGui::TextWrapped("No blocks yet. A block is a mesh building cells and city pieces place; create one above.");
@@ -493,6 +500,26 @@ void draw_block_inspector(EditorProject& project, EditorUi& ui, std::string& sta
     }
     if (ImGui::IsItemActive()) ImGui::TextDisabled("Press Enter to rename. Buildings and pieces using it follow.");
     ImGui::TextDisabled("Used %zu times", block_users(project, asset.name));
+
+    ImGui::SeparatorText("View");
+    int mode = ui.block_vertex_mode ? 0 : 1;
+    if (ImGui::RadioButton("Points##block_mode", &mode, 0)) {
+        ui.block_vertex_mode = true;
+        if (ui.block_selected_vertices.empty() && ui.block_element != BlockElementKind::None) {
+            ui.block_selected_vertices = element_vertices(*block, ui.block_element, ui.block_element_index);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Surfaces##block_mode", &mode, 1)) ui.block_vertex_mode = false;
+    ImGui::SameLine();
+    ImGui::TextDisabled("(Tab)");
+    ImGui::Checkbox("Textured##block_textured", &ui.block_textured);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show each face with the texture picked for its slot below.");
+    if (ui.block_textured && ImGui::TreeNode("Slot textures##block_slots")) {
+        ImGui::TextDisabled("Preview only: the building cell that places a block picks its real textures.");
+        texture_slots(project, "block_slot_textures", ui.block_slot_textures);
+        ImGui::TreePop();
+    }
 
     ImGui::SeparatorText("Box");
     int size[3]{static_cast<int>(block->width), static_cast<int>(block->height), static_cast<int>(block->depth)};
@@ -537,6 +564,7 @@ void draw_block_inspector(EditorProject& project, EditorUi& ui, std::string& sta
             if (ImGui::Selectable((label + "##p" + std::to_string(i)).c_str(), ui.block_element == BlockElementKind::Patch && ui.block_element_index == i)) {
                 ui.block_element = BlockElementKind::Patch;
                 ui.block_element_index = i;
+                ui.block_selected_vertices = element_vertices(*block, ui.block_element, i);
             }
         }
         for (std::size_t i = 0; i < block->lights.size(); ++i) {
@@ -544,6 +572,7 @@ void draw_block_inspector(EditorProject& project, EditorUi& ui, std::string& sta
             if (ImGui::Selectable((label + "##b" + std::to_string(i)).c_str(), ui.block_element == BlockElementKind::Box && ui.block_element_index == i)) {
                 ui.block_element = BlockElementKind::Box;
                 ui.block_element_index = i;
+                ui.block_selected_vertices = element_vertices(*block, ui.block_element, i);
             }
         }
         ImGui::EndListBox();
@@ -574,9 +603,13 @@ void draw_block_inspector(EditorProject& project, EditorUi& ui, std::string& sta
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Turn the surface to face the other way.");
         }
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-        ImGui::TextWrapped("In the view: drag an arrow to move, a white cube to resize a box, an orange dot to move a point. "
-                           "G moves, S scales, R rotates (X/Y/Z lock an axis, click or Enter keeps, Esc cancels, Shift skips snapping). "
-                           "Arrow keys and PgUp/PgDn nudge 1/8 cell.");
+        ImGui::TextWrapped(ui.block_vertex_mode
+            ? "Points: click a point (Shift adds), drag one to move it, or drag a box on empty space. Ctrl+A picks all, Alt+A none. "
+              "G moves, S scales, R rotates (X/Y/Z lock an axis, click or Enter keeps, Esc cancels, Shift skips snapping). "
+              "Arrow keys and PgUp/PgDn nudge 1/8 cell. Tab switches to whole surfaces."
+            : "Surfaces: drag an arrow to move, a white cube to resize a box, an orange dot to move a point. "
+              "G moves, S scales, R rotates (X/Y/Z lock an axis, click or Enter keeps, Esc cancels, Shift skips snapping). "
+              "Arrow keys and PgUp/PgDn nudge 1/8 cell. Tab switches to points.");
         ImGui::PopStyleColor();
         if (patch_selected) draw_patch_properties(*block, block->authored_patches[ui.block_element_index], changed);
         else draw_box_properties(block->lights[ui.block_element_index], changed);
@@ -599,6 +632,7 @@ void duplicate_block_element(EditorProject& project, EditorUi& ui) {
         return;
     }
     translate_element(*block, ui.block_element, ui.block_element_index, {0.125F, 0.0F, 0.125F});
+    ui.block_selected_vertices = element_vertices(*block, ui.block_element, ui.block_element_index);
     mark_block_changed(project, ui, *block);
 }
 
@@ -613,13 +647,8 @@ void delete_block_element(EditorProject& project, EditorUi& ui) {
         return;
     }
     ui.block_element = BlockElementKind::None;
-    mark_block_changed(project, ui, *block);
-}
-
-void nudge_block_element(EditorProject& project, EditorUi& ui, Vec3f delta) {
-    auto* block = selected_block(project, ui);
-    if (block == nullptr || ui.block_element == BlockElementKind::None) return;
-    translate_element(*block, ui.block_element, ui.block_element_index, delta);
+    // Indices after the removed surface shift, so the old points no longer match.
+    ui.block_selected_vertices.clear();
     mark_block_changed(project, ui, *block);
 }
 
@@ -627,17 +656,108 @@ namespace {
 
 Vector3 to_world(Vec3f p) { return {p.x * kUnit, p.y * kUnit, p.z * kUnit}; }
 
-// The positions the selected element is made of: a patch's 16 control points or a
-// box's 8 corners.
-std::vector<Vec3f*> element_points(SblBlockMesh& block, BlockElementKind kind, std::size_t index) {
+// Every point vertex mode shows: a flat patch's four corners (its inner points follow
+// them), all 16 points of a curved patch, and a box's 8 corners.
+std::vector<BlockVertexRef> block_vertices(const SblBlockMesh& block) {
+    std::vector<BlockVertexRef> refs;
+    for (std::size_t i = 0; i < block.authored_patches.size(); ++i) {
+        const auto& patch = block.authored_patches[i];
+        if (patch.control_points.size() != 16U) continue;
+        if (patch_is_flat(patch)) {
+            for (const std::size_t point : {0U, 3U, 12U, 15U}) refs.push_back({BlockElementKind::Patch, i, point});
+        } else {
+            for (std::size_t point = 0; point < 16U; ++point) refs.push_back({BlockElementKind::Patch, i, point});
+        }
+    }
+    for (std::size_t i = 0; i < block.lights.size(); ++i) {
+        for (std::size_t point = 0; point < 8U; ++point) refs.push_back({BlockElementKind::Box, i, point});
+    }
+    return refs;
+}
+
+std::vector<BlockVertexRef> element_vertices(const SblBlockMesh& block, BlockElementKind kind, std::size_t index) {
+    auto refs = block_vertices(block);
+    std::erase_if(refs, [&](const BlockVertexRef& ref) { return ref.kind != kind || ref.element != index; });
+    return refs;
+}
+
+Vec3f* vertex_ptr(SblBlockMesh& block, const BlockVertexRef& ref) {
+    if (ref.kind == BlockElementKind::Patch && ref.element < block.authored_patches.size() &&
+        ref.point < block.authored_patches[ref.element].control_points.size()) {
+        return &block.authored_patches[ref.element].control_points[ref.point].position;
+    }
+    if (ref.kind == BlockElementKind::Box && ref.element < block.lights.size() && ref.point < 8U) {
+        return &block.lights[ref.element].points[ref.point];
+    }
+    return nullptr;
+}
+
+// What a transform moves: the picked points in vertex mode, otherwise every point of
+// the selected patch or box, in element order (the handles index into it).
+std::vector<BlockVertexRef> transform_targets(SblBlockMesh& block, const EditorUi& ui) {
+    std::vector<BlockVertexRef> refs;
+    if (ui.block_vertex_mode) {
+        for (const auto& ref : ui.block_selected_vertices) {
+            if (vertex_ptr(block, ref) != nullptr) refs.push_back(ref);
+        }
+        return refs;
+    }
+    std::size_t count = 0;
+    if (ui.block_element == BlockElementKind::Patch && ui.block_element_index < block.authored_patches.size()) {
+        count = block.authored_patches[ui.block_element_index].control_points.size();
+    } else if (ui.block_element == BlockElementKind::Box && ui.block_element_index < block.lights.size()) {
+        count = 8U;
+    }
+    for (std::size_t point = 0; point < count; ++point) refs.push_back({ui.block_element, ui.block_element_index, point});
+    return refs;
+}
+
+std::vector<Vec3f*> points_of(SblBlockMesh& block, const std::vector<BlockVertexRef>& refs) {
     std::vector<Vec3f*> points;
-    if (kind == BlockElementKind::Patch && index < block.authored_patches.size()) {
-        for (auto& point : block.authored_patches[index].control_points) points.push_back(&point.position);
-    } else if (kind == BlockElementKind::Box && index < block.lights.size()) {
-        for (auto& point : block.lights[index].points) points.push_back(&point);
+    for (const auto& ref : refs) {
+        if (auto* point = vertex_ptr(block, ref)) points.push_back(point);
     }
     return points;
 }
+
+// A flat patch stays flat: after its corners move, its inner points are blended
+// again from them. Only patches with a moved point change, so untouched patches keep
+// their stored bytes.
+void reblend_moved_flat_patches(SblBlockMesh& block, const std::vector<BlockVertexRef>& moved) {
+    for (const auto& ref : moved) {
+        if (ref.kind != BlockElementKind::Patch || ref.element >= block.authored_patches.size()) continue;
+        auto& patch = block.authored_patches[ref.element];
+        if (!patch_is_flat(patch)) continue;
+        const auto corners = patch_corners(patch);
+        set_patch_quad(patch, corners[0], corners[1], corners[2], corners[3]);
+    }
+}
+
+} // namespace
+
+void nudge_block_element(EditorProject& project, EditorUi& ui, Vec3f delta) {
+    auto* block = selected_block(project, ui);
+    if (block == nullptr) return;
+    if (ui.block_vertex_mode) {
+        const auto refs = transform_targets(*block, ui);
+        if (refs.empty()) return;
+        for (auto* point : points_of(*block, refs)) *point = {point->x + delta.x, point->y + delta.y, point->z + delta.z};
+        reblend_moved_flat_patches(*block, refs);
+    } else {
+        if (ui.block_element == BlockElementKind::None) return;
+        translate_element(*block, ui.block_element, ui.block_element_index, delta);
+    }
+    mark_block_changed(project, ui, *block);
+}
+
+void block_select_all(EditorProject& project, EditorUi& ui, bool select) {
+    auto* block = selected_block(project, ui);
+    if (block == nullptr) return;
+    ui.block_vertex_mode = true;
+    ui.block_selected_vertices = select ? block_vertices(*block) : std::vector<BlockVertexRef>{};
+}
+
+namespace {
 
 Vec3f center_of(const std::vector<Vec3f*>& points, const std::vector<std::size_t>& subset = {}) {
     Vec3f lo{FLT_MAX, FLT_MAX, FLT_MAX}, hi{-FLT_MAX, -FLT_MAX, -FLT_MAX};
@@ -654,14 +774,14 @@ Vec3f center_of(const std::vector<Vec3f*>& points, const std::vector<std::size_t
 float axis_value(const Vec3f& p, int axis) { return axis == 0 ? p.x : axis == 1 ? p.y : p.z; }
 float& axis_ref(Vec3f& p, int axis) { return axis == 0 ? p.x : axis == 1 ? p.y : p.z; }
 
-// Handles of the selected element: 0-2 the move arrows (X, Y, Z), 10-15 a box's
-// faces (-X, +X, -Y, +Y, -Z, +Z), and 20-35 a patch's control points (only the four
-// corners of a flat patch).
+// Handles of the selection: 0-2 the move arrows (X, Y, Z). In surface mode also 10-15
+// a box's faces (-X, +X, -Y, +Y, -Z, +Z) and 20-35 a patch's control points (only the
+// four corners of a flat patch); vertex mode picks points directly instead.
 struct BlockHandle {
     int id{};
     Vec3f at{};
     int axis{-1};                      // the axis it moves along, -1 any
-    std::vector<std::size_t> points;   // the element points it moves; empty = all
+    std::vector<std::size_t> points;   // indices into the transform targets; empty = all
 };
 
 float arrow_length(const Camera3D& camera, Vec3f pivot) {
@@ -670,7 +790,7 @@ float arrow_length(const Camera3D& camera, Vec3f pivot) {
 
 std::vector<BlockHandle> block_handles(SblBlockMesh& block, const EditorUi& ui, const Camera3D& camera) {
     std::vector<BlockHandle> handles;
-    auto points = element_points(block, ui.block_element, ui.block_element_index);
+    auto points = points_of(block, transform_targets(block, ui));
     if (points.empty()) return handles;
     const auto pivot = center_of(points);
     const float length = arrow_length(camera, pivot);
@@ -679,6 +799,7 @@ std::vector<BlockHandle> block_handles(SblBlockMesh& block, const EditorUi& ui, 
         axis_ref(tip, axis) += length;
         handles.push_back({axis, tip, axis, {}});
     }
+    if (ui.block_vertex_mode) return handles;
     if (ui.block_element == BlockElementKind::Box) {
         const auto lo_hi = box_bounds(block.lights[ui.block_element_index]);
         for (int face = 0; face < 6; ++face) {
@@ -703,25 +824,33 @@ std::vector<BlockHandle> block_handles(SblBlockMesh& block, const EditorUi& ui, 
     return handles;
 }
 
-Vector2 to_screen(const Camera3D& camera, Vec3f p, Vector2 viewport_size) {
-    return GetWorldToScreenEx(to_world(p), camera, static_cast<int>(viewport_size.x), static_cast<int>(viewport_size.y));
+// Screen position of a block point, or nothing when it is behind the camera.
+std::optional<Vector2> to_screen(const Camera3D& camera, Vec3f p, Vector2 viewport_size) {
+    const auto world = to_world(p);
+    if (camera.projection == CAMERA_PERSPECTIVE &&
+        Vector3DotProduct(Vector3Subtract(world, camera.position), Vector3Subtract(camera.target, camera.position)) <= 0.0F) {
+        return std::nullopt;
+    }
+    return GetWorldToScreenEx(world, camera, static_cast<int>(viewport_size.x), static_cast<int>(viewport_size.y));
 }
 
 std::optional<BlockHandle> handle_under_mouse(SblBlockMesh& block, const EditorUi& ui, const Camera3D& camera, Vector2 mouse, Vector2 viewport_size) {
     std::optional<BlockHandle> best;
     float best_distance = 10.0F;
-    auto points = element_points(block, ui.block_element, ui.block_element_index);
+    auto points = points_of(block, transform_targets(block, ui));
     if (points.empty()) return best;
     const auto pivot = to_screen(camera, center_of(points), viewport_size);
+    if (!pivot) return best;
     for (auto& handle : block_handles(block, ui, camera)) {
         const auto at = to_screen(camera, handle.at, viewport_size);
-        float distance = Vector2Distance(mouse, at);
+        if (!at) continue;
+        float distance = Vector2Distance(mouse, *at);
         if (handle.id < 3) {
             // Arrows can be grabbed anywhere along the shaft.
-            const auto shaft = Vector2Subtract(at, pivot);
+            const auto shaft = Vector2Subtract(*at, *pivot);
             const float length = std::max(1.0F, Vector2LengthSqr(shaft));
-            const float t = std::clamp(Vector2DotProduct(Vector2Subtract(mouse, pivot), shaft) / length, 0.2F, 1.0F);
-            distance = Vector2Distance(mouse, Vector2Add(pivot, Vector2Scale(shaft, t))) + 2.0F;
+            const float t = std::clamp(Vector2DotProduct(Vector2Subtract(mouse, *pivot), shaft) / length, 0.2F, 1.0F);
+            distance = Vector2Distance(mouse, Vector2Add(*pivot, Vector2Scale(shaft, t))) + 2.0F;
         }
         if (distance < best_distance) {
             best_distance = distance;
@@ -731,14 +860,47 @@ std::optional<BlockHandle> handle_under_mouse(SblBlockMesh& block, const EditorU
     return best;
 }
 
+// The vertex-mode point nearest the cursor, within 8 pixels.
+std::optional<BlockVertexRef> vertex_under_mouse(SblBlockMesh& block, const Camera3D& camera, Vector2 mouse, Vector2 viewport_size) {
+    std::optional<BlockVertexRef> best;
+    float best_distance = 8.0F;
+    for (const auto& ref : block_vertices(block)) {
+        const auto at = to_screen(camera, *vertex_ptr(block, ref), viewport_size);
+        if (!at) continue;
+        if (const float distance = Vector2Distance(mouse, *at); distance < best_distance) {
+            best_distance = distance;
+            best = ref;
+        }
+    }
+    return best;
+}
+
+// A point and every other point at the same place, so shared corners of
+// neighbouring surfaces stay joined when one of them is picked.
+std::vector<BlockVertexRef> coincident_vertices(SblBlockMesh& block, const BlockVertexRef& picked) {
+    const auto at = *vertex_ptr(block, picked);
+    std::vector<BlockVertexRef> group;
+    for (const auto& ref : block_vertices(block)) {
+        if (distance(*vertex_ptr(block, ref), at) < 1e-4F) group.push_back(ref);
+    }
+    return group;
+}
+
+void add_vertices(std::vector<BlockVertexRef>& selection, const std::vector<BlockVertexRef>& refs) {
+    for (const auto& ref : refs) {
+        if (std::ranges::find(selection, ref) == selection.end()) selection.push_back(ref);
+    }
+}
+
 float snap(float value, float step, bool free) { return free ? value : std::round(value / step) * step; }
 
 // Works out the preview block from the block, the transform, and the mouse.
 void apply_block_transform(const SblBlockMesh& source, EditorUi& ui, const Camera3D& camera, Vector2 mouse, Vector2 viewport_size) {
     auto preview = source;
     auto start = source;
-    auto start_points = element_points(start, ui.block_element, ui.block_element_index);
-    auto points = element_points(preview, ui.block_element, ui.block_element_index);
+    const auto refs = transform_targets(start, ui);
+    auto start_points = points_of(start, refs);
+    auto points = points_of(preview, refs);
     if (points.empty()) return;
     const bool free = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
     std::vector<std::size_t> moving;
@@ -751,7 +913,7 @@ void apply_block_transform(const SblBlockMesh& source, EditorUi& ui, const Camer
         }
     }
     const auto pivot = center_of(start_points);
-    const auto pivot_screen = to_screen(camera, pivot, viewport_size);
+    const auto pivot_screen = to_screen(camera, pivot, viewport_size).value_or(ui.block_transform_mouse);
     const auto moved = [&](std::size_t i) { return moving.empty() || std::ranges::find(moving, i) != moving.end(); };
 
     if (ui.block_transform == BlockTransform::Grab) {
@@ -760,7 +922,7 @@ void apply_block_transform(const SblBlockMesh& source, EditorUi& ui, const Camer
             // Along one axis: how far the mouse moved along that axis on screen.
             Vec3f one = pivot;
             axis_ref(one, axis) += 1.0F;
-            const auto direction = Vector2Subtract(to_screen(camera, one, viewport_size), pivot_screen);
+            const auto direction = Vector2Subtract(to_screen(camera, one, viewport_size).value_or(pivot_screen), pivot_screen);
             const float length = Vector2LengthSqr(direction);
             if (length > 1e-3F) axis_ref(delta, axis) = Vector2DotProduct(Vector2Subtract(mouse, ui.block_transform_mouse), direction) / length;
         } else {
@@ -778,20 +940,8 @@ void apply_block_transform(const SblBlockMesh& source, EditorUi& ui, const Camer
             if (a && b) delta = {(b->x - a->x) / kUnit, (b->y - a->y) / kUnit, (b->z - a->z) / kUnit};
         }
         delta = {snap(delta.x, 1.0F / 16.0F, free), snap(delta.y, 1.0F / 16.0F, free), snap(delta.z, 1.0F / 16.0F, free)};
-        const bool flat_corner = ui.block_element == BlockElementKind::Patch && ui.block_transform_handle >= 20 &&
-            patch_is_flat(start.authored_patches[ui.block_element_index]);
-        if (flat_corner) {
-            // A flat patch stays flat: move one corner and blend the grid again.
-            auto& patch = preview.authored_patches[ui.block_element_index];
-            auto corners = patch_corners(start.authored_patches[ui.block_element_index]);
-            const auto id = static_cast<std::size_t>(ui.block_transform_handle - 20);
-            const std::size_t corner = id == 0 ? 0U : id == 3 ? 1U : id == 15 ? 2U : 3U;
-            corners[corner] = {corners[corner].x + delta.x, corners[corner].y + delta.y, corners[corner].z + delta.z};
-            set_patch_quad(patch, corners[0], corners[1], corners[2], corners[3], patch_corner_uvs(start.authored_patches[ui.block_element_index]));
-        } else {
-            for (std::size_t i = 0; i < points.size(); ++i) {
-                if (moved(i)) *points[i] = {start_points[i]->x + delta.x, start_points[i]->y + delta.y, start_points[i]->z + delta.z};
-            }
+        for (std::size_t i = 0; i < points.size(); ++i) {
+            if (moved(i)) *points[i] = {start_points[i]->x + delta.x, start_points[i]->y + delta.y, start_points[i]->z + delta.z};
         }
     } else if (ui.block_transform == BlockTransform::Scale) {
         const float from = std::max(4.0F, Vector2Distance(ui.block_transform_mouse, pivot_screen));
@@ -815,6 +965,11 @@ void apply_block_transform(const SblBlockMesh& source, EditorUi& ui, const Camer
             *points[i] = {pivot.x + turned.x, pivot.y + turned.y, pivot.z + turned.z};
         }
     }
+    std::vector<BlockVertexRef> moved_refs;
+    for (std::size_t i = 0; i < refs.size(); ++i) {
+        if (ui.block_transform != BlockTransform::Grab || moved(i)) moved_refs.push_back(refs[i]);
+    }
+    reblend_moved_flat_patches(preview, moved_refs);
     refresh_sbl_block_faces(preview);
     ui.block_transform_preview = std::move(preview);
 }
@@ -822,14 +977,24 @@ void apply_block_transform(const SblBlockMesh& source, EditorUi& ui, const Camer
 void end_block_transform(EditorProject& project, EditorUi& ui, bool keep) {
     if (keep && ui.block_transform_preview && !project.blocks.empty()) {
         auto& block = project.blocks[std::min(ui.selected_block, project.blocks.size() - 1U)].data;
-        block = std::move(*ui.block_transform_preview);
-        mark_block_changed(project, ui, block);
+        // A click that didn't move anything is not an edit.
+        if (!(block == *ui.block_transform_preview)) {
+            block = std::move(*ui.block_transform_preview);
+            mark_block_changed(project, ui, block);
+        }
     }
     ui.block_transform = BlockTransform::None;
     ui.block_transform_axis = -1;
     ui.block_transform_drag = false;
     ui.block_transform_handle = -1;
     ui.block_transform_preview.reset();
+}
+
+// A new or copied surface is selected whole, in either mode.
+void select_element(SblBlockMesh& block, EditorUi& ui, BlockElementKind kind, std::size_t index) {
+    ui.block_element = kind;
+    ui.block_element_index = index;
+    ui.block_selected_vertices = kind == BlockElementKind::None ? std::vector<BlockVertexRef>{} : element_vertices(block, kind, index);
 }
 
 } // namespace
@@ -843,8 +1008,7 @@ void add_block_patch(EditorProject& project, EditorUi& ui) {
     const float w = static_cast<float>(block->width), h = static_cast<float>(block->height);
     set_patch_quad(patch, {0, 0, 0}, {0, h, 0}, {w, h, 0}, {w, 0, 0});
     block->authored_patches.push_back(std::move(patch));
-    ui.block_element = BlockElementKind::Patch;
-    ui.block_element_index = block->authored_patches.size() - 1U;
+    select_element(*block, ui, BlockElementKind::Patch, block->authored_patches.size() - 1U);
     mark_block_changed(project, ui, *block);
 }
 
@@ -855,13 +1019,13 @@ void add_block_box(EditorProject& project, EditorUi& ui) {
     box.final_value = 63U;
     set_box_bounds(box, {0.25F, 0.0F, 0.25F}, {0.75F, 0.5F, 0.75F});
     block->lights.push_back(box);
-    ui.block_element = BlockElementKind::Box;
-    ui.block_element_index = block->lights.size() - 1U;
+    select_element(*block, ui, BlockElementKind::Box, block->lights.size() - 1U);
     mark_block_changed(project, ui, *block);
 }
 
 void start_block_transform(EditorProject& project, EditorUi& ui, BlockTransform mode, Vector2 mouse) {
-    if (selected_block(project, ui) == nullptr || ui.block_element == BlockElementKind::None) return;
+    auto* block = selected_block(project, ui);
+    if (block == nullptr || transform_targets(*block, ui).empty()) return;
     ui.block_transform = mode;
     ui.block_transform_axis = -1;
     ui.block_transform_drag = false;
@@ -887,7 +1051,38 @@ void block_editor_press(EditorProject& project, EditorUi& ui, const Camera3D& ca
         ui.block_transform_preview.reset();
         return;
     }
-    pick_block_element(project, ui, get_viewport_mouse_ray(camera, mouse, viewport_size));
+    if (!ui.block_vertex_mode) {
+        pick_block_element(project, ui, get_viewport_mouse_ray(camera, mouse, viewport_size));
+        return;
+    }
+    const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+    if (const auto hit = vertex_under_mouse(*block, camera, mouse, viewport_size)) {
+        const auto group = coincident_vertices(*block, *hit);
+        auto& selection = ui.block_selected_vertices;
+        const bool was_selected = std::ranges::find(selection, *hit) != selection.end();
+        ui.block_element = hit->kind;
+        ui.block_element_index = hit->element;
+        if (shift) {
+            // Shift+click adds or removes the point.
+            if (was_selected) std::erase_if(selection, [&](const BlockVertexRef& ref) { return std::ranges::find(group, ref) != group.end(); });
+            else add_vertices(selection, group);
+            return;
+        }
+        // A plain click picks only this point (and any point at the same place), so a
+        // drag moves just it. Shift+click builds a bigger selection; G moves that.
+        selection = group;
+        ui.block_transform = BlockTransform::Grab;
+        ui.block_transform_axis = -1;
+        ui.block_transform_drag = true;
+        ui.block_transform_handle = -1;
+        ui.block_transform_mouse = mouse;
+        ui.block_transform_preview.reset();
+        return;
+    }
+    // Empty space: dragging draws a selection box, and a click picks the surface under
+    // the cursor (both on release, in block_editor_update).
+    ui.box_select_active = true;
+    ui.box_select_start = mouse;
 }
 
 void block_editor_update(EditorProject& project, EditorUi& ui, const Camera3D& camera, Vector2 mouse, Vector2 viewport_size, bool hovered) {
@@ -895,17 +1090,61 @@ void block_editor_update(EditorProject& project, EditorUi& ui, const Camera3D& c
     if (block == nullptr || ui.tab != EditorTab::Blocks) {
         if (ui.block_transform != BlockTransform::None) end_block_transform(project, ui, false);
         ui.block_hover_handle = -1;
+        ui.block_hover_vertex.reset();
         return;
+    }
+    // Another block was opened: its points are not the old selection.
+    if (ui.block_selection_block != ui.selected_block) {
+        ui.block_selection_block = ui.selected_block;
+        ui.block_selected_vertices.clear();
+        ui.block_element = BlockElementKind::None;
+    }
+    const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+    if (ui.box_select_active && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+        ui.box_select_active = false;
+        if (Vector2Distance(mouse, ui.box_select_start) > 6.0F) {
+            const float x0 = std::min(mouse.x, ui.box_select_start.x), x1 = std::max(mouse.x, ui.box_select_start.x);
+            const float y0 = std::min(mouse.y, ui.box_select_start.y), y1 = std::max(mouse.y, ui.box_select_start.y);
+            std::vector<BlockVertexRef> inside;
+            for (const auto& ref : block_vertices(*block)) {
+                const auto at = to_screen(camera, *vertex_ptr(*block, ref), viewport_size);
+                if (at && at->x >= x0 && at->x <= x1 && at->y >= y0 && at->y <= y1) inside.push_back(ref);
+            }
+            if (!shift) ui.block_selected_vertices.clear();
+            add_vertices(ui.block_selected_vertices, inside);
+            if (!inside.empty()) {
+                ui.block_element = inside.back().kind;
+                ui.block_element_index = inside.back().element;
+            }
+        } else {
+            // A click on a surface selects all of its points; on nothing, clears.
+            pick_block_element(project, ui, get_viewport_mouse_ray(camera, mouse, viewport_size));
+            if (!shift) ui.block_selected_vertices.clear();
+            if (ui.block_element != BlockElementKind::None) {
+                add_vertices(ui.block_selected_vertices, element_vertices(*block, ui.block_element, ui.block_element_index));
+            }
+        }
     }
     const bool typing = ImGui::GetIO().WantTextInput;
     const bool command = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL) || IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER);
     if (ui.block_transform == BlockTransform::None) {
         const auto handle = hovered ? handle_under_mouse(*block, ui, camera, mouse, viewport_size) : std::nullopt;
         ui.block_hover_handle = handle ? handle->id : -1;
-        if (hovered && !typing && !command && !IsCursorHidden() && ui.block_element != BlockElementKind::None) {
-            if (IsKeyPressed(KEY_G)) start_block_transform(project, ui, BlockTransform::Grab, mouse);
-            else if (IsKeyPressed(KEY_S)) start_block_transform(project, ui, BlockTransform::Scale, mouse);
-            else if (IsKeyPressed(KEY_R)) start_block_transform(project, ui, BlockTransform::Rotate, mouse);
+        ui.block_hover_vertex = hovered && !handle && ui.block_vertex_mode ? vertex_under_mouse(*block, camera, mouse, viewport_size) : std::nullopt;
+        if (hovered && !typing && !command && !IsCursorHidden()) {
+            if (IsKeyPressed(KEY_TAB)) {
+                // Tab switches between picking points and picking whole surfaces.
+                ui.block_vertex_mode = !ui.block_vertex_mode;
+                if (ui.block_vertex_mode && ui.block_selected_vertices.empty() && ui.block_element != BlockElementKind::None) {
+                    ui.block_selected_vertices = element_vertices(*block, ui.block_element, ui.block_element_index);
+                }
+            } else if (IsKeyPressed(KEY_G)) {
+                start_block_transform(project, ui, BlockTransform::Grab, mouse);
+            } else if (IsKeyPressed(KEY_S)) {
+                start_block_transform(project, ui, BlockTransform::Scale, mouse);
+            } else if (IsKeyPressed(KEY_R)) {
+                start_block_transform(project, ui, BlockTransform::Rotate, mouse);
+            }
         }
         return;
     }
@@ -926,12 +1165,27 @@ void block_editor_update(EditorProject& project, EditorUi& ui, const Camera3D& c
     }
 }
 
+namespace {
+
+// The block's faces with the textures picked for slots 0..7, and their edges.
+void draw_block_faces_textured(const EditorProject& project, const EditorUi& ui, const SblBlockMesh& block) {
+    draw_block_mesh_textured(project, block, ui.block_slot_textures, {}, kUnit, 0, 255);
+    for (const auto& face : block.faces) {
+        for (std::size_t k = 0; k < face.vertices.size(); ++k) {
+            DrawLine3D(to_world(face.vertices[k]), to_world(face.vertices[(k + 1) % face.vertices.size()]), Color{20, 23, 26, 160});
+        }
+    }
+}
+
+} // namespace
+
 void draw_block_editor_view(EditorProject& project, const EditorUi& ui) {
     if (project.blocks.empty()) return;
     // While a transform runs, the preview copy is drawn in place of the block.
     auto& real = project.blocks[std::min(ui.selected_block, project.blocks.size() - 1U)].data;
     auto& block = ui.block_transform_preview ? const_cast<SblBlockMesh&>(*ui.block_transform_preview) : real;
-    draw_mesh_faces(block, kUnit, {98, 148, 204, 220});
+    if (ui.block_textured) draw_block_faces_textured(project, ui, block);
+    else draw_mesh_faces(block, kUnit, {98, 148, 204, 220});
     // The block's cell box and its cell grid on the floor.
     const Vector3 size{static_cast<float>(block.width) * kUnit, static_cast<float>(block.height) * kUnit, static_cast<float>(block.depth) * kUnit};
     DrawCubeWiresV(Vector3Scale(size, 0.5F), size, Color{235, 235, 240, 140});
@@ -941,7 +1195,9 @@ void draw_block_editor_view(EditorProject& project, const EditorUi& ui) {
     for (std::uint32_t z = 1; z < block.depth; ++z) {
         DrawLine3D({0.0F, 0.0F, static_cast<float>(z) * kUnit}, {size.x, 0.0F, static_cast<float>(z) * kUnit}, Color{235, 235, 240, 70});
     }
-    // The selected surface over its faces, and its outline.
+    // The selected surface in surface mode: filled when untextured, outlined when
+    // textured so its texture stays visible.
+    if (ui.block_vertex_mode) return;
     std::vector<SblBlockFace> faces;
     if (ui.block_element == BlockElementKind::Patch && ui.block_element_index < block.authored_patches.size()) {
         faces = sbl_patch_faces(block.authored_patches[ui.block_element_index]);
@@ -951,9 +1207,11 @@ void draw_block_editor_view(EditorProject& project, const EditorUi& ui) {
     for (const auto& face : faces) {
         if (face.vertices.size() < 4) continue;
         const auto a = to_world(face.vertices[0]), b = to_world(face.vertices[1]), c = to_world(face.vertices[2]), d = to_world(face.vertices[3]);
-        const Color fill{255, 214, 70, 200};
-        DrawTriangle3D(a, b, c, fill); DrawTriangle3D(c, b, a, fill);
-        DrawTriangle3D(a, c, d, fill); DrawTriangle3D(d, c, a, fill);
+        if (!ui.block_textured) {
+            const Color fill{255, 214, 70, 200};
+            DrawTriangle3D(a, b, c, fill); DrawTriangle3D(c, b, a, fill);
+            DrawTriangle3D(a, c, d, fill); DrawTriangle3D(d, c, a, fill);
+        }
         const Color edge{255, 240, 160, 255};
         DrawLine3D(a, b, edge); DrawLine3D(b, c, edge); DrawLine3D(c, d, edge); DrawLine3D(d, a, edge);
     }
@@ -961,12 +1219,34 @@ void draw_block_editor_view(EditorProject& project, const EditorUi& ui) {
 
 // Drawn after the finished scene, so the handles stay visible through the block.
 void draw_block_editor_handles(EditorProject& project, const EditorUi& ui, const Camera3D& camera) {
-    if (project.blocks.empty() || ui.block_element == BlockElementKind::None) return;
+    if (project.blocks.empty()) return;
     auto& real = project.blocks[std::min(ui.selected_block, project.blocks.size() - 1U)].data;
     auto& block = ui.block_transform_preview ? const_cast<SblBlockMesh&>(*ui.block_transform_preview) : real;
+    if (ui.block_vertex_mode) {
+        // Curved patches show their control grid, so you can see what a point pulls.
+        for (const auto& patch : block.authored_patches) {
+            if (patch_is_flat(patch) || patch.control_points.size() != 16U) continue;
+            for (std::size_t row = 0; row < 4; ++row) {
+                for (std::size_t column = 0; column < 4; ++column) {
+                    const auto here = to_world(patch.control_points[row * 4 + column].position);
+                    if (column < 3) DrawLine3D(here, to_world(patch.control_points[row * 4 + column + 1].position), Color{200, 200, 210, 120});
+                    if (row < 3) DrawLine3D(here, to_world(patch.control_points[(row + 1) * 4 + column].position), Color{200, 200, 210, 120});
+                }
+            }
+        }
+        for (const auto& ref : block_vertices(block)) {
+            const auto at = to_world(*vertex_ptr(block, ref));
+            const float side = view_half_height(camera, at) * 0.014F;
+            const bool selected = std::ranges::find(ui.block_selected_vertices, ref) != ui.block_selected_vertices.end();
+            const Color color = ui.block_hover_vertex == ref ? Color{255, 230, 60, 255}
+                : selected ? Color{255, 150, 60, 255} : Color{25, 28, 32, 255};
+            DrawCubeV(at, {side, side, side}, color);
+        }
+    }
+    if (ui.block_vertex_mode ? ui.block_selected_vertices.empty() : ui.block_element == BlockElementKind::None) return;
     // Handles: the move arrows, box faces, and patch points. The active or hovered
-    // handle is yellow; an axis lock is shown as a long line through the element.
-    const auto points = element_points(block, ui.block_element, ui.block_element_index);
+    // handle is yellow; an axis lock is shown as a long line through the selection.
+    const auto points = points_of(block, transform_targets(block, ui));
     if (points.empty()) return;
     const auto pivot = center_of(points);
     const float length = arrow_length(camera, pivot);

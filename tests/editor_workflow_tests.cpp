@@ -33,6 +33,9 @@ void test_save_and_history(const std::filesystem::path& root) {
     buildblock.layers.resize(1);
     buildblock.layers[0].portal_type = 9;
     write_file_bytes(root / "buildblock/door.sbl", rebuild_sbl_buildblock(buildblock));
+    // The game loads the road textures from the map folder, so Save As must bring them.
+    write_file_bytes(root / "asphalt2.png", {1, 2, 3});
+    write_file_bytes(root / "asphalt2_material.png", {4, 5, 6});
 
     std::string status;
     auto loaded = load_project_folder(root, status, false);
@@ -66,6 +69,9 @@ void test_save_and_history(const std::filesystem::path& root) {
     require(copied && copied->city->data.buildings[0].x == 32 && copied->buildblocks.size() == 1 &&
         copied->buildblocks[0].data.layers[0].portal_type == 10,
         "Save As lost the city or an unchanged buildblock");
+    require(read_file_bytes(copy / "asphalt2.png") == std::vector<std::uint8_t>{1, 2, 3} &&
+        read_file_bytes(copy / "asphalt2_material.png") == std::vector<std::uint8_t>{4, 5, 6},
+        "Save As did not copy the road textures the game loads from the map folder");
 
     undo_city(project, ui, status);
     require(project.city->data.buildings[0].x == 0 && ui.city_dirty,
@@ -114,6 +120,8 @@ void test_archive_snapshot(const std::filesystem::path& root) {
     CsxArchive archive{0xc5f17e01U, 0, 0, {texture, unknown}};
     write_file_bytes(source / "test.csx", build_csx(archive));
     write_file_bytes(source / "texture/loose.png", {137, 'P', 'N', 'G', 13, 10, 26, 10});
+    write_file_bytes(source / "asphalt2.png", {1});
+    write_file_bytes(source / "asphalt2_material.png", {2});
     std::string status;
     auto loaded = load_project_folder(source, status, false);
     require(loaded && loaded->save_blocking_load_errors.empty(), "archive snapshot map failed to load");

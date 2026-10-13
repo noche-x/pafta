@@ -57,34 +57,6 @@ std::string hex_u32(std::uint32_t value) {
     return stream.str();
 }
 
-// Empty names keep their numbered slots and can still be selected.
-bool catalog_combo(const char* label, const std::vector<std::string>& entries, std::size_t& selected) {
-    if (entries.empty()) {
-        ImGui::TextDisabled("%s: (none)", label);
-        return false;
-    }
-    selected = std::min(selected, entries.size() - 1U);
-    const auto entry_text = [&](std::size_t i) {
-        return entries[i].empty() ? ("#" + std::to_string(i)) : entries[i];
-    };
-    bool changed = false;
-    ImGui::SetNextItemWidth(118.0F);
-    if (ImGui::BeginCombo(label, entry_text(selected).c_str())) {
-        for (std::size_t i = 0; i < entries.size(); ++i) {
-            const bool is_selected = (i == selected);
-            if (ImGui::Selectable(entry_text(i).c_str(), is_selected)) {
-                selected = i;
-                changed = true;
-            }
-            if (is_selected) {
-                ImGui::SetItemDefaultFocus();
-            }
-        }
-        ImGui::EndCombo();
-    }
-    return changed;
-}
-
 const LoadedAsset<SblTemplate>* find_buildblock_asset(const EditorProject& project, std::string_view name) {
     const auto match = std::ranges::find_if(project.buildblocks, [name](const LoadedAsset<SblTemplate>& asset) {
         return asset.name == name;
@@ -99,118 +71,43 @@ const LoadedAsset<SblTemplate>* buildblock_for_cell(const EditorProject& project
     return find_buildblock_asset(project, building.block_names[cell.cell_type()]);
 }
 
-// The building's buildblocks, each shown as previews of its first faces. Changes
-// `selected` (an index into building.block_names); true when it changed.
+// The building's buildblocks as a grid; each tile shows its first four faces.
+// Changes `selected` (an index into building.block_names); true when it changed.
 bool buildblock_picker(const EditorProject& project, const SbbBuilding& building, std::size_t& selected) {
     if (building.block_names.empty()) {
         ImGui::TextDisabled("(no buildblocks; add one under Buildblocks)");
         return false;
     }
     selected = std::min(selected, building.block_names.size() - 1U);
-    bool changed = false;
-    const float size = ImGui::GetFrameHeight();
-    ImGui::PushID("buildblock_picker");
-    for (std::size_t i = 0; i < building.block_names.size(); ++i) {
-        ImGui::PushID(static_cast<int>(i));
+    GridOptions options{.size = 52.0F, .height = 128.0F};
+    options.paint = [&](std::size_t i, ImDrawList* draw_list, ImVec2 min, ImVec2 max) {
         const auto* asset = find_buildblock_asset(project, building.block_names[i]);
-        const auto start = ImGui::GetCursorScreenPos();
-        if (ImGui::Selectable("##bb", selected == i, ImGuiSelectableFlags_AllowOverlap, ImVec2(0.0F, size))) {
-            selected = i;
-            changed = true;
+        if (asset == nullptr) return;
+        const float half = (max.x - min.x - 8.0F) * 0.5F;
+        for (std::size_t l = 0; l < std::min<std::size_t>(asset->data.layers.size(), 4U); ++l) {
+            draw_buildblock_layer(draw_list, ImVec2(min.x + 4.0F + static_cast<float>(l % 2U) * half, min.y + 4.0F + static_cast<float>(l / 2U) * half),
+                half - 1.0F, asset->data.layers[l]);
         }
-        ImGui::SetCursorScreenPos(start);
-        const std::size_t shown = asset == nullptr ? 0U : std::min<std::size_t>(asset->data.layers.size(), 4U);
-        for (std::size_t l = 0; l < shown; ++l) {
-            draw_buildblock_layer(ImGui::GetWindowDrawList(), ImGui::GetCursorScreenPos(), size, asset->data.layers[l]);
-            ImGui::Dummy(ImVec2(size, size));
-            ImGui::SameLine(0.0F, 2.0F);
-        }
-        ImGui::SetCursorScreenPos(ImVec2(start.x + 4.0F * (size + 2.0F) + 6.0F, start.y));
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(asset == nullptr ? (building.block_names[i] + " (not loaded)").c_str() : building.block_names[i].c_str());
-        ImGui::PopID();
-    }
-    ImGui::PopID();
-    return changed;
+    };
+    const auto picked = asset_grid("buildblock_picker", building.block_names.size(), selected, options,
+        [&](std::size_t i) {
+            return find_buildblock_asset(project, building.block_names[i]) == nullptr
+                ? building.block_names[i] + " (not loaded)" : building.block_names[i];
+        },
+        [](std::size_t) { return Thumb{}; });
+    if (picked) selected = *picked;
+    return picked.has_value();
 }
 
-// Materials with no loaded texture can still be selected by their short name.
-bool material_swatch_picker(const EditorProject& project, const char* id, const std::vector<std::string>& materials, std::size_t& selected) {
-    if (materials.empty()) {
-        ImGui::TextDisabled("(no materials)");
-        return false;
-    }
-    selected = std::min(selected, materials.size() - 1U);
-    bool changed = false;
-    constexpr float swatch = 40.0F;
-    const float avail = ImGui::GetContentRegionAvail().x;
-    const int per_row = std::max(1, static_cast<int>(avail / (swatch + 6.0F)));
-
-    ImGui::PushID(id);
-    for (std::size_t i = 0; i < materials.size(); ++i) {
-        if (i % static_cast<std::size_t>(per_row) != 0) {
-            ImGui::SameLine();
-        }
-        ImGui::PushID(static_cast<int>(i));
-        const std::string name = materials[i].empty() ? ("material " + std::to_string(i)) : materials[i];
-        const auto* tex = texture_for_material(project, materials[i]);
-        bool clicked = false;
-        if (tex != nullptr && tex->id != 0U) {
-            clicked = rlImGuiImageButtonSize(("##sw" + std::to_string(i)).c_str(), tex, Vector2{swatch, swatch});
-        } else {
-            const std::string label = name.substr(0, 3) + "##sw" + std::to_string(i);
-            clicked = ImGui::Button(label.c_str(), ImVec2(swatch, swatch));
-        }
-        if (clicked) {
-            selected = i;
-            changed = true;
-        }
-        if (selected == i) {
-            ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
-                IM_COL32(255, 200, 80, 255), 2.0F, 0, 3.0F);
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("%s", name.c_str());
-        }
-        ImGui::PopID();
-    }
-    ImGui::PopID();
-    ImGui::TextDisabled("Selected: %s", materials[selected].empty() ? ("material " + std::to_string(selected)).c_str() : materials[selected].c_str());
-    return changed;
-}
-
-std::optional<std::size_t> search_grid(const char* id, std::array<char, 128>& search, std::size_t count, std::size_t selected,
-    float size, float height, const std::function<const std::string&(std::size_t)>& name,
-    const std::function<std::pair<unsigned int, bool>(std::size_t)>& image) {
-    std::optional<std::size_t> clicked;
-    ImGui::PushID(id);
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    ImGui::InputTextWithHint("##search", ICON_FA_MAGNIFYING_GLASS " Search", search.data(), search.size());
-    const auto needle = lower_name(search.data());
-    if (ImGui::BeginChild("##grid", ImVec2(-FLT_MIN, height), ImGuiChildFlags_Borders)) {
-        const int per_row = std::max(1, static_cast<int>(ImGui::GetContentRegionAvail().x / (size + ImGui::GetStyle().ItemSpacing.x + 8.0F)));
-        int column = 0;
-        for (std::size_t i = 0; i < count; ++i) {
-            const std::string& label = name(i);
-            if (!needle.empty() && lower_name(label).find(needle) == std::string::npos) continue;
-            if (column++ % per_row != 0) ImGui::SameLine();
-            ImGui::PushID(static_cast<int>(i));
-            const auto [texture, flipped] = image(i);
-            const bool hit = texture != 0U
-                ? ImGui::ImageButton("##i", ImTextureID(texture), ImVec2(size, size), ImVec2(0.0F, flipped ? 1.0F : 0.0F), ImVec2(1.0F, flipped ? 0.0F : 1.0F))
-                : ImGui::Button(fit_label(label, size).c_str(), ImVec2(size + 8.0F, size + 8.0F));
-            if (hit) clicked = i;
-            if (i == selected) {
-                ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), IM_COL32(235, 190, 78, 255), 2.0F, 0, 3.0F);
-            }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", label.c_str());
-            ImGui::PopID();
-        }
-        if (column == 0) ImGui::TextDisabled("Nothing matches.");
-    }
-    ImGui::EndChild();
-    ImGui::PopID();
-    return clicked;
+// A building's materials as a grid (a material with no loaded texture shows its name).
+std::optional<std::size_t> material_grid(const EditorProject& project, const char* id, const std::vector<std::string>& materials,
+    std::size_t selected, float height) {
+    return asset_grid(id, materials.size(), selected, {.size = 40.0F, .height = height},
+        [&](std::size_t i) { return materials[i].empty() ? "material " + std::to_string(i) : materials[i]; },
+        [&](std::size_t i) {
+            const auto* texture = texture_for_material(project, materials[i]);
+            return Thumb{texture != nullptr ? texture->id : 0U, false};
+        });
 }
 
 // Each layer that is turned on replaces its own block word and textures. A layer
@@ -226,18 +123,18 @@ void draw_block_tool_panel(EditorProject& project, EditorUi& ui) {
     static constexpr std::array<const char*, 8> exterior_slots{"Bottom", "South", "West", "North", "East", "Top", "Slot 6", "Slot 7"};
     static constexpr std::array<const char*, 8> interior_slots{"Floor", "North wall", "East wall", "South wall", "West wall", "Ceiling", "Opening frame", "Slot 7"};
 
-    const auto piece_picker = [&](const char* id, std::array<char, 128>& search, std::size_t& block) {
+    const auto piece_picker = [&](const char* id, std::size_t& block) {
         if (project.blocks.empty()) {
             ImGui::TextDisabled("No blocks loaded.");
             return;
         }
         block = std::min(block, project.blocks.size() - 1U);
         ImGui::Text("Piece: %s", project.blocks[block].name.c_str());
-        const auto picked = search_grid(id, search, project.blocks.size(), block, 48.0F, 132.0F,
-            [&](std::size_t i) -> const std::string& { return project.blocks[i].name; },
+        const auto picked = asset_grid(id, project.blocks.size(), block, {.size = 48.0F, .height = 132.0F},
+            [&](std::size_t i) { return project.blocks[i].name; },
             [&](std::size_t i) {
                 const auto* t = block_thumbnail(project, i);
-                return std::pair{t != nullptr ? t->texture.id : 0U, true};
+                return Thumb{t != nullptr ? t->texture.id : 0U, true};
             });
         if (picked) block = *picked;
     };
@@ -252,18 +149,15 @@ void draw_block_tool_panel(EditorProject& project, EditorUi& ui) {
         for (std::size_t slot = 0; slot < materials.size(); ++slot) {
             ImGui::PushID(static_cast<int>(slot));
             materials[slot] = std::min(materials[slot], building.materials.size() - 1U);
-            const auto* tex = texture_for_material(project, building.materials[materials[slot]]);
-            const bool open = tex != nullptr && tex->id != 0U
-                ? rlImGuiImageButtonSize("##slot", tex, Vector2{30.0F, 30.0F})
-                : ImGui::Button("##slot", ImVec2(30.0F, 30.0F));
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s: %s", names[slot], building.materials[materials[slot]].c_str());
+            grid_button("##slot", 30.0F, building.materials.size(), materials[slot],
+                [&](std::size_t i) { return building.materials[i].empty() ? "material " + std::to_string(i) : building.materials[i]; },
+                [&](std::size_t i) {
+                    const auto* texture = texture_for_material(project, building.materials[i]);
+                    return Thumb{texture != nullptr ? texture->id : 0U, false};
+                }, names[slot], {.size = 40.0F});
             ImGui::SameLine();
+            ImGui::AlignTextToFramePadding();
             ImGui::TextUnformatted(names[slot]);
-            if (open) ImGui::OpenPopup("slot_swatches");
-            if (ImGui::BeginPopup("slot_swatches")) {
-                if (material_swatch_picker(project, "pop", building.materials, materials[slot])) ImGui::CloseCurrentPopup();
-                ImGui::EndPopup();
-            }
             if (slot % 2U == 0U) ImGui::SameLine(170.0F);
             ImGui::PopID();
         }
@@ -271,8 +165,6 @@ void draw_block_tool_panel(EditorProject& project, EditorUi& ui) {
         ImGui::TreePop();
     };
 
-    static std::array<char, 128> exterior_search{};
-    static std::array<char, 128> interior_search{};
     ImGui::SeparatorText("Block to place");
     ImGui::Checkbox("Exterior", &cfg.exterior);
     ImGui::SameLine(110.0F);
@@ -280,7 +172,7 @@ void draw_block_tool_panel(EditorProject& project, EditorUi& ui) {
     ImGui::Checkbox("Piece##exterior", &cfg.exterior_piece);
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Off: a plain solid block. On: a piece mesh (.sbl).");
     if (cfg.exterior) {
-        if (cfg.exterior_piece) piece_picker("exterior_piece", exterior_search, cfg.exterior_piece_block);
+        if (cfg.exterior_piece) piece_picker("exterior_piece", cfg.exterior_piece_block);
         texture_grid("Exterior textures", cfg.exterior_textures, exterior_slots);
     }
     ImGui::EndDisabled();
@@ -292,7 +184,7 @@ void draw_block_tool_panel(EditorProject& project, EditorUi& ui) {
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Off: a room. On: a piece mesh (.sbl) inside the block.");
     if (cfg.interior) {
         if (cfg.interior_piece) {
-            piece_picker("interior_piece", interior_search, cfg.interior_piece_block);
+            piece_picker("interior_piece", cfg.interior_piece_block);
         } else if (!building.block_names.empty()) {
             ImGui::TextUnformatted("Room walls from buildblock");
             buildblock_picker(project, building, cfg.buildblock_index);
@@ -391,9 +283,13 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
             }
         };
         ImGui::SeparatorText("Add material");
-        const auto picked = search_grid("add_material", ui.new_material_name, project.textures.size(), project.textures.size(), 36.0F, 120.0F,
-            [&](std::size_t i) -> const std::string& { return project.textures[i].name; },
-            [&](std::size_t i) { return std::pair{project.textures[i].texture.id, false}; });
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputTextWithHint("##add_material_search", ICON_FA_MAGNIFYING_GLASS " Search or type a name", ui.new_material_name.data(),
+            ui.new_material_name.size());
+        const auto picked = asset_grid("add_material", project.textures.size(), project.textures.size(),
+            {.size = 36.0F, .height = 120.0F, .search = &ui.new_material_name},
+            [&](std::size_t i) { return project.textures[i].name; },
+            [&](std::size_t i) { return Thumb{project.textures[i].texture.id, false}; });
         if (picked) add_material(project.textures[*picked].name);
         ImGui::BeginDisabled(ui.new_material_name[0] == '\0' || building.materials.size() >= 1024);
         if (ImGui::Button("Add typed name")) {
@@ -458,17 +354,21 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
             }
             ImGui::PopID();
         }
-        catalog_combo("##add", library, ui.building_list_add);
-        ImGui::SameLine();
-        ImGui::BeginDisabled(library.empty());
-        if (ImGui::Button("Add") && ui.building_list_add < library.size()) {
-            const auto& name = library[ui.building_list_add];
-            if (std::ranges::find(names, name) == names.end()) {
-                names.push_back(name);
-                mark_building_changed(project, ui);
+        // Add: pick one from the map's library (the same grid as everywhere else).
+        if (library.empty()) {
+            ImGui::TextDisabled("Nothing to add.");
+        } else {
+            ImGui::TextUnformatted("Add:");
+            ImGui::SameLine();
+            std::size_t add = library.size();
+            if (grid_button("##add", 22.0F, library.size(), add, [&](std::size_t i) { return library[i]; },
+                    [](std::size_t) { return Thumb{}; }, "Add")) {
+                if (std::ranges::find(names, library[add]) == names.end()) {
+                    names.push_back(library[add]);
+                    mark_building_changed(project, ui);
+                }
             }
         }
-        ImGui::EndDisabled();
         ImGui::PopID();
     };
     std::vector<std::string> buildblock_library;
@@ -565,13 +465,12 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
             ImGui::TextDisabled("No local .sis files found. Enter a name below.");
         } else {
             // Every .sis found, as previews; click one to add it to this building.
-            static std::array<char, 128> catalog_search{};
-            const auto picked = search_grid("item_set_catalog", catalog_search, project.item_set_catalog.size(),
-                project.item_set_catalog.size(), 56.0F, 150.0F,
-                [&](std::size_t i) -> const std::string& { return project.item_set_catalog[i]; },
+            const auto picked = asset_grid("item_set_catalog", project.item_set_catalog.size(),
+                project.item_set_catalog.size(), {.size = 56.0F, .height = 150.0F},
+                [&](std::size_t i) { return project.item_set_catalog[i]; },
                 [&](std::size_t i) {
                     const auto* t = item_set_thumbnail(project, project.item_set_catalog[i]);
-                    return std::pair{t != nullptr ? t->texture.id : 0U, true};
+                    return Thumb{t != nullptr ? t->texture.id : 0U, true};
                 });
             if (picked && building.item_set_names.size() < 1024U) add_name(project.item_set_catalog[*picked]);
         }
@@ -588,13 +487,12 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
         ImGui::SameLine();
         if (ImGui::RadioButton("Clear", ui.clear_item_set)) ui.clear_item_set = true;
         if (!ui.clear_item_set) {
-            static std::array<char, 128> place_search{};
-            const auto picked = search_grid("item_set_to_place", place_search, building.item_set_names.size(),
-                ui.selected_item_set, 56.0F, 150.0F,
-                [&](std::size_t i) -> const std::string& { return building.item_set_names[i]; },
+            const auto picked = asset_grid("item_set_to_place", building.item_set_names.size(),
+                ui.selected_item_set, {.size = 56.0F, .height = 150.0F},
+                [&](std::size_t i) { return building.item_set_names[i]; },
                 [&](std::size_t i) {
                     const auto* t = item_set_thumbnail(project, building.item_set_names[i]);
-                    return std::pair{t != nullptr ? t->texture.id : 0U, true};
+                    return Thumb{t != nullptr ? t->texture.id : 0U, true};
                 });
             if (picked) ui.selected_item_set = *picked;
             static constexpr std::array<const char*, 4> rotations{"0\xC2\xB0", "90\xC2\xB0", "180\xC2\xB0", "270\xC2\xB0"};
@@ -648,7 +546,9 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
         ImGui::SameLine();
         if (ImGui::RadioButton("Wall type", ui.paint_side_code)) ui.paint_side_code = true;
         if (!ui.paint_side_code) {
-            material_swatch_picker(project, "paint_material", building.materials, ui.paint_material_index);
+            if (const auto picked = material_grid(project, "paint_material", building.materials, ui.paint_material_index, 140.0F)) {
+                ui.paint_material_index = *picked;
+            }
         } else {
             // Side code 0 leaves the side open, 1 is a plain wall, and 3 and up pick a
             // face of the block's buildblock, shown as previews.

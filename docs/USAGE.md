@@ -48,7 +48,7 @@ On desktop, Ctrl+S asks for a folder. Save writes `city2.sbc` and `test.csx` the
 
 Save prepares every file before it replaces anything. If replacing fails, it tries to put the old files back, and if that fails too, the error message says where the backups are. A crash or power cut can still stop a save halfway through several files, so keep copies.
 
-Save rebuilds the asset archive, so the bytes can change even when the content does not. Old city maps with district cells keep their version until you agree to a Piece edit that upgrades them. Other city maps are saved as version 12. Save does not copy `asphalt2.png`, `asphalt2_material.png`, `map.png`, or loose `.sis` and `.it3` files, so a new folder may need those copied over by hand.
+Save rebuilds the asset archive, so the bytes can change even when the content does not. Old city maps with district cells keep their version until you agree to a Piece edit that upgrades them. Other city maps are saved as version 12. Save also writes `asphalt2.png` and `asphalt2_material.png`, which the game loads from the map folder. If the map has none, they are copied from another map in the same data folder. `map.png` is copied when the map has one. Loose `.sis` and `.it3` files live in the game's shared `data/itemset` and `data/item` folders, so Save does not copy them.
 
 If some geometry failed to load, the map still opens so you can look at it. Save and archive rebuilding stay off until you fix or remove the broken file and open the map again. Warnings about item previews do not stop Save.
 

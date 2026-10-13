@@ -157,48 +157,52 @@ void toolbar_divider() {
     ImGui::SameLine();
 }
 
-// A grid of thumbnails that wraps to the window width. `thumb(i)` may return null
-// while a thumbnail is still being drawn. Returns the index clicked, if any.
-template <typename Name, typename Thumb, typename Extra>
-std::optional<std::size_t> thumbnail_strip(const char* id, std::size_t count, std::size_t selected, const std::array<char, 128>& search,
-                                           Name name, Thumb thumb, Extra extra) {
-    constexpr float cell = 88.0F;
-    std::optional<std::size_t> clicked;
-    if (ImGui::BeginChild(id, ImVec2(0.0F, 0.0F), ImGuiChildFlags_None)) {
-        const float step = cell + ImGui::GetStyle().FramePadding.x * 2.0F + ImGui::GetStyle().ItemSpacing.x;
-        const int per_row = std::max(1, static_cast<int>((ImGui::GetContentRegionAvail().x + ImGui::GetStyle().ItemSpacing.x) / step));
-        const auto needle = lower_name(search.data());
-        int column = 0;
-        for (std::size_t i = 0; i < count; ++i) {
-            const std::string& label = name(i);
-            if (!needle.empty() && lower_name(label).find(needle) == std::string::npos) continue;
-            if (column++ % per_row != 0) ImGui::SameLine();
-            ImGui::PushID(static_cast<int>(i));
-            ImGui::BeginGroup();
-            const RenderTexture2D* texture = thumb(i);
-            const bool hit = texture != nullptr && texture->texture.id != 0U
-                ? ImGui::ImageButton("##t", ImTextureID(texture->texture.id), ImVec2(cell, cell), ImVec2(0.0F, 1.0F), ImVec2(1.0F, 0.0F))
-                : ImGui::Button("...##t", ImVec2(cell + 6.0F, cell + 6.0F));
-            if (hit) clicked = i;
-            if (i == selected) {
-                ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), IM_COL32(235, 190, 78, 255), 3.0F, 0, 3.0F);
-            }
-            extra(i);
-            ImGui::TextUnformatted(fit_label(label, cell).c_str());
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", label.c_str());
-            ImGui::EndGroup();
-            ImGui::PopID();
-        }
-        if (column == 0) ImGui::TextDisabled("Nothing matches.");
+// The Piece tool's brush: a preview, its mesh, and its eight slot textures. The
+// textures and mesh can be changed freely; placing reuses the map's piece that
+// matches, or adds one to city2.sbc.
+void draw_piece_brush(EditorProject& project, EditorUi& ui) {
+    ImGui::SeparatorText("Placing piece");
+    if (std::ranges::all_of(ui.place_piece_textures, &std::string::empty) && !project.textures.empty()) {
+        ui.place_piece_textures.fill(project.textures.front().name);
     }
-    ImGui::EndChild();
-    return clicked;
+    const auto mesh_name = piece_brush_mesh_name(project, ui);
+    if (const auto* preview = piece_thumbnail(project, mesh_name, ui.place_piece_textures)) {
+        ImGui::Image(ImTextureID(preview->texture.id), ImVec2(96.0F, 96.0F), ImVec2(0.0F, 1.0F), ImVec2(1.0F, 0.0F));
+        ImGui::SameLine();
+    }
+    ImGui::BeginGroup();
+    ImGui::TextUnformatted("Mesh");
+    std::size_t mesh = ui.place_piece_solid ? 0U : std::min(ui.place_piece_mesh, project.blocks.size() - 1U) + 1U;
+    if (grid_button("##piece_mesh", 44.0F, project.blocks.size() + 1U, mesh,
+            [&](std::size_t i) { return i == 0U ? std::string{"Solid block (nblock)"} : project.blocks[i - 1U].name; },
+            [&](std::size_t i) {
+                const auto* t = i == 0U ? piece_thumbnail(project, {}, ui.place_piece_textures) : block_thumbnail(project, i - 1U);
+                return Thumb{t != nullptr ? t->texture.id : 0U, true};
+            }, "Mesh")) {
+        ui.place_piece_solid = mesh == 0U;
+        if (mesh > 0U) ui.place_piece_mesh = mesh - 1U;
+    }
+    ImGui::TextUnformatted(mesh_name.empty() ? "Solid block" : mesh_name.c_str());
+    // Whether the map already has this piece, or placing adds it.
+    const auto& city_blocks = project.city->data.city_blocks;
+    std::optional<std::size_t> existing;
+    for (std::size_t block = 0; block < city_blocks.size() && !existing; ++block) {
+        if (lower_name(city_blocks[block].name) != lower_name(mesh_name)) continue;
+        if (std::ranges::find(city_blocks[block].layers, ui.place_piece_textures) != city_blocks[block].layers.end()) existing = block;
+    }
+    if (existing) ImGui::TextDisabled("Map piece %zu", *existing);
+    else ImGui::TextDisabled("New piece: added on first place");
+    ImGui::EndGroup();
+    ImGui::TextDisabled("Textures (slots 0-7)");
+    texture_slots(project, "piece_brush_slots", ui.place_piece_textures);
 }
 
 // A one-line hint for the active tool, drawn under the toolbar.
 const char* tool_hint(const EditorUi& ui) {
     if (ui.tab == EditorTab::Blocks) {
-        return "Click to select. Drag the arrows and handles, or G move, S scale, R rotate (X/Y/Z lock). Right-click for more.";
+        return ui.block_vertex_mode
+            ? "Points: click or drag a box to pick (Shift adds, Ctrl+A all), drag a point to move, G/S/R transform. Tab: surfaces."
+            : "Surfaces: click to pick. Drag the arrows and handles, or G move, S scale, R rotate (X/Y/Z lock). Tab: points.";
     }
     if (ui.tab == EditorTab::Buildings) {
         switch (ui.building_tool) {
@@ -381,18 +385,6 @@ void draw_asset_drawer_window(EditorProject* project, EditorUi& ui, std::string&
     ImGui::InputTextWithHint("##drawer_search", ICON_FA_MAGNIFYING_GLASS " Search", search.data(), search.size());
     if (drawer_pieces) {
         ImGui::SameLine();
-        if (!project->textures.empty()) {
-            ui.place_piece_texture = std::min(ui.place_piece_texture, project->textures.size() - 1U);
-            ImGui::SetNextItemWidth(160.0F);
-            if (ImGui::BeginCombo("##piece_texture", project->textures[ui.place_piece_texture].name.c_str())) {
-                for (std::size_t i = 0; i < project->textures.size(); ++i) {
-                    if (ImGui::Selectable(project->textures[i].name.c_str(), ui.place_piece_texture == i)) ui.place_piece_texture = i;
-                }
-                ImGui::EndCombo();
-            }
-            help_tooltip(ui, "Texture the stamped piece uses");
-            ImGui::SameLine();
-        }
         if (ImGui::Button(ICON_FA_ROTATE)) ui.selected_piece_rotation = (ui.selected_piece_rotation + 1) & 3;
         help_tooltip(ui, "Turn the piece", EditorAction::RotateSelection);
         ImGui::SameLine();
@@ -408,28 +400,58 @@ void draw_asset_drawer_window(EditorProject* project, EditorUi& ui, std::string&
     }
     {
         if (drawer_pieces) {
-            ui.place_piece_mesh = std::min(ui.place_piece_mesh, project->blocks.size() - 1U);
-            // The game's solid cube: a city block with no mesh name.
-            if (ImGui::Button("Solid\nblock\n(nblock)", ImVec2(94.0F, 94.0F))) ui.place_piece_solid = true;
-            if (ui.place_piece_solid) {
-                ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), IM_COL32(235, 190, 78, 255), 3.0F, 0, 3.0F);
+            // The map's pieces: each city block of city2.sbc with one of its texture
+            // layers, shown as it looks. Picking one makes it the brush.
+            struct PieceEntry {
+                std::size_t block;
+                std::size_t layer;
+            };
+            const auto& city_blocks = project->city->data.city_blocks;
+            std::vector<PieceEntry> entries;
+            for (std::size_t block = 0; block < city_blocks.size(); ++block) {
+                for (std::size_t layer = 0; layer < std::min<std::size_t>(city_blocks[block].layers.size(), 63U); ++layer) {
+                    entries.push_back({block, layer});
+                }
             }
-            help_tooltip(ui, "A plain solid cube with the chosen texture on every side");
-            ImGui::SameLine();
-            const auto picked = thumbnail_strip("##piece_strip", project->blocks.size(), ui.place_piece_solid ? project->blocks.size() : ui.place_piece_mesh, search,
-                [&](std::size_t i) -> const std::string& { return project->blocks[i].name; },
-                [&](std::size_t i) { return block_thumbnail(*project, i); },
-                [](std::size_t) {});
+            const auto brush_name = lower_name(piece_brush_mesh_name(*project, ui));
+            std::size_t current = entries.size();
+            for (std::size_t i = 0; i < entries.size(); ++i) {
+                const auto& block = city_blocks[entries[i].block];
+                if (lower_name(block.name) == brush_name && block.layers[entries[i].layer] == ui.place_piece_textures) current = i;
+            }
+            if (entries.empty()) ImGui::TextDisabled("This map has no pieces yet. Make one in Properties and place it.");
+            const auto picked = asset_grid("##piece_presets", entries.size(), current, {.size = 88.0F, .labels = true, .search = &search},
+                [&](std::size_t i) {
+                    const auto& block = city_blocks[entries[i].block];
+                    auto label = std::string{city_block_display_name(block)};
+                    if (block.layers.size() > 1U) label += " #" + std::to_string(entries[i].layer + 1U);
+                    return label;
+                },
+                [&](std::size_t i) {
+                    const auto& block = city_blocks[entries[i].block];
+                    const auto* t = piece_thumbnail(*project, block.name, block.layers[entries[i].layer]);
+                    return Thumb{t != nullptr ? t->texture.id : 0U, true};
+                });
             if (picked) {
-                ui.place_piece_mesh = *picked;
-                ui.place_piece_solid = false;
+                const auto& block = city_blocks[entries[*picked].block];
+                ui.place_piece_textures = block.layers[entries[*picked].layer];
+                ui.place_piece_solid = block.name.empty();
+                const auto mesh = std::ranges::find_if(project->blocks, [&](const auto& asset) { return lower_name(asset.name) == lower_name(block.name); });
+                if (mesh != project->blocks.end()) {
+                    ui.place_piece_mesh = static_cast<std::size_t>(mesh - project->blocks.begin());
+                } else if (!block.name.empty()) {
+                    status = "piece mesh " + block.name + " is not loaded; the brush keeps its mesh";
+                }
             }
         } else {
             const bool editing = ui.tab == EditorTab::Buildings;
             const auto current = editing ? ui.selected_building : ui.place_building_template;
-            const auto picked = thumbnail_strip("##building_strip", project->buildings.size(), current, search,
-                [&](std::size_t i) -> const std::string& { return project->buildings[i].name; },
-                [&](std::size_t i) { return building_thumbnail(*project, i); },
+            const auto picked = asset_grid("##building_strip", project->buildings.size(), current, {.size = 88.0F, .labels = true, .search = &search},
+                [&](std::size_t i) { return project->buildings[i].name; },
+                [&](std::size_t i) {
+                    const auto* t = building_thumbnail(*project, i);
+                    return Thumb{t != nullptr ? t->texture.id : 0U, true};
+                },
                 [&](std::size_t i) {
                     if (ImGui::BeginPopupContextItem("##building_menu")) {
                         ImGui::TextDisabled("%s", project->buildings[i].name.c_str());
@@ -581,6 +603,10 @@ void draw_properties_window(EditorProject* project, EditorUi& ui, std::string& s
         if (project->city && ui.city_selection != CitySelectionKind::None &&
             (ui.city_tool == CityTool::Road || ui.city_tool == CityTool::Piece || ui.city_tool == CityTool::Building)) {
             ImGui::SeparatorText("Placing");
+            if (ui.city_tool == CityTool::Road) {
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                ImGui::SliderInt("##new_road_width_selected", &ui.new_road_width, 2, 24, "Width: %d cells");
+            }
             draw_place_height(ui);
         }
         if (!project->city) {
@@ -601,11 +627,7 @@ void draw_properties_window(EditorProject* project, EditorUi& ui, std::string& s
                     ImGui::TextColored(ImVec4(1.0F, 0.4F, 0.35F, 1.0F), ICON_FA_TRIANGLE_EXCLAMATION " %s", ui.placement_conflict.c_str());
                 }
             } else if (ui.city_tool == CityTool::Piece && !project->blocks.empty()) {
-                ImGui::SeparatorText("Placing piece");
-                ImGui::TextUnformatted(ui.place_piece_solid ? "nblock (solid block)" : project->blocks[std::min(ui.place_piece_mesh, project->blocks.size() - 1U)].name.c_str());
-                if (!project->textures.empty()) {
-                    ImGui::Text("Texture: %s", project->textures[std::min(ui.place_piece_texture, project->textures.size() - 1U)].name.c_str());
-                }
+                draw_piece_brush(*project, ui);
                 if (ImGui::Button(ICON_FA_ROTATE " Turn")) ui.selected_piece_rotation = (ui.selected_piece_rotation + 1) & 3;
                 help_tooltip(ui, "Turn the piece before placing it", EditorAction::RotateSelection);
                 ImGui::SameLine();
@@ -731,39 +753,8 @@ void draw_properties_window(EditorProject* project, EditorUi& ui, std::string& s
                 const auto layer = std::min<std::size_t>(std::max(1U, (ui.selected_piece_word >> 16U) & 0x3fU) - 1U,
                     city_block.layers.empty() ? 0U : city_block.layers.size() - 1U);
                 auto textures = city_block.layers.empty() ? std::array<std::string, 8>{} : city_block.layers[layer];
-                static std::array<char, 128> texture_search{};
-                static std::size_t repaint_slot{};
-                bool repaint = false;
                 ImGui::SeparatorText("Textures");
-                for (std::size_t slot = 0; slot <= textures.size(); ++slot) {
-                    ImGui::PushID(static_cast<int>(slot));
-                    const bool all = slot == textures.size();
-                    const auto* tex = all ? nullptr : find_project_texture(*project, textures[slot]);
-                    const bool open = tex != nullptr && tex->id != 0U
-                        ? ImGui::ImageButton("##t", ImTextureID(tex->id), ImVec2(30.0F, 30.0F))
-                        : ImGui::Button(all ? "All" : "?", ImVec2(38.0F, 38.0F));
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", all ? "Set every slot" : textures[slot].empty() ? "(none)" : textures[slot].c_str());
-                    if (open) {
-                        repaint_slot = slot;
-                        ImGui::OpenPopup("repaint");
-                    }
-                    if (ImGui::BeginPopup("repaint")) {
-                        ImGui::BeginChild("##repaint", ImVec2(320.0F, 250.0F));
-                        const auto picked = search_grid("repaint_grid", texture_search, project->textures.size(), project->textures.size(), 44.0F, 210.0F,
-                            [&](std::size_t i) -> const std::string& { return project->textures[i].name; },
-                            [&](std::size_t i) { return std::pair{project->textures[i].texture.id, false}; });
-                        ImGui::EndChild();
-                        if (picked) {
-                            if (repaint_slot == textures.size()) textures.fill(project->textures[*picked].name);
-                            else textures[repaint_slot] = project->textures[*picked].name;
-                            repaint = true;
-                            ImGui::CloseCurrentPopup();
-                        }
-                        ImGui::EndPopup();
-                    }
-                    if (slot % 5U != 4U && slot != textures.size()) ImGui::SameLine();
-                    ImGui::PopID();
-                }
+                const bool repaint = texture_slots(*project, "repaint", textures);
                 if (repaint) {
                     begin_city_action(*project, ui, "repaint piece");
                     repaint_city_piece(*project, ui, textures, status);

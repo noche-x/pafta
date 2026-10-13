@@ -526,6 +526,8 @@ struct EditorProject {
     std::vector<bool> block_thumbnail_ready;
     // Item set thumbnails by lower-case set name.
     std::unordered_map<std::string, RenderTexture2D> item_set_thumbnails;
+    // Piece previews: a block mesh (empty = the solid cube) with eight slot textures, keyed by those names.
+    std::unordered_map<std::string, RenderTexture2D> piece_thumbnails;
     // The Pieces tab preview comes from one city-block definition and the current
     // block-mesh catalog. Keep it between frames and rebuild it after edits.
     CityBlockPreviewScene cached_city_block_preview_scene;
@@ -587,6 +589,13 @@ enum class CityTool {
 
 // What the block editor has selected inside the block.
 enum class BlockElementKind { None, Patch, Box };
+// One point of a block in vertex mode: a patch control point or a box corner.
+struct BlockVertexRef {
+    BlockElementKind kind{};
+    std::size_t element{};
+    std::size_t point{};
+    bool operator==(const BlockVertexRef&) const = default;
+};
 // A Blender-style transform of the selected patch or box: G grabs, S scales, R
 // rotates. Gizmo arrows and handles use Grab on part of the element.
 enum class BlockTransform { None, Grab, Scale, Rotate };
@@ -704,6 +713,8 @@ enum class EditorAction {
     WindowTools,
     WindowLibrary,
     WindowProperties,
+    SelectAll,
+    DeselectAll,
     Count,
 };
 
@@ -827,6 +838,17 @@ struct EditorUi {
     std::optional<SblBlockMesh> block_transform_preview;
     // The handle under the mouse, for the hover colour.
     int block_hover_handle{-1};
+    // Vertex mode (Tab toggles, like Blender's edit mode): click, Shift+click, or drag a
+    // box to pick points across every surface, then G/S/R or the arrows move them.
+    // Off, a click picks a whole patch or box.
+    bool block_vertex_mode{true};
+    std::vector<BlockVertexRef> block_selected_vertices;
+    std::optional<BlockVertexRef> block_hover_vertex;
+    std::size_t block_selection_block{};   // the block the selected points belong to
+    // The block view's textures: one project texture per material slot 0..7 (a block's
+    // faces name slots; the building cell that places it picks the real textures).
+    bool block_textured{true};
+    std::array<std::string, 8> block_slot_textures{};
     std::size_t selected_block_field{};
     std::size_t selected_block_patch{};
     std::size_t selected_block_point{};
@@ -882,7 +904,6 @@ struct EditorUi {
     // instead of a texture.
     bool paint_side_code{false};
     std::uint32_t paint_code{1};
-    std::size_t building_list_add{};
     // Click and hold to keep placing: the last grid cell a held drag placed in, so
     // dragging across cells places quickly without placing in the same cell every
     // frame. Reset when the mouse is released. {INT32_MIN} means nothing placed yet in
@@ -918,9 +939,11 @@ struct EditorUi {
     std::size_t selected_city_block_layer{};
     std::size_t selected_city_block_slot{};
     std::size_t selected_piece_rotation{};
+    // The Piece tool's brush: a mesh (or the game's solid cube, "nblock") and the eight
+    // slot textures. Picking one of the map's pieces fills these; placing reuses the
+    // map's piece with the same mesh and textures, or adds one.
     std::size_t place_piece_mesh{};
-    std::size_t place_piece_texture{};
-    // Place the game's solid cube city block (no name, shown as "nblock").
+    std::array<std::string, 8> place_piece_textures{};
     bool place_piece_solid{false};
     std::size_t selected_portal{};
     std::array<int, 3> new_portal_cell{};
@@ -1096,12 +1119,36 @@ void draw_outliner_window(EditorProject* project, EditorUi& ui);
 std::string fit_label(const std::string& name, float width);
 // A label on the left, in a shared column, for the next widget (ui_panels.cpp).
 void field_label(const char* label);
-// A search box above a wrapping grid of thumbnails; returns the index clicked
-// (ui_panels.cpp). `image(i)` gives a GL texture id (0 means not ready yet) and
-// whether it is a render target (stored upside down).
-std::optional<std::size_t> search_grid(const char* id, std::array<char, 128>& search, std::size_t count, std::size_t selected,
-    float size, float height, const std::function<const std::string&(std::size_t)>& name,
-    const std::function<std::pair<unsigned int, bool>(std::size_t)>& image);
+// Shared pickers (ui_widgets.cpp). Every picker in the editor is one of these.
+// A grid item's thumbnail: a GL texture (0 = none yet, the name is shown instead)
+// and whether it is stored upside down (render targets are).
+struct Thumb {
+    unsigned int texture{};
+    bool flipped{};
+};
+struct GridOptions {
+    float size{48.0F};                     // thumbnail side in pixels
+    float height{0.0F};                    // grid height; 0 fills the space left
+    bool labels{false};                    // a name under each thumbnail
+    std::array<char, 128>* search{};       // a search box drawn elsewhere; null draws one above the grid
+    // Draws over an item's button (for previews that aren't textures).
+    std::function<void(std::size_t, ImDrawList*, ImVec2, ImVec2)> paint;
+};
+// A wrapping grid of thumbnails with a search box; returns the index clicked.
+// `extra(i)` runs right after each item (for its context menu).
+std::optional<std::size_t> asset_grid(const char* id, std::size_t count, std::size_t selected, const GridOptions& options,
+    const std::function<std::string(std::size_t)>& name, const std::function<Thumb(std::size_t)>& thumb,
+    const std::function<void(std::size_t)>& extra = {});
+// A thumbnail button showing the current pick; clicking opens the grid in a popup.
+// True when the pick changed.
+bool grid_button(const char* id, float size, std::size_t count, std::size_t& selected,
+    const std::function<std::string(std::size_t)>& name, const std::function<Thumb(std::size_t)>& thumb,
+    const char* tooltip = nullptr, const GridOptions& popup_options = {});
+// grid_button over the project's textures, by name.
+bool texture_button(const EditorProject& project, const char* id, std::string& texture_name, float size, const char* tooltip = nullptr);
+// The eight texture slots of a block or piece, plus one button that sets them all.
+bool texture_slots(const EditorProject& project, const char* id, std::array<std::string, 8>& names,
+    const std::array<const char*, 8>* slot_labels = nullptr);
 void draw_properties_window(EditorProject* project, EditorUi& ui, std::string& status);
 void toggle_in_selection(std::vector<std::size_t>& set, std::size_t index);
 void focus_current_selection(EditorProject& project, EditorUi& ui, Camera3D& camera);
@@ -1219,10 +1266,6 @@ const Texture2D* texture_for_material(const EditorProject& project, std::string_
 // Finds a loaded project texture by material name (ignoring case); nullptr if there
 // is none. The mesh exporter uses it too.
 const Texture2D* find_project_texture(const EditorProject& project, std::string_view name);
-// Picks a material from a grid of thumbnails you can click (the real texture when
-// there is one, a colour tile otherwise). Changes `selected` in place; returns true
-// when it changed.
-bool material_swatch_picker(const EditorProject& project, const char* id, const std::vector<std::string>& materials, std::size_t& selected);
 void draw_mesh_faces(const SblBlockMesh& mesh, float scale, Color fill);
 void draw_sbb_scene_for_app(
     const SbbBuilding& building,
@@ -1230,6 +1273,9 @@ void draw_sbb_scene_for_app(
     const SbbCell* selected,
     std::uint32_t guide_floor);
 void draw_building_item_set_guides(const EditorProject& project, const SbbBuilding& building, std::optional<std::uint32_t> floor);
+// The cell whose item set the ray hits first (its items' bounds), and the hit distance.
+std::optional<std::pair<std::size_t, float>> pick_building_item_set(
+    const EditorProject& project, const SbbBuilding& building, std::optional<std::uint32_t> floor, Ray ray);
 void draw_city_building_mask(GpuBuildingRenderModel& model, const SbcBuilding& placement);
 void draw_outline_from_mask(RenderTexture2D& mask, Vector2 viewport_size, Color tint);
 void draw_city_road_mask(const EditorProject& project, const MapScene& scene, std::size_t street_index);
@@ -1255,7 +1301,11 @@ void draw_city_scene(
     bool render_roads,
     bool render_terrain);
 void draw_city_editor_overlay(const EditorProject& project, const MapScene& scene);
-void draw_city_traffic_light_poles(const EditorProject& project, const MapScene& scene);
+// The game draws traffic lights and street signs only for near sectors
+// (RenderModels walks the near list from _render_buildsectorlist), so with the
+// game's interior LOD they stop at kNearLodDistance. 0 means no limit.
+float street_object_range();
+void draw_city_traffic_light_poles(const EditorProject& project, const MapScene& scene, Vector3 camera_position);
 void draw_city_shadow_volumes(EditorProject& project, const Camera3D& camera, float max_distance);
 void composite_city_shadows(Vector2 viewport_size);
 void draw_city_cursor(CityGridPoint point, float unit_size, CityTool tool);
@@ -1379,6 +1429,16 @@ const RenderTexture2D* building_thumbnail(EditorProject& project, std::size_t in
 void invalidate_building_thumbnail(EditorProject& project, std::size_t index);
 void rebuild_single_building_render(EditorProject& project, std::size_t index);
 const RenderTexture2D* city_block_thumbnail(EditorProject& project, std::size_t index);
+// The Piece tool brush's mesh name; empty for the solid cube (app.cpp).
+std::string piece_brush_mesh_name(const EditorProject& project, const EditorUi& ui);
+// The game's solid cube piece ("nblock"): a 1x1x1 block with all six sides.
+const SblBlockMesh& solid_piece_mesh();
+// A block mesh with a texture per material slot 0..7 (a slot with no texture gets a
+// colour), at origin, `unit` world units per cell, turned `rotation` quarter turns.
+void draw_block_mesh_textured(const EditorProject& project, const SblBlockMesh& mesh, const std::array<std::string, 8>& textures,
+    Vector3 origin, float unit, std::int32_t rotation, unsigned char alpha);
+// A cached preview of a piece: mesh name (empty = solid cube) plus slot textures.
+const RenderTexture2D* piece_thumbnail(EditorProject& project, const std::string& mesh_name, const std::array<std::string, 8>& textures);
 // Block-mesh thumbnail, drawn when first needed (ui_windows.cpp); nullptr until
 // ready.
 const RenderTexture2D* block_thumbnail(EditorProject& project, std::size_t index);
@@ -1388,11 +1448,15 @@ const RenderTexture2D* item_set_thumbnail(EditorProject& project, const std::str
 void invalidate_buildblock_preview_scene(EditorProject& project);
 const BuildblockPreviewScene& buildblock_preview_scene(EditorProject& project, std::size_t index);
 void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& status);
+// A 1x1x1 cube block, selected in the Blocks tab.
+void create_new_block(EditorProject& project, EditorUi& ui, std::string& status);
 void draw_block_inspector(EditorProject& project, EditorUi& ui, std::string& status);
 // Block editor (block_editor.cpp): the selected patch or box of the selected block.
 void duplicate_block_element(EditorProject& project, EditorUi& ui);
 void delete_block_element(EditorProject& project, EditorUi& ui);
 void nudge_block_element(EditorProject& project, EditorUi& ui, Vec3f delta);
+// Ctrl+A / Alt+A in the Blocks tab: every point of the block, or none (vertex mode).
+void block_select_all(EditorProject& project, EditorUi& ui, bool select);
 void draw_block_editor_view(EditorProject& project, const EditorUi& ui);
 void draw_block_editor_handles(EditorProject& project, const EditorUi& ui, const Camera3D& camera);
 void pick_block_element(EditorProject& project, EditorUi& ui, Ray ray);

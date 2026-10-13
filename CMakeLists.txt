@@ -218,6 +218,7 @@ if(NOT EMSCRIPTEN)
     src/ui_limits_buildblock.cpp
     src/ui_windows.cpp
     src/ui_workspace.cpp
+    src/ui_widgets.cpp
     src/viewport.cpp
     ${PAFTA_FONT_SOURCE}
   )
@@ -260,6 +261,7 @@ if(PAFTA_BUILD_WEB)
     src/ui_limits_buildblock.cpp
     src/ui_windows.cpp
     src/ui_workspace.cpp
+    src/ui_widgets.cpp
     src/viewport.cpp
     ${PAFTA_FONT_SOURCE}
   )

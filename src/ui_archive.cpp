@@ -46,6 +46,9 @@ std::uint64_t map_fingerprint(const EditorProject& project) {
     mix(project.archive_entries.size());
     mix(project.buildings.size());
     mix(project.blocks.size());
+    // Auto-fixes and imports replace assets in place and clear load errors.
+    mix(project.failed_assets.size());
+    mix(project.save_blocking_load_errors.size());
     mix(project.undo_stack.size());
     mix(project.redo_stack.size());
     mix(project.action_log.size());
@@ -392,11 +395,13 @@ void draw_csx_editor(ArchiveWorkspace& workspace, bool& open, EditorProject* pro
         if (!selected_folder) return;
         folder = *selected_folder;
 #endif
-        const auto write = [&](const std::string& name, const std::vector<std::uint8_t>& bytes) {
+        // Files go where the game reads loose assets: building/%s.sbb, block/%s.sbl,
+        // buildblock/%s.sbl, texture/%s.png, and texturematerial/%s.png.
+        const auto write = [&](const char* subfolder, const std::string& name, const std::vector<std::uint8_t>& bytes) {
 #ifdef __EMSCRIPTEN__
-            web_download(name, bytes);
+            web_download(std::string{subfolder} + "_" + name, bytes);
 #else
-            write_file_bytes(folder / name, bytes);
+            write_file_bytes(folder / subfolder / name, bytes);
 #endif
         };
         for (const auto i : indices) {
@@ -405,14 +410,22 @@ void draw_csx_editor(ArchiveWorkspace& workspace, bool& open, EditorProject* pro
             checked_name(entry.name);
             if (entry.kind == CsxEntryKind::Texture) {
                 const auto [image_size, material_size] = texture_parts(entry);
-                write(entry.name + ".png", {entry.payload.begin() + 0x4c, entry.payload.begin() + 0x4c + image_size});
-                if (material_size) write(entry.name + ".material.png",
+                write("texture", entry.name + ".png", {entry.payload.begin() + 0x4c, entry.payload.begin() + 0x4c + image_size});
+                if (material_size) write("texturematerial", entry.name + ".png",
                     {entry.payload.begin() + 0x4c + image_size, entry.payload.begin() + 0x4c + image_size + material_size});
+            } else if (entry.kind == CsxEntryKind::Sbb) {
+                write("building", entry.name + ".sbb", normalize_packed_sbb_bytes(entry.payload));
+            } else if (entry.kind == CsxEntryKind::Sbl) {
+                const auto bytes = normalize_packed_sbl_bytes(entry.payload);
+                bool block = true;
+                try {
+                    block = parse_sbl(bytes).block.has_value();
+                } catch (const std::exception&) {
+                    // Unreadable: keep it with the blocks, where archives normally hold .sbl files.
+                }
+                write(block ? "block" : "buildblock", entry.name + ".sbl", bytes);
             } else {
-                auto bytes = entry.payload;
-                if (entry.kind == CsxEntryKind::Sbb) bytes = normalize_packed_sbb_bytes(bytes);
-                if (entry.kind == CsxEntryKind::Sbl) bytes = normalize_packed_sbl_bytes(bytes);
-                write(entry.name + (entry.kind == CsxEntryKind::Sbb ? ".sbb" : entry.kind == CsxEntryKind::Sbl ? ".sbl" : ".bin"), bytes);
+                write("unknown", entry.name + ".bin", entry.payload);
             }
         }
 #ifdef __EMSCRIPTEN__
@@ -789,12 +802,22 @@ void draw_csx_editor(ArchiveWorkspace& workspace, bool& open, EditorProject* pro
         }
     });
 #endif
-    ImGui::BeginDisabled(workspace.refill.has_value());
+    // While a source asset is still broken the list is the stored archive, so writing
+    // it would drop every fix and edit made since.
+    const bool blocked = project != nullptr && workspace.follows_map && !project->save_blocking_load_errors.empty();
+    ImGui::BeginDisabled(workspace.refill.has_value() || blocked);
     if (ImGui::Button(dirty ? ICON_FA_FLOPPY_DISK " Write test.csx *" : ICON_FA_FLOPPY_DISK " Write test.csx")) {
         file_action([&] { save_archive_workspace(workspace); });
     }
     ImGui::EndDisabled();
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Writes test.csx into the map folder; the game reads no other name.");
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        if (blocked) {
+            ImGui::SetTooltip("%zu file(s) still failed to load. Fix them in Load problems (Windows menu) first.",
+                project->save_blocking_load_errors.size());
+        } else {
+            ImGui::SetTooltip("Writes test.csx into the map folder; the game reads no other name.");
+        }
+    }
     ImGui::SameLine();
     ImGui::BeginDisabled(selected.empty());
     if (ImGui::Button(ICON_FA_FILE_EXPORT " Extract selected...")) file_action([&] { extract(selected); });

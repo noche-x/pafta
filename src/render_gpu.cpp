@@ -3018,19 +3018,67 @@ bool draw_item_set_items(const EditorProject& project, const std::vector<SisItem
     return drawn;
 }
 
+namespace {
+// The set placed on a cell, or null when its name has no loaded .sis.
+const std::vector<SisItem>* cell_item_set(const EditorProject& project, const SbbBuilding& building, const SbbCell& cell) {
+    const auto name_index = sbb_item_set_name_index(cell.item_set_index);
+    if (name_index >= building.item_set_names.size()) return nullptr;
+    const auto set = project.item_sets.find(lower_name(building.item_set_names[name_index]));
+    return set == project.item_sets.end() ? nullptr : &set->second;
+}
+
+// Centre of a cell's floor in the edit view, where its item set stands.
+Vector3 item_set_origin(const SbbBuilding& building, const SbbCell& cell) {
+    constexpr float unit = 4.0F;
+    return {(static_cast<float>(cell.x) - building.anchor_x) * unit + unit * 0.5F,
+        (static_cast<float>(cell.y) - building.anchor_y) * unit,
+        (static_cast<float>(cell.z) - building.anchor_z) * unit + unit * 0.5F};
+}
+} // namespace
+
+std::optional<std::pair<std::size_t, float>> pick_building_item_set(
+    const EditorProject& project, const SbbBuilding& building, std::optional<std::uint32_t> floor, Ray ray) {
+    std::optional<std::pair<std::size_t, float>> best;
+    for (std::size_t index = 0; index < building.cells.size(); ++index) {
+        const auto& cell = building.cells[index];
+        if (cell.item_set_index == 0U || (floor && cell.y != *floor)) continue;
+        const auto origin = item_set_origin(building, cell);
+        // Sets with no item meshes show the diamond marker on the cell's ceiling.
+        BoundingBox box{{origin.x - 1.3F, origin.y + 3.8F, origin.z - 1.3F}, {origin.x + 1.3F, origin.y + 4.3F, origin.z + 1.3F}};
+        if (const auto* items = cell_item_set(project, building, cell)) {
+            const float angle = static_cast<float>(sbb_item_set_rotation(cell.item_set_index) & 3U) * PI * 0.5F;
+            const float c = std::cos(angle), s = std::sin(angle);
+            const auto turn = [&](Vec3f v) { return Vec3f{v.x * c - v.z * s, v.y, v.x * s + v.z * c}; };
+            Vector3 lo{FLT_MAX, FLT_MAX, FLT_MAX}, hi{-FLT_MAX, -FLT_MAX, -FLT_MAX};
+            for (const auto& item : *items) {
+                const auto mesh = project.item_meshes.find(lower_name(item.type));
+                if (mesh == project.item_meshes.end()) continue;
+                const auto p = turn(item.pos);
+                const std::array<Vec3f, 3> r{turn(item.rot[0]), turn(item.rot[1]), turn(item.rot[2])};
+                for (const auto& l : mesh->second.vertices) {
+                    const Vector3 v{origin.x + p.x + r[0].x * l.x + r[1].x * l.y + r[2].x * l.z,
+                        origin.y + p.y + r[0].y * l.x + r[1].y * l.y + r[2].y * l.z,
+                        origin.z + p.z + r[0].z * l.x + r[1].z * l.y + r[2].z * l.z};
+                    lo = Vector3Min(lo, v);
+                    hi = Vector3Max(hi, v);
+                }
+            }
+            if (lo.x <= hi.x) box = {lo, hi};
+        }
+        const auto hit = GetRayCollisionBox(ray, box);
+        if (hit.hit && (!best || hit.distance < best->second)) best = std::pair{index, hit.distance};
+    }
+    return best;
+}
+
 void draw_building_item_set_guides(const EditorProject& project, const SbbBuilding& building, std::optional<std::uint32_t> floor) {
     constexpr float unit = 4.0F;
     constexpr Color color{250, 196, 75, 255};
     for (const auto& cell : building.cells) {
         if (cell.item_set_index == 0U || (floor && cell.y != *floor)) continue;
-        const float x = (static_cast<float>(cell.x) - building.anchor_x) * unit + unit * 0.5F;
-        const float y = (static_cast<float>(cell.y) - building.anchor_y) * unit;
-        const float z = (static_cast<float>(cell.z) - building.anchor_z) * unit + unit * 0.5F;
-        const auto name_index = sbb_item_set_name_index(cell.item_set_index);
-        const auto set = name_index < building.item_set_names.size()
-            ? project.item_sets.find(lower_name(building.item_set_names[name_index])) : project.item_sets.end();
-        if (set != project.item_sets.end() &&
-            draw_item_set_items(project, set->second, {x, y, z}, sbb_item_set_rotation(cell.item_set_index))) continue;
+        const auto [x, y, z] = item_set_origin(building, cell);
+        if (const auto* items = cell_item_set(project, building, cell);
+            items && draw_item_set_items(project, *items, {x, y, z}, sbb_item_set_rotation(cell.item_set_index))) continue;
         const float top = y + unit + 0.08F;
         const Vector3 north{x, top, z - 1.3F};
         const Vector3 east{x + 1.3F, top, z};
@@ -3041,6 +3089,107 @@ void draw_building_item_set_guides(const EditorProject& project, const SbbBuildi
         DrawLine3D(south, west, color);
         DrawLine3D(west, north, color);
     }
+}
+
+const SblBlockMesh& solid_piece_mesh() {
+    static const SblBlockMesh mesh = [] {
+        SblBlockMesh cube{};
+        cube.width = cube.height = cube.depth = 1;
+        cube.exterior_flags.fill(1);
+        refresh_sbl_block_faces(cube);
+        return cube;
+    }();
+    return mesh;
+}
+
+void draw_block_mesh_textured(const EditorProject& project, const SblBlockMesh& mesh, const std::array<std::string, 8>& textures,
+    Vector3 origin, float unit, std::int32_t rotation, unsigned char alpha) {
+    // Each slot's colour when it has no texture, so the eight slots stay apart.
+    static constexpr std::array<Color, 8> kSlotColors{
+        Color{196, 196, 200, 255}, Color{214, 120, 96, 255}, Color{110, 170, 110, 255}, Color{100, 140, 210, 255},
+        Color{220, 190, 90, 255}, Color{170, 110, 200, 255}, Color{90, 190, 190, 255}, Color{150, 150, 110, 255}};
+    rlDrawRenderBatchActive();
+    rlDisableBackfaceCulling();
+    for (std::uint32_t slot = 0; slot < 8U; ++slot) {
+        const auto* texture = textures[slot].empty() ? nullptr : find_project_texture(project, textures[slot]);
+        rlSetTexture(texture != nullptr ? texture->id : rlGetTextureIdDefault());
+        rlBegin(RL_TRIANGLES);
+        for (const auto& face : mesh.faces) {
+            // A face's slot is its material; outside faces clamp to 7 (piece_face_slot).
+            if (face.vertices.size() < 3 || std::min(face.material & 0xffffU, 7U) != slot) continue;
+            std::vector<Vector3> points;
+            std::vector<Vec2f> uvs = face.uvs;
+            if (rotation != 0 && face.vertices.size() == 4U) {
+                const auto turned = rotate_block_face_native(mesh, face, rotation);
+                for (const auto& v : turned.vertices) points.push_back({v.x, v.y, v.z});
+            } else {
+                for (const auto& v : face.vertices) points.push_back({v.x, v.y, v.z});
+            }
+            for (auto& p : points) p = Vector3Add(origin, Vector3Scale(p, unit));
+            const auto n = Vector3Normalize(Vector3CrossProduct(Vector3Subtract(points[1], points[0]), Vector3Subtract(points[2], points[0])));
+            // Simple facing light so the shape reads without the game's lighting.
+            const float light = 0.6F + 0.3F * std::fabs(n.y) + 0.1F * std::fabs(n.x);
+            const auto base = texture != nullptr ? WHITE : kSlotColors[slot];
+            rlColor4ub(static_cast<unsigned char>(static_cast<float>(base.r) * light), static_cast<unsigned char>(static_cast<float>(base.g) * light),
+                static_cast<unsigned char>(static_cast<float>(base.b) * light), alpha);
+            const auto vertex = [&](std::size_t i) {
+                const auto uv = i < uvs.size() ? uvs[i] : Vec2f{};
+                rlTexCoord2f(uv.u, uv.v);
+                rlVertex3f(points[i].x, points[i].y, points[i].z);
+            };
+            for (std::size_t k = 1; k + 1 < points.size(); ++k) {
+                vertex(0);
+                vertex(k);
+                vertex(k + 1);
+            }
+        }
+        rlEnd();
+    }
+    rlSetTexture(0);
+    rlDrawRenderBatchActive();
+    rlEnableBackfaceCulling();
+}
+
+const RenderTexture2D* piece_thumbnail(EditorProject& project, const std::string& mesh_name, const std::array<std::string, 8>& textures) {
+    std::string key = lower_name(mesh_name);
+    for (const auto& texture : textures) key += "|" + lower_name(texture);
+    if (const auto found = project.piece_thumbnails.find(key); found != project.piece_thumbnails.end()) return &found->second;
+    const SblBlockMesh* mesh = &solid_piece_mesh();
+    if (!mesh_name.empty()) {
+        const auto block = std::ranges::find_if(project.blocks, [&](const auto& asset) { return lower_name(asset.name) == lower_name(mesh_name); });
+        if (block == project.blocks.end()) return nullptr;
+        mesh = &block->data;
+    }
+    if (project.thumbnail_budget <= 0) return nullptr;
+    --project.thumbnail_budget;
+    constexpr float unit = 4.0F;
+    Vector3 lo{FLT_MAX, FLT_MAX, FLT_MAX}, hi{-FLT_MAX, -FLT_MAX, -FLT_MAX};
+    for (const auto& face : mesh->faces) {
+        for (const auto& v : face.vertices) {
+            lo = Vector3Min(lo, Vector3Scale({v.x, v.y, v.z}, unit));
+            hi = Vector3Max(hi, Vector3Scale({v.x, v.y, v.z}, unit));
+        }
+    }
+    if (lo.x > hi.x) lo = hi = {};
+    const auto center = Vector3Scale(Vector3Add(lo, hi), 0.5F);
+    const float radius = std::max(1.0F, Vector3Distance(lo, hi) * 0.5F);
+    const float dist = radius * 2.3F;
+    Camera3D cam{};
+    cam.position = {center.x + dist * 0.7F, center.y + dist * 0.6F, center.z + dist * 0.7F};
+    cam.target = center;
+    cam.up = {0.0F, 1.0F, 0.0F};
+    cam.fovy = 45.0F;
+    cam.projection = CAMERA_PERSPECTIVE;
+    auto& target = project.piece_thumbnails[key];
+    target = LoadRenderTexture(128, 128);
+    begin_game_texture_mode(target);
+    ClearBackground(Color{32, 36, 41, 255});
+    BeginMode3D(cam);
+    rlEnableDepthTest();
+    draw_block_mesh_textured(project, *mesh, textures, {}, unit, 0, 255);
+    EndMode3D();
+    end_game_texture_mode();
+    return &target;
 }
 
 const RenderTexture2D* item_set_thumbnail(EditorProject& project, const std::string& name) {
@@ -3539,7 +3688,11 @@ void draw_city_shadow_volumes(EditorProject& project, const Camera3D& camera, fl
     g_shadow_cull = ShadowCull{planes, Vector3Scale(light, -32.0F)};
     draw_gpu_mesh_instances(project.portal_gpu_model.shadow_volume, {MatrixIdentity()}, GpuSurface::ShadowVolume);
     g_shadow_cull.reset();
-    if (g_render_settings.street_objects) draw_street_object_shadow_volumes(project.city_scene_cache, camera, max_distance, light);
+    if (g_render_settings.street_objects) {
+        const auto range = street_object_range();
+        draw_street_object_shadow_volumes(project.city_scene_cache, camera,
+            range > 0.0F && (max_distance <= 0.0F || range < max_distance) ? range : max_distance, light);
+    }
     glDisable(GL_POLYGON_OFFSET_FILL);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDepthMask(GL_TRUE);
@@ -4164,7 +4317,12 @@ Texture2D render_street_label(const char* text, const GameFont* font) {
 }
 
 // Every light is an instance of one model; signs are grouped by street name.
-void draw_city_traffic_light_poles(const EditorProject& project, const MapScene& scene) {
+float street_object_range() {
+    return g_render_settings.near_lod && !g_render_settings.interiors_selected_only ? kNearLodDistance : 0.0F;
+}
+
+void draw_city_traffic_light_poles(const EditorProject& project, const MapScene& scene, Vector3 camera_position) {
+    const float range = street_object_range();
     auto& light = traffic_light_model().mesh;
     auto& sign = street_sign_model().mesh;
     static std::filesystem::path label_root;
@@ -4185,6 +4343,7 @@ void draw_city_traffic_light_poles(const EditorProject& project, const MapScene&
     transforms.clear();
     for (auto& group : by_name) group.clear();
     for (const auto& pole : scene.traffic_light_poles) {
+        if (range > 0.0F && Vector3DistanceSqr({pole.base.x, pole.base.y, pole.base.z}, camera_position) > range * range) continue;
         const auto transform = MatrixMultiply(MatrixRotateY(street_object_yaw(pole.arm_direction)),
             MatrixTranslate(pole.base.x, pole.base.y, pole.base.z));
         transforms.push_back(transform);
