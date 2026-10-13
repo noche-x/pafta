@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #include "editor_state.hpp"
 
 #include <cstdint>
@@ -13,85 +14,39 @@ void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-void test_building_state() {
-    map_editor::SbbEditorState empty{{}};
-    require(empty.selected_cell() == nullptr, "empty building has a selected cell");
-    empty.select_next_occupied();
-    empty.adjust_active_field(1);
-    require(!empty.dirty(), "empty building became dirty");
+void test_building_grid_expansion() {
+    pafta::SbbBuilding building;
+    building.size_x = 63;
+    building.size_y = 63;
+    building.size_z = 64;
+    building.anchor_x = building.anchor_y = building.anchor_z = 4;
+    pafta::SbbCell cell;
+    cell.x = cell.y = cell.z = 63;
+    cell.exterior_block() = 0x40000000U;
+    pafta::refresh_sbb_cell_payloads(cell);
+    building.cells.push_back(cell);
+    const auto original = building;
+    for (const auto target : {std::array<std::int64_t, 3>{64, 63, 63}, {63, 64, 63}, {63, 63, 64},
+                             {-1, 63, 63}, {63, -1, 63}, {63, 63, -1}}) {
+        require(!pafta::shift_sbb_grid_for_cell(building, target[0], target[1], target[2]),
+            "unsupported building grid expansion was accepted");
+        require(building == original, "rejected grid expansion changed the building");
+    }
 
-    map_editor::SbbBuilding building{};
-    building.cells.resize(3);
-    building.cells[1].occupied = true;
-    building.cells[2].occupied = true;
-    map_editor::SbbEditorState state{building};
-    require(state.selected_index() == 1 && !state.dirty(), "first occupied cell was not selected");
-    state.select_next_occupied();
-    require(state.selected_index() == 2, "next occupied cell was not selected");
-    state.select_next_occupied();
-    require(state.selected_index() == 1, "occupied cell navigation did not wrap");
-    state.select_previous_occupied();
-    require(state.selected_index() == 2, "previous occupied cell did not wrap");
-    state.set_active_field(map_editor::SbbCellField::ItemSet);
-    state.adjust_active_field(-1);
-    require(!state.dirty(), "clamped no-op dirtied a building");
-    state.adjust_active_field(2);
-    require(state.dirty() && state.selected_cell()->item_set_index == 2,
-        "item-set field edit did not reach the selected cell");
-    state.adjust_active_field(-9);
-    require(state.selected_cell()->item_set_index == 0, "item-set field did not clamp at zero");
-}
-
-void test_city_state() {
-    map_editor::SbcEditorState empty{{}};
-    require(empty.selected_building() == nullptr, "empty city has a selected building");
-    empty.select_next_building();
-    empty.adjust_active_field(1);
-    require(!empty.dirty(), "empty city became dirty");
-
-    map_editor::SbcMap map{};
-    map.buildings.push_back({0, "a", 10, 0, 0, 0});
-    map.buildings.push_back({1, "b", 20, 0, 0, 1});
-    map_editor::SbcEditorState state{map};
-    state.select_previous_building();
-    require(state.selected_index() == 1, "city building navigation did not wrap");
-    state.set_active_field(map_editor::SbcBuildingField::Rotation);
-    state.adjust_active_field(1);
-    require(state.dirty() && state.selected_building()->rotation == 2,
-        "city rotation edit did not reach the selected building");
-    state.select_next_building();
-    require(state.selected_index() == 0 && state.selected_building()->x == 10,
-        "city next-building selection is wrong");
-}
-
-void test_block_word_state() {
-    map_editor::SblEditorState empty{{1, 2, 3}};
-    empty.select_next_word();
-    empty.adjust_selected_word(1);
-    require(!empty.dirty(), "incomplete SBL word became editable");
-
-    map_editor::SblEditorState state{{1, 0, 0, 0, 255, 255, 255, 255}};
-    require(state.selected_word_value() == 1, "first SBL word was decoded incorrectly");
-    state.select_previous_word();
-    require(state.selected_word_index() == 1, "SBL word navigation did not wrap");
-    state.adjust_selected_word(1);
-    require(!state.dirty() && state.selected_word_value() == std::numeric_limits<std::uint32_t>::max(),
-        "clamped SBL word edit changed bytes");
-    state.adjust_selected_word(-1);
-    require(state.dirty() && state.selected_word_value() == std::numeric_limits<std::uint32_t>::max() - 1,
-        "SBL word edit did not write little-endian bytes");
-    state.select_next_word();
-    require(state.selected_word_index() == 0 && state.selected_word_value() == 1,
-        "SBL next-word navigation is wrong");
+    building.cells[0].x = building.cells[0].y = building.cells[0].z = 62;
+    const auto coordinate = pafta::shift_sbb_grid_for_cell(building, -1, -1, -1);
+    require(coordinate == std::array<std::uint32_t, 3>{0, 0, 0}, "negative expansion did not return the shifted target");
+    require(building.cells[0].x == 63 && building.cells[0].y == 63 && building.cells[0].z == 63,
+        "supported expansion did not move the existing cell");
+    require(building.anchor_x == 5 && building.anchor_y == 5 && building.anchor_z == 5,
+        "supported expansion did not preserve the anchor-relative cell position");
 }
 
 } // namespace
 
 int main() {
     try {
-        test_building_state();
-        test_city_state();
-        test_block_word_state();
+        test_building_grid_expansion();
         std::cout << "Editor state tests passed\n";
         return 0;
     } catch (const std::exception& error) {

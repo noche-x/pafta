@@ -1,4 +1,5 @@
-// Floating tool windows, rebindable shortcuts, and preferences.
+// SPDX-License-Identifier: GPL-2.0-only
+// Floating tool windows, shortcuts you can change, and preferences.
 #include "app_internal.hpp"
 
 #include <imgui.h>
@@ -6,10 +7,14 @@
 #include <rlgl.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <iostream>
+#include <limits>
 #include <functional>
 #include <sstream>
 
@@ -19,12 +24,16 @@
 #include <emscripten/emscripten.h>
 #endif
 
-namespace map_editor::app_internal {
+extern const unsigned char pafta_editor_font[];
+extern const std::size_t pafta_editor_font_size;
+
+namespace pafta::app_internal {
 namespace {
 
-// Defaults avoid keys the host takes first: Chrome reserves Ctrl+T/N/W (so the
-// docked Tools/Library/Properties toggles are unbound; the Windows menu has
-// them) and macOS hides the app on Cmd+H (so Changes is Ctrl/Cmd+Shift+H).
+// The default keys avoid ones the browser or OS grabs first. Chrome keeps
+// Ctrl+T/N/W, so the toggles for the docked Tools, Library, and Properties windows
+// have no key (the Windows menu has them). macOS hides the app on Cmd+H, so Changes
+// is Ctrl/Cmd+Shift+H. Rows follow the EditorAction order.
 constexpr std::array<ShortcutInfo, static_cast<std::size_t>(EditorAction::Count)> kShortcutInfos{{
     {"save", "Save map", {KEY_S, true, false, false}},
     {"undo", "Undo", {KEY_Z, true, false, false}},
@@ -46,10 +55,10 @@ constexpr std::array<ShortcutInfo, static_cast<std::size_t>(EditorAction::Count)
     {"nudge_up", "Nudge selection up", {KEY_PAGE_UP, false, false, false}},
     {"nudge_down", "Nudge selection down", {KEY_PAGE_DOWN, false, false, false}},
     {"next_cell", "Next building cell / buildblock face (Shift reverses)", {KEY_TAB, false, false, false}},
+    // Keep the old Preferences alias so saved bindings that use it still load.
     {"tab_editor", "Mode: Preferences window", {0, false, false, false}},
     {"tab_city", "Mode: City", {KEY_ONE, true, false, false}},
     {"tab_buildings", "Mode: Building", {KEY_TWO, true, false, false}},
-    {"tab_pieces", "Mode: Pieces", {0, false, false, false}},
     {"window_building_browser", "Window: Building browser", {KEY_B, true, false, false}},
     {"window_block_browser", "Window: Block browser", {KEY_K, true, false, false}},
     {"window_buildblock", "Window: Buildblock", {KEY_L, true, false, false}},
@@ -110,8 +119,8 @@ std::string named_key(int key) {
     }
 }
 
-// Builds and draws one orbiting offscreen view. `draw` runs inside BeginMode3D
-// with the game surface shader camera already set.
+// Builds and draws one offscreen view you can orbit. `draw` runs inside BeginMode3D,
+// with the game surface shader's camera already set.
 void draw_preview_view(PreviewView& view, const char* id, ImVec2 size, Vector3 center, float radius,
                        const std::function<void()>& draw) {
     const int width = std::max(16, static_cast<int>(size.x));
@@ -194,8 +203,7 @@ void block_bounds(const SblBlockMesh& block, float scale, Vector3& center, float
 }
 
 
-// Floating windows open staggered over the viewport instead of all at one
-// default spot (where they stacked); Reset window layout puts them back.
+// Only apply the staggered positions on first use or when the layout is reset.
 void place_floating_window(const EditorUi& ui, int slot, ImVec2 size) {
     const auto* viewport = ImGui::GetMainViewport();
     const ImGuiCond cond = ui.reset_layout ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
@@ -207,7 +215,7 @@ void place_floating_window(const EditorUi& ui, int slot, ImVec2 size) {
 
 } // namespace
 
-// Name cut to fit a thumbnail's width (with "..."), so labels never widen a
+// A name cut to fit a thumbnail's width (ending in "..."), so labels never widen a
 // grid cell and push the last column out of view.
 std::string fit_label(const std::string& name, float width) {
     if (ImGui::CalcTextSize(name.c_str()).x <= width) return name;
@@ -260,7 +268,7 @@ struct MapDiffTarget {
     std::size_t index{};
 };
 
-// Classifies what an undo step changed and picks the first thing to focus on.
+// Works out what an undo step changed and picks the first thing to focus on.
 MapDiffTarget diff_maps(const SbcMap& before, const SbcMap& after) {
     MapDiffTarget t;
     if (after.buildings.size() > before.buildings.size()) {
@@ -306,7 +314,7 @@ MapDiffTarget diff_maps(const SbcMap& before, const SbcMap& after) {
         const auto& x = before.portals[i].voxel_blocks();
         const auto& y = after.portals[i].voxel_blocks();
         if (x != y) {
-            // Added if any cell went from empty to set and none the other way.
+            // Added if any cell went from empty to set, and none went the other way.
             bool added = false;
             bool removed = false;
             for (std::size_t k = 0; k < std::min(x.size(), y.size()); ++k) {
@@ -347,7 +355,7 @@ void focus_diff_target(EditorProject& project, EditorUi& ui, const MapDiffTarget
             const auto& portal = map.portals[target.index];
             ui.city_selection = CitySelectionKind::Piece;
             ui.selected_portal = target.index;
-            ui.selected_piece_voxel = CityGridPoint{portal.fields[1] * 8 + 4, portal.fields[2] * 8, portal.fields[3] * 8 + 4};
+            ui.selected_piece_voxel = CityGridPoint{sbc_portal_cell_base(portal.fields[1]) + 4, sbc_portal_cell_base(portal.fields[2]), sbc_portal_cell_base(portal.fields[3]) + 4};
             break;
         }
         default:
@@ -369,8 +377,8 @@ void reset_shortcuts(EditorUi& ui) {
 }
 
 bool action_pressed(const EditorUi& ui, EditorAction action) {
-    // While flying (right mouse held, cursor captured) the keys steer the
-    // camera: Ctrl+S or Ctrl+Z must not save or undo mid-flight.
+    // While flying (right mouse held, cursor captured), the keys steer the camera,
+    // so Ctrl+S or Ctrl+Z must not save or undo in the middle of a flight.
     if (ui.capturing_shortcut.has_value() || IsCursorHidden()) return false;
     const auto& binding = ui.shortcuts[index_of(action)];
     if (binding.key == 0) return false;
@@ -378,7 +386,7 @@ bool action_pressed(const EditorUi& ui, EditorAction action) {
     const bool ctrl = ctrl_down();
     const bool shift = modifier_down(KEY_LEFT_SHIFT, KEY_RIGHT_SHIFT);
     const bool alt = modifier_down(KEY_LEFT_ALT, KEY_RIGHT_ALT);
-    // Shift is allowed to vary for actions that document a Shift variant.
+    // Shift may differ for actions that list a Shift version.
     const bool shift_free = action == EditorAction::NextCell || action == EditorAction::RotateSelection;
     return ctrl == binding.ctrl && alt == binding.alt && (shift_free || shift == binding.shift);
 }
@@ -406,87 +414,151 @@ std::filesystem::path preferences_path() {
     const char* home = std::getenv("HOME");
     if (home == nullptr) home = std::getenv("USERPROFILE");
     const std::filesystem::path base = home == nullptr ? std::filesystem::temp_directory_path() : std::filesystem::path{home};
-    return base / ".map_editor_cpp" / "prefs.txt";
+    return base / ".pafta" / "prefs.txt";
 }
 
 void load_preferences(EditorUi& ui) {
     reset_shortcuts(ui);
 #ifdef __EMSCRIPTEN__
-    web_restore_file(preferences_path(), "map_editor.prefs");
+    web_restore_file(preferences_path(), "pafta.prefs");
 #endif
     std::ifstream in(preferences_path());
     if (!in) return;
+    // Preferences can be edited outside Pafta. Reject broken values and keep the
+    // defaults or the last good setting.
     std::string line;
     while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         const auto eq = line.find('=');
         if (eq == std::string::npos) continue;
         const auto key = line.substr(0, eq);
         const auto value = line.substr(eq + 1);
+        const auto read_float = [&](float& setting, float minimum, float maximum) {
+            char* end = nullptr;
+            errno = 0;
+            const auto number = std::strtof(value.c_str(), &end);
+            if (end == value.c_str() || errno == ERANGE || !std::isfinite(number)) {
+                return;
+            }
+            const auto finish = value.c_str() + value.size();
+            while (end != finish && std::isspace(static_cast<unsigned char>(*end))) {
+                ++end;
+            }
+            if (end != finish) {
+                return;
+            }
+            setting = std::clamp(number, minimum, maximum);
+        };
+        const auto read_int = [&](int& setting, int minimum, int maximum) {
+            char* end = nullptr;
+            errno = 0;
+            const auto number = std::strtol(value.c_str(), &end, 10);
+            if (end == value.c_str() || errno == ERANGE || number < std::numeric_limits<int>::min() ||
+                number > std::numeric_limits<int>::max()) {
+                return;
+            }
+            const auto finish = value.c_str() + value.size();
+            while (end != finish && std::isspace(static_cast<unsigned char>(*end))) {
+                ++end;
+            }
+            if (end != finish) {
+                return;
+            }
+            setting = std::clamp(static_cast<int>(number), minimum, maximum);
+        };
+        const auto read_bool = [&](bool& setting) {
+            if (value == "0") {
+                setting = false;
+            } else if (value == "1") {
+                setting = true;
+            }
+        };
         if (key.rfind("shortcut.", 0) == 0) {
             const auto name = key.substr(9);
             for (std::size_t i = 0; i < kShortcutInfos.size(); ++i) {
                 if (name != kShortcutInfos[i].name) continue;
-                Shortcut s{};
+                Shortcut shortcut{};
                 int ctrl = 0;
                 int shift = 0;
                 int alt = 0;
-                char comma = ',';
+                char first_comma = 0;
+                char second_comma = 0;
+                char third_comma = 0;
                 std::istringstream fields(value);
-                fields >> s.key >> comma >> ctrl >> comma >> shift >> comma >> alt;
-                s.ctrl = ctrl != 0;
-                s.shift = shift != 0;
-                s.alt = alt != 0;
-                ui.shortcuts[i] = s;
+                if (!(fields >> shortcut.key >> first_comma >> ctrl >> second_comma >> shift >> third_comma >> alt)) continue;
+                fields >> std::ws;
+                if (!fields.eof() || first_comma != ',' || second_comma != ',' || third_comma != ',' || shortcut.key < 0 ||
+                    (ctrl != 0 && ctrl != 1) || (shift != 0 && shift != 1) || (alt != 0 && alt != 1)) continue;
+                shortcut.ctrl = ctrl == 1;
+                shortcut.shift = shift == 1;
+                shortcut.alt = alt == 1;
+                ui.shortcuts[i] = shortcut;
             }
         } else if (key == "font_size") {
-            ui.ui_font_size = std::clamp(std::strtof(value.c_str(), nullptr), 10.0F, 28.0F);
+            read_float(ui.ui_font_size, 10.0F, 28.0F);
         } else if (key == "render.shadows") {
-            ui.render_shadows = value == "1";
+            read_bool(ui.render_shadows);
         } else if (key == "render.sky") {
-            ui.render_sky = value == "1";
+            read_bool(ui.render_sky);
         } else if (key == "render.shadow_distance") {
-            ui.shadow_distance = std::clamp(std::strtof(value.c_str(), nullptr), 64.0F, 2000.0F);
+            read_float(ui.shadow_distance, 64.0F, 2000.0F);
         } else if (key == "render.terrain") {
-            ui.render_terrain = std::atoi(value.c_str()) != 0;
+            read_bool(ui.render_terrain);
         } else if (key == "render.near_lod") {
-            ui.near_lod = value == "1";
+            read_bool(ui.near_lod);
         } else if (key == "render.scale") {
-            ui.render_scale = std::clamp(std::strtof(value.c_str(), nullptr), 0.5F, 1.0F);
+            read_float(ui.render_scale, 0.5F, 1.0F);
         } else if (key == "render.building_distance") {
-            ui.building_distance = std::clamp(std::strtof(value.c_str(), nullptr), 0.0F, 4000.0F);
+            read_float(ui.building_distance, 0.0F, 4000.0F);
         } else if (key == "render.half_textures") {
-            ui.half_textures = value == "1";
+            read_bool(ui.half_textures);
         } else if (key == "render.vsync") {
-            ui.vsync = value == "1";
+            read_bool(ui.vsync);
         } else if (key == "render.fps_limit") {
-            ui.fps_limit = std::clamp(std::atoi(value.c_str()), 0, 240);
+            read_int(ui.fps_limit, 0, 240);
         } else if (key == "render.background_throttle") {
-            ui.background_throttle = value == "1";
+            read_bool(ui.background_throttle);
         } else if (key == "render.street_objects") {
-            ui.street_objects = value == "1";
+            read_bool(ui.street_objects);
         } else if (key == "render.live_reflections") {
-            ui.live_reflections = value == "1";
+            read_bool(ui.live_reflections);
         } else if (key == "render.anisotropy") {
-            ui.anisotropy = std::clamp(std::atoi(value.c_str()), 1, 16);
+            read_int(ui.anisotropy, 1, 16);
         } else if (key == "render.world_time") {
-            ui.world_time_hours = std::clamp(std::strtof(value.c_str(), nullptr), 0.0F, 24.0F);
+            read_float(ui.world_time_hours, 0.0F, 24.0F);
         } else if (key == "view.coordinates") {
-            ui.show_coordinates = value == "1";
+            read_bool(ui.show_coordinates);
         } else if (key == "map.street_labels") {
-            ui.map_menu.street_labels = value == "1";
+            read_bool(ui.map_menu.street_labels);
         } else if (key == "map.font") {
             ui.map_menu.font = value;
         } else if (key == "map.export_size") {
-            ui.map_export_size = std::clamp(std::atoi(value.c_str()), 64, 4096);
+            read_int(ui.map_export_size, 64, 4096);
         } else if (key == "camera.fly_speed") {
-            ui.camera_fly_speed = std::clamp(std::strtof(value.c_str(), nullptr), 2.0F, 512.0F);
+            read_float(ui.camera_fly_speed, 2.0F, 512.0F);
+        } else if (key == "camera.blender_mouse") {
+            read_bool(ui.blender_mouse);
+        } else if (key == "render.interiors_selected_only") {
+            read_bool(ui.interiors_selected_only);
+        } else if (key == "window.toolbar") {
+            read_bool(ui.show_toolbar_window);
+        } else if (key == "window.outliner") {
+            read_bool(ui.show_library_window);
+        } else if (key == "window.properties") {
+            read_bool(ui.show_properties_window);
+        } else if (key == "window.assets") {
+            read_bool(ui.show_asset_drawer);
+        } else if (key == "load.loose_first") {
+            read_bool(ui.loose_files_win);
+        } else if (key == "export.mesh_folder") {
+            ui.mesh_export_folder = value;
         }
     }
 }
 
 #ifdef __EMSCRIPTEN__
-// The browser build's filesystem lives in memory, so settings files are
-// mirrored into localStorage to survive a reload.
+// The browser build's file system only lives in memory, so settings files are
+// copied into localStorage to survive a reload.
 void web_restore_file(const std::filesystem::path& path, const char* key) {
     EM_ASM({
         try {
@@ -511,12 +583,7 @@ void web_store_file(const std::filesystem::path& path, const char* key) {
 #endif
 
 void save_preferences(const EditorUi& ui) {
-    const auto path = preferences_path();
-    std::error_code ec;
-    std::filesystem::create_directories(path.parent_path(), ec);
-    {
-    std::ofstream out(path);
-    if (!out) return;
+    std::ostringstream out;
     out << "font_size=" << ui.ui_font_size << '\n';
     out << "render.shadows=" << (ui.render_shadows ? 1 : 0) << '\n';
     out << "render.sky=" << (ui.render_sky ? 1 : 0) << '\n';
@@ -534,6 +601,14 @@ void save_preferences(const EditorUi& ui) {
     out << "render.live_reflections=" << (ui.live_reflections ? 1 : 0) << '\n';
     out << "render.anisotropy=" << ui.anisotropy << '\n';
     out << "camera.fly_speed=" << ui.camera_fly_speed << '\n';
+    out << "camera.blender_mouse=" << (ui.blender_mouse ? 1 : 0) << '\n';
+    out << "render.interiors_selected_only=" << (ui.interiors_selected_only ? 1 : 0) << '\n';
+    out << "window.toolbar=" << (ui.show_toolbar_window ? 1 : 0) << '\n';
+    out << "window.outliner=" << (ui.show_library_window ? 1 : 0) << '\n';
+    out << "window.properties=" << (ui.show_properties_window ? 1 : 0) << '\n';
+    out << "window.assets=" << (ui.show_asset_drawer ? 1 : 0) << '\n';
+    out << "export.mesh_folder=" << ui.mesh_export_folder << '\n';
+    out << "load.loose_first=" << (ui.loose_files_win ? 1 : 0) << '\n';
     out << "view.coordinates=" << (ui.show_coordinates ? 1 : 0) << '\n';
     out << "map.street_labels=" << (ui.map_menu.street_labels ? 1 : 0) << '\n';
     out << "map.font=" << ui.map_menu.font << '\n';
@@ -543,37 +618,31 @@ void save_preferences(const EditorUi& ui) {
         out << "shortcut." << kShortcutInfos[i].name << '=' << s.key << ',' << (s.ctrl ? 1 : 0) << ','
             << (s.shift ? 1 : 0) << ',' << (s.alt ? 1 : 0) << '\n';
     }
-    }
+    const auto text = out.str();
+    try {
+        const auto path = preferences_path();
+        pafta::write_file_bytes(path, std::vector<std::uint8_t>{text.begin(), text.end()});
 #ifdef __EMSCRIPTEN__
-    web_store_file(path, "map_editor.prefs");
+        web_store_file(path, "pafta.prefs");
 #endif
+    } catch (const std::exception& error) {
+        std::string failure;
+        report_failure(failure, std::string{"Preferences save failed: "} + error.what());
+        std::cerr << failure << '\n';
+    }
 }
 
-// Light style from Pacome Danhiez (itamago), imgui PR #511, mapped onto the
-// current ImGuiCol names. Fonts must be added before rlImGuiEndInitImGui.
+// Light style by Pacome Danhiez (itamago), imgui PR #511, mapped onto today's
+// ImGuiCol names. Fonts must be added before rlImGuiEndInitImGui.
 void apply_editor_style(float font_size) {
     auto& io = ImGui::GetIO();
-    std::vector<std::filesystem::path> candidates;
-#ifdef MAPED_ASSET_DIR
-    candidates.emplace_back(std::filesystem::path{MAPED_ASSET_DIR} / "fonts" / "DejaVuSansMono.ttf");
-#endif
-    candidates.emplace_back(std::filesystem::path{GetApplicationDirectory()} / "assets" / "fonts" / "DejaVuSansMono.ttf");
-    candidates.emplace_back(std::filesystem::path{"assets"} / "fonts" / "DejaVuSansMono.ttf");
-    for (const auto& candidate : candidates) {
-        std::error_code ec;
-        if (std::filesystem::exists(candidate, ec)) {
-            // rlImGui already added its default font; make ours the default so
-            // text uses it and Font Awesome merges into it (rlImGuiEndInitImGui
-            // merges into the last font added).
-            if (ImFont* font = io.Fonts->AddFontFromFileTTF(candidate.string().c_str(), font_size); font != nullptr) {
-                io.FontDefault = font;
-                break;
-            }
-        }
-    }
-    // Font Awesome merged into the text font at the text size, every icon the
-    // same width: rlImGui's own merge (13 px, variable width) left icons off the
-    // text line and labels after them starting at different x positions.
+    // The font is compiled in (CMakeLists.txt makes editor_font.cpp), so no asset
+    // folder has to sit next to the binary. The atlas only reads it.
+    ImFontConfig text;
+    text.FontDataOwnedByAtlas = false;
+    io.FontDefault = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(pafta_editor_font),
+        static_cast<int>(pafta_editor_font_size), font_size, &text);
+    // Giving every icon the same width keeps labels lined up across toolbar buttons.
     static const ImWchar icon_ranges[] = {ICON_MIN_FA, ICON_MAX_FA, 0};
     ImFontConfig icons;
     icons.MergeMode = true;
@@ -638,9 +707,8 @@ void apply_editor_style(float font_size) {
     style.Colors[ImGuiCol_DockingPreview]        = ImVec4(0.26f, 0.59f, 0.98f, 0.70f);
     style.Colors[ImGuiCol_DockingEmptyBg]        = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
 
-    // Dark mode: flip the value of every low-saturation color (greys, text,
-    // backgrounds) so the palette inverts while the blue accents keep their hue
-    // and brightness.
+    // Dark mode: flip the brightness of every dull colour (greys, text, backgrounds),
+    // so the palette turns dark while the blue accents keep their hue and brightness.
     for (int i = 0; i < ImGuiCol_COUNT; ++i) {
         ImVec4& c = style.Colors[i];
         float h = 0.0F;
@@ -652,7 +720,7 @@ void apply_editor_style(float font_size) {
         }
     }
     style.Colors[ImGuiCol_Text]        = ImVec4(0.92f, 0.92f, 0.92f, 1.00f);
-    // Opaque: at 94-96% the menus and floating windows let panels show through.
+    // Solid backgrounds keep text readable over the 3D scene.
     style.Colors[ImGuiCol_WindowBg]    = ImVec4(0.11f, 0.11f, 0.12f, 1.00f);
     style.Colors[ImGuiCol_PopupBg]     = ImVec4(0.09f, 0.09f, 0.10f, 1.00f);
     style.Colors[ImGuiCol_FrameBg]     = ImVec4(0.18f, 0.18f, 0.20f, 1.00f);
@@ -691,8 +759,7 @@ void draw_shortcuts_table(EditorUi& ui, bool editable) {
     }
     const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchProp |
         ImGuiTableFlags_ScrollY;
-    // Grouped so the list reads by purpose; the retired Pieces/Preferences
-    // "mode" actions are not shown.
+    // The old Preferences alias still loads, but isn't shown in this list.
     const auto group_of = [](EditorAction action) -> int {
         switch (action) {
             case EditorAction::Save: case EditorAction::Undo: case EditorAction::Redo: return 0;
@@ -705,14 +772,14 @@ void draw_shortcuts_table(EditorUi& ui, bool editable) {
             case EditorAction::NextCell: return 3;
             case EditorAction::TabCity: case EditorAction::TabBuildings: return 4;
             case EditorAction::ToggleShadows: case EditorAction::ToggleSky: return 5;
-            case EditorAction::TabEditor: case EditorAction::TabPieces: return -1;
+            case EditorAction::TabEditor: return -1;
             default: return 6;
         }
     };
     constexpr const char* kGroups[] = {"General", "Camera", "Tools", "Editing", "Modes", "View", "Windows"};
     if (ImGui::BeginTable("##shortcuts", editable ? 3 : 2, flags, ImVec2(0.0F, 0.0F))) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        // Sized for the docked Preferences tab: the key column fits "Ctrl+Shift+H"
+        // Sized for the docked Preferences tab: the key column fits "Ctrl+Shift+H",
         // and action names wrap instead of being cut off.
         ImGui::TableSetupColumn("Action");
         ImGui::TableSetupColumn("Shortcut", ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize("Ctrl+Shift+PgDn").x + 12.0F);
@@ -747,7 +814,7 @@ void draw_shortcuts_table(EditorUi& ui, bool editable) {
             ImGui::PopID();
         }
         }
-        // Keys handled directly by the viewport; listed so every key is findable.
+        // Keys the viewport handles itself, listed so every key can be found.
         constexpr const char* kFixed[][2] = {
             {"Orbit camera", "Alt + left drag"},
             {"Pan camera", "Middle drag"},
@@ -774,7 +841,7 @@ void draw_shortcuts_table(EditorUi& ui, bool editable) {
         }
         ImGui::EndTable();
     }
-    // Duplicate-binding warning.
+    // Warning for two actions on the same key.
     for (std::size_t i = 0; i < kShortcutInfos.size(); ++i) {
         for (std::size_t j = i + 1; j < kShortcutInfos.size(); ++j) {
             if (ui.shortcuts[i].key != 0 && ui.shortcuts[i] == ui.shortcuts[j]) {
@@ -792,6 +859,25 @@ bool draw_world_time_slider(EditorUi& ui) {
     std::snprintf(label, sizeof(label), "%02d:%02d", minutes / 60, minutes % 60);
     field_label("Time of day");
     return ImGui::SliderFloat("##world_time", &ui.world_time_hours, 0.0F, 24.0F, label);
+}
+
+// The building interior setting: off, the game's distance rule, or only the
+// selected buildings. True when it changed.
+bool draw_interior_mode(EditorUi& ui) {
+    int mode = !ui.near_lod ? 0 : ui.interiors_selected_only ? 2 : 1;
+    constexpr const char* modes[] = {"Never (shell only)", "Up close (game LOD)", "Selected buildings only"};
+    field_label("Interiors");
+    if (!ImGui::Combo("##interior_mode", &mode, modes, 3)) {
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Up close: like the game, buildings within 192 units show their rooms through open\n"
+                              "doors and see-through windows. Selected only: the selected city buildings show their\n"
+                              "rooms at any distance and every other building keeps its shell.");
+        }
+        return false;
+    }
+    ui.near_lod = mode != 0;
+    ui.interiors_selected_only = mode == 2;
+    return true;
 }
 
 void draw_preferences_contents(EditorUi& ui) {
@@ -842,11 +928,7 @@ void draw_preferences_contents(EditorUi& ui) {
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Drops to 15 frames per second while another window has focus.");
 
     ImGui::SeparatorText("Performance");
-    changed |= ImGui::Checkbox("Interiors up close (game LOD)", &ui.near_lod);
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Like the game: within 192 units buildings show their rooms through open doors and\n"
-                          "see-through windows; farther away the reflective shell. Off: always the shell (cheaper).");
-    }
+    changed |= draw_interior_mode(ui);
     field_label("Render scale");
     changed |= ImGui::SliderFloat("##render_scale", &ui.render_scale, 0.5F, 1.0F, "%.2fx");
     field_label("Building distance");
@@ -881,10 +963,16 @@ void draw_preferences_contents(EditorUi& ui) {
     ImGui::SeparatorText("Camera");
     field_label("Fly speed");
     changed |= ImGui::SliderFloat("##fly_speed", &ui.camera_fly_speed, 2.0F, 512.0F, "%.0f");
+    changed |= ImGui::Checkbox("Blender-style mouse", &ui.blender_mouse);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("On: middle drag orbits, Shift+middle drag pans, Ctrl+middle drag zooms.\n"
+                          "Off: middle drag pans. Alt+left drag orbits either way.");
+    }
 
     ImGui::SeparatorText("Interface");
     field_label("Font size");
-    // ImGui 1.92+ resizes fonts live (rlImGui supports dynamic font textures).
+    // ImGui 1.92 and later resize fonts on the fly (rlImGui supports dynamic font
+    // textures).
     if (ImGui::SliderFloat("##font_size", &ui.ui_font_size, 10.0F, 28.0F, "%.0f px")) {
         ImGui::GetStyle().FontSizeBase = ui.ui_font_size;
         changed = true;
@@ -965,7 +1053,7 @@ void draw_building_browser_window(EditorProject& project, EditorUi& ui) {
                 ImGui::TextUnformatted(project.buildings[i].name.c_str());
                 ImGui::EndDragDropSource();
             }
-            // Shortened on one line (wrapping broke names mid-word); full name on hover.
+            // Keep the grid width fixed and show the full name on hover.
             ImGui::TextUnformatted(fit_label(project.buildings[i].name, cell).c_str());
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", project.buildings[i].name.c_str());
             ImGui::EndGroup();
@@ -1065,7 +1153,7 @@ void draw_block_browser_window(EditorProject& project, EditorUi& ui) {
                 ui.city_tool = CityTool::Piece;
                 ui.requested_tab = EditorTab::City;
             }
-            // Shortened on one line (wrapping broke names mid-word); full name on hover.
+            // Keep the grid width fixed and show the full name on hover.
             ImGui::TextUnformatted(fit_label(project.blocks[i].name, cell).c_str());
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", project.blocks[i].name.c_str());
             ImGui::EndGroup();
@@ -1113,7 +1201,13 @@ void draw_buildblock_window(EditorProject& project, EditorUi& ui, std::string& s
     (void)status;
     ui.buildblock_window_focused = false;
     if (!ui.show_buildblock_window) return;
-    place_floating_window(ui, 1, ImVec2(860.0F, 560.0F));
+    place_floating_window(ui, 1, ImVec2(620.0F, 620.0F));
+    // The window keeps a 1:1 shape while floating, so the face canvas stays square and
+    // fills it.
+    ImGui::SetNextWindowSizeConstraints(ImVec2(360.0F, 360.0F), ImVec2(FLT_MAX, FLT_MAX), [](ImGuiSizeCallbackData* data) {
+        const float side = std::max(data->DesiredSize.x, data->DesiredSize.y);
+        data->DesiredSize = ImVec2(side, side);
+    });
     if (!ImGui::Begin(ICON_FA_TABLE_CELLS " Buildblock###Buildblock", &ui.show_buildblock_window)) {
         ImGui::End();
         return;
@@ -1126,8 +1220,35 @@ void draw_buildblock_window(EditorProject& project, EditorUi& ui, std::string& s
     }
     ui.selected_buildblock = std::min(ui.selected_buildblock, project.buildblocks.size() - 1U);
 
-    // While editing a building, offer the buildblocks that building uses and the
-    // one under the selected cell, so a face can be tuned without leaving the mode.
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0F);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(ImGui::GetFontSize() * 22.0F, 0.0F), ImVec2(FLT_MAX, ImGui::GetFontSize() * 30.0F));
+    if (ImGui::BeginCombo("##bbk_pick", project.buildblocks[ui.selected_buildblock].name.c_str(), ImGuiComboFlags_HeightLarge)) {
+        for (std::size_t i = 0; i < project.buildblocks.size(); ++i) {
+            ImGui::PushID(static_cast<int>(i));
+            const auto& layers = project.buildblocks[i].data.layers;
+            if (ImGui::Selectable("##pick", ui.selected_buildblock == i, 0, ImVec2(0.0F, ImGui::GetFrameHeight()))) {
+                ui.selected_buildblock = i;
+                ui.selected_buildblock_layer = 0;
+                ui.bb_selected_kind = 0;
+                ui.bb_selected_index = 0;
+            }
+            // Each buildblock with small previews of its first faces.
+            ImGui::SameLine(0.0F, 0.0F);
+            ImGui::SetCursorPosX(ImGui::GetStyle().WindowPadding.x);
+            for (std::size_t l = 0; l < std::min<std::size_t>(layers.size(), 4U); ++l) {
+                const auto p = ImGui::GetCursorScreenPos();
+                draw_buildblock_layer(ImGui::GetWindowDrawList(), p, ImGui::GetFrameHeight(), layers[l]);
+                ImGui::Dummy(ImVec2(ImGui::GetFrameHeight(), ImGui::GetFrameHeight()));
+                ImGui::SameLine(0.0F, 2.0F);
+            }
+            ImGui::SetCursorPosX(ImGui::GetStyle().WindowPadding.x + 4.0F * (ImGui::GetFrameHeight() + 2.0F) + 6.0F);
+            ImGui::TextUnformatted(project.buildblocks[i].name.c_str());
+            ImGui::PopID();
+        }
+        ImGui::EndCombo();
+    }
+    // While editing a building, jump to the buildblock under the selected cell, so a
+    // face can be adjusted without leaving the mode.
     if (ui.tab == EditorTab::Buildings && !project.buildings.empty()) {
         const auto& building = project.buildings[std::min(ui.selected_building, project.buildings.size() - 1U)].data;
         const auto occupied = occupied_cell_indices(building);
@@ -1136,48 +1257,25 @@ void draw_buildblock_window(EditorProject& project, EditorUi& ui, std::string& s
             const auto& cell = building.cells[occupied[std::min(ui.selected_building_cell, occupied.size() - 1U)]];
             cell_block = buildblock_for_cell(project, building, cell);
         }
-        if (cell_block != nullptr) {
-            if (ImGui::Button((std::string{ICON_FA_ARROW_POINTER " Selected cell's buildblock: "} + cell_block->name + "##bbk_use_cell").c_str())) {
-                ui.selected_buildblock = static_cast<std::size_t>(cell_block - project.buildblocks.data());
-                ui.selected_buildblock_layer = 0;
-            }
-        } else {
-            ImGui::TextDisabled("The selected cell has no exterior buildblock.");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(cell_block == nullptr);
+        if (ImGui::Button(ICON_FA_ARROW_POINTER " Selected block's")) {
+            ui.selected_buildblock = static_cast<std::size_t>(cell_block - project.buildblocks.data());
+            ui.selected_buildblock_layer = 0;
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(cell_block != nullptr ? "Edit the buildblock of the selected block's room"
+                                                    : "The selected block has no room with a buildblock");
         }
     }
-    ImGui::SetNextItemWidth(-100.0F);
-    if (ImGui::BeginCombo("Buildblock##bbk_pick", project.buildblocks[ui.selected_buildblock].name.c_str())) {
-        for (std::size_t i = 0; i < project.buildblocks.size(); ++i) {
-            if (ImGui::Selectable(project.buildblocks[i].name.c_str(), ui.selected_buildblock == i)) {
-                ui.selected_buildblock = i;
-                ui.selected_buildblock_layer = 0;
-                ui.bb_selected_kind = 0;
-                ui.bb_selected_index = 0;
-            }
-        }
-        ImGui::EndCombo();
-    }
-    ImGui::Separator();
-
-    // Right pane is a square canvas; the left pane takes the rest.
-    const auto avail = ImGui::GetContentRegionAvail();
-    // Keep ~400 px for the editor column (legend, items table) before the
-    // canvas grows; at 60% of the width it clipped both.
-    const float canvas_side = std::clamp(avail.y, 200.0F, std::max(200.0F, avail.x - 400.0F));
-    if (ImGui::BeginChild("##bbk_editor_pane", ImVec2(avail.x - canvas_side - 8.0F, 0.0F), true)) {
-        draw_buildblock_face_editor(project, ui);
-    }
-    ImGui::EndChild();
-    ImGui::SameLine();
-    if (ImGui::BeginChild("##bbk_canvas_pane", ImVec2(0.0F, 0.0F), true)) {
-        draw_buildblock_face_canvas(project, ui);
-    }
-    ImGui::EndChild();
+    draw_buildblock_face_editor(project, ui);
+    draw_buildblock_face_canvas(project, ui);
     ImGui::End();
 }
 
-// The in-game map screen as DrawMapMenu draws it (map_menu_texture), with the
-// street/avenue names toggle, their font, and a PNG export.
+// The in-game map screen as DrawMapMenu draws it (map_menu_texture), with a switch
+// for street and avenue names, their font, and a PNG export.
 void draw_map_image_window(EditorProject& project, EditorUi& ui) {
     if (!ui.show_map_image_window) return;
     place_floating_window(ui, 2, ImVec2(560.0F, 640.0F));
@@ -1187,7 +1285,7 @@ void draw_map_image_window(EditorProject& project, EditorUi& ui) {
     }
     const bool auto_generated = project.root.filename() == "round";
     bool changed = false;
-    // The game prints no names on auto-generated maps (DrawMapMenu).
+    // The game shows no names on auto-generated maps (DrawMapMenu).
     ImGui::BeginDisabled(auto_generated);
     changed |= ImGui::Checkbox("Street names", &ui.map_menu.street_labels);
     ImGui::SameLine();
@@ -1252,9 +1350,9 @@ void draw_map_image_window(EditorProject& project, EditorUi& ui) {
     const auto origin = ImGui::GetCursorScreenPos();
     ImGui::Image(ImTextureID(image->id), ImVec2(side, side), ImVec2(0.0F, 1.0F), ImVec2(1.0F, 0.0F));
 
-    // Map units to world, as DrawMapMenu places things: map = (world - legend)
-    // * scale, over a view of half-extent 128 around map (120, 120), or (128,
-    // 128) with legend (960, 896) and scale 0.25 on auto-generated maps.
+    // Map units to world, the way DrawMapMenu places things: map = (world - legend) *
+    // scale, over a view of half-size 128 around map (120, 120). On auto-generated maps
+    // it is (128, 128), with legend (960, 896) and scale 0.25.
     const float center = auto_generated ? 128.0F : 120.0F;
     const float scale = auto_generated ? 0.25F : 0.125F;
     const ImVec2 legend = auto_generated ? ImVec2(960.0F, 896.0F) : ImVec2(896.0F, 896.0F);
@@ -1262,7 +1360,8 @@ void draw_map_image_window(EditorProject& project, EditorUi& ui) {
         return ImVec2(origin.x + ((world_x - legend.x) * scale - center + 128.0F) / 256.0F * side,
                       origin.y + ((world_z - legend.y) * scale - center + 128.0F) / 256.0F * side);
     };
-    // The editor camera: a dot with a heading tick, like the game's chevron.
+    // The editor camera: a dot with a small line for its heading, like the game's
+    // chevron.
     auto* draw = ImGui::GetWindowDrawList();
     const auto camera = to_screen(ui.view_camera_position.x, ui.view_camera_position.z);
     const Vector2 heading{ui.view_camera_target.x - ui.view_camera_position.x, ui.view_camera_target.z - ui.view_camera_position.z};
@@ -1304,7 +1403,7 @@ void draw_changes_window(EditorProject& project, EditorUi& ui, std::string& stat
         ImGui::End();
         return;
     }
-    // Without a saved point in the history, every recorded step is unsaved.
+    // With no saved point in the history, every recorded step is unsaved.
     const auto saved = project.saved_undo_depth.value_or(0U);
     const auto pending = project.undo_stack.size() - saved;
     if (!project.saved_undo_depth) {
@@ -1372,4 +1471,4 @@ void unload_preview_views(EditorUi& ui) {
     }
 }
 
-} // namespace map_editor::app_internal
+} // namespace pafta::app_internal

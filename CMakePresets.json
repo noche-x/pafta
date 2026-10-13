@@ -1,5 +1,5 @@
 {
-  "version": 6,
+  "version": 5,
   "cmakeMinimumRequired": {
     "major": 3,
     "minor": 24,
@@ -12,7 +12,7 @@
       "binaryDir": "${sourceDir}/build/dev",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "MAP_EDITOR_CPP_BUILD_TESTS": "ON"
+        "PAFTA_BUILD_TESTS": "ON"
       },
       "condition": {
         "type": "notEquals",
@@ -27,7 +27,7 @@
       "binaryDir": "${sourceDir}/build/dev-msvc",
       "architecture": "x64",
       "cacheVariables": {
-        "MAP_EDITOR_CPP_BUILD_TESTS": "ON"
+        "PAFTA_BUILD_TESTS": "ON"
       },
       "condition": {
         "type": "equals",
@@ -41,7 +41,7 @@
       "binaryDir": "${sourceDir}/build/ci",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "MAP_EDITOR_CPP_BUILD_TESTS": "ON"
+        "PAFTA_BUILD_TESTS": "ON"
       },
       "condition": {
         "type": "notEquals",
@@ -56,12 +56,25 @@
       "binaryDir": "${sourceDir}/build/ci-msvc",
       "architecture": "x64",
       "cacheVariables": {
-        "MAP_EDITOR_CPP_BUILD_TESTS": "ON"
+        "PAFTA_BUILD_TESTS": "ON"
       },
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
         "rhs": "Windows"
+      }
+    },
+    {
+      "name": "quality",
+      "displayName": "Native sanitizer and parser fuzz checks",
+      "inherits": "dev",
+      "binaryDir": "${sourceDir}/build/quality",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++",
+        "PAFTA_ENABLE_SANITIZERS": "ON",
+        "PAFTA_BUILD_FUZZERS": "ON",
+        "PAFTA_WARNINGS_AS_ERRORS": "ON",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
       }
     }
   ],
@@ -69,24 +82,28 @@
     {
       "name": "dev",
       "configurePreset": "dev",
-      "targets": ["map_editor_cpp", "map_editor_tests", "binary_export_tests", "editor_state_tests", "mesh_export_tests"]
+      "targets": ["pafta", "pafta_tests", "binary_export_tests", "editor_state_tests", "mesh_export_tests", "editor_workflow_tests"]
     },
     {
       "name": "dev-msvc",
       "configurePreset": "dev-msvc",
       "configuration": "Debug",
-      "targets": ["map_editor_cpp", "map_editor_tests", "binary_export_tests", "editor_state_tests", "mesh_export_tests"]
+      "targets": ["pafta", "pafta_tests", "binary_export_tests", "editor_state_tests", "mesh_export_tests", "editor_workflow_tests"]
     },
     {
       "name": "ci",
       "configurePreset": "ci",
-      "targets": ["map_editor_cpp", "map_editor_tests", "binary_export_tests", "editor_state_tests", "mesh_export_tests"]
+      "targets": ["pafta", "pafta_tests", "binary_export_tests", "editor_state_tests", "mesh_export_tests", "editor_workflow_tests"]
     },
     {
       "name": "ci-msvc",
       "configurePreset": "ci-msvc",
       "configuration": "Release",
-      "targets": ["map_editor_cpp", "map_editor_tests", "binary_export_tests", "editor_state_tests", "mesh_export_tests"]
+      "targets": ["pafta", "pafta_tests", "binary_export_tests", "editor_state_tests", "mesh_export_tests", "editor_workflow_tests"]
+    },
+    {
+      "name": "quality",
+      "configurePreset": "quality"
     }
   ],
   "testPresets": [
@@ -110,6 +127,10 @@
       "configurePreset": "ci",
       "output": {
         "outputOnFailure": true
+      },
+      "execution": {
+        "jobs": 2,
+        "noTestsAction": "error"
       }
     },
     {
@@ -118,6 +139,21 @@
       "configuration": "Release",
       "output": {
         "outputOnFailure": true
+      },
+      "execution": {
+        "jobs": 2,
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "quality",
+      "configurePreset": "quality",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "jobs": 2,
+        "noTestsAction": "error"
       }
     }
   ]

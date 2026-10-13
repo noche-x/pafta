@@ -1,111 +1,109 @@
-# Sub Rosa TERRAIN BUILD / DATA Pipeline — Full Reverse Engineering Spec
+# How Sub Rosa builds its terrain data
 
-> Target: `subrosa.exe.THIS_ONE` (PE x86:LE:64, image base 0)
-> All addresses in `0x000xxxxx` range. Read-only analysis via Ghidra MCP.
+Target: `subrosa.exe.THIS_ONE` (PE x86:LE:64, image base 0)
+All addresses are in the `0x000xxxxx` range. Read-only analysis through Ghidra MCP.
 
----
+[terrain_generation.md](terrain_generation.md) has the later, checked findings. Where they disagree with this page (for example on the island formula's constants), the later page is right.
 
-## 1. Call Order — Numbered Pipeline
+## 1. Call order
 
-World_LoadMapAndInitializeTerrain @ `0x56980` drives the full terrain lifecycle:
+`World_LoadMapAndInitializeTerrain` @ `0x56980` runs the whole terrain setup:
 
 | Step | Function | Address | What it does |
 |------|----------|---------|-------------|
-| 1 | `Render_InitTerrainStreamingBuffers` | `0xc2db0` | Allocates GL vertex/index buffers for 7 LOD pools; resets slot metadata |
-| 2 | `Terrain_GenerateIslandHeightfield` | `0x56560` | Fills `g_terrainHeightfield` (2049x2049 float array) with procedural noise + radial falloff |
-| 3 | `Memory_FillBytes(g_landUseMaskBits, 0, 0x4000000)` | — | Resets the 4096x4096 u16 land-use bitmask to all 0xFFFF |
-| 4 | `_createarea` | `0x4db20` | Creates a 64x8x64 SBB working volume for map-area entities |
-| 5 | …Street graph, district, building instantiation loop… | — | Calls `UpdateMapTopHeightAndClearOccupancyBit` for every placed cell |
-| 6 | `Terrain_RebuildLandTilesRoadPatchesAndChunkCaches` | `0xd12e0` | The big one — see §3 below |
-| 7 | …Cell render geometry rebuild loop… | — | `BuildCellRenderGeometryAndAdjacency` for each active world cell |
-| 8 | …Street label textures… | — | `RenderStreetLabelTexture` for 17 labels |
+| 1 | `Render_InitTerrainStreamingBuffers` | `0xc2db0` | Allocates GL vertex and index buffers for 7 detail-level pools and resets the slot data |
+| 2 | `Terrain_GenerateIslandHeightfield` | `0x56560` | Fills `g_terrainHeightfield` (a 2049x2049 float array) with noise and a round falloff |
+| 3 | `Memory_FillBytes(g_landUseMaskBits, 0, 0x4000000)` | none | Resets the 4096x4096 u16 land-use bitmask to all 0xFFFF |
+| 4 | `_createarea` | `0x4db20` | Makes a 64x8x64 SBB working volume for map-area objects |
+| 5 | The loop over the street graph, districts, and buildings | none | Calls `UpdateMapTopHeightAndClearOccupancyBit` for every placed cell |
+| 6 | `Terrain_RebuildLandTilesRoadPatchesAndChunkCaches` | `0xd12e0` | The main step; see §3 |
+| 7 | The loop that rebuilds cell render geometry | none | `BuildCellRenderGeometryAndAdjacency` for each active world cell |
+| 8 | The street label textures | none | `RenderStreetLabelTexture` for 17 labels |
 
----
-
-## 2. Data Structures
+## 2. Data structures
 
 ### 2.1 `g_terrainHeightfield`
-- **Address:** `0x2d48282c` (start of data; label `g_terrainHeightfield` at `0x2d482830`)
-- **Layout:** `float[0x801 * 0x801]` = `float[2049][2049]`
-- **Size:** `2049 * 2049 * 4 = 0x1004004` bytes
-- **Content:** Procedural heightfield (Y = stored height directly, no scaling)
-- **Grid-to-world:** `worldX = gridX - 0x280` (4096); `worldZ = gridZ - 0x280` (4096)
-- **Sentinel convention:** `DAT_2d482820` and `DAT_2d482828` are both set to `0xc5800000` (= –4096.0f) at the very start of the function — these are the two leading float slots just before the array body. They are NOT part of the heightfield but serve as border-guard sentinels for out-of-bounds sample lookup during bilinear resampling.
+- Address: `0x2d48282c` (start of the data; the label `g_terrainHeightfield` is at `0x2d482830`)
+- Layout: `float[0x801 * 0x801]` = `float[2049][2049]`
+- Size: `2049 * 2049 * 4 = 0x1004004` bytes
+- Contents: the generated heightfield (Y is the stored height, with no scaling)
+- Grid to world: `worldX = gridX - 0x280` (4096); `worldZ = gridZ - 0x280` (4096)
+- Guard values: `DAT_2d482820` and `DAT_2d482828` are both set to `0xc5800000` (= –4096.0f) at the very start of the function. They are the two float slots just before the array. They are NOT part of the heightfield; they guard against reading past the edge during bilinear resampling.
 
 ### 2.2 `g_landTileHeightChunks`
-- **Base array:** at offset `+0x18` within the chunk record (see §2.5), label `0x411bf858`.
-- **Per-entry:** A `float[0x801 * 0x801]` heap allocation (= `2049 * 2049 * 4 = ~16 MB` per tile)
-- **Count:** 64 entries (8 row × 8 column tiles)
-- **Addressing:** `chunk_tile_x = uVar3 = sample_x >> 11`, `chunk_tile_y = uVar2 = sample_y >> 11`, index = `uVar3 + uVar2 * 8`. Within an entry: `sample_offset = (sample_y & 0x7ff) * 0x801 + (sample_x & 0x7ff)`.
-- **Border mirroring** (see §4): when `(sample_x & 0x7ff) == 0`, the value is also written to the *previous column tile's* right edge; when `(sample_y & 0x7ff) == 0`, it is written to the *previous row tile's* bottom edge.
+- Base array: at offset `+0x18` inside the chunk record (see §2.5), label `0x411bf858`.
+- Each entry: a `float[0x801 * 0x801]` heap allocation (`2049 * 2049 * 4`, about 16 MB per tile)
+- Count: 64 entries (8 rows × 8 columns of tiles)
+- Addressing: `chunk_tile_x = uVar3 = sample_x >> 11`, `chunk_tile_y = uVar2 = sample_y >> 11`, index = `uVar3 + uVar2 * 8`. Inside an entry: `sample_offset = (sample_y & 0x7ff) * 0x801 + (sample_x & 0x7ff)`.
+- Edge copying (see §4): when `(sample_x & 0x7ff) == 0`, the value is also written to the right edge of the tile to the left; when `(sample_y & 0x7ff) == 0`, it is also written to the bottom edge of the tile above.
 
-### 2.3 The Four `mapTopHeight` Buffers
+### 2.3 The four `mapTopHeight` buffers
+
 Defined in `UpdateMapTopHeightAndClearOccupancyBit` @ `0x3fa40`:
 
-| Buffer | Address | Derivation |
+| Buffer | Address | How it is found |
 |--------|---------|-----------|
 | `mapTopHeight0` | `0x3ce6f5f8` | `*4` as `float[0x1000 * 0x1000]` |
-| `mapTopHeight1` | `0x3ce6f5fc` | +4 bytes → second float per cell |
-| `mapTopHeight2` | `0x3ce735f8` | +0x4000 → next row (0x3ce6f5fc + 0x4000) |
-| `mapTopHeight3` | `0x3ce735fc` | +4 bytes from buffer2 |
+| `mapTopHeight1` | `0x3ce6f5fc` | +4 bytes, the next float in the cell |
+| `mapTopHeight2` | `0x3ce735f8` | +0x4000, the next row (0x3ce6f5fc + 0x4000) |
+| `mapTopHeight3` | `0x3ce735fc` | +4 bytes from buffer 2 |
 
-Each is `float[0x1000 * 0x1000]` = 4096x4096 = 67 MB per buffer, total 268 MB.
-They are elementwise max-updated: `if (current <= height && height != current) current = height`.
-This is a 4-sample "top-height" surface used to evict overlapping buildings (occupancy check).
+Each is `float[0x1000 * 0x1000]` = 4096x4096 = 67 MB, so 268 MB in total. Each value only ever goes up: `if (current <= height && height != current) current = height`. Together they form a four-sample "top height" surface used to remove overlapping buildings (an occupancy check).
 
 ### 2.4 `g_landUseMaskBits`
-- **Address:** `g_landUseMaskBits` label
-- **Layout:** `uint16[0x400 * 0x400]` = `uint16[1024][1024]` = 2 MB
-- **Coords:** `(floorX + 0x400) >> 2`, `(floorZ + 0x400) >> 2`
-- **Bit:** `bit = (floorX & 3) + (floorZ & 3) * 4` — a 4x4 micro-grid per u16 cell
+- Address: the `g_landUseMaskBits` label
+- Layout: `uint16[0x400 * 0x400]` = `uint16[1024][1024]` = 2 MB
+- Coordinates: `(floorX + 0x400) >> 2`, `(floorZ + 0x400) >> 2`
+- Bit: `bit = (floorX & 3) + (floorZ & 3) * 4`, a 4x4 grid inside each u16
 
-### 2.5 Chunk World-Origin Record (`0x411bf840`)
-- **Array stride:** `0x3420` = 13344 bytes (verified in disassembly: `imul rax, rax, 0x3420`)
-- **Count:** 64 entries (8x8 chunks)
-- **Per-record layout:**
+### 2.5 Chunk world-origin record (`0x411bf840`)
+- Records are `0x3420` = 13344 bytes apart (checked in the disassembly: `imul rax, rax, 0x3420`)
+- Count: 64 (8x8 chunks)
+- Each record:
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
-| `+0x00` | 4 | `worldOriginX` (float) | World-space X of chunk corner |
-| `+0x04` | 4 | `worldOriginY` (float) | World-space Y (base elevation) |
-| `+0x08` | 4 | `worldOriginZ` (float) | World-space Z of chunk corner |
-| `+0x0c` | 4 | `tileCoordX` (int) | Which land-tile column (0-7) |
-| `+0x10` | 4 | `tileCoordZ` (int) | Which land-tile row (0-7) |
-| `+0x14` | 4 | (padding / unused) | — |
+| `+0x00` | 4 | `worldOriginX` (float) | World X of the chunk's corner |
+| `+0x04` | 4 | `worldOriginY` (float) | World Y (base height) |
+| `+0x08` | 4 | `worldOriginZ` (float) | World Z of the chunk's corner |
+| `+0x0c` | 4 | `tileCoordX` (int) | Land-tile column (0-7) |
+| `+0x10` | 4 | `tileCoordZ` (int) | Land-tile row (0-7) |
+| `+0x14` | 4 | (padding or unused) | none |
 | `+0x18` | 8 | `pHeightData` (ptr) | Pointer to this chunk's `float[0x801][0x801]` |
-| `+0x20` | 12 | (unknown/unused) | — |
-| `+0x2c` | 4 | `subSlotCoordX[i]` (int) | Grid X offset for sub-slot i |
-| `+0x30` | 4 | `subSlotCoordZ[i]` (int) | Grid Z offset for sub-slot i |
-| … | … | 256 sub-slot records | Each `0x34` bytes |
+| `+0x20` | 12 | (unknown or unused) | none |
+| `+0x2c` | 4 | `subSlotCoordX[i]` (int) | Grid X offset of sub-slot i |
+| `+0x30` | 4 | `subSlotCoordZ[i]` (int) | Grid Z offset of sub-slot i |
+| … | … | 256 sub-slot records | each `0x34` bytes |
 
-The 256 sub-slots per chunk encode a `16x16` grid of "mini-tiles". Each sub-slot spans `0x80 × 0x80` samples (= 128×128 in the land-tile). A full chunk = `16 * 128 = 2048` samples + 1 overlap column = 2049 total.
+The 256 sub-slots in each chunk make a 16x16 grid of small tiles. Each sub-slot covers `0x80 × 0x80` samples (128×128 in the land tile). A whole chunk is `16 * 128 = 2048` samples plus one shared column, so 2049.
 
-**Chunk world-origin assignment:** The world origin for chunk `(tx, tz)` is simply the tile coordinate scaled into world space:
+How chunk origins are set: the world origin of chunk `(tx, tz)` is just its tile coordinate scaled into world space:
 ```
 worldOriginX = tileCoordX * 2048.0f   (i.e., tileCoordX << 11)
 worldOriginZ = tileCoordZ * 2048.0f
 worldOriginY = 0 (overwritten per-subslot)
 ```
-(Verified in `Terrain_RebuildChunkVertexBufferAndNormals` @ `0xd00f0`: `shl edx, 0xb` where EDX = tileCoordX, giving `tileCoordX * 2048 → worldOriginX`.)
+(Checked in `Terrain_RebuildChunkVertexBufferAndNormals` @ `0xd00f0`: `shl edx, 0xb` with EDX = tileCoordX gives `tileCoordX * 2048 → worldOriginX`.)
 
-### 2.6 Vertex and Index Buffers
+### 2.6 Vertex and index buffers
 
-**Vertex scratch buffer:**
-- **Address:** `0x40e7f720`
-- **Layout:** Interleaved `float[6]` per vertex: X, Y, Z, Nx, Ny, Nz
-- **Vertex stride:** 24 bytes
-- **Max capacity:** enough for LOD-0 full-chunk + sub-slot rebuilds
+Scratch vertex buffer:
+- Address: `0x40e7f720`
+- Layout: `float[6]` per vertex, in order: X, Y, Z, Nx, Ny, Nz
+- Each vertex is 24 bytes
+- Big enough for a full detail-0 chunk plus sub-slot rebuilds
 
-**GL vertex buffers:**
-- Array at `0x43e9b0c0` stores GL buffer object names
-- Array at `0x43e98c04` / `0x43e98c8c` stores slot indices
-- Binding: `glBindBuffer(GL_ARRAY_BUFFER, names[idx])` then `glBufferData(…, size, data, GL_DYNAMIC_DRAW)`
+GL vertex buffers:
+- The array at `0x43e9b0c0` holds GL buffer names
+- The arrays at `0x43e98c04` / `0x43e98c8c` hold slot numbers
+- Binding: `glBindBuffer(GL_ARRAY_BUFFER, names[idx])`, then `glBufferData(…, size, data, GL_DYNAMIC_DRAW)`
 
-**GL index buffers:**
-- Array at `0x43e9b0c4` stores GL EBO names from `Terrain_InitLandscapeChunkLodIndexBuffers`
+GL index buffers:
+- The array at `0x43e9b0c4` holds GL index buffer names from `Terrain_InitLandscapeChunkLodIndexBuffers`
 
-### 2.7 LOD Slot Pools
-Six LOD slot pools (LOD 0–6) with per-slot metadata:
+### 2.7 Detail-level slot pools
+
+Seven pools of slots (detail levels 0–6), each slot with its own data:
 
 | Pool | ChunkId Base | Age Base | SlotCount Addr | SlotsBase |
 |------|-------------|---------|---------------|-----------|
@@ -113,57 +111,56 @@ Six LOD slot pools (LOD 0–6) with per-slot metadata:
 | LOD1 | `0x411177b0` | `0x411177b8` | `0x411177a0` | `0x41117798` |
 | … | … | … | … | … |
 
-Each slot: 3 int32s = `{chunkId, subSlot, age/active}`. Active = 4, decaying = 4 → 0.
+Each slot is 3 int32s: `{chunkId, subSlot, age/active}`. Active is 4, and it counts down from 4 to 0.
 
-### 2.8 Intersection Patch Scratch Buffer
-- **Address:** `0x04afa9a0` (static 87 MB buffer)
-- **Purpose:** Holds sparse candidate sample positions + per-sample distance-weight lists during the multi-pass feather/blend algorithm in `Terrain_ApplyStreetIntersectionHeightPatch`.
-- **Layout:**
-  - `DAT_04afa9a0[i]` (int): count of candidate weights at slot i
-  - `DAT_04afa9a4[i + j*12]` (int): grid X of j-th candidate
-  - `DAT_04afa9a8[i + j*12]` (int): grid Z of j-th candidate
-  - `DAT_04afa9ac[i + j*12]` (float): weight of j-th candidate
-- **Stride:** 7 dwords (28 bytes) per grid cell; grid is `(iVar34/4+1) × (iVar32/4+1)` cells, each spanning 4×4 heightfield samples
-- **Multi-pass output staging:** `DAT_04afc5c4` (offset `+0x1c24` from start) — the accumulated per-sample weight list for the smoothstep merge
-
----
+### 2.8 Scratch buffer for intersection patches
+- Address: `0x04afa9a0` (a fixed 87 MB buffer)
+- Use: holds the candidate sample positions and their distance weights while `Terrain_ApplyStreetIntersectionHeightPatch` softens and blends over several passes.
+- Layout:
+  - `DAT_04afa9a0[i]` (int): how many candidate weights slot i has
+  - `DAT_04afa9a4[i + j*12]` (int): grid X of candidate j
+  - `DAT_04afa9a8[i + j*12]` (int): grid Z of candidate j
+  - `DAT_04afa9ac[i + j*12]` (float): weight of candidate j
+- Each grid cell is 7 dwords (28 bytes). The grid is `(iVar34/4+1) × (iVar32/4+1)` cells, each covering 4×4 heightfield samples.
+- Output for the merge: `DAT_04afc5c4` (offset `+0x1c24` from the start), the weights collected for each sample, used by the smoothstep merge
 
 ## 3. `Terrain_RebuildLandTilesRoadPatchesAndChunkCaches` @ `0xd12e0`
 
-### 3.1 The Upsample: 2049² → 8×8 chunks at 16384²
+### 3.1 Scaling up: 2049² into 8×8 chunks of 16384²
 
-The function iterates over 64 tile positions (8×8). For each tile `(tx, tz)`:
-1. Reads 4 corner height values from `g_terrainHeightfield`:
+The function goes over 64 tile positions (8×8). For each tile `(tx, tz)`:
+1. It reads 4 corner heights from `g_terrainHeightfield`:
    ```
    h00 = heightfield[tz*2049 + tx]       // tile corner NW
    h01 = heightfield[tz*2049 + tx + 1]    // NE
    h10 = heightfield[(tz+1)*2049 + tx]    // SW
    h11 = heightfield[(tz+1)*2049 + tx+1]  // SE
    ```
-2. For each sub-sample `(sx, sz)` where `sx = 0..7, sz = 0..7`:
+2. For each sub-sample `(sx, sz)` with `sx = 0..7, sz = 0..7`:
    ```
    fx = sx * 0.125   // = sx * FLOAT_00278224 (0x3e000000 = 0.125)
    fz = sz * 0.125
    height = (1-fx)*( (1-fz)*h00 + fz*h10 ) + fx*( (1-fz)*h01 + fz*h11 )
    ```
-   This is standard bilinear interpolation with a 1/8 step, resampling each 2049² tile into 8×8 sub-tile cells.
-3. Calls `Terrain_SetLandSampleWithTileBorderMirroring(tileX + sx, tileZ + sz, height)` — see §4.
+   This is plain bilinear blending in steps of 1/8, turning each source cell into 8×8 smaller cells.
+3. It calls `Terrain_SetLandSampleWithTileBorderMirroring(tileX + sx, tileZ + sz, height)`; see §4.
 
-### 3.2 Intersection Patch Application
-When `isMapAutoGenerated == 0`, 28 hardcoded intersection indices are patched:
+### 3.2 Applying intersection patches
+
+When `isMapAutoGenerated == 0`, 28 fixed intersection numbers are patched:
 ```
 {2, 40, 32, 46, 45, 47, 28, 10, 33, 42, 35, 13, 59, 31,
  52, 48, 50, 19, 22, 58, 62, 61, 41, 36, 43, 44, 38, 39}
 ```
-Each calls `Terrain_ApplyStreetIntersectionHeightPatch(idx)` — see §5.
+Each one calls `Terrain_ApplyStreetIntersectionHeightPatch(idx)`; see §5.
 
-### 3.3 Chunk Vertex Buffer Rebuild
+### 3.3 Rebuilding chunk vertex buffers
+
 Calls `Terrain_RebuildChunkVertexBufferAndNormals(i)` for `i = 0..63`.
 
-### 3.4 Slot Cache Invalidation
-Clears all 7 LOD slot pools (LOD0–LOD6) by marking every slot `chunkId = -1` and resetting age/stats.
+### 3.4 Clearing the slot caches
 
----
+Clears all 7 detail-level pools (LOD0–LOD6) by setting every slot's `chunkId = -1` and resetting the age and stats.
 
 ## 4. `Terrain_SetLandSampleWithTileBorderMirroring` @ `0xd2db0`
 
@@ -198,19 +195,19 @@ void SetLandSample(uint sampleX, uint sampleZ, float height)
 }
 ```
 
-The `0x684` stride used by the decompiler is the *pointer-to-data array* stride — each pointer is 8 bytes, and the decompiler inferred a sub-structure size. The actual per-tile height buffer is separately allocated and pointed to by each entry in the `0x411bf858` array.
+The `0x684` step the decompiler uses is the step through the array of pointers to the data. Each pointer is 8 bytes, and the decompiler guessed a sub-structure size. The real height buffer for each tile is allocated separately and pointed to by each entry in the `0x411bf858` array.
 
-Key insight: samples on tile edges (localX=0 or localZ=0) are mirrored into the neighboring tile's opposite edge, ensuring seamless bilinear sampling across tile boundaries.
+Samples on a tile edge (localX=0 or localZ=0) are copied into the neighbouring tile's opposite edge, so bilinear sampling can cross from one tile into the next.
 
----
+## 5. `Terrain_ApplyStreetIntersectionHeightPatch` @ `0xd3340`: how it works
 
-## 5. `Terrain_ApplyStreetIntersectionHeightPatch` @ `0xd3340` — Complete Algorithm
+### 5.1 The first check
 
-### 5.1 Precondition Check
-The function verifies a fully-connected 4-way intersection block exists. It traverses the street graph: if the target intersection `param_1` has south+west neighbors and those south of those also have west neighbors, the block is valid for patching.
+The function checks that a closed block of four intersections exists. It walks the street graph: if the intersection `param_1` has south and west neighbours, and the ones south of those also have west neighbours, the block can be patched.
 
-### 5.2 Phase 1: Bilinear Base Surface
-Parameters (in heightfield sample coords, centered on the intersection block):
+### 5.2 Phase 1: the bilinear base surface
+
+The settings (in heightfield sample coordinates, around the intersection block):
 ```
 x0 = (intersection.pos.x + field_0x30) * 4 + 0x1000
 x1 = (southIntersection.pos.x - field_0x2c) * 4 + 0x1000
@@ -218,7 +215,7 @@ z0 = (intersection.unk0[1] + field_0x2c) * 4 + 0x1000      // Note: unk0[1] is g
 z1 = (southIntersection.unk0[1] - field_0x2c) * 4 + 0x1000
 ```
 
-Four corner heights at the four intersections of the block:
+The four corner heights at the block's four intersections:
 ```
 hNW = intersection.unk0[2] * 4.0 + 4.25        // 4.0 = DAT_00278688, 4.25 = DAT_00278698
 hNE = southIntersection.unk0[2] * 4.0 + 4.25
@@ -226,27 +223,28 @@ hSW = westIntersection.unk0[2] * 4.0 + 4.25
 hSE = farSouthWestIntersection.unk0[2] * 4.0 + 4.25
 ```
 
-Then bilinear interpolation over the rectangle `[x0, x1] × [z0, z1]` with steps `1/(x1-x0)` and `1/(z1-z0)`:
+Then a bilinear blend over the rectangle `[x0, x1] × [z0, z1]`, in steps of `1/(x1-x0)` and `1/(z1-z0)`:
 ```
 for (x = x0; x <= x1; x++)
   for (z = z0; z <= z1; z++)
     SetLandSample(x, z, bilinear(hNW, hNE, hSW, hSE, fx, fz));
 ```
 
-This writes a flat drivable road surface. Note the +0x1000 offset: heightfield coords are shifted by 4096 to cover the map space centered around the city grid.
+This writes a flat road surface you can drive on. Note the +0x1000 offset: heightfield coordinates are shifted by 4096 to cover the map around the city grid.
 
-### 5.3 Phase 2: Sparse Candidate Collection
-The intersection rectangle is divided into a coarse grid of 4×4-heightfield-sample cells:
+### 5.3 Phase 2: collecting candidates
+
+The rectangle is split into a coarse grid of cells, each 4×4 heightfield samples:
 ```
 cellsX = (x1 - x0) >> 2   // columns in the coarse grid
 cellsZ = (z1 - z0) >> 2   // rows
 ```
 
-Each cell is probed in a 5×5 sub-sample grid within the 4 sampled `mapTopHeight` buffers. If all four mapTopHeight buffers have `> 0.0` values at that location, the cell is a "road interior" candidate.
+Each cell is checked at 5×5 points in the 4 `mapTopHeight` buffers. If all four buffers are `> 0.0` there, the cell counts as "inside a road".
 
-For each valid cell, a 5×5 pattern of candidate sample positions is generated and stored in the scratch buffer at `0x04afa9a0`. Each candidate stores its grid coordinates and an initial weight of `1.0`.
+For each such cell, a 5×5 pattern of candidate sample positions goes into the scratch buffer at `0x04afa9a0`. Each candidate stores its grid coordinates and a starting weight of `1.0`.
 
-### 5.4 Phase 3: Multi-Pass Distance-Weight Propagation (16 passes)
+### 5.4 Phase 3: spreading weights by distance (16 passes)
 ```
 for (pass = 0; pass < 16; pass++) {       // local_120 = 0x10
     for (each grid cell) {
@@ -285,12 +283,12 @@ for (pass = 0; pass < 16; pass++) {       // local_120 = 0x10
 }
 ```
 
-- **Kernel:** 8-neighbor dilation with `1/16` edge-length decay rate
-- **Cap:** 2 candidates per cell
-- **Distance weighting:** `w = 1.0 - dist * (1/16)`, clamped to [0, 1]
-- **Directional filtering:** candidates are selected based on dot-product similarity with existing candidates, only replacing existing entries if they have higher weight AND the directions are parallel (dot > 0)
+- Pattern: grows into the 8 neighbours, with weight dropping by `1/16` per unit of distance
+- At most 2 candidates per cell
+- Weight: `w = 1.0 - dist * (1/16)`, clamped to [0, 1]
+- Direction check: a candidate only replaces an existing one if it has a higher weight AND points the same way (dot > 0)
 
-### 5.5 Phase 4: Smoothstep Merge (Final Blending)
+### 5.5 Phase 4: the smoothstep merge
 ```
 float smoothstep3 = 3.0;   // FLOAT_00278644 = 0x40400000 = 3.0
 
@@ -336,15 +334,13 @@ for (z = z0+1; z < z1; z++) {
 }
 ```
 
-This performs a cubic smoothstep blend between the original terrain height and the patch-induced height, with the per-cell weight maximum determining the blend ratio. The result is a smoothly feathered road surface that blends seamlessly into the surrounding terrain.
+This blends the original terrain height with the patch height along a cubic smoothstep. The largest weight in each cell decides how far the patch reaches into the terrain around it.
 
----
-
-## 6. Vertex / Normal Generation
+## 6. Making vertices and normals
 
 ### 6.1 `Terrain_RebuildChunkVertexBufferAndNormals` @ `0xd00f0`
 
-For one chunk (param_1 = 0..63), generates a full LOD-0 vertex buffer:
+For one chunk (param_1 = 0..63), it makes a full detail-0 vertex buffer:
 
 ```
 chunkIdx = param_1
@@ -356,15 +352,15 @@ wy = g_terrainChunkWorldOriginY[chunkIdx]        // base Y
 wz = g_terrainChunkWorldOriginZ[chunkIdx]        // = tileZ * 2048.0
 ```
 
-**Grid dimensions:** `0x802 × 0x802` = 2050×2050 samples (with a half-step inset on each edge). The actual generated coverage is `129 × 129` vertices for LOD-0, stepped at 0x80×0x80 (128) sample intervals to cover the 2048×2048 sample region (plus one extra column/row for edge stitching).
+Grid size: `0x802 × 0x802` = 2050×2050 samples (with a half-step inset on each edge). What actually gets made at detail 0 is `129 × 129` vertices, stepping 0x80 (128) samples at a time across the 2048×2048 area (plus one extra column and row to join up the edges).
 
-Wait — re-examining the disassembly:
-- Outer loop: `R14D` from −1 to 0x801 (= 2050 samples)
+The disassembly gives these loop limits:
+- Outer loop: `R14D` from −1 to 0x801 (2050 samples)
 - Inner loop: `R10D` from −1 to 0x801
-- The negative initial values act as sentinels for border clamping (when `R14D < 0`, use sample index 0; when `R10D < 0`, use 0)
-- Steps: 0x7f (127) per iteration, plus 1, for 0x80 samples per step
+- The starting values below zero clamp to the edge (when `R14D < 0`, use sample 0; when `R10D < 0`, use 0)
+- Steps: 0x7f (127) per loop, plus 1, so 0x80 samples per step
 
-**Per-vertex output (6 floats = 24 bytes):**
+Each vertex is 6 floats (24 bytes):
 ```
 vertex[idx*6 + 0] = worldX + sampleX            // world position X
 vertex[idx*6 + 1] = height + worldY             // world position Y  (with -16.0 edge penalty for out-of-bounds)
@@ -374,7 +370,7 @@ vertex[idx*6 + 4] = ny                           // normal Y
 vertex[idx*6 + 5] = nz                           // normal Z
 ```
 
-**Normal computation:**
+Working out the normal:
 ```
 // Sample neighbors ±128 in X and Z
 h_left  = GetHeightAt(sampleX - 0x80, sampleZ)   // or 0 if OOB
@@ -404,7 +400,7 @@ if (len != 0.0) {
 }
 ```
 
-Note the two-step scaling of `dx` and `dz`: first multiply by `1/128` to get the world-space slope, then re-multiply by `1/128` during normalization? No — the `fVar8 = DAT_00278118 = 1/128`, and it's applied to both the unnormalized nx/nz AND during normalization (multiplying by `fVar8` before dividing by length). Actually re-reading the decompile:
+The scaling in the pseudocode above needs checking. The decompiled lines below use `fVar8 = DAT_00278118 = 1/128` when making the X and Z parts of the normal:
 ```
 fVar28 = fVar26 - fVar27;    // h_near - h_far
 fVar26 = SQRT((fVar26*fVar26 + fVar28*fVar28) * fVar7 + fVar9);
@@ -413,21 +409,21 @@ fVar28 = fVar27 * fVar28 * fVar8;   // nz = (1/len) * (h_near - h_far) * (1/128)
 fVar26 = fVar27 * fVar26 * fVar8;   // nx = (1/len) * (h_left - h_right) * (1/128)
 ```
 
-So the normal is: `(dx/128, 1.0, dz/128) / length((dx/128, 1.0, dz/128))`. The 1/128 factor accounts for the fact that heightfield samples are spaced 1/128 world unit apart (land tile spans 2049 samples over ~2048 world units).
+So the normal is `(dx/128, 1.0, dz/128) / length((dx/128, 1.0, dz/128))`. The 1/128 factor allows for heightfield samples being 1/128 of a world unit apart (a land tile covers 2049 samples over about 2048 world units).
 
-**After generation:** `glBindBuffer(GL_ARRAY_BUFFER, …)` then `glBufferData(GL_ARRAY_BUFFER, vertexCount * 24, scratchBuffer, GL_DYNAMIC_DRAW)`.
+Afterwards: `glBindBuffer(GL_ARRAY_BUFFER, …)`, then `glBufferData(GL_ARRAY_BUFFER, vertexCount * 24, scratchBuffer, GL_DYNAMIC_DRAW)`.
 
 ### 6.2 `Terrain_RebuildChunkSlot` @ `0xd0c10`
 
-For a specific sub-slot within a chunk at a given LOD:
+For one sub-slot inside a chunk, at a given detail level.
 
-**Parameters:** `(chunkIdx, subSlotIdx, lodLevel)` where `lodLevel = 0..6`
+Settings: `(chunkIdx, subSlotIdx, lodLevel)`, with `lodLevel = 0..6`
 
-**Vertex step:** `step = 1 << lodLevel`
-**Samples per side:** `0x80 / step + 2` (from `0x81` down to 3 at max LOD)
-**Actual loop bounds:** −1 to `0x80/step + 1` (= 0x81)
+Vertex step: `step = 1 << lodLevel`
+Samples per side: `0x80 / step + 2` (from `0x81` down to 3 at the lowest detail)
+Loop limits: −1 to `0x80/step + 1` (= 0x81)
 
-**Sub-slot world placement:**
+Where the sub-slot sits in the world:
 ```
 subSlotCoordX = chunk_record[chunkIdx].subSlotCoordX[subSlotIdx]  // grid offset (0-15)
 subSlotCoordZ = chunk_record[chunkIdx].subSlotCoordZ[subSlotIdx]
@@ -435,21 +431,19 @@ gridStartX = subSlotCoordX * 0x80 + tileCoordX * 0x800           // tile-sample 
 gridStartZ = subSlotCoordZ * 0x80 + tileCoordZ * 0x800
 ```
 
-**Normal computation:** Same as the chunk-level rebuild but with `fVar36 = 1.0 / (step + 1.0)` as the gradient scale instead of `1/128`.
+Normals: the same as for whole chunks, but scaled by `fVar36 = 1.0 / (step + 1.0)` instead of `1/128`.
 
-**Slot eviction:** Before writing, finds an unused or oldest slot in the LOD pool. If the evicted slot's chunk/subSlot are still valid, nullifies the back-reference at `0x411bf874`.
+Reusing slots: before writing, it finds a free slot or the oldest one in the pool. If the slot it takes still points at a valid chunk and sub-slot, it clears that back-reference at `0x411bf874`.
 
-**Upload:** `glBufferSubData(GL_ARRAY_BUFFER, slot_offset_bytes, vertexCount * 24, scratchBuffer)`.
+Upload: `glBufferSubData(GL_ARRAY_BUFFER, slot_offset_bytes, vertexCount * 24, scratchBuffer)`.
 
----
-
-## 7. LOD Index Buffer Construction
+## 7. Building the detail-level index buffers
 
 ### `Terrain_InitLandscapeChunkLodIndexBuffers` @ `0xd3190`
 
-Called once during world init from `World_InitResourcePoolsAndCatalogs` @ `0x13dcd0`.
+Called once while setting up the world, from `World_InitResourcePoolsAndCatalogs` @ `0x13dcd0`.
 
-**7 LOD levels** (LOD 0 through LOD 6):
+There are 7 detail levels (LOD 0 to LOD 6):
 
 | LOD | Step (uVar4) | Verts/Side | Total Vertices | Tris | Indices |
 |-----|-------------|------------|----------------|------|---------|
@@ -461,7 +455,7 @@ Called once during world init from `World_InitResourcePoolsAndCatalogs` @ `0x13d
 | 5   | 32          | 6          | 36              | 50    | 150   |
 | 6   | 64          | 4          | 16              | 18    | 54    |
 
-**Index pattern (triangle strip grid):**
+How the indices are laid out (a grid of triangle pairs):
 ```
 rowStride = vertsPerSide + 1           // = (0x80 / step) + 3
 
@@ -476,11 +470,9 @@ For each row r (1 to vertsPerSide-1):
     Triangle 2:              bottom_left, top_right, top_left
 ```
 
-Note: The vertex buffer has `0x81 / step + 1` vertices but the index buffer expects `0x80 / step + 2` vertices per side. At LOD 0 this is 129 vs 130 — meaning the index buffer has one extra "ghost" row/column, likely for a skirt or degenerate-triangle seam strip. This is a known technique for terrain chunk stitching.
+Note: the vertex buffer has `0x81 / step + 1` vertices per side, but the index buffer expects `0x80 / step + 2`. At detail 0 that is 129 against 130, so the index buffer has one extra "ghost" row and column, probably for a skirt or a strip of empty triangles to hide seams. This is a common trick for joining terrain chunks.
 
-The per-slot index buffer stride is recorded in `g_terrainChunkSlotsLod0IndexBufferStride` at the relevant LOD pool offset.
-
----
+The index buffer step for each slot is stored in `g_terrainChunkSlotsLod0IndexBufferStride`, at the offset of the matching pool.
 
 ## 8. `UpdateMapTopHeightAndClearOccupancyBit` @ `0x3fa40`
 
@@ -513,45 +505,43 @@ void UpdateMapTopHeightAndClearOccupancyBit(uint sampleX, uint sampleZ, float he
 }
 ```
 
-The landUseMask is a coarse 4×4 occupancy grid → each u16 cell covers a 16×16 meter region. Clearing a bit marks a 4×4 meter sub-cell as buildable (no street above). The occupancy bits are set to 0xFFFF initially; clearing specific bits indicates street presence.
+The land-use mask is a rough 4×4 occupancy grid, so each u16 covers a 16×16 metre area. Clearing a bit marks a 4×4 metre piece as buildable (no street on top). All bits start at 0xFFFF, and clearing a bit means a street is there.
 
----
+## 9. Constants
 
-## 9. Constants Table
-
-| Address | Raw (IEEE-754) | Decoded | Symbol / Variable | Meaning |
+| Address | Raw (IEEE-754) | Value | Symbol / Variable | Meaning |
 |---------|---------------|---------|-------------------|---------|
-| `0x002783f4` | `0x3f800000` | 1.0 | `FLOAT_002783f4` | Identity / step denominator / base normal Y |
-| `0x00278688` | `0x40800000` | 4.0 | `DAT_00278688` | Height multipliers for street intersection corners |
-| `0x00278774` | `0x41800000` | 16.0 | `DAT_00278774` | Edge penalty (subtracted from OOB height samples) + terrain noise amplitude |
-| `0x00278280` | `0x3e800000` | 0.25 | `FLOAT_00278280` | Edge ramp gradient scale (1/4) |
-| `0x00278118` | `0x3c000000` | 0.0078125 | `DAT_00278118` | World-scale gradient step = 1/128 |
-| `0x0027806c` | `0x38800000` | ~0.0000610 | `DAT_0027806c` | Small epsilon for sqrt in normal calc |
+| `0x002783f4` | `0x3f800000` | 1.0 | `FLOAT_002783f4` | One / step divisor / base normal Y |
+| `0x00278688` | `0x40800000` | 4.0 | `DAT_00278688` | Height multiplier for street intersection corners |
+| `0x00278774` | `0x41800000` | 16.0 | `DAT_00278774` | Edge penalty (subtracted from out-of-range heights), and a terrain noise strength |
+| `0x00278280` | `0x3e800000` | 0.25 | `FLOAT_00278280` | Edge ramp slope scale (1/4) |
+| `0x00278118` | `0x3c000000` | 0.0078125 | `DAT_00278118` | Slope step in world scale = 1/128 |
+| `0x0027806c` | `0x38800000` | about 0.0000610 | `DAT_0027806c` | Small epsilon for the sqrt in the normal |
 | `0x00278644` | `0x40400000` | 3.0 | `DAT_00278644` | Smoothstep constant |
-| `0x002781bc` | `0x3d800000` | 0.0625 | `FLOAT_002781bc` | Feather falloff rate = 1/16 |
-| `0x00278224` | `0x3e000000` | 0.125 | `FLOAT_00278224` | Bilinear upsample step = 1/8 |
+| `0x002781bc` | `0x3d800000` | 0.0625 | `FLOAT_002781bc` | Softening falloff = 1/16 |
+| `0x00278224` | `0x3e000000` | 0.125 | `FLOAT_00278224` | Bilinear scale-up step = 1/8 |
 | `0x00278698` | `0x40880000` | 4.25 | `DAT_00278698` | Street intersection base height offset (z*4.0+4.25) |
-| `0x002787b0` | `0x41c00000` | 24.0 | `DAT_002787b0` | Edge ramp coefficient |
+| `0x002787b0` | `0x41c00000` | 24.0 | `DAT_002787b0` | Edge ramp factor |
 | `0x002787e0` | `0x42100000` | 36.0 | `DAT_002787e0` | Edge ramp base scale |
-| `0x002787ac` | `0x41bf0000` | 23.875 | `DAT_002787ac` | Island base height (center) |
+| `0x002787ac` | `0x41bf0000` | 23.875 | `DAT_002787ac` | Island base height (middle) |
 | `0x002787a8` | `0x41be0000` | 23.75 | `DAT_002787a8` | Noise floor offset |
-| `0x00278728` | `0x41000000` | 8.0 | `DAT_00278728` | Noise amplitude multiplier |
-| `0x002780cc` | `0x3b800000` | 0.00390625 | `DAT_002780cc` | Island radial distance scale = 1/256 |
-| `0x002783a0` | `0x3f400000` | 0.75 | `DAT_002783a0` | Radial falloff offset |
-| `0x00278900` | `0x43a00000` | 320.0 | `DAT_00278900` | Noise outer radius offset |
-| `0x00278148` | `0x3c800000` | 0.015625 | `DAT_00278148` | Noise scale for Z dimension = 1/64 |
-| `0x002787d4` | `0x42000000` | 32.0 | `DAT_002787d4` | Noise Z amplitude |
-| `0x0027874c` | `0x413c0000` | 11.75 | `DAT_0027874c` | Edge ramp final addition |
-| `0x00278338` | `0x3f000000` | 0.5 | `DAT_00278338` | Radial noise mixed term |
-| `0x00278178` | `0x3d000000` | 0.03125 | `DAT_00278178` | Noise scale for X dimension = 1/32 |
-| `0x00278a68` | `0x44b90000` | 1480.0 | `DAT_00278a68` | Map center offset |
-| `0x002785a0` | `0x3ff921fb54442eea` | π/2 ≈ 1.570796 | `DAT_002785a0` | 90° rotation for building placement |
-| `0x00278814` | `0x42800000` | 64.0 | `DAT_00278814` | Chunk half-extent for LOD distance calc |
-| `0x00278a1c` | `0x44800000` | 1024.0 | `DAT_00278a1c` | Chunk full extent for LOD distance calc |
+| `0x00278728` | `0x41000000` | 8.0 | `DAT_00278728` | Noise strength |
+| `0x002780cc` | `0x3b800000` | 0.00390625 | `DAT_002780cc` | Island distance scale = 1/256 |
+| `0x002783a0` | `0x3f400000` | 0.75 | `DAT_002783a0` | Round falloff offset |
+| `0x00278900` | `0x43a00000` | 320.0 | `DAT_00278900` | Noise outer radius |
+| `0x00278148` | `0x3c800000` | 0.015625 | `DAT_00278148` | Noise scale for Z = 1/64 |
+| `0x002787d4` | `0x42000000` | 32.0 | `DAT_002787d4` | Noise Z strength |
+| `0x0027874c` | `0x413c0000` | 11.75 | `DAT_0027874c` | Added at the end of the edge ramp |
+| `0x00278338` | `0x3f000000` | 0.5 | `DAT_00278338` | Mixed round-noise term |
+| `0x00278178` | `0x3d000000` | 0.03125 | `DAT_00278178` | Noise scale for X = 1/32 |
+| `0x00278a68` | `0x44b90000` | 1480.0 | `DAT_00278a68` | Map centre offset |
+| `0x002785a0` | `0x3ff921fb54442eea` | π/2 ≈ 1.570796 | `DAT_002785a0` | 90° turn for placing buildings |
+| `0x00278814` | `0x42800000` | 64.0 | `DAT_00278814` | Chunk half-size for detail distance |
+| `0x00278a1c` | `0x44800000` | 1024.0 | `DAT_00278a1c` | Chunk full size for detail distance |
 
-**LOD Squared-Distance Thresholds (from `Terrain_SelectAndRefreshVisibleChunkSlotsAroundPoint`):**
+Squared distances for switching detail level (from `Terrain_SelectAndRefreshVisibleChunkSlotsAroundPoint`):
 
-| Address | Raw | Decoded | LOD |
+| Address | Raw | Value | LOD |
 |---------|-----|---------|-----|
 | `0x00278aec` | `0x48800000` | 262,144 | LOD 1 (512²) |
 | `0x00278af4` | `0x49100000` | 589,824 | LOD 2 (768²) |
@@ -561,29 +551,25 @@ The landUseMask is a coarse 4×4 occupancy grid → each u16 cell covers a 16×1
 | `0x00278b08` | `0x4b100000` | 9,437,184 | LOD 6 (3072²) |
 | `0x00278b0c` | `0x4b800000` | 16,777,216 | Far clip (4096²) |
 
----
+## 10. Unknowns
 
-## 10. Honest Unknowns
+1. The chunk record size does not add up. The decompiler guesses `0xd08` for some field steps, but the disassembly confirms `0x3420` as the real record size. The bytes `+0x20` to `+0x2b` and `+0x2c..+0x341f` in each record are only partly worked out. The decompiler's `0x684` for the `g_landTileHeightChunks` pointer array is a mistake: each pointer is 8 bytes, but the decompiler thinks there are 417 bytes of other data between them.
 
-1. **Chunk record stride discrepancy:** The decompiler infers `0xd08` for some sub-field strides while the disassembly confirms `0x3420` as the true chunk record stride. The exact layout of bytes `+0x20` through `+0x2b` and `+0x2c..+0x341f` within each record is only partially resolved. The decompiler's `0x684` for the `g_landTileHeightChunks` pointer array is an artifact — each pointer is 8 bytes, but the decompiler thinks there are 417 bytes of other data between pointers.
+2. The ghost index column. The index buffer expects `0x80 / step + 2` vertices per side, but the vertex buffer makes `0x81 / step + 1`. At detail 0 that is 130 against 129. The extra row and column of indices probably make a skirt of empty triangles to hide seams between chunks. The exact skirt shape needs more work.
 
-2. **Ghost index column:** The LOD index buffer expects `0x80 / step + 2` vertices per side, but the vertex buffer generates `0x81 / step + 1` vertices per side. At LOD 0 this is 130 vs 129 — one extra row/column of indices likely encodes a degenerate-triangle skirt for chunk-stitching seams. The exact skirt geometry needs further analysis.
+3. The land-tile height pointer. The height data at `+0x18` of each chunk record is an 8-byte pointer to a separate allocation of `0x801 * 0x801 * 4 = 0x1004004` bytes. Whether all 64 chunks are always allocated, or only when needed, is not known.
 
-3. **LandTileHeightChunks pointer:** The per-chunk height data at offset `+0x18` of the chunk record is an 8-byte pointer to a separate heap allocation. The allocation size is `0x801 * 0x801 * 4 = 0x1004004` bytes. Whether all 64 chunks always allocate or use lazy initialization is not determined.
+4. Setting the sub-slot coordinates. When and how the `subSlotCoordX/Z` values (at `+0x2c`/`+0x30`) that make the 16×16 grid inside each chunk are set was not traced. Probably in `Render_InitTerrainStreamingBuffers` or where the chunk array is allocated.
 
-4. **Sub-slot coordinates initialization:** The values in `subSlotCoordX/Z` (offsets `+0x2c`/`+0x30`) that define the 16×16 sub-grid within each chunk — exactly when and how these are assigned is not traced. Likely in `Render_InitTerrainStreamingBuffers` or in the chunk array allocation logic.
+5. The 28 intersection numbers. They are fixed in `Terrain_RebuildLandTilesRoadPatchesAndChunkCaches`. Which real intersections they are depends on the city's layout and street graph. They are single-byte numbers (2–0x3e) into the `streetIntersections` array. The pattern they make on the default map was not mapped out.
 
-5. **The 28 intersection indices:** These are hardcoded in `Terrain_RebuildLandTilesRoadPatchesAndChunkCaches`. Their meaning (which physical intersections on the map they refer to) depends on the specific city layout and street graph topology. They are single-byte indices (2–0x3e) into the `streetIntersections` array. The exact spatial pattern they form on the default map layout is not mapped.
+6. `DAT_00278a68` (1480.0). `World_LoadMapAndInitializeTerrain` adds it to the first street intersection's Y when working out the map centre. Where it comes from is unclear; it may relate to the city district layout or the SBB coordinates.
 
-6. **`DAT_00278a68` (1480.0):** Used in `World_LoadMapAndInitializeTerrain` as an offset to the first street intersection's Y coordinate when computing the map center. Its exact origin is unclear — it may relate to the city district layout or the SBB coordinate system.
+7. `DAT_2b2a2ecc` / `DAT_2b2a2ed0` (`0x41c00000` = 24.0, `0x44800000` = 1024). Working out the map centre adds these to the first intersection's position. The +4096 world shift suggests they centre the map on the street grid's origin.
 
-7. **`DAT_2b2a2ecc` / `DAT_2b2a2ed0` (`0x41c00000` = 24.0 offset, `0x44800000` = 1024 offset):** Map center computation adjusts the first intersection's position by adding these offsets. The +4096 world-space shift suggests these center the map around the street grid origin.
+8. The edge ramp on the island. The branch at `0x56690` (`if (isMapAutoGenerated == 0)`) shapes the edges only when the map is NOT auto-generated. Auto-generated maps keep the raw heightfield (just noise and the round falloff). The shaping uses a cubic `(36 - d*24) * d² + 11.75`, going from 11.75 in the middle to a very sharp edge near the border.
 
-8. **Island heightfield edge ramp:** The branch at `0x56690` (`if (isMapAutoGenerated == 0)`) applies additional edge shaping when the map is NOT auto-generated. For auto-generated maps, the heightfield is left raw (just noise + radial falloff). The shaping uses a cubic falloff `(36 - d*24) * d² + 11.75` which transitions from 11.75 at the center to a very sharp edge near the perimeter.
-
----
-
-## 11. Summary Diagram
+## 11. Overview diagram
 
 ```
 World_LoadMapAndInitializeTerrain @ 0x56980

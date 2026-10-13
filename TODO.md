@@ -1,3 +1,3 @@
 # TODO
 
-- Expose world time as an editor control after its intended behavior and placement are defined.
+Track beta release checks and unresolved limits in [docs/BETA_RELEASE.md](docs/BETA_RELEASE.md).

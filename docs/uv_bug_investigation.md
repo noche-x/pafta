@@ -1,47 +1,47 @@
 # UV bug investigation
 
-## Second pass — independent Ghidra RE of texture PLACEMENT (2026-06-18, Claude, no codex)
+## Research on texture placement (2026-06-18, Claude, without Codex)
 
-Verified directly against editor.exe and subrosa.exe.THIS_ONE. Findings:
+This pass compared the port with `editor.exe` and `subrosa.exe.THIS_ONE`. The source line numbers below are from the checkout as it was that day.
 
-- **Editor UV authoring is faithful in the port — confirmed by reading the binary, not assuming.**
-  - `PostProcessBlockMesh_TextureCoordinatesAndBuffers @ 14004eaa0` (decompiled + the 0x20000 `1.0 - z` branch checked in disasm): the 6 orientation-tag UV formulas exactly equal the port's `native_oriented_uv` (scene.cpp:456 / formats.cpp:539).
-  - `EmitPatchedBezierFaceGeometry @ 14004fad0`: authored bezier UVs interpolated then OVERWRITTEN by position-projection iff face tag high-nibble != 0; the port replicates this via the `fallback` arg at formats.cpp:631-646. Match.
-  - `LoadBlock_SBL @ 140053740`: control points read as 16 × (3-float pos + 2-float uv), row-major, u-then-v. Port formats.cpp:765-781 matches byte-for-byte. No V-flip, no axis swap at load.
-  - `RotateBlockMeshGeometry_90Degrees_CounterClockwise @ 1400507b0` (full disasm decoded): winding rotation for tags 0x30000/0x40000 is `{old3,old0,old1,old2}` = port scene.cpp:496. Material cycle is ONLY 1->2->3->4->1; 9..12 untouched (port's fixed helper at scene.cpp:434 is correct).
+- The port's UV formulas matched the game's formulas found in this pass.
+  - `PostProcessBlockMesh_TextureCoordinatesAndBuffers @ 14004eaa0` (decompiled, with the 0x20000 `1.0 - z` branch also checked in the disassembly): the six orientation-tag UV formulas are exactly the port's `native_oriented_uv` (scene.cpp:456 / formats.cpp:539).
+  - `EmitPatchedBezierFaceGeometry @ 14004fad0`: the stored Bezier UVs are interpolated, then REPLACED by a projection from the position whenever the face tag's high nibble is not 0. The port does the same with the `fallback` argument at formats.cpp:631-646. Match.
+  - `LoadBlock_SBL @ 140053740`: control points are read as 16 × (3-float position + 2-float uv), row by row, u before v. Port formats.cpp:765-781 matches byte for byte. Nothing flips V or swaps axes while loading.
+  - `RotateBlockMeshGeometry_90Degrees_CounterClockwise @ 1400507b0` (full disassembly decoded): for tags 0x30000/0x40000 the corners rotate as `{old3,old0,old1,old2}`, the same as port scene.cpp:496. Materials ONLY cycle 1->2->3->4->1, and 9..12 stay the same (the port's fixed helper at scene.cpp:434 is right).
 
-- **Runtime (subrosa.exe.THIS_ONE) default-cube paths carry NO baked UVs.**
-  - `Voxel_GenerateBlockFaceGeometry @ 0xe8b0` (collision/voxel) and `BuildBlock_GenerateCubeVerticesFaces @ 0x3fb90` (render cube) both build box geometry from shared corner table `DAT_002b34f0` and face-index table `DAT_002b3660`, faces tagged constant `4`, with NO per-vertex UV. Texturing for these is position/planar-projected at draw, not a stored UV quad.
-  - Corner table `DAT_002b34f0` decoded: c0(0,0,0) c1(0,0,1) c2(0,1,0) c3(0,1,1) c4(1,0,0) c5(1,0,1) c6(1,1,0) c7(1,1,1).
+- The game's default-cube paths (subrosa.exe.THIS_ONE) have NO stored UVs.
+  - `Voxel_GenerateBlockFaceGeometry @ 0xe8b0` (collision and voxels) and `BuildBlock_GenerateCubeVerticesFaces @ 0x3fb90` (the drawn cube) both build boxes from the shared corner table `DAT_002b34f0` and face table `DAT_002b3660`. Every face has the fixed tag `4` and there is NO UV per vertex. These are textured by projecting the position at draw time, not with a stored UV quad.
+  - Corner table `DAT_002b34f0`, decoded: c0(0,0,0) c1(0,0,1) c2(0,1,0) c3(0,1,1) c4(1,0,0) c5(1,0,1) c6(1,1,0) c7(1,1,1).
 
-- **Likely-missed divergence (default cube preview only):** the port's SBB cube-cell preview uses a single FIXED uv quad `native_preview_face_uvs = {(0,0),(0,1),(1,1),(1,0)}` on ALL 6 faces (scene.cpp:362), plus an approximated corner table `native_preview_cube_corners` (scene.cpp:342) the comment itself calls a "planar fallback," NOT the native `DAT_002b34f0` order. A fixed UV quad cannot match the engine's per-face position projection, so faces whose native U/V axis runs opposite appear flipped. This is the strongest candidate for a single "upside-down" face on default cube cells. NOT yet fixed — needs the per-face orientation-tag projection wired into the preview path (or the native corner/face tables ported) to confirm.
-  - Caveat: loaded buildings made of resolved SBL block-mesh pieces (scene.cpp:2639/2715 via add_rotated_block_mesh_to_buffer) already use the verified-correct projected UVs, so this preview divergence affects default-cube cells, not authored block-mesh pieces.
+- A difference that was probably missed (default cube preview only): the port's SBB cube-cell preview uses one FIXED uv quad, `native_preview_face_uvs = {(0,0),(0,1),(1,1),(1,0)}`, on ALL 6 faces (scene.cpp:362). It also uses a guessed corner table, `native_preview_cube_corners` (scene.cpp:342), which its own comment calls a "planar fallback", and which is NOT the game's `DAT_002b34f0` order. A fixed UV quad cannot match the engine's per-face projection, so faces whose U or V runs the other way show up flipped. This is the most likely cause of a single "upside-down" face on default cube cells. NOT fixed yet: to confirm, the preview needs the per-face orientation-tag projection (or the game's corner and face tables).
+  - Note: buildings made of SBL block-mesh pieces (scene.cpp:2639/2715 via add_rotated_block_mesh_to_buffer) already use the checked projected UVs. So this preview difference only affects default cube cells, not authored block-mesh pieces.
 
-## Root cause summary
+## Causes found
 
-- The core UV projection formula in the port is not the root cause. `editor.exe` derives oriented block-face UVs exactly as `src/formats.cpp:539-555` and `src/scene.cpp:449-465` do.
-- The Bezier patch sampler in the port is not row/column swapped. `editor.exe` samples the 4x4 grid as row-major `row * 4 + column`, evaluates row direction first at fixed column, then column direction; this matches `src/formats.cpp:513-536` and the face emission at `src/formats.cpp:631-646`.
-- The CSX-packed `.sbb` loader is not using a different UV/texture-short layout. `subrosa.exe` and `subrosa.exe.THIS_ONE` both read the same per-cell 0x3c record order as loose `.sbb`; the packed path only hard-checks leading sentinel `1`.
-- The mild "one texture flipped/wrong" case has one concrete port divergence: native SBL block rotation only cycles low material slots `1..4`, but the port's shared `rotate_native_material_slot` also cycles `9..12` at `src/scene.cpp:428-430`. If that block face uses material slots in `9..12`, rotation can select the wrong material while the UV math itself is correct.
-- The severe "CSX map has essentially every block texture wrong" case is most plausibly an asset pairing problem, not a CSX UV decode problem. Geometry loading is CSX-wins (`src/app.cpp:489-541`), but texture loading skips CSX textures when a loose texture of the same name was loaded first (`src/app.cpp:430-440`). That can pair CSX buildings with stale loose textures and make every block look UV-wrong.
+- The port's main UV projection formula is not the cause. `editor.exe` works out block-face UVs exactly as `src/formats.cpp:539-555` and `src/scene.cpp:449-465` do.
+- The port's Bezier patch sampler does not swap rows and columns. `editor.exe` reads the 4x4 grid row by row as `row * 4 + column`, works along the rows first at a fixed column, then along the columns. This matches `src/formats.cpp:513-536` and the face output at `src/formats.cpp:631-646`.
+- The loader for `.sbb` files packed in a CSX archive does not use a different UV or texture layout. `subrosa.exe` and `subrosa.exe.THIS_ONE` both read the same 0x3c-byte cell order as loose `.sbb` files; the packed path only checks that the first value is `1`.
+- The mild "one texture flipped or wrong" case has one real difference in the port. The game's SBL block rotation only cycles the low material slots `1..4`, but the port's shared `rotate_native_material_slot` also cycles `9..12` at `src/scene.cpp:428-430`. If that block face uses a slot in `9..12`, rotation can pick the wrong material even though the UV math is right.
+- The severe "CSX map has nearly every block texture wrong" case is most likely the wrong textures being paired with buildings, not a CSX UV decoding problem. For geometry, the CSX copy wins (`src/app.cpp:489-541`). But texture loading skips a CSX texture when a loose texture with the same name was loaded first (`src/app.cpp:430-440`). That can pair CSX buildings with old loose textures and make every block look like its UVs are wrong.
 
-## Applied fixes (2026-06-18)
+## Fixes made (2026-06-18)
 
-- Symptom 1: `src/scene.cpp:434-438` adds `rotate_native_block_mesh_material_slot`, and `src/scene.cpp:505` uses it only for SBL block-mesh rotation; `rotate_native_material_slot` remains unchanged for the procedural/tool buildblock path. Regression coverage is `tests/parser_tests.cpp:2158-2182`.
-- Symptom 2: `src/app.cpp:381-395` adds CSX texture upsert by lowercased name, and `src/app.cpp:452-453` now lets embedded CSX textures replace same-name loose textures while reusing the existing vector slot via `LoadedTexture` move assignment.
+- Problem 1: `src/scene.cpp:434-438` adds `rotate_native_block_mesh_material_slot`, and `src/scene.cpp:505` uses it only when rotating SBL block meshes. `rotate_native_material_slot` stays the same for the procedural and tool buildblock path. The test is `tests/parser_tests.cpp:2158-2182`.
+- Problem 2: `src/app.cpp:381-395` adds a way to insert or replace CSX textures by lower-case name, and `src/app.cpp:452-453` now lets textures inside the CSX replace loose textures with the same name. It reuses the existing slot in the list through `LoadedTexture` move assignment.
 
-## `editor.exe` evidence
+## Evidence from `editor.exe`
 
 ### Oriented UV formula
 
 Function: `PostProcessBlockMesh_TextureCoordinatesAndBuffers @ 14004eaa0`.
 
-Relevant xrefs:
-- `LoadAndInitBlockTemplates_SBL @ 14004d73b` calls it after built-in/default block generation and after loaded SBL patch emission.
-- `RotateBlockMeshGeometry_90Degrees_CounterClockwise @ 1400507b0` mutates orientation tags, then callers postprocess rotated variants.
-- `FUN_140051070 @ 140051423` also calls it for a buildblock path.
+Callers:
+- `LoadAndInitBlockTemplates_SBL @ 14004d73b` calls it after making the built-in default blocks and after adding loaded SBL patches.
+- `RotateBlockMeshGeometry_90Degrees_CounterClockwise @ 1400507b0` changes orientation tags, and its callers then post-process the rotated copies.
+- `FUN_140051070 @ 140051423` also calls it on a buildblock path.
 
-Decompiled behavior:
+What the decompiled code does:
 
 ```c
 switch (faceMaterialAndOrientation & 0xf0000) {
@@ -55,18 +55,18 @@ default:      keep existing authored/fallback UV;
 }
 ```
 
-Assembly check: `14004eaf7` masks `0xf0000`; `14004eafc` compares `0x10000`; `14004eca3-14004ecab` loads `1.0` and subtracts the selected coordinate for the `0x20000` case. The other decompiled branches mirror the six formulas above.
+Checked in the assembly: `14004eaf7` masks `0xf0000`, `14004eafc` compares with `0x10000`, and `14004eca3-14004ecab` loads `1.0` and subtracts the chosen coordinate for the `0x20000` case. The other decompiled branches follow the six formulas above.
 
-Port comparison:
+Compared with the port:
 - `src/formats.cpp:539-555` matches this formula.
-- `src/scene.cpp:449-465` matches this formula for placed/rotated block meshes.
-- `src/render_gpu.cpp:519-520`, `src/render_gpu.cpp:592-593`, and `src/render_gpu.cpp:768-769` upload `u,v` unchanged; there is no later V flip in the GPU upload path.
+- `src/scene.cpp:449-465` matches this formula for placed and rotated block meshes.
+- `src/render_gpu.cpp:519-520`, `src/render_gpu.cpp:592-593`, and `src/render_gpu.cpp:768-769` upload `u,v` unchanged; nothing flips V later on the way to the GPU.
 
-### Bezier patch UV sampling
+### Sampling Bezier patch UVs
 
 Function: `EmitPatchedBezierFaceGeometry @ 14004fad0`.
 
-`LoadBlock_SBL @ 140053740` reads each authored SBL face as:
+`LoadBlock_SBL @ 140053740` reads each SBL face like this:
 
 ```c
 for (row = 0; row < 4; ++row) {
@@ -79,29 +79,29 @@ for (row = 0; row < 4; ++row) {
 
 `EmitPatchedBezierFaceGeometry @ 14004fad0` then:
 
-1. Outer loop samples rows: `local_50 = 0..row_tess`, `local_44 += 1.0 / row_tess`.
-2. For each fixed column `local_54`, it evaluates `param_6`/row order across offsets `0x00, 0x30, 0x60, 0x90`.
-3. Inner loop samples columns: `local_4c = 0..column_tess`, `local_48 += 1.0 / column_tess`.
-4. It evaluates `param_4`/column order across the four intermediate columns.
-5. UVs use the same traversal: source UV offsets `0x00, 0x20, 0x40, 0x60` at fixed column, then column interpolation.
-6. Quad index order is `{row,col}`, `{row,col+1}`, `{row+1,col+1}`, `{row+1,col}`.
+1. Loops over rows on the outside: `local_50 = 0..row_tess`, `local_44 += 1.0 / row_tess`.
+2. For each fixed column `local_54`, works out `param_6` (the row order) across offsets `0x00, 0x30, 0x60, 0x90`.
+3. Loops over columns on the inside: `local_4c = 0..column_tess`, `local_48 += 1.0 / column_tess`.
+4. Works out `param_4` (the column order) across the four in-between columns.
+5. Walks the UVs the same way: source UV offsets `0x00, 0x20, 0x40, 0x60` at a fixed column, then blends across columns.
+6. Orders quad corners as `{row,col}`, `{row,col+1}`, `{row+1,col+1}`, `{row+1,col}`.
 
-Port comparison:
-- `src/formats.cpp:513-536` does the same `control_uvs[column]`, `control_uvs[4 + column]`, `control_uvs[8 + column]`, `control_uvs[12 + column]` row-major traversal.
-- `src/formats.cpp:622-647` emits the same quad corner order.
-- No V inversion exists in native before postprocess; the port does not need a blanket `1.0 - v` in this sampler.
+Compared with the port:
+- `src/formats.cpp:513-536` walks row by row the same way: `control_uvs[column]`, `control_uvs[4 + column]`, `control_uvs[8 + column]`, `control_uvs[12 + column]`.
+- `src/formats.cpp:622-647` uses the same quad corner order.
+- The game does not flip V before post-processing, so the port does not need a blanket `1.0 - v` in this sampler.
 
-### Native SBL rotation material divergence
+### Where SBL rotation materials differ
 
 Function: `RotateBlockMeshGeometry_90Degrees_CounterClockwise @ 1400507b0`.
 
-Native rotation behavior:
-- Coordinates: `x' = previous_depth - z`, `z' = x`; width/depth are swapped.
-- For orientation tags `0x30000` or `0x40000`, native rotates quad corner indices.
-- For low material slot rotation, native cycles only `1 -> 2 -> 3 -> 4 -> 1`; it does not cycle `9..12`.
-- Orientation tag cycle is `0x60000 -> 0x10000 -> 0x50000 -> 0x20000 -> 0x60000`.
+What the game does:
+- Coordinates: `x' = previous_depth - z`, `z' = x`; width and depth swap.
+- For orientation tags `0x30000` or `0x40000`, it rotates the quad's corner indices.
+- For the low material slots, it only cycles `1 -> 2 -> 3 -> 4 -> 1`. It does not cycle `9..12`.
+- Orientation tags cycle `0x60000 -> 0x10000 -> 0x50000 -> 0x20000 -> 0x60000`.
 
-Port divergence:
+How the port differed:
 
 ```cpp
 // src/scene.cpp:421-430
@@ -113,7 +113,7 @@ if (material >= 9U && material <= 12U) {
 }
 ```
 
-Wrong line:
+The wrong lines:
 
 ```cpp
 if (material >= 9U && material <= 12U) {
@@ -121,13 +121,13 @@ if (material >= 9U && material <= 12U) {
 }
 ```
 
-Corrected SBL block-mesh behavior:
+What SBL block meshes should do there:
 
 ```cpp
 return material;
 ```
 
-Minimal proposed fix for the mild case:
+Smallest fix suggested for the mild case:
 
 ```diff
 +std::uint32_t rotate_native_block_mesh_material_slot(std::uint32_t material, std::int32_t rotation) {
@@ -141,42 +141,42 @@ Minimal proposed fix for the mild case:
 +            rotated.material = rotate_native_block_mesh_material_slot(rotated.material, 1);
 ```
 
-Keep the existing `rotate_native_material_slot` for procedural/tool buildblock box code until that separate native path is audited, because `src/scene.cpp:803-830` uses it outside SBL block mesh rotation.
+Keep the existing `rotate_native_material_slot` for the procedural and tool buildblock box code until that separate game path has been checked, because `src/scene.cpp:803-830` uses it outside SBL block-mesh rotation.
 
-## `subrosa.exe` and `subrosa.exe.THIS_ONE` evidence
+## Evidence from `subrosa.exe` and `subrosa.exe.THIS_ONE`
 
 ### Loose `.sbb`
 
 Function: `Sbb_LoadFromFile @ 00026830` in both `subrosa.exe` and `subrosa.exe.THIS_ONE`.
 
 Evidence:
-- It accepts versions `12..14` via `local_258 - 0xcU < 3`.
-- It reads dimensions at struct offsets `+0x40`, `+0x44`, `+0x48`.
-- For each cell it reads 0x3c bytes in this order: dwords to `+0x5c`, `+0x60`, `+0x58`, `+0x64`, `+0x68`, `+0x6c`; then shorts `+0x70..+0x8e`; then dword `+0x90`.
+- It accepts versions `12..14` through `local_258 - 0xcU < 3`.
+- It reads the sizes at struct offsets `+0x40`, `+0x44`, `+0x48`.
+- For each cell it reads 0x3c bytes in this order: dwords into `+0x5c`, `+0x60`, `+0x58`, `+0x64`, `+0x68`, `+0x6c`; then shorts `+0x70..+0x8e`; then a dword into `+0x90`.
 
-Port comparison:
-- `src/formats.cpp:194-238` reads exactly six dwords, sixteen shorts, and a final dword per 0x3c cell.
-- `src/formats.hpp:41-48` documents the native non-struct file order.
+Compared with the port:
+- `src/formats.cpp:194-238` reads exactly six dwords, sixteen shorts, and one last dword per 0x3c-byte cell.
+- `src/formats.hpp:41-48` notes that the file order is not the order of the game's struct.
 
-### CSX-packed `.sbb`
+### `.sbb` packed in a CSX
 
 Function: `SbbContainer_ReadWrite @ 00196d60` in both `subrosa.exe` and `subrosa.exe.THIS_ONE`.
 
 Evidence:
-- Packed `.sbb` starts with sentinel dword `1`; read path returns failure if it is not `1`.
-- It then reads the same 0x40 header, dimensions/anchors, tables, cell records, and aux records as loose v14 layout.
-- Its cell loop uses the same dword/short order as `Sbb_LoadFromFile @ 00026830`.
+- A packed `.sbb` starts with the dword `1`, and reading fails if it is anything else.
+- After that it reads the same 0x40 header, sizes and anchors, name lists, cells, and extra records as a loose v14 file.
+- Its cell loop reads dwords and shorts in the same order as `Sbb_LoadFromFile @ 00026830`.
 
-Port comparison:
-- `src/app.cpp:470-481` rewrites only leading sentinel `1` to loose version `14`.
-- `src/formats.cpp:953-998` then parses the payload using the loose parser.
-- Fixture check: `/Users/noche/repos/SRC/server/data/test2/test.csx` SBB entries begin with dword `1`, dimensions at `+0x44/+0x48/+0x4c`, anchors at `+0x50/+0x54/+0x58`, and material table count at `+0x5c`, matching the binary.
+Compared with the port:
+- `src/app.cpp:470-481` only changes the leading `1` into loose version `14`.
+- `src/formats.cpp:953-998` then reads the data with the loose-file parser.
+- Checked against a real file: the SBB entries in `/Users/noche/repos/SRC/server/data/test2/test.csx` start with the dword `1`, with sizes at `+0x44/+0x48/+0x4c`, anchors at `+0x50/+0x54/+0x58`, and the material count at `+0x5c`, just like the binary expects.
 
-### CSX texture blobs
+### CSX textures
 
 Function: `Csx_ReadWriteTypedBlobPayload @ 00197630`.
 
-Native texture record layout:
+The game's texture record:
 
 ```c
 uint32 sentinel = 1;
@@ -187,36 +187,36 @@ byte color_png[color_png_size];
 byte material_png[material_png_size];
 ```
 
-Port comparison:
-- `src/app.cpp:381-405` reads only the first/color PNG from `+0x4c`. That is enough for diffuse display, but it ignores the material PNG that native uploads too.
-- This is not a UV-coordinate bug, but it is another CSX rendering parity gap.
+Compared with the port:
+- `src/app.cpp:381-405` only reads the first (color) PNG, from `+0x4c`. That is enough to show the color, but it skips the material PNG that the game also uploads.
+- This is not a UV bug, but it is another way CSX rendering differs from the game.
 
-## Exact port divergences and proposed fixes
+## The exact differences and the fixes suggested
 
-### 1. Mild single flipped/wrong block face
+### 1. One block face flipped or wrong (mild)
 
-Confirmed divergence:
-- `src/scene.cpp:428-430` rotates material slots `9..12` for SBL block mesh rotation.
-- Native `RotateBlockMeshGeometry_90Degrees_CounterClockwise @ 1400507b0` only cycles `1..4`.
+Confirmed difference:
+- `src/scene.cpp:428-430` rotates material slots `9..12` when rotating SBL block meshes.
+- The game's `RotateBlockMeshGeometry_90Degrees_CounterClockwise @ 1400507b0` only cycles `1..4`.
 
-Minimal proposed fix:
-- Add a block-mesh-specific material rotation helper that cycles only `1..4`.
-- Use it at `src/scene.cpp:498` inside `rotate_block_face_native_impl`.
-- Do not change `native_oriented_uv`; it already matches native.
+Smallest fix suggested:
+- Add a material rotation helper just for block meshes that only cycles `1..4`.
+- Use it at `src/scene.cpp:498` in `rotate_block_face_native_impl`.
+- Leave `native_oriented_uv` alone; it already matches the game.
 
-Validation:
-- Load the map/block that has the one flipped/wrong face.
-- Inspect whether the offending `SblBlockFace::material` is in `9..12` and the building placement has nonzero rotation.
-- Confirm that after the proposed helper split, the face selects the same local material slot as `editor.exe`/native rotated SBL output.
+How to check:
+- Load the map or block with the one flipped or wrong face.
+- Check whether the bad face's `SblBlockFace::material` is in `9..12` and whether the building is placed with a rotation other than zero.
+- After splitting the helper, check that the face picks the same local material slot as the rotated SBL output from `editor.exe` or the game.
 
-### 2. Severe CSX-wide wrong textures
+### 2. Wrong textures across a whole CSX map (severe)
 
-Confirmed divergence:
-- `src/app.cpp:430-440` loads loose textures first, then skips CSX textures with duplicate names.
-- `src/app.cpp:489-541` makes geometry CSX-wins.
-- Native `World_LoadMapAndInitializeTerrain @ 000579a0` iterates CSX type `0x585a0004` texture records and loads them from the archive for the map runtime.
+Confirmed difference:
+- `src/app.cpp:430-440` loads loose textures first, then skips CSX textures with the same names.
+- `src/app.cpp:489-541` lets the CSX copy win for geometry.
+- The game's `World_LoadMapAndInitializeTerrain @ 000579a0` goes through the CSX texture records (type `0x585a0004`) and loads them from the archive for the map.
 
-Wrong line:
+The wrong lines:
 
 ```cpp
 if (loaded_names.contains(lower_name(entry.name))) {
@@ -224,14 +224,14 @@ if (loaded_names.contains(lower_name(entry.name))) {
 }
 ```
 
-Corrected behavior:
+What it should do:
 
 ```cpp
 // CSX texture entries should upsert/override by name, matching CSX geometry.
 upsert_texture(project, entry.name, *texture, loaded_names);
 ```
 
-Minimal proposed fix:
+Smallest fix suggested:
 
 ```diff
  for (const auto& entry : archive.entries) {
@@ -248,16 +248,16 @@ Minimal proposed fix:
  }
 ```
 
-`upsert_texture_by_name` should unload the old `Texture2D` when replacing an existing entry, update the same vector slot, and preserve `loaded_names` index mapping.
+When `upsert_texture_by_name` replaces an entry, it should unload the old `Texture2D`, reuse the same slot in the list, and keep the `loaded_names` index mapping.
 
-Validation:
-- Use `/Users/noche/repos/SRC/server/data/test2/test.csx` or the reported CSX map.
-- Log a duplicate texture name that exists both loose and in CSX; verify CSX wins after the proposed change.
-- Load one affected CSX building before/after and compare material names from `SbbBuilding::materials` against `project.textures`.
-- Confirm the visual symptom changes without touching UV formulas.
+How to check:
+- Use `/Users/noche/repos/SRC/server/data/test2/test.csx` or the CSX map from the report.
+- Log a texture name that exists both as a loose file and in the CSX, and check that the CSX one wins after the change.
+- Load one affected CSX building before and after, and compare the material names in `SbbBuilding::materials` with `project.textures`.
+- Check that the problem on screen changes without touching any UV formula.
 
 ## What not to change yet
 
-- Do not add a blanket `v = 1.0F - v` in `native_oriented_uv`, `bezier_patch_uv_sample`, or GPU upload. Native evidence does not support it.
-- Do not reorder Bezier control rows/columns. `editor.exe @ 14004fad0` matches the current row-major traversal.
-- Do not invent a special CSX `.sbb` cell stride, endianness, winding, or UV-short order. `subrosa.exe @ 00196d60` contradicts that theory.
+- Do not add a blanket `v = 1.0F - v` in `native_oriented_uv`, `bezier_patch_uv_sample`, or the GPU upload. Nothing in the game supports it.
+- Do not reorder Bezier control rows or columns. `editor.exe @ 14004fad0` matches the current row-by-row walk.
+- Do not invent a special cell size, byte order, winding, or UV order for `.sbb` files in a CSX. `subrosa.exe @ 00196d60` shows that idea is wrong.

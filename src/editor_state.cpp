@@ -1,277 +1,79 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #include "editor_state.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
+#include <utility>
 
-namespace map_editor {
-namespace {
-
-std::size_t first_occupied_index(const SbbBuilding& building) {
-    const auto match = std::ranges::find_if(building.cells, [](const SbbCell& cell) {
-        return cell.occupied;
-    });
-    return match == building.cells.end() ? 0U : static_cast<std::size_t>(match - building.cells.begin());
-}
-
-std::uint32_t add_clamped(std::uint32_t value, std::int32_t delta) {
-    if (delta < 0 && value < static_cast<std::uint32_t>(-delta)) {
-        return 0;
+namespace pafta {
+std::optional<std::array<std::uint32_t, 3>> shift_sbb_grid_for_cell(
+    SbbBuilding& building, std::int64_t x, std::int64_t y, std::int64_t z) {
+    constexpr auto side = static_cast<std::int64_t>(supported_sbb_grid_side);
+    if (x <= -side || x >= side || y <= -side || y >= side || z <= -side || z >= side) return std::nullopt;
+    const auto sx = static_cast<std::uint32_t>(std::max<std::int64_t>(0, -x));
+    const auto sy = static_cast<std::uint32_t>(std::max<std::int64_t>(0, -y));
+    const auto sz = static_cast<std::uint32_t>(std::max<std::int64_t>(0, -z));
+    for (const auto& cell : building.cells) {
+        if (cell.x >= supported_sbb_grid_side - sx || cell.y >= supported_sbb_grid_side - sy ||
+            cell.z >= supported_sbb_grid_side - sz) return std::nullopt;
     }
-    if (delta > 0 && value > std::numeric_limits<std::uint32_t>::max() - static_cast<std::uint32_t>(delta)) {
-        return std::numeric_limits<std::uint32_t>::max();
+    if (building.anchor_x > std::numeric_limits<std::uint32_t>::max() - sx ||
+        building.anchor_y > std::numeric_limits<std::uint32_t>::max() - sy ||
+        building.anchor_z > std::numeric_limits<std::uint32_t>::max() - sz) return std::nullopt;
+
+    // Moving both the cells and the anchor keeps every world position the same.
+    // Check the whole move first, so a refused placement can't half move it.
+    for (auto& cell : building.cells) {
+        cell.x += sx;
+        cell.y += sy;
+        cell.z += sz;
     }
-    return static_cast<std::uint32_t>(static_cast<std::int64_t>(value) + delta);
-}
-
-std::uint32_t& field_ref(SbbCell& cell, SbbCellField field) {
-    switch (field) {
-        case SbbCellField::ExteriorBlock:
-            return cell.exterior_block();
-        case SbbCellField::InteriorBlock:
-            return cell.interior_block();
-        case SbbCellField::CellType:
-            return cell.cell_type();
-        case SbbCellField::ExteriorPortalFace:
-            return cell.exterior_portal_face();
-        case SbbCellField::InteriorPortalFace:
-            return cell.interior_portal_face();
-        case SbbCellField::PlacedFlag:
-            return cell.placed_flag();
-        case SbbCellField::ItemSet:
-            return cell.item_set_index;
-    }
-    return cell.exterior_block();
-}
-
-std::int32_t& field_ref(SbcBuilding& building, SbcBuildingField field) {
-    switch (field) {
-        case SbcBuildingField::X:
-            return building.x;
-        case SbcBuildingField::Y:
-            return building.y;
-        case SbcBuildingField::Z:
-            return building.z;
-        case SbcBuildingField::Rotation:
-            return building.rotation;
-    }
-    return building.x;
-}
-
-std::uint32_t read_word(const std::vector<std::uint8_t>& bytes, std::size_t word_index) {
-    const auto offset = word_index * 4U;
-    if (offset + 4 > bytes.size()) {
-        return 0;
-    }
-    return static_cast<std::uint32_t>(bytes[offset]) |
-        (static_cast<std::uint32_t>(bytes[offset + 1]) << 8U) |
-        (static_cast<std::uint32_t>(bytes[offset + 2]) << 16U) |
-        (static_cast<std::uint32_t>(bytes[offset + 3]) << 24U);
-}
-
-void write_word(std::vector<std::uint8_t>& bytes, std::size_t word_index, std::uint32_t value) {
-    const auto offset = word_index * 4U;
-    if (offset + 4 > bytes.size()) {
-        return;
-    }
-    bytes[offset] = static_cast<std::uint8_t>(value & 0xffU);
-    bytes[offset + 1] = static_cast<std::uint8_t>((value >> 8U) & 0xffU);
-    bytes[offset + 2] = static_cast<std::uint8_t>((value >> 16U) & 0xffU);
-    bytes[offset + 3] = static_cast<std::uint8_t>((value >> 24U) & 0xffU);
-}
-
-} // namespace
-
-SbbEditorState::SbbEditorState(SbbBuilding building)
-    : building_{std::move(building)}, selected_index_{first_occupied_index(building_)} {}
-
-const SbbBuilding& SbbEditorState::building() const {
-    return building_;
-}
-
-std::size_t SbbEditorState::selected_index() const {
-    return selected_index_;
-}
-
-SbbCellField SbbEditorState::active_field() const {
-    return active_field_;
-}
-
-bool SbbEditorState::dirty() const {
-    return dirty_;
-}
-
-const SbbCell* SbbEditorState::selected_cell() const {
-    if (selected_index_ >= building_.cells.size()) {
-        return nullptr;
-    }
-    return &building_.cells[selected_index_];
-}
-
-void SbbEditorState::set_active_field(SbbCellField field) {
-    active_field_ = field;
-}
-
-void SbbEditorState::select_next_occupied() {
-    if (building_.cells.empty()) {
-        return;
-    }
-    for (std::size_t step = 1; step <= building_.cells.size(); ++step) {
-        const auto index = (selected_index_ + step) % building_.cells.size();
-        if (building_.cells[index].occupied) {
-            selected_index_ = index;
-            return;
-        }
-    }
-}
-
-void SbbEditorState::select_previous_occupied() {
-    if (building_.cells.empty()) {
-        return;
-    }
-    for (std::size_t step = 1; step <= building_.cells.size(); ++step) {
-        const auto index = (selected_index_ + building_.cells.size() - step) % building_.cells.size();
-        if (building_.cells[index].occupied) {
-            selected_index_ = index;
-            return;
-        }
-    }
-}
-
-void SbbEditorState::adjust_active_field(std::int32_t delta) {
-    if (selected_index_ >= building_.cells.size()) {
-        return;
-    }
-    auto& value = field_ref(building_.cells[selected_index_], active_field_);
-    const auto next = add_clamped(value, delta);
-    if (next != value) {
-        value = next;
-        dirty_ = true;
-    }
-}
-
-SbcEditorState::SbcEditorState(SbcMap map) : map_{std::move(map)} {}
-
-const SbcMap& SbcEditorState::map() const {
-    return map_;
-}
-
-std::size_t SbcEditorState::selected_index() const {
-    return selected_index_;
-}
-
-SbcBuildingField SbcEditorState::active_field() const {
-    return active_field_;
-}
-
-bool SbcEditorState::dirty() const {
-    return dirty_;
-}
-
-const SbcBuilding* SbcEditorState::selected_building() const {
-    if (selected_index_ >= map_.buildings.size()) {
-        return nullptr;
-    }
-    return &map_.buildings[selected_index_];
-}
-
-void SbcEditorState::set_active_field(SbcBuildingField field) {
-    active_field_ = field;
-}
-
-void SbcEditorState::select_next_building() {
-    if (map_.buildings.empty()) {
-        return;
-    }
-    selected_index_ = (selected_index_ + 1U) % map_.buildings.size();
-}
-
-void SbcEditorState::select_previous_building() {
-    if (map_.buildings.empty()) {
-        return;
-    }
-    selected_index_ = (selected_index_ + map_.buildings.size() - 1U) % map_.buildings.size();
-}
-
-void SbcEditorState::adjust_active_field(std::int32_t delta) {
-    if (selected_index_ >= map_.buildings.size()) {
-        return;
-    }
-    auto& value = field_ref(map_.buildings[selected_index_], active_field_);
-    value += delta;
-    dirty_ = true;
-}
-
-SblEditorState::SblEditorState(std::vector<std::uint8_t> bytes) : bytes_{std::move(bytes)} {}
-
-const std::vector<std::uint8_t>& SblEditorState::bytes() const {
-    return bytes_;
-}
-
-std::size_t SblEditorState::selected_word_index() const {
-    return selected_word_index_;
-}
-
-std::uint32_t SblEditorState::selected_word_value() const {
-    return read_word(bytes_, selected_word_index_);
-}
-
-bool SblEditorState::dirty() const {
-    return dirty_;
-}
-
-void SblEditorState::select_next_word() {
-    const auto word_count = bytes_.size() / 4U;
-    if (word_count == 0) {
-        return;
-    }
-    selected_word_index_ = (selected_word_index_ + 1U) % word_count;
-}
-
-void SblEditorState::select_previous_word() {
-    const auto word_count = bytes_.size() / 4U;
-    if (word_count == 0) {
-        return;
-    }
-    selected_word_index_ = (selected_word_index_ + word_count - 1U) % word_count;
-}
-
-void SblEditorState::adjust_selected_word(std::int32_t delta) {
-    const auto word_count = bytes_.size() / 4U;
-    if (selected_word_index_ >= word_count) {
-        return;
-    }
-    const auto current = read_word(bytes_, selected_word_index_);
-    const auto next = add_clamped(current, delta);
-    if (next != current) {
-        write_word(bytes_, selected_word_index_, next);
-        dirty_ = true;
-    }
+    building.anchor_x += sx;
+    building.anchor_y += sy;
+    building.anchor_z += sz;
+    return std::array<std::uint32_t, 3>{static_cast<std::uint32_t>(x + sx),
+        static_cast<std::uint32_t>(y + sy), static_cast<std::uint32_t>(z + sz)};
 }
 
 float fly_speed_multiplier(bool slow, bool fast) {
-    if (slow) return fast ? 1.0F / 16.0F : 0.25F;
+    if (slow) {
+        return fast ? 1.0F / 16.0F : 0.25F;
+    }
     return fast ? 4.0F : 1.0F;
 }
 
 Vec3 fly_camera_step(Vec3 forward, const FlyInput& input, float speed, float seconds) {
-    const auto length = [](Vec3 v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); };
+    const auto length = [](Vec3 vector) {
+        return std::sqrt(vector.x * vector.x + vector.y * vector.y + vector.z * vector.z);
+    };
     const auto forward_length = length(forward);
-    if (forward_length <= 0.0F) return {};
-    const Vec3 f{forward.x / forward_length, forward.y / forward_length, forward.z / forward_length};
-    // Level right (forward x up), so strafing never climbs or sinks.
-    Vec3 r{-f.z, 0.0F, f.x};
-    const auto right_length = length(r);
-    r = right_length > 1e-6F ? Vec3{r.x / right_length, 0.0F, r.z / right_length} : Vec3{1.0F, 0.0F, 0.0F};
-    const auto axis = [](bool plus, bool minus) { return (plus ? 1.0F : 0.0F) - (minus ? 1.0F : 0.0F); };
+    if (forward_length <= 0.0F) {
+        return {};
+    }
+    const Vec3 direction{forward.x / forward_length, forward.y / forward_length, forward.z / forward_length};
+    // Level right (forward x up), so moving sideways never climbs or sinks.
+    Vec3 right{-direction.z, 0.0F, direction.x};
+    const auto right_length = length(right);
+    if (right_length > 1e-6F) {
+        right = {right.x / right_length, 0.0F, right.z / right_length};
+    } else {
+        right = {1.0F, 0.0F, 0.0F};
+    }
+    const auto axis = [](bool plus, bool minus) {
+        return (plus ? 1.0F : 0.0F) - (minus ? 1.0F : 0.0F);
+    };
     const auto along = axis(input.forward, input.back);
     const auto side = axis(input.right, input.left);
     const auto lift = axis(input.up, input.down);
-    const Vec3 move{f.x * along + r.x * side, f.y * along + lift, f.z * along + r.z * side};
+    const Vec3 move{direction.x * along + right.x * side, direction.y * along + lift, direction.z * along + right.z * side};
     const auto move_length = length(move);
-    if (move_length <= 1e-6F) return {};
+    if (move_length <= 1e-6F) {
+        return {};
+    }
     const auto step = speed * fly_speed_multiplier(input.slow, input.fast) * seconds / move_length;
     return {move.x * step, move.y * step, move.z * step};
 }
 
-} // namespace map_editor
+} // namespace pafta

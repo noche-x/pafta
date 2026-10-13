@@ -3,6 +3,7 @@ build/
 build-debug/
 build-*/
 out/
+dist/
 
 # CMake user state
 CMakeUserPresets.json
@@ -21,3 +22,7 @@ captures/
 .vscode/
 .idea/
 compile_commands.json
+
+# Python packaging/test caches
+__pycache__/
+*.py[cod]

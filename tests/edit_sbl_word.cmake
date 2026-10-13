@@ -1,5 +1,6 @@
-if(NOT DEFINED MAP_EDITOR_CPP_EXE)
-  message(FATAL_ERROR "MAP_EDITOR_CPP_EXE is required")
+# SPDX-License-Identifier: GPL-2.0-only
+if(NOT DEFINED PAFTA_EXE)
+  message(FATAL_ERROR "PAFTA_EXE is required")
 endif()
 if(NOT DEFINED FIXTURE)
   message(FATAL_ERROR "FIXTURE is required")
@@ -14,7 +15,7 @@ set(output "${WORK}/edit_sbl_word_output.sbl")
 file(COPY_FILE "${FIXTURE}" "${input}" ONLY_IF_DIFFERENT)
 
 execute_process(
-  COMMAND "${MAP_EDITOR_CPP_EXE}" --set-sbl-word "${input}" 1 77 "${output}"
+  COMMAND "${PAFTA_EXE}" --set-sbl-word "${input}" 1 77 "${output}"
   RESULT_VARIABLE set_result
   OUTPUT_VARIABLE set_output
   ERROR_VARIABLE set_error
@@ -27,7 +28,7 @@ if(NOT EXISTS "${output}")
 endif()
 
 execute_process(
-  COMMAND "${MAP_EDITOR_CPP_EXE}" --dump-sbl-word "${output}" 1
+  COMMAND "${PAFTA_EXE}" --dump-sbl-word "${output}" 1
   RESULT_VARIABLE dump_result
   OUTPUT_VARIABLE dump_output
   ERROR_VARIABLE dump_error

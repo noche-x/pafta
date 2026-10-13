@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #include "mesh_export.hpp"
 
 #include <algorithm>
@@ -6,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <future>
+#include <stdexcept>
 #include <unordered_map>
 
 #define TINYGLTF_NO_STB_IMAGE
@@ -17,12 +19,11 @@
 
 #include "app_internal.hpp"
 
-namespace map_editor {
+namespace pafta {
 namespace {
 
-// Engine and glTF are both Y-up; geometry renders correctly as-authored, so we
-// export positions verbatim and keep the original (CCW) winding. No axis mirror is
-// applied, so no winding reversal is needed to keep faces outward.
+// The game and glTF both have Y pointing up. Apply the placement basis, then the
+// export offset. Keeping these axes also keeps the triangle winding.
 Vec3 transform_vertex(const ExportMeshGroup& group, const Vec3& v) {
     Vec3 world = v;
     if (group.transformed) {
@@ -52,9 +53,9 @@ Vec3 face_normal(const Vec3& a, const Vec3& b, const Vec3& c) {
     return n;
 }
 
-// Flat-normal, de-indexed triangle soup for one material across all groups that
-// reference it. Each triangle contributes 3 fresh vertices so faces never share
-// normals/UVs.
+// Loose triangles with flat normals and no shared vertices, for one material across
+// all the groups that use it. Each triangle adds 3 new vertices, so faces never
+// share normals or UVs.
 struct PrimitiveData {
     std::vector<float> positions; // xyz per vertex
     std::vector<float> normals;   // xyz per vertex
@@ -77,22 +78,11 @@ struct PrimitiveData {
     }
 };
 
-// Procedural material colors the city view renders without a texture (render_gpu
-// city_tile_material_color / terrain_material_color). Returns true and fills rgb
-// (0..1) when the name is one of these, so the glTF material gets a matching
-// baseColorFactor instead of plain white.
 bool procedural_material_color(const std::string& name, double rgb[3]) {
-    auto set = [&](int r, int g, int b) {
-        rgb[0] = r / 255.0;
-        rgb[1] = g / 255.0;
-        rgb[2] = b / 255.0;
-        return true;
-    };
-    if (name == "city_road_asphalt") return set(43, 47, 50);
-    if (name == "city_curb_concrete") return set(150, 154, 151);
-    if (name == "city_terrain_grass") return set(64, 83, 67);
-    if (name == "__window") return set(128, 128, 128);
-    return false;
+    const auto color = procedural_material_rgb(name);
+    if (!color) return false;
+    for (std::size_t i = 0; i < color->size(); ++i) rgb[i] = (*color)[i] / 255.0;
+    return true;
 }
 
 std::string sanitize_filename(std::string s) {
@@ -105,9 +95,9 @@ std::string sanitize_filename(std::string s) {
     return s;
 }
 
-// Encodes a read-back texture as an upright PNG. The loaded GPU texture is
-// vertically flipped (editor convention applied at load), so flip once more to
-// restore the original PNG orientation for DCC tools. CPU only; takes `image`.
+// Turns a texture read back from the GPU into an upright PNG. The editor flips
+// textures upside down when loading them, so flip once more to get the PNG's
+// original way up for modelling tools. CPU only; takes ownership of `image`.
 bool encode_texture_png(Image image, const std::filesystem::path& out) {
     ImageFlipVertical(&image);
     ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
@@ -138,10 +128,9 @@ std::size_t estimate_city_export_triangles(
 struct GltfExport {
     std::filesystem::path path;
     tinygltf::Model model;
-    // Material index and name of each material that may take a project texture.
+    // The index and name of each material that may use a project texture.
     std::vector<std::pair<int, std::string>> textures;
     std::size_t next_texture{};
-    std::unordered_map<std::string, int> texture_cache; // material name -> gltf texture index
     // PNG encodes running off the GL thread, with their file names.
     std::vector<std::pair<std::future<bool>, std::string>> encodes;
     ExportStats stats;
@@ -156,8 +145,8 @@ GltfExportPtr build_gltf_export(
     const std::vector<ExportMeshGroup>& groups,
     const ExportOptions& options,
     ExportResult& result) {
-    // Collect material name -> primitive accumulator. Material 0 with no name still
-    // gets a default bucket so untextured geometry exports.
+    // Collect material name -> triangles for that material. Material 0 with no name
+    // still gets a default group, so geometry without textures is exported too.
     std::vector<std::string> material_order;
     std::unordered_map<std::string, std::size_t> material_index;
     std::vector<PrimitiveData> primitives;
@@ -180,10 +169,15 @@ GltfExportPtr build_gltf_export(
         }
         const auto& buffer = *group.buffer;
         for (const auto& tri : buffer.triangles) {
-            // Window/door panes are the city_window_surface triangles; drop them
-            // entirely when the option is off so openings read as holes.
+            // Window and door panes are the city_window_surface triangles. Leave them
+            // out completely when the option is off, so openings show as holes.
             if (tri.city_window_surface && !options.include_window_panes) {
                 continue;
+            }
+            for (const auto index : tri.indices) {
+                if (index >= buffer.vertices.size()) {
+                    throw std::runtime_error("Invalid triangle vertex in export group " + group.name);
+                }
             }
             const auto& v0 = buffer.vertices[tri.indices[0]];
             const auto& v1 = buffer.vertices[tri.indices[1]];
@@ -193,10 +187,10 @@ GltfExportPtr build_gltf_export(
             const Vec3 p2 = transform_vertex(group, v2.position);
             const Vec3 n = face_normal(p0, p1, p2);
 
-            // Resolve the triangle's material to a texture name. Window/door panes
-            // (city_window_surface) all share one solid-gray material. Buildings
-            // index a material slot into building_materials; terrain/tile buffers
-            // use material_names.
+            // Find the texture name for the triangle's material. Window and door panes
+            // (city_window_surface) all share one solid grey material. Buildings look up
+            // a material slot in building_materials; terrain and tile buffers use
+            // material_names.
             std::string mat_name;
             if (tri.city_window_surface) {
                 mat_name = "__window";
@@ -228,33 +222,22 @@ GltfExportPtr build_gltf_export(
     tinygltf::Mesh mesh;
     mesh.name = gltf_path.stem().string();
 
-    // One shared .bin buffer holds all attribute + index data.
+    // One shared .bin buffer holds all the attribute and index data.
     tinygltf::Buffer gltf_buffer;
     auto& bin = gltf_buffer.data;
 
-    auto append_float_view = [&](const std::vector<float>& src) {
-        const std::size_t offset = bin.size();
-        const std::size_t bytes = src.size() * sizeof(float);
+    // Attributes and indices share one binary buffer. The target tells glTF how to use
+    // the bytes; it doesn't change how they are laid out.
+    const auto append_buffer_view = [&](const auto& values, int target) {
+        const auto offset = bin.size();
+        const auto bytes = values.size() * sizeof(values.front());
         bin.resize(offset + bytes);
-        std::memcpy(bin.data() + offset, src.data(), bytes);
+        std::memcpy(bin.data() + offset, values.data(), bytes);
         tinygltf::BufferView view;
         view.buffer = 0;
         view.byteOffset = offset;
         view.byteLength = bytes;
-        view.target = TINYGLTF_TARGET_ARRAY_BUFFER;
-        model.bufferViews.push_back(view);
-        return static_cast<int>(model.bufferViews.size() - 1);
-    };
-    auto append_index_view = [&](const std::vector<std::uint32_t>& src) {
-        const std::size_t offset = bin.size();
-        const std::size_t bytes = src.size() * sizeof(std::uint32_t);
-        bin.resize(offset + bytes);
-        std::memcpy(bin.data() + offset, src.data(), bytes);
-        tinygltf::BufferView view;
-        view.buffer = 0;
-        view.byteOffset = offset;
-        view.byteLength = bytes;
-        view.target = TINYGLTF_TARGET_ELEMENT_ARRAY_BUFFER;
+        view.target = target;
         model.bufferViews.push_back(view);
         return static_cast<int>(model.bufferViews.size() - 1);
     };
@@ -273,10 +256,10 @@ GltfExportPtr build_gltf_export(
             indices[i] = i;
         }
 
-        const int pos_view = append_float_view(prim.positions);
-        const int nrm_view = append_float_view(prim.normals);
-        const int uv_view = append_float_view(prim.uvs);
-        const int idx_view = append_index_view(indices);
+        const int pos_view = append_buffer_view(prim.positions, TINYGLTF_TARGET_ARRAY_BUFFER);
+        const int nrm_view = append_buffer_view(prim.normals, TINYGLTF_TARGET_ARRAY_BUFFER);
+        const int uv_view = append_buffer_view(prim.uvs, TINYGLTF_TARGET_ARRAY_BUFFER);
+        const int idx_view = append_buffer_view(indices, TINYGLTF_TARGET_ELEMENT_ARRAY_BUFFER);
 
         tinygltf::Accessor pos_acc;
         pos_acc.bufferView = pos_view;
@@ -312,7 +295,7 @@ GltfExportPtr build_gltf_export(
         model.accessors.push_back(idx_acc);
         const int idx_idx = static_cast<int>(model.accessors.size() - 1);
 
-        // Material; its texture is attached later on the GL thread.
+        // Material; its texture is added later on the GL thread.
         tinygltf::Material material;
         material.name = material_order[pi];
         material.pbrMetallicRoughness.metallicFactor = 0.0;
@@ -365,31 +348,38 @@ bool write_next_gltf_texture(GltfExport& job, const EditorProject& project) {
     const auto& [material_index, mat_name] = job.textures[job.next_texture++];
     const Texture2D* tex = app_internal::find_project_texture(project, mat_name);
     if (tex == nullptr || tex->id == 0U) return true;
-    int gltf_tex_index = -1;
-    if (const auto cached = job.texture_cache.find(mat_name); cached != job.texture_cache.end()) {
-        gltf_tex_index = cached->second;
-    } else {
-        const auto png_name = sanitize_filename(mat_name) + ".png";
-        // Only the readback needs the GL thread; encoding runs on a worker.
-        Image pixels = LoadImageFromTexture(*tex);
-        if (IsImageValid(pixels)) {
-            job.encodes.emplace_back(
-                std::async(std::launch::async, [pixels, out = job.path.parent_path() / png_name] { return encode_texture_png(pixels, out); }),
-                png_name);
-            tinygltf::Image image;
-            image.uri = png_name;
-            job.model.images.push_back(image);
-            tinygltf::Texture gltf_tex;
-            gltf_tex.source = static_cast<int>(job.model.images.size() - 1);
-            job.model.textures.push_back(gltf_tex);
-            gltf_tex_index = static_cast<int>(job.model.textures.size() - 1);
-            job.texture_cache.emplace(mat_name, gltf_tex_index);
-            ++job.stats.texture_count;
-        }
+    // build_gltf_export queues one readback per material name. The image number keeps
+    // file names different when cleanup turns different names into the same text.
+    const auto png_name = std::to_string(job.model.images.size()) + "_" + sanitize_filename(mat_name) + ".png";
+    // Only the readback needs the GL thread; encoding runs on a worker.
+    job.encodes.reserve(job.textures.size());
+    auto encode_name = png_name;
+    auto output = job.path.parent_path() / png_name;
+    Image pixels = LoadImageFromTexture(*tex);
+    if (!IsImageValid(pixels)) {
+        throw std::runtime_error("Cannot read back texture " + mat_name);
     }
-    if (gltf_tex_index >= 0) {
-        job.model.materials[static_cast<std::size_t>(material_index)].pbrMetallicRoughness.baseColorTexture.index = gltf_tex_index;
+    // The worker owns the pixels once async succeeds. Make the file name and reserve
+    // the job slot first, so adding it afterwards only moves things.
+    std::future<bool> encode;
+    try {
+        encode = std::async(std::launch::async, [pixels, out = std::move(output)] {
+            return encode_texture_png(pixels, out);
+        });
+    } catch (...) {
+        UnloadImage(pixels);
+        throw;
     }
+    job.encodes.emplace_back(std::move(encode), std::move(encode_name));
+    tinygltf::Image image;
+    image.uri = png_name;
+    job.model.images.push_back(image);
+    tinygltf::Texture gltf_tex;
+    gltf_tex.source = static_cast<int>(job.model.images.size() - 1);
+    job.model.textures.push_back(gltf_tex);
+    const auto gltf_tex_index = static_cast<int>(job.model.textures.size() - 1);
+    ++job.stats.texture_count;
+    job.model.materials[static_cast<std::size_t>(material_index)].pbrMetallicRoughness.baseColorTexture.index = gltf_tex_index;
     return true;
 }
 
@@ -436,8 +426,8 @@ ExportResult export_groups_to_gltf(
 BuildingRenderBuffer build_block_mesh_render_buffer(const SblBlockMesh& mesh, float unit_size) {
     BuildingRenderBuffer buffer;
     buffer.unit_size = unit_size;
-    // Standalone block has no cell to resolve material slots against, so name groups
-    // by slot. Authored UVs still export; textures only bind if a project material of
+    // A block on its own has no cell to look up material slots in, so name the groups
+    // by slot. Stored UVs still export; textures only attach if a project material with
     // this name exists.
     auto material_for_slot = [&](std::uint32_t slot) {
         const auto name = "material_" + std::to_string(slot);
@@ -476,15 +466,16 @@ std::vector<ExportMeshGroup> city_export_groups(
     const ExportOptions& options) {
     std::vector<ExportMeshGroup> groups;
 
-    // Recenter the whole city on the origin: subtract the bounds center (X/Z; keep
-    // Y so the ground stays at its height) from every group's world vertices.
+    // Move the whole city so it is centred on the origin: subtract the centre of its
+    // bounds (X and Z only, so the ground stays at its height) from every group's
+    // world vertices.
     const Vec3 recenter{
         (scene.bounds.min_x + scene.bounds.max_x) * 0.5F,
         0.0F,
         (scene.bounds.min_z + scene.bounds.max_z) * 0.5F,
     };
 
-    // Terrain + road/curb tile geometry export as untransformed world-space groups.
+    // Terrain and road and curb tiles export as world-space groups, unmoved.
     if (options.include_terrain && scene.terrain.has_value()) {
         ExportMeshGroup terrain;
         terrain.name = "terrain";
@@ -499,8 +490,8 @@ std::vector<ExportMeshGroup> city_export_groups(
         tiles.world_offset = recenter;
         groups.push_back(tiles);
     }
-    // City piece/portal geometry (districts placed with the Piece tool). The live
-    // view draws this at a +0.25 Y lift, so subtract -0.25 in world_offset.y.
+    // City piece and portal geometry (districts placed with the Piece tool). The live
+    // view draws it raised 0.25 in Y, so world_offset.y subtracts -0.25.
     if (options.include_pieces && !piece_buffer.triangles.empty()) {
         ExportMeshGroup pieces;
         pieces.name = "pieces";
@@ -509,18 +500,18 @@ std::vector<ExportMeshGroup> city_export_groups(
         groups.push_back(pieces);
     }
 
-    // Each placed building, transformed into world space by its placement basis.
+    // Each placed building, moved into world space by its placement basis.
     if (options.include_buildings) {
         for (std::size_t i = 0; i < scene.buildings.size() && i < placement_buffers.size(); ++i) {
             const auto& placement = scene.buildings[i];
-            if (placement.source == nullptr || placement_buffers[i] == nullptr || placement_buffers[i]->triangles.empty()) {
+            if (placement_buffers[i] == nullptr || placement_buffers[i]->triangles.empty()) {
                 continue;
             }
             ExportMeshGroup group;
             group.name = "building_" + std::to_string(i);
             group.buffer = placement_buffers[i];
             group.basis = native_city_building_rotation_basis(static_cast<std::int32_t>(placement.rotation));
-            group.origin = native_city_building_render_origin(*placement.source, scene.unit_size);
+            group.origin = native_city_building_render_origin(placement.source, scene.unit_size);
             group.world_offset = recenter;
             group.transformed = true;
             if (i < placement_buildings.size() && placement_buildings[i] != nullptr) {
@@ -533,4 +524,4 @@ std::vector<ExportMeshGroup> city_export_groups(
     return groups;
 }
 
-} // namespace map_editor
+} // namespace pafta

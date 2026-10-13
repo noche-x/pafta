@@ -6,6 +6,11 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      publish_pages:
+        description: Publish the browser beta to GitHub Pages
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -18,9 +23,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {platform: linux, os: ubuntu-latest, preset: ci, executable: build/ci/map_editor_cpp}
-          - {platform: macos, os: macos-latest, preset: ci, executable: build/ci/map_editor_cpp}
-          - {platform: windows, os: windows-2022, preset: ci-msvc, executable: build/ci-msvc/Release/map_editor_cpp.exe}
+          - {platform: linux, os: ubuntu-latest, preset: ci, executable: build/ci/pafta}
+          - {platform: macos, os: macos-latest, preset: ci, executable: build/ci/pafta}
+          - {platform: windows, os: windows-2022, preset: ci-msvc, executable: build/ci-msvc/Release/pafta.exe}
 
     steps:
       - uses: actions/checkout@v4
@@ -36,19 +41,36 @@ jobs:
       - name: Build
         run: cmake --build --preset ${{ matrix.preset }} --parallel
       - name: Test
-        run: ctest --preset ${{ matrix.preset }}
+        run: ctest --preset ${{ matrix.preset }} --schedule-random
       - name: Package beta build
         shell: bash
         run: |
           mkdir -p dist/package
-          cp '${{ matrix.executable }}' dist/package/
-          cp -R assets dist/package/
-          (cd dist/package && cmake -E tar cf ../pafta-${{ matrix.platform }}.zip --format=zip map_editor_cpp* assets)
+          cmake --install "build/${{ matrix.preset }}" --config Release --prefix dist/package --component Pafta
+          printf 'Platform: %s\nArchitecture: %s\nSource revision: %s\n' '${{ matrix.platform }}' '${{ runner.arch }}' "$GITHUB_SHA" > dist/package/BUILD_INFO.txt
+          (cd dist/package && cmake -E tar cf ../pafta-${{ matrix.platform }}.zip --format=zip pafta* BUILD_INFO.txt LICENSE README.md CONTRIBUTING.md STYLE_GUIDE.md THIRD_PARTY_NOTICES.md docs licenses)
+          mkdir -p dist/smoke
+          (cd dist/smoke && cmake -E tar xf ../pafta-${{ matrix.platform }}.zip)
+          python -c "import struct; from pathlib import Path; Path('dist/smoke/smoke.csx').write_bytes(struct.pack('<III', 0, 13, 1) + bytes([1]) + struct.pack('<III52s', 0, 12, 1, b'smoke'))"
+          executable=$(basename '${{ matrix.executable }}')
+          (cd dist/smoke && "./$executable" --check smoke.csx)
+          test -f dist/smoke/licenses/OFL-1.1.txt
       - name: Upload build
         uses: actions/upload-artifact@v4
         with:
           name: pafta-${{ matrix.platform }}
           path: dist/pafta-${{ matrix.platform }}.zip
+          if-no-files-found: error
+
+      - name: Package corresponding source
+        if: matrix.platform == 'linux'
+        run: python3 scripts/package_source.py build/ci dist/pafta-source.tar.gz
+      - name: Upload corresponding source
+        if: matrix.platform == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pafta-source
+          path: dist/pafta-source.tar.gz
           if-no-files-found: error
 
   coverage:
@@ -70,8 +92,36 @@ jobs:
           path: |
             build/coverage/coverage.txt
             build/coverage/coverage-export.txt
+            build/coverage/coverage-workflows.txt
             build/coverage/coverage-html/
           if-no-files-found: error
+
+  native-quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native check dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang clang-tidy libasound2-dev libgl1-mesa-dev libgtk-3-dev \
+            libglu1-mesa-dev libx11-dev libxcursor-dev libxext-dev libxi-dev \
+            libxinerama-dev libxrandr-dev mesa-common-dev xorg-dev
+      - name: Configure
+        run: cmake --preset quality
+      - name: Build
+        run: cmake --build --preset quality --parallel 2
+      - name: Sanitizer tests and bounded parser fuzzing
+        run: ctest --preset quality
+      - name: Check CPU code with clang-tidy
+        run: bash tests/check_cpp.sh
+      - name: Keep fuzz inputs and failure reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pafta-fuzz-inputs
+          path: build/quality/fuzz/
+          if-no-files-found: ignore
 
   web:
     runs-on: ubuntu-latest
@@ -86,18 +136,39 @@ jobs:
           EM_CACHE="$PWD/build/web/emcache" emcmake cmake -S . -B build/web \
             -DPLATFORM=Web \
             -DGRAPHICS=GRAPHICS_API_OPENGL_ES3 \
-            -DMAP_EDITOR_CPP_BUILD_TESTS=OFF \
-            -DMAP_EDITOR_CPP_ENABLE_PROFILER=OFF
+            -DPAFTA_BUILD_TESTS=OFF \
+            -DPAFTA_ENABLE_PROFILER=OFF
       - name: Build browser editor
-        run: EM_CACHE="$PWD/build/web/emcache" EMCC_BATCH_BUILD=0 cmake --build build/web --target map_editor_web --parallel 2
+        run: EM_CACHE="$PWD/build/web/emcache" EMCC_BATCH_BUILD=0 cmake --build build/web --target pafta_web --parallel 2
+      - name: Install browser test tool
+        run: |
+          npm install --prefix build/browser-test --no-save --package-lock=false playwright@1.64.0
+          build/browser-test/node_modules/.bin/playwright install --with-deps chromium
+      - name: Run compiled editor in Chromium
+        run: |
+          python3 -m http.server 8000 --bind 127.0.0.1 --directory build/web > build/web/http.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid"' EXIT
+          NODE_PATH="$PWD/build/browser-test/node_modules" node tests/browser_smoke_tests.js
+      - name: Keep browser diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pafta-browser-smoke
+          path: |
+            build/web/browser-smoke.png
+            build/web/http.log
+          if-no-files-found: ignore
       - name: Package browser build
         run: |
           mkdir -p dist/site
-          cp build/web/map_editor_web.html dist/site/index.html
-          cp build/web/map_editor_web.js build/web/map_editor_web.wasm dist/site/
+          cp build/web/pafta_web.html dist/site/index.html
+          cp build/web/pafta_web.js build/web/pafta_web.wasm dist/site/
+          cp LICENSE README.md CONTRIBUTING.md STYLE_GUIDE.md THIRD_PARTY_NOTICES.md dist/site/
+          cp -R docs licenses dist/site/
           touch dist/site/.nojekyll
-          test ! -e build/web/map_editor_web.data
-          (cd dist/site && cmake -E tar cf ../pafta-web.zip --format=zip index.html map_editor_web.js map_editor_web.wasm .nojekyll)
+          test ! -e build/web/pafta_web.data
+          (cd dist/site && cmake -E tar cf ../pafta-web.zip --format=zip index.html pafta_web.js pafta_web.wasm .nojekyll LICENSE README.md CONTRIBUTING.md STYLE_GUIDE.md THIRD_PARTY_NOTICES.md docs licenses)
       - name: Upload browser build
         uses: actions/upload-artifact@v4
         with:
@@ -113,8 +184,8 @@ jobs:
           if-no-files-found: error
 
   pages:
-    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    needs: [build-test, coverage, web]
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_pages && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: [build-test, coverage, native-quality, web]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -140,7 +211,7 @@ jobs:
 
   draft-release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-test, coverage, web]
+    needs: [build-test, coverage, native-quality, web]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -154,4 +225,4 @@ jobs:
       - name: Create draft beta release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" release-assets/pafta-*.zip --verify-tag --draft --prerelease --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" release-assets/pafta-*.zip release-assets/pafta-source.tar.gz --verify-tag --draft --prerelease --generate-notes

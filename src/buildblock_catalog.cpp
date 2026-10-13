@@ -1,37 +1,38 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #include "buildblock_catalog.hpp"
 
 #include <array>
 #include <cmath>
 #include <cstdint>
 
-// Faithful port of the native procedural buildblock template catalog
+// Port of the game's built-in buildblock template catalog
 // (Buildblock_InitTemplateMeshCatalog @0x10110, subrosa.exe THIS_ONE).
 //
-// The native code builds g_buildblockTemplateCatalog @0x05098c00 by:
-//   1. assigning sequential ids to named slot globals,
-//   2. running geometry phases that fill global scratch buffers
-//      (DAT_110ab760 vertex count, DAT_112db764 quad count, position/normal/uv
-//      arrays) via AddBezierPatch / AddBoxFaces / _block_addbeam /
+// The game builds g_buildblockTemplateCatalog @0x05098c00 in four steps:
+//   1. give each named slot global the next id in turn,
+//   2. run geometry phases that fill global scratch buffers
+//      (DAT_110ab760 vertex count, DAT_112db764 quad count, position, normal, and
+//      uv arrays) through AddBezierPatch / AddBoxFaces / _block_addbeam /
 //      _block_addbasicsurface,
-//   3. baking the scratch into catalog[id] (BakeScratchEntry @0x17ca0),
-//      classifying faces by axis and deriving per-orientation UVs,
-//   4. emitting 4 Y90 rotations of each entry (RotateEntryY90 @0x4d170).
+//   3. bake the scratch into catalog[id] (BakeScratchEntry @0x17ca0), sorting faces
+//      by axis and working out UVs for each orientation,
+//   4. make 4 copies of each entry turned 90 degrees about Y (RotateEntryY90
+//      @0x4d170).
 //
-// This port mirrors that flow phase-for-phase so the index assignment falls out
-// exactly as the game computes it (id20 = railing, etc.). Collision/tri data is
-// NOT serialized: the editor renderer consumes only quad faces (SblBlockMesh).
+// This port follows the same phases in the same order, so every id ends up exactly
+// where the game puts it (id 20 = railing, and so on). Collision and triangle data
+// are NOT kept: the editor's renderer only uses quad faces (SblBlockMesh).
 //
-// Verified id map (corrected prologue emulation): ids 0-15 = curb/edge family;
-// id16 = first floor patch (+3 rot = 16..19); id20 = third beam group base
-// (+3 rot = 20..23) = the railing. Beam group bases: id81, id85, id20.
+// Slot ids follow the recovered prologue: ids 0..15 are curbs, 16..19 the first
+// floor patch, and 20..23 railings. assign_slot_ids works out the other group ids
+// instead of copying them into a second id table.
 
-namespace map_editor {
+namespace pafta {
 namespace {
 
-constexpr float kOne = 1.0F;
-
-// Native quad-orientation codes (axis/sign of the face normal), used as the
-// high bits of a quad material and consumed by the bake's UV derivation.
+// The game's quad orientation codes (which axis the face normal points along, and
+// which way). They go in the high bits of a quad's material, and the bake uses them
+// to work out UVs.
 constexpr std::uint32_t kOrientPosX = 0x10000;
 constexpr std::uint32_t kOrientNegX = 0x20000;
 constexpr std::uint32_t kOrientPosY = 0x30000;  // top
@@ -40,24 +41,18 @@ constexpr std::uint32_t kOrientPosZ = 0x50000;
 constexpr std::uint32_t kOrientNegZ = 0x60000;
 constexpr std::uint32_t kOrientMask = 0xf0000;
 
-// NOTE: the curb/edge/grade phases (ids 0-15, grade tiles, floor patches) need
-// the bicubic Bezier tessellator (Bezier_Evaluate1D @0x187180,
-// Bezier_Evaluate1DDerivative @0x1872f0, AddBezierPatch @0x1f20). Those are
-// fully decoded in the project memory but NOT yet emitted by this port. The beam
-// family (railings/posts) below needs only the box primitives.
-
 // ---------------------------------------------------------------------------
-// Data tables read verbatim from subrosa.exe.
+// Tables copied exactly from subrosa.exe.
 //
-// Cube corners DAT_002b34f0 (8 corners, 3 floats each), read from the raw bytes:
-// the bottom ring (y=0) then the top ring (y=1), each wound (0,0)->(1,0)->(1,1)->
-// (0,1) in x,z. Face 0 of DAT_002b3660 is therefore the bottom and face 5 the top,
-// matching the normal table DAT_002b3550.
+// Cube corners DAT_002b34f0 (8 corners of 3 floats each), read from the raw bytes:
+// the bottom ring (y=0), then the top ring (y=1), each going (0,0)->(1,0)->(1,1)->
+// (0,1) in x,z. So face 0 of DAT_002b3660 is the bottom and face 5 the top, which
+// matches the normal table DAT_002b3550.
 //
-// Edge/face table DAT_002b3660 (6 faces x 4 corner indices). _block_addbeam
-// @0x19940 walks it via piVar9 starting at &DAT_002b3664 and reading
-// [-1],[0],[1],[2] with stride 4 ints, i.e. face f reads the four ints at
-// 0x002b3660 + f*0x10. Verified by reading the raw bytes at 0x002b3660.
+// Edge and face table DAT_002b3660 (6 faces x 4 corner indices). _block_addbeam
+// @0x19940 walks it through piVar9, starting at &DAT_002b3664 and reading
+// [-1],[0],[1],[2] in steps of 4 ints, so face f reads the four ints at
+// 0x002b3660 + f*0x10. Checked against the raw bytes at 0x002b3660.
 // ---------------------------------------------------------------------------
 constexpr Vec3f kCubeCorner[8] = {
     {0, 0, 0},  // C0
@@ -70,7 +65,7 @@ constexpr Vec3f kCubeCorner[8] = {
     {0, 1, 1},  // C7
 };
 
-// Face -> 4 corner indices, matching DAT_002b3660 exactly.
+// Face -> 4 corner indices, exactly as in DAT_002b3660.
 constexpr int kFaceCorners[6][4] = {
     {3, 2, 1, 0},  // F0
     {7, 6, 2, 3},  // F1
@@ -80,10 +75,10 @@ constexpr int kFaceCorners[6][4] = {
     {4, 5, 6, 7},  // F5
 };
 
-// Per-face orientation code, indexed by _block_addbeam's loop counter (the same
-// index that selects the face above). This is a UV/material projection tag, NOT
-// the geometric normal — the bake derives UVs from it. Verified from the
-// iVar7 == 0..5 chain in _block_addbeam @0x19940.
+// The orientation code for each face, indexed by _block_addbeam's loop counter (the
+// same index that picks the face above). It tags how UVs and materials are
+// projected; it is NOT the geometric normal. The bake works out UVs from it.
+// Checked against the iVar7 == 0..5 chain in _block_addbeam @0x19940.
 constexpr std::uint32_t kBeamFaceOrient[6] = {
     0x30000,  // face 0
     0x60000,  // face 1
@@ -94,16 +89,16 @@ constexpr std::uint32_t kBeamFaceOrient[6] = {
 };
 
 // ---------------------------------------------------------------------------
-// Scratch mesh: the vertex/quad buffers the generators write into. Quads hold 4
-// vertex indices + a packed material (orientation in the high bits).
+// Scratch mesh: the vertex and quad buffers the generators write into. Quads hold
+// 4 vertex indices and a packed material (with the orientation in the high bits).
 //
-// The native scratch also tracks per-vertex normals, but the editor renderer
-// recomputes face normals from the emitted quad, so only positions + the quad's
-// orientation (which drives UVs and material) need to survive the bake.
+// The game's scratch also keeps a normal per vertex, but the editor's renderer works
+// out face normals again from each quad. So only the positions and the quad's
+// orientation (which sets UVs and material) need to survive the bake.
 // ---------------------------------------------------------------------------
 struct ScratchMesh {
     std::vector<Vec3f> pos;
-    std::vector<Vec2f> uv;  // authored UV per vertex (used when orient nibble == 0)
+    std::vector<Vec2f> uv;  // stored UV for each vertex (used when the orient nibble is 0)
     struct Quad {
         std::array<int, 4> v{};
         std::uint32_t material{};
@@ -124,15 +119,15 @@ struct ScratchMesh {
 };
 
 // _block_addbeam @0x19940: a box of size (sx,sy,sz) at origin (ox,oy,oz), with
-// faces gated by face_mask. The loop counter walks all 6 faces; for each enabled
-// bit it emits a quad whose corners come from kFaceCorners (scaled+offset by the
-// cube corner table) and whose UV/material projection tag is kBeamFaceOrient.
+// faces turned on by face_mask. The loop counter goes over all 6 faces, and for each
+// bit that is on, it makes a quad. The corners come from kFaceCorners (scaled and
+// moved by the cube corner table), and the UV/material projection tag comes from
+// kBeamFaceOrient.
 //
-// Material: the native reads materials[face] (advancing per emitted face) and
-// rotates it by param_1 (the beam rotation, always 0 for the built-ins here, so
-// the rotate is a no-op). materials is a 6-entry array; pass {0,0,0,0,0,0} for
-// the procedural built-ins that carry no per-face texture, or a filled array for
-// the textured base slab.
+// Material: the game reads materials[face] (moving on for each face it makes) and
+// turns it by param_1 (the beam's rotation, which is always 0 for the built-ins
+// here, so turning does nothing). materials has 6 entries. Pass {0,0,0,0,0,0} for
+// built-ins with no per-face texture, or a filled list for the textured base slab.
 void add_beam(ScratchMesh& m, float ox, float oy, float oz, float sx, float sy, float sz,
               std::uint32_t face_mask, const std::array<std::uint32_t, 6>& materials) {
     for (int f = 0; f < 6; ++f) {
@@ -153,18 +148,14 @@ void add_beam(ScratchMesh& m, float ox, float oy, float oz, float sx, float sy, 
     }
 }
 
-// NOTE: the general bicubic tessellator (Bezier_Evaluate1D @0x187180, degree
-// 1/2/3 with constants 3.0/6.0) is only exercised by the single tessellated
-// floor-patch call AddBezierPatch(...,1,1,8,3,0x30000), whose exact control mesh
-// lives in scattered globals. That patch's id (16) is approximated as a flat top
-// plate below; until its control mesh is transcribed there is no caller for the
-// curved evaluator, so it is intentionally not carried here. Every other catalog
-// call uses order-1 tessellation, which collapses to a single quad (add_quad_patch).
+// The game's floor patch uses AddBezierPatch(...,1,1,8,3,0x30000). Its control mesh
+// has not been found, so slots 16..19 use a flat plate. Other catalog patches are a
+// single quad and only need the corners of their control grid.
 
-// add_quad_patch: the AddBezierPatch(...,1,1,1,1,orient) case — order-1
-// tessellation collapses the 4x4 control grid to its 4 corners, emitting one
-// quad. UVs are the authored corner UVs (the bake keeps them when orient nibble
-// is 0, overwrites them by projection otherwise).
+// add_quad_patch: the AddBezierPatch(...,1,1,1,1,orient) case. With order 1, the
+// 4x4 control grid shrinks to its 4 corners and makes one quad. UVs are the stored
+// corner UVs (the bake keeps them when the orient nibble is 0, and replaces them by
+// projection otherwise).
 void add_quad_patch(ScratchMesh& m, const Vec3f& p0, const Vec3f& p1, const Vec3f& p2,
                     const Vec3f& p3, const Vec2f& t0, const Vec2f& t1, const Vec2f& t2,
                     const Vec2f& t3, std::uint32_t orient) {
@@ -175,28 +166,20 @@ void add_quad_patch(ScratchMesh& m, const Vec3f& p0, const Vec3f& p1, const Vec3
     m.quads.push_back({{i0, i1, i2, i3}, orient});
 }
 
-// add_box_faces: BuildblockMeshBuilder_AddBoxFaces @0x19c10. Emits one quad per
-// enabled face from an explicit 8-corner box, classifying the per-face
-// orientation from the face normal (the -0.707/+0.707 thresholds DAT_00278be4 /
-// DAT_0027838c). corners are indexed by the same kFaceCorners/kCubeCorner tables.
+// add_box_faces: BuildblockMeshBuilder_AddBoxFaces @0x19c10. Makes one quad for
+// each face that is turned on, from an explicit 8-corner box, and picks each face's
+// orientation from its normal (the -0.707/+0.707 limits DAT_00278be4 /
+// DAT_0027838c). Corners use the same kFaceCorners/kCubeCorner tables.
 constexpr float kNormLo = -0.70709884F;  // DAT_00278be4
 constexpr float kNormHi = 0.70709884F;   // DAT_0027838c
 
 std::uint32_t classify_orient(const Vec3f& n) {
-    // Mirror of the AddBoxFaces/AddBezierPatch normal-classify ladder.
-    if (n.y <= kNormHi) {
-        if (kNormLo <= n.y) {
-            if (n.x <= kNormHi) {
-                if (kNormLo <= n.x) {
-                    return kNormHi < n.z ? 0x60000U : 0x50000U;
-                }
-                return 0x10000U;
-            }
-            return 0x20000U;
-        }
-        return 0x40000U;  // -Y (bottom)
-    }
-    return 0x30000U;  // +Y (top)
+    // The game's winding makes the X and Z tags the opposite sign of the normal.
+    if (n.y > kNormHi) return kOrientPosY;
+    if (n.y < kNormLo) return kOrientNegY;
+    if (n.x > kNormHi) return kOrientNegX;
+    if (n.x < kNormLo) return kOrientPosX;
+    return n.z > kNormHi ? kOrientNegZ : kOrientPosZ;
 }
 
 void add_box_faces(ScratchMesh& m, const std::array<Vec3f, 8>& corners, std::uint32_t material,
@@ -209,7 +192,7 @@ void add_box_faces(ScratchMesh& m, const std::array<Vec3f, 8>& corners, std::uin
         const Vec3f& b = corners[static_cast<std::size_t>(kFaceCorners[f][1])];
         const Vec3f& c = corners[static_cast<std::size_t>(kFaceCorners[f][2])];
         const Vec3f& d = corners[static_cast<std::size_t>(kFaceCorners[f][3])];
-        // Face normal from the first three corners (matches the native cross
+        // Face normal from the first three corners (the same as the game's cross
         // product of edges (b-a)x(c-a), normalized).
         const Vec3f e1{b.x - a.x, b.y - a.y, b.z - a.z};
         const Vec3f e2{c.x - a.x, c.y - a.y, c.z - a.z};
@@ -227,38 +210,14 @@ void add_box_faces(ScratchMesh& m, const std::array<Vec3f, 8>& corners, std::uin
     }
 }
 
-// BakeScratchEntry @0x17ca0 UV derivation: project each vertex position onto the
-// plane selected by the quad's orientation code. Mirrors the 0x10000..0x60000
-// switch (positions feed UVs; some axes are mirrored via 1-coord).
-Vec2f derive_uv(std::uint32_t orient, const Vec3f& p) {
-    switch (orient & kOrientMask) {
-        case kOrientPosX:
-            return {p.z, p.y};
-        case kOrientNegX:
-            return {kOne - p.z, p.y};
-        case kOrientPosY:
-            return {p.x, p.z};
-        case kOrientNegY:
-            return {p.x, kOne - p.z};
-        case kOrientPosZ:
-            return {kOne - p.x, p.y};
-        case kOrientNegZ:
-            return {p.x, p.y};
-        default:
-            return {p.x, p.y};
-    }
-}
-
-// BakeScratchEntry @0x17ca0: flatten the shared-vertex scratch into the
-// per-face SblBlockMesh the editor renderer consumes. Derives UVs per quad
-// orientation, masks materials to the low 12 bits, and records size.
-BuildblockCatalogEntry bake_entry(const ScratchMesh& m, int sx, int sy, int sz,
-                                  const std::string& name) {
+// BakeScratchEntry @0x17ca0: turns the scratch, whose vertices are shared, into the
+// per-face SblBlockMesh the editor's renderer uses. Works out UVs from each quad's
+// orientation, keeps only the low 12 bits of materials, and records the size.
+BuildblockCatalogEntry bake_entry(const ScratchMesh& m, int sx, int sy, int sz) {
     BuildblockCatalogEntry entry;
     entry.size_x = sx;
     entry.size_y = sy;
     entry.size_z = sz;
-    entry.name = name;
     entry.mesh.width = static_cast<std::uint32_t>(sx);
     entry.mesh.height = static_cast<std::uint32_t>(sy);
     entry.mesh.depth = static_cast<std::uint32_t>(sz);
@@ -270,15 +229,14 @@ BuildblockCatalogEntry bake_entry(const ScratchMesh& m, int sx, int sy, int sz,
         face.authored = true;
         face.vertices.reserve(4);
         face.uvs.reserve(4);
-        const bool has_orient = (q.material & kOrientMask) != 0;
         for (int k = 0; k < 4; ++k) {
             const auto vi = static_cast<std::size_t>(q.v[k]);
             const Vec3f& p = m.pos[vi];
             face.vertices.push_back(p);
-            // BakeScratchEntry overwrites UVs by position-projection iff the quad's
-            // orientation nibble is set (0x10000..0x60000); orientation 0 keeps the
-            // authored UV carried from the bezier control grid.
-            face.uvs.push_back(has_orient ? derive_uv(q.material, p) : m.uv[vi]);
+            // BakeScratchEntry replaces UVs with a projection of the position only
+            // when the quad's orientation nibble is set (0x10000..0x60000).
+            // Orientation 0 keeps the UV that came from the Bezier control grid.
+            face.uvs.push_back(native_oriented_uv(p, m.uv[vi], q.material));
         }
         entry.mesh.faces.push_back(std::move(face));
     }
@@ -286,10 +244,11 @@ BuildblockCatalogEntry bake_entry(const ScratchMesh& m, int sx, int sy, int sz,
     return entry;
 }
 
-// RotateEntryY90 @0x4d170: produce a copy of an entry rotated 90 deg about Y.
-// Swaps x<->z dims; vertex (x,z) -> (size_x' - z, x); recomputes UVs by re-bake
-// of the rotated geometry (the native rotates orientation codes; re-deriving
-// UVs from rotated positions is equivalent for the unit geometry here).
+// RotateEntryY90 @0x4d170: makes a copy of an entry turned 90 degrees about Y.
+// Swaps the x and z sizes, moves vertex (x,z) to (size_x' - z, x), and works out UVs
+// again by baking the turned geometry. (The game turns the orientation codes;
+// working out UVs again from the turned positions gives the same result for this
+// unit-sized geometry.)
 BuildblockCatalogEntry rotate_entry_y90(const BuildblockCatalogEntry& src) {
     BuildblockCatalogEntry dst = src;
     dst.size_x = src.size_z;
@@ -298,15 +257,15 @@ BuildblockCatalogEntry rotate_entry_y90(const BuildblockCatalogEntry& src) {
     dst.mesh.depth = static_cast<std::uint32_t>(dst.size_z);
     const float new_x_extent = static_cast<float>(src.size_z);
     for (auto& face : dst.mesh.faces) {
-        // Rotate orientation code through the native side-face cycle. Top/bottom
-        // (0x30000/0x40000) and orient-0 (authored-UV) faces keep their axis.
+        // Turn the orientation code through the game's side-face cycle. Top and
+        // bottom (0x30000/0x40000) and orient-0 (stored UV) faces keep their axis.
         std::uint32_t orient = face.orientation;
         switch (orient) {
             case kOrientNegZ: orient = kOrientPosX; break;  // 0x60000 -> 0x10000
             case kOrientPosX: orient = kOrientPosZ; break;  // 0x10000 -> 0x50000
             case kOrientPosZ: orient = kOrientNegX; break;  // 0x50000 -> 0x20000
             case kOrientNegX: orient = kOrientNegZ; break;  // 0x20000 -> 0x60000
-            default: break;                                 // top/bottom/authored keep axis
+            default: break;                                 // top, bottom, and stored-UV faces keep their axis
         }
         face.orientation = orient;
         face.material = (face.material & 0xfffU) | (orient & kOrientMask);
@@ -317,33 +276,25 @@ BuildblockCatalogEntry rotate_entry_y90(const BuildblockCatalogEntry& src) {
             const float nz = p.x;
             p.x = nx;
             p.z = nz;
-            // Position-projected faces re-derive UVs from the rotated geometry;
-            // authored-UV faces (orient 0) carry their UV through the rotation
-            // unchanged, matching the native bake (which only overwrites UVs for
-            // a set orientation nibble).
+            // Faces with projected UVs work them out again from the turned geometry.
+            // Faces with stored UVs (orient 0) keep their UV unchanged through the
+            // turn, like the game's bake (which only replaces UVs when the
+            // orientation nibble is set).
             if (has_orient) {
-                face.uvs[k] = derive_uv(orient, p);
+                face.uvs[k] = native_oriented_uv(p, face.uvs[k], orient);
             }
         }
     }
     return dst;
 }
 
-// Ensure out has room for the given id.
-void ensure_id(std::vector<BuildblockCatalogEntry>& out, int id) {
-    if (id >= 0 && static_cast<std::size_t>(id) >= out.size()) {
-        out.resize(static_cast<std::size_t>(id) + 1);
-    }
-}
-
-// Bake the scratch into catalog[base_id], then write its 3 Y90 rotations into
-// the next three explicit ids (the native bakes id, then RotateEntryY90+Bake for
-// id+1, id+2, id+3 using consecutive slot globals — which are consecutive ids
-// for every 4-rotation group in the driver).
+// Bakes the scratch into catalog[base_id], then writes its 3 turned copies into the
+// next three ids (the game bakes id, then RotateEntryY90 + Bake for id+1, id+2, and
+// id+3, using slot globals in a row, which are ids in a row for every 4-rotation
+// group in the driver).
 void emit_rot_group(std::vector<BuildblockCatalogEntry>& out, ScratchMesh& m, int base_id, int sx,
                     int sy, int sz) {
-    ensure_id(out, base_id + 3);
-    BuildblockCatalogEntry base = bake_entry(m, sx, sy, sz, "");
+    BuildblockCatalogEntry base = bake_entry(m, sx, sy, sz);
     BuildblockCatalogEntry r1 = rotate_entry_y90(base);
     BuildblockCatalogEntry r2 = rotate_entry_y90(r1);
     BuildblockCatalogEntry r3 = rotate_entry_y90(r2);
@@ -354,29 +305,28 @@ void emit_rot_group(std::vector<BuildblockCatalogEntry>& out, ScratchMesh& m, in
     m.clear();
 }
 
-// Bake the scratch into a single catalog[id] (no rotation group).
+// Bakes the scratch into one catalog[id] (no rotation group).
 void emit_single(std::vector<BuildblockCatalogEntry>& out, ScratchMesh& m, int id, int sx, int sy,
                  int sz) {
-    ensure_id(out, id);
-    out[static_cast<std::size_t>(id)] = bake_entry(m, sx, sy, sz, "");
+    out[static_cast<std::size_t>(id)] = bake_entry(m, sx, sy, sz);
     m.clear();
 }
 
-// Standard unit-quad authored UVs (the curb/floor patches set a (0,0)-(1,1) UV
-// control block; with orient nibble 0 the bake keeps these).
+// The usual unit-quad UVs (the curb and floor patches set a (0,0)-(1,1) UV control
+// block, and with orient nibble 0 the bake keeps them).
 constexpr Vec2f kUV00{0.0F, 0.0F};
 constexpr Vec2f kUV10{1.0F, 0.0F};
 constexpr Vec2f kUV11{1.0F, 1.0F};
 constexpr Vec2f kUV01{0.0F, 1.0F};
 
-// --- Phase: curb/edge family (ids 0..15) -----------------------------------
-// The native curb loop (piVar11 = &DAT_0500a70c, uVar9 = 0..15) emits a flat top
-// plate at y=0.0625 spanning the cell (material 5), plus up to four vertical edge
-// skirts dropping to y=0, gated by the 4 bits of the variant index uVar9:
+// --- Phase: curb and edge family (ids 0..15) -------------------------------
+// The game's curb loop (piVar11 = &DAT_0500a70c, uVar9 = 0..15) makes a flat top
+// plate at y=0.0625 covering the cell (material 5), plus up to four upright edge
+// skirts down to y=0, turned on by the 4 bits of the variant number uVar9:
 //   bit0 (&1): the z=0 (-Z) edge      bit3 (&8): the x=0 (-X) edge
 //   bit2 (&4): the z=1 (+Z) edge      bit1 (&2): the x=1 (+X) edge
-// Control points transcribed verbatim from Buildblock_InitTemplateMeshCatalog.
-// Edges carry material 0 (orient nibble 0 -> authored UVs survive).
+// Control points copied exactly from Buildblock_InitTemplateMeshCatalog.
+// Edges use material 0 (orient nibble 0, so the stored UVs are kept).
 void build_curb_family(std::vector<BuildblockCatalogEntry>& out) {
     constexpr float kT = 0.0625F;  // top plate height
     for (std::uint32_t variant = 0; variant < 16; ++variant) {
@@ -404,36 +354,28 @@ void build_curb_family(std::vector<BuildblockCatalogEntry>& out) {
             add_quad_patch(m, {1, kT, 1}, {1, kT, 0}, {1, 0, 0}, {1, 0, 1}, kUV00, kUV10, kUV11,
                            kUV01, 0);
         }
-        out[variant] = bake_entry(m, 1, 1, 1, "");
+        out[variant] = bake_entry(m, 1, 1, 1);
     }
 }
 
 // --- Phase: floor patch (ids 16..19) ---------------------------------------
-// The native phase emits a single AddBezierPatch(...,1,1,8,3,0x30000) — an 8x1
-// tessellated, order-3 curved top surface (the rounded floor/ramp) — then bakes
-// it plus three Y90 rotations. The exact bicubic control mesh lives in scattered
-// globals; round never renders this id, so (best-effort) we approximate it as a
-// flat top plate at y=0.0625 with the same +Y (0x30000) orientation. Geometry is
-// sane (correct footprint/orientation); the subtle curvature is the only loss.
-void build_floor_patch(std::vector<BuildblockCatalogEntry>& out) {
+// The game makes one AddBezierPatch(...,1,1,8,3,0x30000) here: a curved top surface
+// of order 3, split 8x1 (the rounded floor or ramp). It then bakes it plus three
+// turned copies. The exact bicubic control mesh is spread over several globals and
+// has not been copied out. Until then, keep the flat top plate at y=0.0625 facing
+// +Y; its shape has not been checked against the game's mesh.
+void build_floor_patch(std::vector<BuildblockCatalogEntry>& out, int base_id) {
     constexpr float kT = 0.0625F;
     ScratchMesh m;
     add_quad_patch(m, {0, kT, 0}, {1, kT, 0}, {1, kT, 1}, {0, kT, 1}, kUV00, kUV10, kUV11, kUV01,
                    0x30000);
-    BuildblockCatalogEntry base = bake_entry(m, 1, 1, 1, "");
-    BuildblockCatalogEntry r1 = rotate_entry_y90(base);
-    BuildblockCatalogEntry r2 = rotate_entry_y90(r1);
-    BuildblockCatalogEntry r3 = rotate_entry_y90(r2);
-    out[16] = std::move(base);
-    out[17] = std::move(r1);
-    out[18] = std::move(r2);
-    out[19] = std::move(r3);
+    emit_rot_group(out, m, base_id, 1, 1, 1);
 }
 
-// Corner heights of a grade tile's sloped surface, in the order of the patch
-// control corners P00 (x0,z0), P03 (x1,z0), P30 (x0,z1), P33 (x1,z1). The edge
-// picks the direction (Buildblock_InitTemplateMeshCatalog grade loops): 0 rises
-// along +X, 1 along +Z, 2 falls along +X, 3 falls along +Z.
+// Corner heights of a slope tile's surface, in the order of the patch control
+// corners P00 (x0,z0), P03 (x1,z0), P30 (x0,z1), P33 (x1,z1). The edge picks the
+// direction (the slope loops in Buildblock_InitTemplateMeshCatalog): 0 rises along
+// +X, 1 along +Z, 2 falls along +X, and 3 falls along +Z.
 std::array<float, 4> grade_corner_heights(int edge, float low, float high) {
     switch (edge) {
         case 0: return {low, high, low, high};
@@ -443,18 +385,18 @@ std::array<float, 4> grade_corner_heights(int edge, float low, float high) {
     }
 }
 
-// --- Prologue id model -----------------------------------------------------
-// The driver assigns catalog ids to named slot globals in textual order, then
-// runs geometry phases that write catalog[slotId]. Rather than hardcode ids, we
-// replay the assignment with a running counter so every id lands exactly where
-// the game computes it. Only the slots consumed by a geometry phase are recorded.
+// --- How the prologue hands out ids ---------------------------------------
+// The driver gives catalog ids to named slot globals in the order they appear in
+// the code, then runs geometry phases that write catalog[slotId]. Instead of
+// hardcoding ids, we replay that with a running counter, so every id lands exactly
+// where the game puts it. Only slots that a geometry phase uses are recorded.
 struct SlotIds {
     std::array<int, 16> curb{};         // a70c[0..15]   = ids 0..15
     int floor1_base = 0;                // a74c          = id 16 (+3 rot)
     int railing_base = 0;               // a75c          = id 20 (+3 rot)
-    // Grade tiles: 9 grade levels (n = 4..12), each with an aa14 group and a
-    // ba14 group of 4 edge-variants x n ids. Indexed [grade][group][edge][step].
-    // We store the flat id per (grade, group, edge, step).
+    // Slope tiles: 9 slope levels (n = 4..12), each with an aa14 group and a ba14
+    // group of 4 edge variants x n ids, indexed [grade][group][edge][step].
+    // We store the flat id for each (grade, group, edge, step).
     std::array<std::array<std::array<std::vector<int>, 4>, 2>, 9> grade{};
     std::array<int, 4> floor2{};        // a7c4[0..3]
     int beam1_base = 0;                 // cb84          (+3 rot)
@@ -462,7 +404,7 @@ struct SlotIds {
     int next = 0;                       // first free id after the prologue
 };
 
-// Replays Buildblock_InitTemplateMeshCatalog's prologue id assignment.
+// Replays how Buildblock_InitTemplateMeshCatalog's prologue hands out ids.
 SlotIds assign_slot_ids() {
     SlotIds s;
     int count = 0;
@@ -473,17 +415,17 @@ SlotIds assign_slot_ids() {
     count += 4;
     s.railing_base = count;  // a75c = 20; a760/764/768 = 21/22/23
     count += 4;
-    // The driver then assigns a long run of sequential reserved slots
-    // (a76c..a798, cad4..cb20, a79c..a7c0 = ids 24..65) with no procedural
-    // geometry; skip the counter past them.
-    count = 66;  // = the grade-tile fill start (verified from the prologue math)
+    // The driver then hands out a long run of reserved slots in a row
+    // (a76c..a798, cad4..cb20, a79c..a7c0 = ids 24..65) with no built-in
+    // geometry, so skip the counter past them.
+    count = 66;  // where the slope tiles start (checked against the prologue's math)
 
-    // Grade-tile fill loop: lVar29(per-group count)=4, lVar26(array offset)=0x10,
-    // repeated 9 times; each iteration fills aa14 then ba14 for 4 edge-variants of
-    // (count) ids, with count growing by 1 each grade level.
-    int per = 4;             // ids per edge-variant at this grade level
+    // The slope-tile loop: lVar29 (count per group) = 4, lVar26 (array offset) = 0x10,
+    // repeated 9 times. Each time it fills aa14 and then ba14 for 4 edge variants of
+    // (count) ids, and the count goes up by 1 for each slope level.
+    int per = 4;             // ids per edge variant at this slope level
     for (int grade = 0; grade < 9; ++grade) {
-        const int n = per;   // grade level n = 4..12
+        const int n = per;   // slope level n = 4..12
         for (int edge = 0; edge < 4; ++edge) {
             auto& v = s.grade[static_cast<std::size_t>(grade)][0][static_cast<std::size_t>(edge)];
             for (int step = 0; step < n; ++step) {
@@ -499,13 +441,13 @@ SlotIds assign_slot_ids() {
         ++per;
     }
 
-    // DAT_0500a704 = align up to 4; floor2 + beam groups follow.
+    // DAT_0500a704 = rounded up to a multiple of 4; the floor2 and beam groups follow.
     count = (count + 3) & ~3;
     for (int i = 0; i < 4; ++i) {
         s.floor2[static_cast<std::size_t>(i)] = count++;  // a7c4[0..3]
     }
-    // (cb24..cb80 reserved ids skipped; cb84/cb94 are the next two beam groups.)
-    count = (count + 0x2c);  // advance past cb24..cb80 reserved span
+    // (The reserved ids cb24..cb80 are skipped; cb84 and cb94 are the next two beam groups.)
+    count = (count + 0x2c);  // skip the reserved ids cb24..cb80
     s.beam1_base = count;
     count += 4;
     s.beam2_base = count;
@@ -514,13 +456,13 @@ SlotIds assign_slot_ids() {
     return s;
 }
 
-// --- Phase: grade-tile family (sloped street tiles) ------------------------
-// For grade n (4..12) each of the n steps rises 1/n across the cell. The ba14
-// group is the curb beside a sloped lane: a 1/16-thick slab whose top runs from
-// k/n+1/16 to (k+1)/n+1/16 (AddBoxFaces, all faces but the bottom, material 0),
+// --- Phase: slope-tile family (sloped street tiles) ------------------------
+// For slope level n (4..12), each of the n steps rises 1/n across the cell. The ba14
+// group is the curb next to a sloped lane: a slab 1/16 thick whose top runs from
+// k/n+1/16 to (k+1)/n+1/16 (AddBoxFaces, every face except the bottom, material 0),
 // with size_y 2 once the top reaches the next cell. The aa14 group is the lane
-// surface: one linear patch from k/n to (k+1)/n with authored UVs (x, z) and
-// material 0, so it takes the cell's face-array slot 0 (the lane code).
+// surface: one flat patch from k/n to (k+1)/n with stored UVs (x, z) and material 0,
+// so it takes slot 0 of the cell's face array (the lane code).
 void build_grade_tiles(std::vector<BuildblockCatalogEntry>& out, const SlotIds& s) {
     constexpr float kCurb = 0.0625F;  // fVar5 = FLOAT_002781bc
     for (int grade = 0; grade < 9; ++grade) {
@@ -531,8 +473,8 @@ void build_grade_tiles(std::vector<BuildblockCatalogEntry>& out, const SlotIds& 
             for (int k = 0; k < static_cast<int>(ba.size()); ++k) {
                 const float low = static_cast<float>(k) * step + kCurb;
                 const auto top = grade_corner_heights(edge, low, low + step);
-                // Box corners in kCubeCorner order: bottom ring then top ring,
-                // each (x0,z0) (x1,z0) (x1,z1) (x0,z1).
+                // Box corners in kCubeCorner order: the bottom ring, then the top
+                // ring, each (x0,z0) (x1,z0) (x1,z1) (x0,z1).
                 const std::array<float, 4> ring{top[0], top[1], top[3], top[2]};
                 std::array<Vec3f, 8> c{};
                 for (int i = 0; i < 4; ++i) {
@@ -558,8 +500,8 @@ void build_grade_tiles(std::vector<BuildblockCatalogEntry>& out, const SlotIds& 
     }
 }
 
-// --- Phase: beam groups 1 & 2 (barrier/bench pieces) ------------------------
-// Args resolved from the disassembly (xmm register tracing):
+// --- Phase: beam groups 1 and 2 (barrier and bench pieces) -----------------
+// Arguments worked out from the disassembly (by following the xmm registers):
 //   XMM12 = FLOAT_002783f4 = 1.0, XMM8 = FLOAT_002781bc = 0.0625,
 //   XMM7  = 1.0 (= XMM12), XMM6 = DAT_002782b0 = 0.3125, XMM13 = 0.0.
 // Group 1 (cb84):
@@ -568,7 +510,7 @@ void build_grade_tiles(std::vector<BuildblockCatalogEntry>& out, const SlotIds& 
 // Group 2 (cb94):
 //   addbeam(0,0,0,0, 1.0,    1.0,    1.0,    0x32, mat={1..})
 //   addbeam(0,0,0,0, 0.0625, 0.3125, 0.0625, 0x32, mat={1..})
-// Each is baked at its slot id then 3 Y90 rotations.
+// Each is baked at its slot id, then 3 turned copies.
 void build_beam_groups_1_2(std::vector<BuildblockCatalogEntry>& out, const SlotIds& s) {
     constexpr std::array<std::uint32_t, 6> kMat{1, 1, 1, 1, 1, 1};  // _DAT_00278ee0
     {
@@ -586,9 +528,9 @@ void build_beam_groups_1_2(std::vector<BuildblockCatalogEntry>& out, const SlotI
 }
 
 // --- Phase: floor patch 2 group (a7c4[0..3]) --------------------------------
-// The native phase emits a flat bezier quad (AddBezierPatch(...,1,1,1,1,0)) per
-// lVar29 = 0..3, each a unit top quad at y=0 oriented by lVar29. Best-effort: a
-// flat top quad with authored UVs (orient 0). Round renders none.
+// The game makes a flat Bezier quad (AddBezierPatch(...,1,1,1,1,0)) for each
+// lVar29 = 0..3, each a unit top quad at y=0 turned by lVar29. Our best guess: a
+// flat top quad with stored UVs (orient 0). The round map draws none.
 void build_floor_patch_2(std::vector<BuildblockCatalogEntry>& out, const SlotIds& s) {
     for (int i = 0; i < 4; ++i) {
         ScratchMesh m;
@@ -597,14 +539,15 @@ void build_floor_patch_2(std::vector<BuildblockCatalogEntry>& out, const SlotIds
     }
 }
 
-// --- Phase: third beam group (ids 20..23) = the railing ---------------------
-// Verified from Buildblock_InitTemplateMeshCatalog @0x10110, exact float
-// constants read from subrosa.exe (fVar6=FLOAT_002783f4=1.0, fVar5=FLOAT_002781bc
-// =0.0625, fVar33=DAT_002782b0=0.3125):
+// --- Phase: third beam group (ids 20..23), the railing ---------------------
+// Checked against Buildblock_InitTemplateMeshCatalog @0x10110, with the exact float
+// constants read from subrosa.exe (fVar6=FLOAT_002783f4=1.0,
+// fVar5=FLOAT_002781bc=0.0625, fVar33=DAT_002782b0=0.3125):
 //   _block_addbeam(0, 0,   0,    0,      1.0,    0.0625, 1.0,   0x2a, mat={1..})
 //   _block_addbeam(0, 0.5, 0,    0.5,    0.0625, 0.3125, 0.0625,0x3f, mat={0..})
 //   _block_addbeam(0, 0,   0.25, 0.4375, 1.0,    0.1875, 0.125, 0x3f, mat={0..})
-// The base slab material array is _DAT_00278ee0 = {1,1,1,1,1,1}; post/bar zeroed.
+// The base slab's material list is _DAT_00278ee0 = {1,1,1,1,1,1}; the post and bar
+// use zeros.
 void build_railing_group(std::vector<BuildblockCatalogEntry>& out, const SlotIds& s) {
     constexpr float kFull = 1.0F;
     constexpr float kS = 0.0625F;
@@ -628,7 +571,7 @@ void build_railing_group(std::vector<BuildblockCatalogEntry>& out, const SlotIds
 }  // namespace
 
 std::array<std::int32_t, 2048> native_grade_slot_table() {
-    // DAT_0500aa14 row r = 4n + edge holds 16 ids: row-major 16 ints, rows at
+    // DAT_0500aa14 row r = 4n + edge holds 16 ids: 16 ints per row, with rows at
     // int offset n*64 + edge*16. ba14 is the next 0x1000 bytes.
     std::array<std::int32_t, 2048> table{};
     const SlotIds slots = assign_slot_ids();
@@ -647,28 +590,27 @@ std::array<std::int32_t, 2048> native_grade_slot_table() {
 }
 
 std::vector<BuildblockCatalogEntry> build_native_builtin_catalog() {
-    // Faithful structural port of Buildblock_InitTemplateMeshCatalog: replays the
-    // prologue id assignment (assign_slot_ids) so every procedural id lands at its
-    // true catalog index, then runs each geometry phase writing catalog[slotId]:
-    //   ids   0..15 = curb/edge family            (build_curb_family)
-    //   ids  16..19 = floor patch + 3 rots         (build_floor_patch)
-    //   ids  20..23 = railing beam + 3 rots         (build_railing_group)
-    //   ids  66..   = grade-tile ramp family        (build_grade_tiles)
-    //   beam groups 1 & 2 + floor-patch-2 at their computed ids.
-    // The reserved/runtime/garage/CSX slots (ids 24..65 and the CSX 0x585a0001
-    // append) carry no procedural geometry; those indices resolve to empty slots
-    // that render nothing, exactly as the native instancing loop does for an
-    // unbuilt catalog slot.
+    // A close port of Buildblock_InitTemplateMeshCatalog. It replays how the prologue
+    // hands out ids (assign_slot_ids), so every built-in id lands at its real catalog
+    // index, then runs each geometry phase, which writes catalog[slotId]:
+    //   ids   0..15 = curb and edge family        (build_curb_family)
+    //   ids  16..19 = floor patch + 3 turns       (build_floor_patch)
+    //   ids  20..23 = railing beam + 3 turns      (build_railing_group)
+    //   ids  66..   = slope-tile ramp family      (build_grade_tiles)
+    //   beam groups 1 and 2 and floor patch 2, at their worked-out ids.
+    // The reserved, runtime, garage, and CSX slots (ids 24..65 and the CSX 0x585a0001
+    // additions) have no built-in geometry. Those indices are empty slots that draw
+    // nothing, just like the game's loop does for a catalog slot that was never built.
     const SlotIds slots = assign_slot_ids();
     std::vector<BuildblockCatalogEntry> out;
     out.resize(static_cast<std::size_t>(slots.next));
     build_curb_family(out);             // ids 0..15
-    build_floor_patch(out);             // ids 16..19
+    build_floor_patch(out, slots.floor1_base); // ids 16..19
     build_railing_group(out, slots);    // ids 20..23
-    build_grade_tiles(out, slots);      // grade ramp family
+    build_grade_tiles(out, slots);      // slope ramp family
     build_beam_groups_1_2(out, slots);  // barrier/bench beams
     build_floor_patch_2(out, slots);    // floor-patch-2 group
     return out;
 }
 
-}  // namespace map_editor
+}  // namespace pafta

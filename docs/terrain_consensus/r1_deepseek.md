@@ -1,32 +1,30 @@
-# Round 1 RE: CITY GROUND Terrain — deepseek
+# City terrain research, DeepSeek round 1
 
-**Target binary**: `subrosa.exe.THIS_ONE` (x86-64 PE, image base 0x00000000, 3779 functions)
-**Date**: 2026-06-08
-**Method**: Ghidra MCP decompile + full disassembly, constant decoding, struct layout inspection
+Target binary: `subrosa.exe.THIS_ONE` (x86-64 PE, image base 0x00000000, 3779 functions)
+Date: 2026-06-08
+Method: Ghidra MCP decompiling and full disassembly, decoding constants, and reading struct layouts
 
----
+[terrain_generation.md](../terrain_generation.md) has the later, checked findings. Where they disagree with this round (for example on axes and on how far the smoothing reaches), the later page is right.
 
-## 0. KEY CONSTANTS (IEEE-754 decoded from read_memory)
+## 0. Key constants (decoded as IEEE-754 from read_memory)
 
 | Address     | Hex           | IEEE-754  | Symbol              |
 |-------------|---------------|-----------|---------------------|
-| 0x00278688  | 0x40800000    | **4.0**   | `DAT_00278688`      |
-| 0x00278698  | 0x40880000    | **4.25**  | `DAT_00278698`      |
-| 0x002783f4  | 0x3F800000    | **1.0**   | `FLOAT_002783f4`    |
-| 0x00278280  | 0x3E800000    | **0.25**  | `FLOAT_00278280`    |
-| 0x002781bc  | 0x3D800000    | **0.0625**| `FLOAT_002781bc`    |
-| 0x00278644  | 0x40400000    | **3.0**   | `DAT_00278644`      |
-| 0x00278224  | 0x3E000000    | **0.125** | `FLOAT_00278224`    |
+| 0x00278688  | 0x40800000    | 4.0       | `DAT_00278688`      |
+| 0x00278698  | 0x40880000    | 4.25      | `DAT_00278698`      |
+| 0x002783f4  | 0x3F800000    | 1.0       | `FLOAT_002783f4`    |
+| 0x00278280  | 0x3E800000    | 0.25      | `FLOAT_00278280`    |
+| 0x002781bc  | 0x3D800000    | 0.0625    | `FLOAT_002781bc`    |
+| 0x00278644  | 0x40400000    | 3.0       | `DAT_00278644`      |
+| 0x00278224  | 0x3E000000    | 0.125     | `FLOAT_00278224`    |
 
----
+## 1. Corner heights
 
-## 1. CORNER HEIGHTS — Proven source
+### Question: is it `intersection.unk0[2]*4.0+4.25`, or does it come from the mapTopHeight buffers?
 
-### Question: `intersection.unk0[2]*4.0+4.25` OR from mapTopHeight buffers?
+The corner height is `streetIntersection.unk0[2] * 4.0 + 4.25`. The mapTopHeight buffers are only used to check the four corners of each sub-cell and as samples for the 5×5 sub-cell softening. They do not give the bilinear corner heights.
 
-**Answer: Direct from `streetIntersection.unk0[2] * 4.0 + 4.25`. The mapTopHeight buffers are read ONLY as a 4-corner occupancy gate and as sample-source for the 5×5 sub-cell feather; they do NOT serve as corner heights for the bilinear fill.**
-
-### Proof: Decompile + Disassembly at 0xd349e–0xd3650
+### Proof: decompile and disassembly at 0xd349e–0xd3650
 
 From the decompile (0xd3340):
 
@@ -37,37 +35,35 @@ fVar36 = (float)streetIntersections[lVar14].unk0[2] * DAT_00278688 + DAT_0027869
 fVar38 = (float)streetIntersections[lVar15].unk0[2] * DAT_00278688 + DAT_00278698;
 ```
 
-Where `DAT_00278688 = 4.0` and `DAT_00278698 = 4.25`. So each corner = `unk0[2] * 4.0 + 4.25`.
+`DAT_00278688 = 4.0` and `DAT_00278698 = 4.25`, so each corner is `unk0[2] * 4.0 + 4.25`.
 
-The four corners correspond to the four intersections forming the city block:
-- **TL**: `param_1` (the "NE" intersection — top-left in the patch's param order)
-- **TR**: `lVar28` (far-south intersection — but mapped to top-right in bilinear fill)
-- **BL**: `lVar14` (far-west intersection)
-- **BR**: `lVar15` (far-southwest intersection)
+The four corners are the four intersections around the city block:
+- TL: `param_1` (the "NE" intersection, top-left in the patch's own order)
+- TR: `lVar28` (the far-south intersection, which ends up top-right in the bilinear fill)
+- BL: `lVar14` (the far-west intersection)
+- BR: `lVar15` (the far-south-west intersection)
 
-The mapTopHeight buffers (`DAT_3ce6f5f8`, `DAT_3ce6f5fc`, `DAT_3ce735f8`, `DAT_3ce735fc`) are read in the feather phase at 0xd382f–0xd3850 as a **precondition gate** and as a **5×5 sub-sample source** — NOT as corner height sources.
+The mapTopHeight buffers (`DAT_3ce6f5f8`, `DAT_3ce6f5fc`, `DAT_3ce735f8`, `DAT_3ce735fc`) are read in the softening phase at 0xd382f–0xd3850, as a check that must pass first and as the source for the 5×5 sub-samples. They are NOT where the corner heights come from.
 
 ### What writes the mapTopHeight buffers?
 
-`UpdateMapTopHeightAndClearOccupancyBit` @0x3fa40 writes `(int)uVar19 * 4.0` (street surface height, WITHOUT the +4.25) to ALL FOUR buffers simultaneously. Called by:
+`UpdateMapTopHeightAndClearOccupancyBit` @0x3fa40 writes `(int)uVar19 * 4.0` (the street surface height, WITHOUT the +4.25) to ALL FOUR buffers at once. It is called by:
 - `MapConnector_PlaceStreetSegmentTilesAndSlopes` @0x20580
 - `ApplyAllCityDistrictCellsToWorld` @0x20000
 - `InstantiateSbbVolumeIntoWorldAndMetadata` @0x23ac0
 - `World_LoadMapAndInitializeTerrain` @0x56980
 
-The street surface height = `intersection.unk0[2] * 4.0` (no +4.25).
+The street surface height is `intersection.unk0[2] * 4.0` (no +4.25).
 
-The patch writes a surface **0.25 world-units HIGHER** than the street tiles (`4.0*level + 4.25` vs `4.0*level` for street floors). This is the road SURFACE (above the tile floor) — likely the drivable road level.
+So the patch writes a surface 0.25 world units HIGHER than the street tiles (`4.0*level + 4.25` against `4.0*level` for the street floor). That is the road SURFACE, on top of the tile floor, and probably the height you drive at.
 
----
+## 2. Patch rectangle
 
-## 2. PATCH RECTANGLE — Exact bounds
+### Question: which fields set the rectangle? Is it the gap between FOUR intersections, or one intersection's footprint?
 
-### Question: Which fields define the rectangle? Gap between FOUR intersections or single intersection footprint?
+The rectangle covers the gap between the four intersections around a city block. `*4 + 0x1000` turns world coordinates into grid samples (1 unit = 4 samples, offset 4096).
 
-**Answer: The rectangle spans the gap between FOUR intersections forming a city block — NOT a single intersection. The `*4 + 0x1000` maps world coordinates to grid-sample coordinates (1 unit = 4 samples, bias 4096).**
-
-### Rectangle bounds formula
+### Rectangle formula
 
 From the decompile at 0xd34e0–0xd366b:
 
@@ -79,43 +75,41 @@ y_min = (unk0[1] + field_0x2c) * 4 + 0x1000    // south edge of param_1
 y_max = (unk0[1] - field_0x2c) * 4 + 0x1000    // north edge of far-south corner (lVar28)
 ```
 
-### Field identification (StreetIntersection struct, 136 bytes)
+### The fields (StreetIntersection struct, 136 bytes)
 
 From `get_struct_layout("StreetIntersection")`:
 
 | Offset | Size | Type       | Name           | Role                        |
 |--------|------|------------|----------------|-----------------------------|
-| 0      | 12   | int[3]     | unk0           | [0]=X?, [1]=Y-pos, [2]=height-level |
-| 12     | 12   | Vector     | pos            | .x = world X-coord          |
-| 40     | 4    | int (unnamed) | field_0x28 | connectivity flag (-1=dead) |
-| 44     | 4    | int (unnamed) | field_0x2c | half-extent +Y (south)      |
-| 48     | 4    | int (unnamed) | field_0x30 | half-extent +X (east)       |
-| 52     | 4    | int (unnamed) | field_0x34 | half-extent -Y (north)      |
-| 56     | 4    | int (unnamed) | field_0x38 | half-extent -X (west)       |
+| 0      | 12   | int[3]     | unk0           | [0]=X?, [1]=Y position, [2]=height level |
+| 12     | 12   | Vector     | pos            | .x = world X coordinate     |
+| 40     | 4    | int (unnamed) | field_0x28 | connection flag (-1 = dead end) |
+| 44     | 4    | int (unnamed) | field_0x2c | reach in +Y (south)         |
+| 48     | 4    | int (unnamed) | field_0x30 | reach in +X (east)          |
+| 52     | 4    | int (unnamed) | field_0x34 | reach in -Y (north)         |
+| 56     | 4    | int (unnamed) | field_0x38 | reach in -X (west)          |
 
-**Confidence: HIGH** — confirmed by both struct layout and usage patterns in MapConnector @0x20580:
+Confidence: HIGH. Both the struct layout and how MapConnector @0x20580 uses the fields agree:
 ```c
 // Horizontal street: uses +field_0x2c for south end, -field_0x34 for north end
 uVar3 = streetIntersections[iVar6].unk0[1] + *(int *)&streetIntersections[iVar6].field_0x2c;
 iVar18 = (streetIntersections[iVar13].unk0[1] - *(int *)&streetIntersections[iVar13].field_0x34) - uVar3;
 ```
 
-### Size calculation
+### Size
 
 ```
 width  = iVar32 = x_max - x_min  (grid samples)
 height = iVar34 = y_max - y_min  (grid samples)
 ```
 
-This covers the INTERIOR of the city block — from the inner road edge of one intersection to the inner road edge of the opposite intersection. The streets themselves are placed separately by `MapConnector_PlaceStreetSegmentTilesAndSlopes`.
+This covers the INSIDE of the city block, from the inner road edge of one intersection to the inner road edge of the one across from it. The streets themselves are placed separately by `MapConnector_PlaceStreetSegmentTilesAndSlopes`.
 
----
+## 3. Checking for a four-cornered block
 
-## 3. PRECONDITION — 4-corner block gate
+### Proof from the decompile at 0xd3367–0xd3498
 
-### Proof from decompile at 0xd3367–0xd3498
-
-The precondition verifies that all FOUR corners of the city block exist and are connected by streets:
+Before patching, the function checks that all FOUR corners of the block exist and are joined by streets:
 
 ```
 streetIntersections[param_1].streetSouth != -1
@@ -126,15 +120,13 @@ streetIntersections[param_1].streetSouth != -1
   AND streetIntersections[lVar15].field_0x28 != -1    (far-SW corner is valid)
 ```
 
-This ensures a complete 4-way city block (param_1 → south → SW, param_1 → west → SW). The recursion allows for one level of indirection (if a street corner lacks a direct west/south, it checks again one step further). Without this "closure," the patch is skipped.
+This makes sure the block is closed on all four sides (param_1 → south → SW, and param_1 → west → SW). The recursion allows one extra step: if a corner has no direct west or south street, it checks once more one intersection further on. If the block is not closed, the patch is skipped.
 
----
-
-## 4. FEATHER/SMOOTHING — Complete pass breakdown
+## 4. Softening and smoothing passes
 
 ### 4.1 Scratch buffer layout
 
-Base address: `DAT_04afa9bc` (count array starts at `DAT_04afa9a0` = `DAT_04afa9bc - 0x1c`)
+Base address: `DAT_04afa9bc` (the count array starts at `DAT_04afa9a0` = `DAT_04afa9bc - 0x1c`)
 
 Memory map:
 ```
@@ -144,15 +136,15 @@ DAT_04afa9a8  row_slot[row*0x100 + col].row[0..1]  (int32*2)
 DAT_04afa9ac  weight[row*0x100 + col].weight[0..1] (float*2)
 ```
 
-- Each "cell" occupies **0x1c = 28 bytes**: count (4) + 2 entries × 12 bytes (col+row+weight)
-- Max **2 entries per cell** (total size = 4 + 24 = 28)
-- **Row stride**: 0x100 cells × 0x1c = **0x1c00 bytes** = 7168
-- **Grid dimensions**: (iVar32>>2) × (iVar34>>2) cells, where each cell maps to **4×4 grid samples**
-- Physical layout: `buffer[row * 0x100 + col]` — 256 columns per row
+- Each "cell" is 0x1c = 28 bytes: a count (4) and 2 entries of 12 bytes (col, row, weight).
+- A cell holds at most 2 entries (4 + 24 = 28).
+- Rows are 0x100 cells × 0x1c = 0x1c00 bytes = 7168 apart.
+- The grid is (iVar32>>2) × (iVar34>>2) cells, each covering 4×4 grid samples.
+- In memory: `buffer[row * 0x100 + col]`, 256 columns per row.
 
-### 4.2 Phase 1 — Bilinear fill (initial patch)
+### 4.2 Phase 1: bilinear fill
 
-At 0xd3680–0xd3710: For every grid sample within the rectangle, writes a bilinearly interpolated height from the four intersection corner heights using `Terrain_SetLandSampleWithTileBorderMirroring`:
+At 0xd3680–0xd3710: for every grid sample in the rectangle, it writes a height blended from the four corner heights, using `Terrain_SetLandSampleWithTileBorderMirroring`:
 
 ```
 for y in [y_min..y_max]:
@@ -163,13 +155,13 @@ for y in [y_min..y_max]:
         Terrain_SetLandSampleWithTileBorderMirroring(y, x, h)
 ```
 
-### 4.3 Phase 2 — Scratch buffer init (zeroing)
+### 4.3 Phase 2: clearing the scratch buffer
 
-At 0xd371b–0xd37a4: Zeros the scratch buffer region covering (iVar32>>2)×(iVar34>>2) cells plus one-ring ghost cells. Each init zeroes 5 cells in a column (ghost cell + 4 actual cells) across 5 columns (ghost + 4 actual).
+At 0xd371b–0xd37a4: it zeroes the scratch area covering (iVar32>>2)×(iVar34>>2) cells plus a ring of extra cells around it. Each step zeroes 5 cells in a column (one extra cell plus 4 real ones) across 5 columns (one extra plus 4 real).
 
-### 4.4 Phase 3 — 5×5 sub-cell feather ACCUMULATION
+### 4.4 Phase 3: filling 5×5 sub-cells
 
-At 0xd37b9–0xd3a0c: For each 4×4 block where **all four mapTopHeight buffers > 0.0**:
+At 0xd37b9–0xd3a0c: for each 4×4 block where all four mapTopHeight buffers are > 0.0:
 
 ```c
 // Index into mapTopHeight buffers
@@ -195,11 +187,11 @@ if (fVar36 > 0 && fVar38 > 0 && fVar41 > 0 && fVar42 > 0):
                 Terrain_SetLandSampleWithTileBorderMirroring(y_sample, x_sample, h)
 ```
 
-**Key insight**: The 5×5 kernel reads from the same four mapTopHeight buffers as 4-corner bilinear interpolation, generating 25 sub-samples per 4×4 block. This creates a higher-resolution sampling of the street surface that can resolve sub-block detail.
+The 5×5 pattern reads the same four mapTopHeight buffers as a four-corner bilinear blend, making 25 sub-samples per 4×4 block. That samples the street surface more finely, so detail smaller than a block shows up.
 
-### 4.5 Phase 4 — Scattered neighbor propagation (16 passes)
+### 4.5 Phase 4: spreading to neighbours (16 passes)
 
-At 0xd3a1f–0xd3c8d (outer `local_120 = 0x10` = 16 iterations):
+At 0xd3a1f–0xd3c8d (outer loop `local_120 = 0x10` = 16 passes):
 
 For each cell where `count == 0` OR `max_weight <= 1.0`:
 
@@ -234,13 +226,13 @@ For each of 8 neighbors (offsets -1..+1 in both x and y, excluding (0,0)):
             cell.count = 1, cell.entry[0] = {col: neighbor.col, row: neighbor.row, weight: weight}
 ```
 
-The dot-product test ensures directional consistency: only propagate data from neighbors that "point toward" the empty cell. The `0.0625` kernel radius means influence decays to zero at distance = `1.0 / 0.0625 = 16` cells (i.e., `16 * 4 = 64` grid samples).
+The dot-product test keeps directions consistent: data only spreads from neighbours that "point at" the empty cell. With a factor of `0.0625`, influence drops to zero at a distance of `1.0 / 0.0625 = 16` cells (that is, `16 * 4 = 64` grid samples).
 
-**16 passes** (confidence: HIGH, confirmed by disassembly at 0xd3a28: `MOV EDX, 0x10`).
+There are 16 passes (confidence: HIGH, confirmed in the disassembly at 0xd3a28: `MOV EDX, 0x10`).
 
-### 4.6 Phase 5 — Final smoothstep merge with original terrain
+### 4.6 Phase 5: final smoothstep merge with the original terrain
 
-At 0xd3c93–0xd4048: For every cell in the scratch region where count > 0:
+At 0xd3c93–0xd4048: for every cell in the scratch area where count > 0:
 
 ```
 // Step 1: Accumulate total weight
@@ -283,9 +275,9 @@ result = (1 - t2) * h_orig + blend * t2
 Terrain_SetLandSampleWithTileBorderMirroring(cell.row, cell.col, result)
 ```
 
-**This is the KEY feather mechanism**: The `max_weight` smoothstep controls how much of the patched terrain vs. original terrain is used. When a cell accumulated many samples (high max_weight), t2 ≈ 1 → result ≈ blend (the patched road). When a cell has sparse data (low max_weight), t2 ≈ 0 → result ≈ h_orig (the island terrain). This creates a smooth, natural-looking transition.
+This is how the edge gets softened. The smoothstep of `max_weight` decides how much patched terrain and how much original terrain to use. When a cell picked up strong samples (high max_weight), t2 is near 1 and the result is near the blended road height. When a cell has little data (low max_weight), t2 is near 0 and the result is near the original island height. The result is a smooth, natural-looking change.
 
-### Smoothstep formula (confirmed from disassembly at 0xd3f40–0xd3f76)
+### Smoothstep formula (confirmed in the disassembly at 0xd3f40–0xd3f76)
 
 ```
 XMM9 = 3.0           // DAT_00278644
@@ -295,9 +287,7 @@ XMM2 = t * t         // t²
 XMM1 = XMM1 * XMM2   // (3-2t)*t² = smoothstep output
 ```
 
----
-
-## 5. WHICH INTERSECTIONS GET PATCHED
+## 5. Which intersections get patched
 
 From `Terrain_RebuildLandTilesRoadPatchesAndChunkCaches` @0xd12e0:
 
@@ -333,13 +323,11 @@ if (isMapAutoGenerated == 0):
     Terrain_ApplyStreetIntersectionHeightPatch(0x27);
 ```
 
-**28 calls to 28 distinct intersection indices** (only for non-autogenerated maps). Each call's internal precondition (4-corner connectivity test) independently determines whether the patch actually executes.
+That is 28 calls with 28 different intersection numbers, only on maps that are not auto-generated. Each call's own four-corner check decides whether the patch really runs.
 
-**Why a subset?** These are the intersections that form the central city grid. The precondition at the top of `Terrain_ApplyStreetIntersectionHeightPatch` ensures only intersections that form a complete 4-way city block (with all four corners existing and interconnected) actually get patched. The 28 listed intersections are those candidate NE-corners; those that don't form a complete block silently return.
+Why only some intersections? These are the intersections in the central city grid. The check at the top of `Terrain_ApplyStreetIntersectionHeightPatch` only lets through intersections that close a full block, with all four corners present and joined. The 28 listed are the possible north-east corners; the ones that do not close a block just return.
 
----
-
-## 6. WORLD↔GRID COORDINATE MAPPING
+## 6. World and grid coordinates
 
 From `Terrain_SetLandSampleWithTileBorderMirroring` @0xd2db0:
 
@@ -361,65 +349,59 @@ void Terrain_SetLandSampleWithTileBorderMirroring(uint param_1, uint param_2, fl
 }
 ```
 
-**Key facts**:
-- `>> 0xb` (= >> 11 = / 2048): Each terrain chunk is **2049×2049** samples (0x801 = 2049)
-- `chunk_stride = 0x684` bytes = 1668 → `1668 / 4 = 417` floats → This is NOT 2049². The chunk is a pointer array, not directly allocated inline
-- 8×8 = 64 chunks total
-- World→grid: `grid = (world + 4096) * 4` ← the `*4 + 0x1000` pattern in rectangle computation
-  - That is: `grid_sample = world_unit * 4 + 0x1000`
-  - So: `world = (grid_sample - 0x1000) / 4`
-- Grid origin offset: +4096 samples (= +1024 world units) places the world origin in the center of the grid
-- Max grid extent: 0x7ff × 0x801 ≈ 2047 × 2049 per chunk in 8×8 = 16384 × 16384 total
+Main points:
+- `>> 0xb` (= >> 11 = / 2048): each terrain chunk is 2049×2049 samples (0x801 = 2049).
+- `chunk_stride = 0x684` bytes = 1668, and `1668 / 4 = 417` floats, which is NOT 2049². The chunk is an array of pointers, not stored inline.
+- 8×8 = 64 chunks in total.
+- World to grid: `grid = (world + 4096) * 4`, from the `*4 + 0x1000` pattern in the rectangle math.
+  - That is, `grid_sample = world_unit * 4 + 0x1000`.
+  - So `world = (grid_sample - 0x1000) / 4`.
+- The grid origin offset of +4096 samples (+1024 world units) puts the world origin in the middle of the grid.
+- The largest extent is 0x7ff × 0x801 ≈ 2047 × 2049 per chunk, in 8×8 chunks, so 16384 × 16384 in total.
 
-The `0x1000` (=4096) offset shifts the grid so that negative world coordinates (down to -1024) map to positive grid samples. The `*4` gives 4 samples per world unit. The CITY region operates in this same unified grid.
+The `0x1000` (=4096) offset shifts the grid so that negative world coordinates (down to -1024) become positive grid samples. The `*4` gives 4 samples per world unit. The CITY uses this same grid.
 
----
+## 7. Scratch buffer: exact layout
 
-## 7. SCRATCH BUFFER ADDRESSING — precise layout
+Confirmed in the disassembly at 0xd372f–0xd37a4 and 0xd37f8–0xd3986:
 
-Confirmed from disassembly at 0xd372f–0xd37a4 and 0xd37f8–0xd3986:
+| Symbol              | Address     | Offset in cell | Type  | Description              |
+|---------------------|-------------|----------------|-------|--------------------------|
+| `DAT_04afa9a0`     | 0x04afa9a0  | +0x00          | int32 | Entry count (0–2)        |
+| `DAT_04afa9a4`     | 0x04afa9a4  | +0x04          | int32 | Entry[0].col (x_base+col)|
+| `DAT_04afa9a8`     | 0x04afa9a8  | +0x08          | int32 | Entry[0].row (y_base+row)|
+| `DAT_04afa9ac`     | 0x04afa9ac  | +0x0C          | float | Entry[0].weight          |
+|                     |             | +0x10          | int32 | Entry[1].col             |
+|                     |             | +0x14          | int32 | Entry[1].row             |
+|                     |             | +0x18          | float | Entry[1].weight          |
 
-| Symbol              | Address     | Offset within cell | Type  | Description              |
-|---------------------|-------------|---------------------|-------|--------------------------|
-| `DAT_04afa9a0`     | 0x04afa9a0  | +0x00               | int32 | Entry count (0–2)        |
-| `DAT_04afa9a4`     | 0x04afa9a4  | +0x04               | int32 | Entry[0].col (x_base+col)|
-| `DAT_04afa9a8`     | 0x04afa9a8  | +0x08               | int32 | Entry[0].row (y_base+row)|
-| `DAT_04afa9ac`     | 0x04afa9ac  | +0x0C               | float | Entry[0].weight          |
-|                     |             | +0x10               | int32 | Entry[1].col             |
-|                     |             | +0x14               | int32 | Entry[1].row             |
-|                     |             | +0x18               | float | Entry[1].weight          |
+Each cell is 0x1C = 28 bytes (a count int plus 2 entries of 12 bytes).
 
-**Total cell size**: 0x1C = 28 bytes (count int + 2 entries × 12 bytes)
+Indexing: `cell[row][col] = base + (row * 0x100 + col) * 0x1c`
 
-**Indexing**: `cell[row][col] = base + (row * 0x100 + col) * 0x1c`
+`row` and `col` are in block coordinates (one block = 4×4 grid samples). The scratch array covers the patch rectangle, rounded up to the next multiple of 4 samples.
 
-Where `row` and `col` are in "block" coordinates (each block = 4×4 grid samples). The scratch array covers the patch rectangle rounded up to the nearest 4-sample boundary.
+## 8. Decompiler mistakes and register reuse
 
----
+The Ghidra decompiler mixes up some registers in the softening code. Checked against the raw disassembly:
 
-## 8. DECOMPILER BUGS / REGISTER ALIASING CORRECTIONS
+| Location           | Decompiler says              | Disassembly says               | Note |
+|--------------------|------------------------------|--------------------------------|------|
+| Clearing loop step | `puVar29 += 0x1c00`         | `ADD R9, 0x7000`               | The real row step is 0x7000, so the decompiled 0x1c00 is WRONG for the outer loop. 0x1c00 is the row step of the 5×5 pattern. |
+| 5×5 cell index     | `(local_118+local_120)*0x70`| `IMUL R14, RAX, 0x70`         | Checked: 0x70 = 112 = 4 cells. |
+| Softening passes   | `local_120 = 0x10`          | `MOV EDX, 0x10`                | 16 passes confirmed. |
 
-The Ghidra decompiler incorrectly aliases several registers in the feather kernel. Verified against the raw disassembly:
+About the clearing step: the assembly at 0xd3799 shows `ADD R9, 0x7000`, but the decompiler shows `puVar29 = puVar29 + 0x1c00`. That would make the decompiler wrong: the clearing phase's outer row step would be 0x7000 bytes, not 0x1c00. But the clearing phase uses 0x7000 while the softening phase uses 0x1c00 as its row step, because the clearing loop works at a different grid size. The softening's `(local_118 + local_120) * 0x70` with `local_118 += 0x100` gives `row * 0x100 * 0x70 = row * 0x7000`, which matches the clearing step. Confidence: MEDIUM on the exact clearing step. The decompiler may be right and I may be misreading register reuse in the assembly. 0x1c00 (256 cells × 28 bytes) makes more sense, since the softening phase clearly uses 0x100 cells per row.
 
-| Location          | Decompiler claim            | Actual from disassembly        | Correction |
-|--------------------|------------------------------|--------------------------------|------------|
-| Init loop stride  | `puVar29 += 0x1c00`         | `ADD R9, 0x7000`               | Actual row stride = 0x7000. Decompiled 0x1c00 is WRONG for the outer loop. The 0x1c00 is the 5×5 kernel row stride.|
-| 5×5 cell index    | `(local_118+local_120)*0x70`| `IMUL R14, RAX, 0x70`         | Verified: 0x70 = 112 = 4 cells. |
-| Feather iterations| `local_120 = 0x10`          | `MOV EDX, 0x10`                | 16 passes confirmed.        |
+## 9. Summary: the formulas the port needs
 
-**Important correction on init stride**: The assembly at 0xd3799 shows `ADD R9, 0x7000`, but the decompiler shows `puVar29 = puVar29 + 0x1c00`. The decompiler is wrong here — the actual outer row stride for the init phase is **0x7000 bytes** (not 0x1c00). However, the INIT phase uses 0x7000 while the FEATHER phase uses 0x1c00 as the cell-grid row stride. This is because the init loop operates on a different grid granularity than the feather. The feather's `(local_118 + local_120) * 0x70` with `local_118 += 0x100` gives `row * 0x100 * 0x70 = row * 0x7000`, matching the init stride. **Confidence: MEDIUM** on the exact init-stride value — the decompiler may be correct and I may be misreading the assembly register reuse. The 0x1c00 (256 cells × 28 bytes) is the more logical value since the feather phase clearly uses 0x100 cells per row.
-
----
-
-## 9. SUMMARY — Critical formulas for port accuracy
-
-### Corner heights (GOOD — confirmed)
+### Corner heights (confirmed)
 ```
 h_corner = intersection.unk0[2] * 4.0 + 4.25
 ```
 Each corner uses its own intersection's `unk0[2]`.
 
-### Rectangle bounds (GOOD — confirmed)
+### Rectangle (confirmed)
 ```
 x_min = (pos.x + field_0x30) * 4 + 0x1000    // world→grid
 x_max = (far_west.pos.x - far_west.field_0x30) * 4 + 0x1000
@@ -427,7 +409,7 @@ y_min = (unk0[1] + field_0x2c) * 4 + 0x1000
 y_max = (far_south.unk0[1] - far_south.field_0x2c) * 4 + 0x1000
 ```
 
-### Feather parameters (NEW — previously unknown)
+### Softening settings (NEW, not known before)
 ```
 kernel_radius            = 1/0.0625 = 16 cells = 64 grid samples
 feather_passes           = 16
@@ -438,22 +420,18 @@ smoothstep               = (3 - 2t) * t²
 final_blend(t)           = (1 - smoothstep(max_weight)) * h_orig + smoothstep(max_weight) * h_blend
 ```
 
-### World↔grid (GOOD — confirmed)
+### World and grid (confirmed)
 ```
 grid_sample = world_unit * 4 + 0x1000
 world_unit  = (grid_sample - 0x1000) / 4
 ```
 
----
+## 10. Open questions (less sure)
 
-## 10. OPEN QUESTIONS (lower confidence)
+1. Why four mapTopHeight buffers? All four get the same value in every call to `UpdateMapTopHeightAndClearOccupancyBit`, so checking that all four are > 0 is the same as checking one. My guess is that they are used differently somewhere else (for example at other detail levels or in other terrain phases), but in the CITY ground patch they act as one occupancy check and as the corners of a 2×2 blend inside the 5×5 pattern.
 
-1. **Why four mapTopHeight buffers?** All four are written with the same value in every call to `UpdateMapTopHeightAndClearOccupancyBit`. The 4-corner test `all > 0` is therefore equivalent to testing a single buffer. **Speculation**: They may be used differently elsewhere (e.g., at different LODs or for different terrain generation phases), but within the CITY GROUND patch they serve as a unified occupancy test and a 2×2 interpolation source within the 5×5 kernel.
+2. What is `field_0x28`? The check uses it as a connection flag (`!= -1` for the far south-west corner). The struct layout puts it at offset 40 (the first unnamed field after `streetNorth`). My guess is it could be a "diagonal street" index or a padding or height field.
 
-2. **What does `field_0x28` represent?** It's used in the precondition as a connectivity flag (`!= -1` for the far-SW corner). The struct layout shows it at offset 40 (the first unnamed field after `streetNorth`). **Speculation**: It may be the "diagonal street" index or a "padding/height" field.
+3. The exact clearing-loop step. The decompiler says 0x1c00 but the disassembly shows 0x7000. I think the decompiler is right (0x1c00) and I misread the register reuse in the assembly, because 0x7000 is 7 × 0x1000, which does not fit the cell grid. Confidence: MEDIUM-LOW; another reverser should check.
 
-3. **Exact init-loop stride**: The decompiler says 0x1c00 but the disassembly shows 0x7000. I believe the decompiler is correct (0x1c00) and I've misread the register reuse in the assembly. The 0x7000 would correspond to 7 × 0x1000 which doesn't fit the cell grid model. **Confidence: MEDIUM-LOW**; recommend cross-checking with another reverser.
-
-4. **Why 5×5 sub-kernel within 4×4 blocks?** The 5×5 kernel reads the mapTopHeight buffers and bilinearly interpolates within the 4×4 block. With 5 sub-samples in each direction (step 0.25), the corners of adjacent 5×5 kernels overlap by 1 sample — creating continuous coverage without gaps and without redundant computation at the exact same sample points (the overlap handles the edges).
-
----
+4. Why a 5×5 pattern inside 4×4 blocks? The 5×5 pattern reads the mapTopHeight buffers and blends bilinearly inside the 4×4 block. With 5 sub-samples in each direction (step 0.25), neighbouring 5×5 patterns share their edge samples. That covers the area with no gaps and without working out the same points twice (the shared samples handle the edges).

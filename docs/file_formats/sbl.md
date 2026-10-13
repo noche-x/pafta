@@ -1,10 +1,6 @@
 # SBL block and buildblock format
 
-The `.sbl` extension covers two record families. A block SBL stores renderable
-mesh data. A buildblock SBL stores up to 16 variable-length opening-profile
-layers. Both begin with a `u32`, but no confirmed magic value distinguishes the
-families; the editor recognizes a block only when the first word is 1 or 2 and
-the next three words form valid nonzero dimensions no greater than 64.
+The `.sbl` extension is used for two different kinds of file. A block SBL holds a mesh that can be drawn. A buildblock SBL holds up to 16 opening layers of varying length (doors, windows, and beams). Both start with a `u32`, and no known magic value tells them apart. Pafta treats a file as a block only when the first word is 1 or 2 and the next three words are sizes between 1 and 64.
 
 ## Block header
 
@@ -14,29 +10,26 @@ the next three words form valid nonzero dimensions no greater than 64.
 | `0x04` | `u32` | width in cells |
 | `0x08` | `u32` | height in cells |
 | `0x0c` | `u32` | depth in cells |
-| `0x10` | `u32[6]` | exterior-plane flags |
-| `0x28` | `u32` | authored patch count |
+| `0x10` | `u32[6]` | outside-face flags |
+| `0x28` | `u32` | patch count |
 
-Each nonzero exterior flag generates one or more axis-aligned faces from the
-dimensions. The six indices correspond to the native face-direction table, but
-the final human-readable direction names should come from a direct loader trace
-rather than inference from the editor cube helper.
+Each outside-face flag that is not zero adds one or more flat faces sized from the block's dimensions. The six positions follow the game's face-direction table. The names for each direction should come from tracing the game's loader, not from guessing based on the editor's cube helper.
 
-## Authored patch
+## Patch
 
-Each patch occupies `0x158` bytes.
+Each patch is `0x158` bytes.
 
 | Relative offset | Type | Field |
 |---:|---|---|
 | `0x00` | `u32` | column order |
-| `0x04` | `u32` | column tessellation |
+| `0x04` | `u32` | column subdivision |
 | `0x08` | `u32` | row order |
-| `0x0c` | `u32` | row tessellation |
+| `0x0c` | `u32` | row subdivision |
 | `0x10` | `u32` | normal or material flag A |
 | `0x14` | `u32` | normal or material flag B |
 | `0x18` | `ControlPoint[16]` | Bezier control grid |
 
-One control point occupies 20 bytes:
+Each control point is 20 bytes:
 
 | Relative offset | Type | Field |
 |---:|---|---|
@@ -46,51 +39,34 @@ One control point occupies 20 bytes:
 | `0x0c` | `f32` | U |
 | `0x10` | `f32` | V |
 
-The native in-memory record uses a `0x15c` stride. That extra four-byte runtime
-field does not occur in the file. Readers must advance by `0x158`.
+In the game's memory each record is `0x15c` bytes. The extra four bytes only exist at runtime, not in the file, so readers must step `0x158` bytes per patch.
 
-The editor caps the parsed patch count at `0x400` and clamps tessellation while
-building preview triangles. Those are local safety limits, not confirmed file
-limits.
+Pafta rejects more than `0x400` patches or a patch that is cut off, and it caps the subdivision when building preview triangles. These are Pafta's limits, not confirmed limits of the game.
 
-## Version-2 box section
+## Version-2 boxes
 
-Version 2 stores a `u32` box count immediately after the authored patches
-(`BlockSbl_LoadFromFile @e6e50` reads it only when the version is above 1).
-These records are extra textured boxes, not lights: the game has no lights, and
-`Buildblock_InitTemplateMeshCatalog` passes each record to
-`BuildblockMeshBuilder_AddBoxFaces @19c10`. The editor's code still names them
-`SblBlockLight`. Each record occupies `0x7c` bytes:
+Version 2 stores a `u32` box count right after the patches. `BlockSbl_LoadFromFile @e6e50` only reads it when the version is above 1. These records are extra textured boxes, not lights: `Buildblock_InitTemplateMeshCatalog` hands each one to `BuildblockMeshBuilder_AddBoxFaces @19c10`. Pafta's code still calls them `SblBlockLight`. Each record is `0x7c` bytes:
 
 | Relative offset | Type | Field |
 |---:|---|---|
-| `0x00` | `Vec3f[8]` | eight corners, 96 bytes: 0-3 one ring, 4-7 the ring above it |
-| `0x60` | `u32` | material: the face texture slot |
-| `0x64` | `u32[5]` | read and kept, not used to build the mesh |
-| `0x78` | `u32` | side mask: bit n emits side n (63 = all six) |
+| `0x00` | `Vec3f[8]` | eight corners, 96 bytes: 0-3 are one ring, 4-7 are the ring above it |
+| `0x60` | `u32` | material: the texture slot for its faces |
+| `0x64` | `u32[5]` | read and kept, but not used to build the mesh |
+| `0x78` | `u32` | side mask: bit n draws side n (63 = all six) |
 
-Sides use corners `3 2 1 0`, `7 6 2 3`, `4 7 3 0`, `5 4 0 1`, `6 5 1 2` and
-`4 5 6 7` for bits 0 to 5. The game ORs a UV projection into each side's
-material from its normal (component beyond 0.7071): +Y `0x40000`, -Y `0x30000`,
-+X `0x20000`, -X `0x10000`, +Z `0x60000`, otherwise `0x50000`. The first word is
-the material and the last word the mask; a record written as `63, 0, 0, 0, 0,
-0, 0` has no sides.
+Pafta needs every counted box to fit in the file and rejects more than 256 boxes.
 
-Face materials of a block (patch flag A, box material) are texture slots 0 to
-7 of the building cell that places the block, not global texture indices
-(see `material_for_piece_face` in `scene.cpp`).
+For bits 0 to 5, the sides use corners `3 2 1 0`, `7 6 2 3`, `4 7 3 0`, `5 4 0 1`, `6 5 1 2`, and `4 5 6 7`. The game adds a UV projection to each side's material based on its normal (the component above 0.7071): +Y `0x40000`, -Y `0x30000`, +X `0x20000`, -X `0x10000`, +Z `0x60000`, and `0x50000` for anything else. The first word is the material and the last is the mask, so a record written as `63, 0, 0, 0, 0, 0, 0` has no sides.
 
-Inside a CSX archive, `BlockSblContainer_ReadWrite @1967e0` requires version 1
-but always reads the box count and records, so an archived block is the
-version-2 layout with 1 in the version field.
+A block's face materials (patch flag A and the box material) are texture slots 0 to 7 of the building cell that places the block. They are not global texture numbers. See `material_for_piece_face` in `scene.cpp`.
 
-## Buildblock layer stream
+Inside a CSX archive, `BlockSblContainer_ReadWrite @1967e0` requires version 1 but always reads the box count and boxes. So an archived block uses the version-2 layout with 1 in the version field.
 
-If the block-header test fails, the editor reads variable-length layers from
-offset `0x04` until end of file or 16 layers. The first word remains exposed as
-the template version, but its accepted values and native meaning are unresolved.
+## Buildblock layers
 
-Each layer begins with:
+If the file does not pass the block-header test, Pafta reads layers of varying length from offset `0x04` to the end of the file. It rejects more than 16 layers or a layer that is cut off. The first word is shown as the template version, but nobody knows which values are allowed or what the game does with it.
+
+Each layer starts with:
 
 | Relative offset | Type | Field |
 |---:|---|---|
@@ -101,32 +77,28 @@ Each layer begins with:
 | `0x10` | `f32` | bounds height |
 | `0x14` | `u32` | door count |
 
-Door records follow immediately and occupy 12 bytes:
+The doors come right after, 12 bytes each:
 
 ```text
 type u32, x f32, y f32
 ```
 
-A `u32` window count follows the doors. Each window occupies 20 bytes:
+Next is a `u32` window count, and each window is 20 bytes:
 
 ```text
 type u32, x f32, width f32, y f32, height f32
 ```
 
-A `u32` beam count and the same 20-byte rectangle shape follow the windows.
-There is no per-layer byte count, alignment pad, or fixed file stride.
+Then a `u32` beam count, with beams in the same 20-byte shape as windows. There is no byte count per layer, no padding, and no fixed step through the file.
 
-The editor caps doors at 2 and rectangles at 16 while parsing. Native runtime
-storage uses fixed-size layer structures, but those runtime offsets do not
-describe this variable-length file stream.
+Pafta rejects more than 2 doors, 16 windows, or 16 beams in one layer, and needs every counted record to fit in the file. The game stores layers in fixed-size structures in memory, but those memory offsets do not describe this file layout.
 
-Side codes 3 through 15 select `layers[side_code - 3]`. Portal type 1 changes
-the horizontal mirroring rule on portal sides greater than 1.
+Side codes 3 to 15 pick `layers[side_code - 3]`. Portal type 1 changes how sides with a code above 1 are mirrored horizontally.
 
-## Writer behavior
+## How Pafta writes it
 
-The editor patches block header values, authored-patch data, and buildblock
-layers in place. It does not rebuild an SBL from an empty model, resize a layer,
-or change record counts beyond the space already present in the source file.
-Unknown and trailing bytes remain intact.
+The patch functions change block headers, patches, or existing buildblock layer records directly in the original bytes. Bytes outside the changed ranges stay the same. They cannot add or delete records.
 
+`write_sbl_block` writes a block as version 2, including its patches and boxes. Every patch needs 16 control points. Writing a whole block and patching bytes in place are separate paths.
+
+Map Save uses `rebuild_sbl_buildblock` for loose buildblocks. It preserves the loaded header (new templates start with header 1) and writes the layers Pafta understands, with limits of 16 layers, 2 doors per layer, and 16 windows and 16 beams per layer. This rebuild does not keep bytes Pafta does not understand or anything left at the end. The editor can change existing opening records but cannot add or delete them.

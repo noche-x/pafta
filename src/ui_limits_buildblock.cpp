@@ -1,19 +1,21 @@
-// Game map limits (from subrosa.exe array capacities) and the 2D buildblock
-// face editor with draggable vertices.
+// SPDX-License-Identifier: GPL-2.0-only
+// Game map limits (from the sizes of subrosa.exe's arrays) and the 2D buildblock
+// face editor, whose corners you can drag.
 #include "app_internal.hpp"
 
 #include <imgui.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <string>
 
-namespace map_editor::app_internal {
+namespace pafta::app_internal {
 namespace {
 
-// Capacities recovered from subrosa.exe (see docs/RE_render_shader_spec.md and
-// the CitySbc_Load @0xd5a50 / Sbb_LoadFromFile @0x26830 / _createarea @0x4db20
-// notes). "Sectors" are the 8x8x8-cell blocks the world allocates on demand.
+// Limits found in subrosa.exe (see docs/RE_render_shader_spec.md and the notes on
+// CitySbc_Load @0xd5a50 / Sbb_LoadFromFile @0x26830 / _createarea @0x4db20).
+// "Sectors" are the 8x8x8-cell blocks the world sets up when needed.
 constexpr int kMaxIntersections = 1024;   // file array 0x2e48687c..0x2e48987c, 12 B each
 constexpr int kMaxStreetsSafe = 512;      // no runtime check; file array slack ends at 669
 constexpr int kMaxStreetsHard = 669;
@@ -23,7 +25,7 @@ constexpr int kMaxPortals = 16384;        // g_cityDistrictId, 0xe04 B each up t
 constexpr int kMaxHeaderRecords = 1088;   // 0x35eea090..0x35efb090, 64 B each
 constexpr int kMaxChunks = 512;           // World_AllocateAreaChunkIndex slot table
 constexpr int kMaxSectors = 4096;         // sector tables loop to 0x1000
-constexpr unsigned kMaxBuildingSide = 63; // SBB cell grid is 64 x 64 (loops run 0..size inclusive)
+constexpr unsigned kMaxBuildingSide = 63; // the SBB cell grid is 64 x 64 (loops run from 0 to size, both included)
 constexpr unsigned kMaxBuildingFloors = 192;
 constexpr unsigned kMaxBuildingMaterials = 320;
 constexpr unsigned kMaxBuildingBlockNames = 1088;
@@ -61,7 +63,7 @@ void rebuild_report(EditorProject& project, MapLimitReport& report) {
     count_line("Piece portals", map.portals.size(), kMaxPortals * 9 / 10, kMaxPortals);
     count_line("Header records", map.header_records.size(), kMaxHeaderRecords * 9 / 10, kMaxHeaderRecords);
 
-    // World bounds and space: the scene's replay of the game's load (GameWorldFit).
+    // World bounds and space: the scene's replay of how the game loads (GameWorldFit).
     for (auto& problem : game_world_fit_problems(project)) report.lines.emplace_back(true, std::move(problem));
     const auto& fit = project.city_scene_cache.world_fit;
     report.sectors = static_cast<int>(fit.sectors_used);
@@ -88,13 +90,7 @@ void rebuild_report(EditorProject& project, MapLimitReport& report) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Buildblock face editor helpers
-
 constexpr ImU32 kColBounds = IM_COL32(97, 183, 239, 255);
-constexpr ImU32 kColWindow = IM_COL32(240, 164, 84, 255);
-constexpr ImU32 kColBeam = IM_COL32(132, 216, 147, 255);
-constexpr ImU32 kColDoor = IM_COL32(190, 120, 235, 255);
 constexpr ImU32 kColSelected = IM_COL32(255, 230, 90, 255);
 
 const char* kind_name(int kind) {
@@ -111,7 +107,8 @@ float snap_value(float v, int steps) {
     return std::clamp(std::round(v * static_cast<float>(steps)) / static_cast<float>(steps), 0.0F, 1.0F);
 }
 
-// Uniform rectangle view over the face bounds (x,w,y,h array) and portal rects.
+// A rectangle view, scaled the same in both directions, over the face bounds
+// (x,w,y,h array) and the portal rectangles.
 struct RectRef {
     float* x;
     float* w;
@@ -156,211 +153,302 @@ int draw_map_limit_warnings(EditorProject& project) {
     return static_cast<int>(report.lines.size());
 }
 
+// Draws one buildblock layer in a square the way the game builds the room wall
+// (BuildBlock_AddBeams @1a1c0): wall frames around the bounds opening, beam boxes,
+// glass for each window record, and a marker for each door record. Cell x runs
+// left to right and y bottom to top.
+void draw_buildblock_layer(ImDrawList* dl, ImVec2 min, float side, const SblLayer& layer) {
+    const auto at = [&](float x, float y) { return ImVec2{min.x + x * side, min.y + (1.0F - y) * side}; };
+    const auto fill = [&](float x, float y, float w, float h, ImU32 color) {
+        if (w <= 0.0F || h <= 0.0F) return;
+        dl->AddRectFilled(at(x, y + h), at(x + w, y), color);
+    };
+    // The room behind the opening.
+    dl->AddRectFilled(min, ImVec2(min.x + side, min.y + side), IM_COL32(28, 30, 36, 255));
+    const float x = std::clamp(layer.bounds[0], 0.0F, 1.0F), w = std::clamp(layer.bounds[1], 0.0F, 1.0F - x);
+    const float y = std::clamp(layer.bounds[2], 0.0F, 1.0F), h = std::clamp(layer.bounds[3], 0.0F, 1.0F - y);
+    // The four frames of FUN_140051c60 / BuildBlock_AddBeams.
+    constexpr ImU32 wall = IM_COL32(168, 160, 148, 255);
+    fill(0.0F, 0.0F, x, 1.0F, wall);
+    fill(x + w, 0.0F, 1.0F - (x + w), 1.0F, wall);
+    fill(0.0F, 0.0F, 1.0F, y, wall);
+    fill(0.0F, y + h, 1.0F, 1.0F - (y + h), wall);
+    if (layer.portal_type == 1U) {
+        // An interior layer is an open doorway: show the floor line through it.
+        dl->AddLine(at(x, y), at(x + w, y), IM_COL32(110, 104, 96, 255), std::max(1.0F, side * 0.012F));
+    }
+    for (const auto& beam : layer.beams) {
+        // Wall, overhang, and second overhang beams are boxes; any other type is a thin
+        // mullion (the editor's Wall/Overhang/Overhang2/Mullion Beam buttons).
+        const ImU32 color = beam.type == 0U ? IM_COL32(150, 142, 130, 255) : beam.type == 1U ? IM_COL32(120, 112, 100, 255)
+            : beam.type == 2U ? IM_COL32(96, 88, 78, 255) : IM_COL32(70, 70, 74, 255);
+        fill(beam.x, beam.y, beam.width, beam.height, color);
+        dl->AddRect(at(beam.x, beam.y + beam.height), at(beam.x + beam.width, beam.y), IM_COL32(60, 56, 50, 200));
+    }
+    for (const auto& window : layer.windows) {
+        const auto a = at(window.x, window.y + window.height), b = at(window.x + window.width, window.y);
+        dl->AddRectFilled(a, b, IM_COL32(120, 175, 225, 150));
+        // A highlight across the glass so windows read as glass at a glance.
+        dl->AddLine(ImVec2(a.x + (b.x - a.x) * 0.2F, b.y), ImVec2(a.x + (b.x - a.x) * 0.6F, a.y), IM_COL32(230, 245, 255, 120), 1.5F);
+        dl->AddRect(a, b, IM_COL32(50, 70, 90, 255));
+    }
+    for (const auto& door : layer.doors) {
+        // A door record is a point (where the doorway is), drawn as a small door.
+        const auto p = at(door.x, door.y);
+        const float dw = std::max(4.0F, side * 0.07F), dh = std::max(7.0F, side * 0.13F);
+        dl->AddRectFilled(ImVec2(p.x - dw * 0.5F, p.y - dh), ImVec2(p.x + dw * 0.5F, p.y), IM_COL32(150, 95, 200, 230), 1.5F);
+        dl->AddCircleFilled(ImVec2(p.x + dw * 0.25F, p.y - dh * 0.5F), std::max(1.0F, dw * 0.12F), IM_COL32(240, 220, 120, 255));
+    }
+    dl->AddRect(min, ImVec2(min.x + side, min.y + side), IM_COL32(200, 205, 210, 255));
+}
+
+bool buildblock_layer_button(const char* id, const SblLayer& layer, float size, bool selected) {
+    const auto min = ImGui::GetCursorScreenPos();
+    const bool pressed = ImGui::InvisibleButton(id, ImVec2(size, size));
+    auto* dl = ImGui::GetWindowDrawList();
+    draw_buildblock_layer(dl, min, size, layer);
+    if (selected) dl->AddRect(min, ImVec2(min.x + size, min.y + size), kColSelected, 0.0F, 0, 3.0F);
+    else if (ImGui::IsItemHovered()) dl->AddRect(min, ImVec2(min.x + size, min.y + size), IM_COL32(120, 200, 255, 255), 0.0F, 0, 2.0F);
+    return pressed;
+}
+
+namespace {
+
+void select_item(EditorUi& ui, int kind, int index) {
+    ui.bb_selected_kind = kind;
+    ui.bb_selected_index = index;
+}
+
+// Copies the selected window, beam, or door a little up and right; false when the
+// layer is full.
+bool duplicate_item(SblLayer& layer, EditorUi& ui) {
+    const float step = 1.0F / 16.0F;
+    if (ui.bb_selected_kind == 1 && static_cast<std::size_t>(ui.bb_selected_index) < layer.windows.size() && layer.windows.size() < 16) {
+        auto copy = layer.windows[static_cast<std::size_t>(ui.bb_selected_index)];
+        copy.x = std::min(copy.x + step, 1.0F - copy.width);
+        layer.windows.push_back(copy);
+        select_item(ui, 1, static_cast<int>(layer.windows.size()) - 1);
+    } else if (ui.bb_selected_kind == 2 && static_cast<std::size_t>(ui.bb_selected_index) < layer.beams.size() && layer.beams.size() < 16) {
+        auto copy = layer.beams[static_cast<std::size_t>(ui.bb_selected_index)];
+        copy.y = std::min(copy.y + step, 1.0F - copy.height);
+        layer.beams.push_back(copy);
+        select_item(ui, 2, static_cast<int>(layer.beams.size()) - 1);
+    } else if (ui.bb_selected_kind == 3 && static_cast<std::size_t>(ui.bb_selected_index) < layer.doors.size() && layer.doors.size() < 2) {
+        auto copy = layer.doors[static_cast<std::size_t>(ui.bb_selected_index)];
+        copy.x = std::min(copy.x + step * 4.0F, 1.0F);
+        layer.doors.push_back(copy);
+        select_item(ui, 3, static_cast<int>(layer.doors.size()) - 1);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+bool delete_item(SblLayer& layer, EditorUi& ui) {
+    const auto index = static_cast<std::size_t>(std::max(0, ui.bb_selected_index));
+    if (ui.bb_selected_kind == 1 && index < layer.windows.size()) layer.windows.erase(layer.windows.begin() + static_cast<std::ptrdiff_t>(index));
+    else if (ui.bb_selected_kind == 2 && index < layer.beams.size()) layer.beams.erase(layer.beams.begin() + static_cast<std::ptrdiff_t>(index));
+    else if (ui.bb_selected_kind == 3 && index < layer.doors.size()) layer.doors.erase(layer.doors.begin() + static_cast<std::ptrdiff_t>(index));
+    else return false;
+    select_item(ui, 0, 0);
+    return true;
+}
+
+// Adds a window, beam, or door centred on (cx, cy), or in the middle of the face.
+bool add_item(SblLayer& layer, EditorUi& ui, int kind, float cx = 0.5F, float cy = 0.5F) {
+    const auto clamp01 = [](float v, float size) { return std::clamp(v - size * 0.5F, 0.0F, 1.0F - size); };
+    if (kind == 1 && layer.windows.size() < 16) {
+        layer.windows.push_back({0, clamp01(cx, 0.25F), 0.25F, clamp01(cy, 0.25F), 0.25F});
+        select_item(ui, 1, static_cast<int>(layer.windows.size()) - 1);
+    } else if (kind == 2 && layer.beams.size() < 16) {
+        layer.beams.push_back({0, 0.0F, 1.0F, clamp01(cy, 0.0625F), 0.0625F});
+        select_item(ui, 2, static_cast<int>(layer.beams.size()) - 1);
+    } else if (kind == 3 && layer.doors.size() < 2) {
+        layer.doors.push_back({0, std::clamp(cx, 0.0F, 1.0F), std::clamp(cy, 0.0F, 1.0F)});
+        select_item(ui, 3, static_cast<int>(layer.doors.size()) - 1);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+constexpr const char* kBeamTypes[] = {"Wall beam", "Overhang beam", "Overhang 2 beam", "Mullion"};
+
+} // namespace
+
+// The rows above the canvas: the face picker (previews of each face), the face
+// settings, the add buttons, and the selected item's numbers.
 void draw_buildblock_face_editor(EditorProject& project, EditorUi& ui) {
     if (project.buildblocks.empty()) return;
     ui.selected_buildblock = std::min(ui.selected_buildblock, project.buildblocks.size() - 1U);
-    auto& asset = project.buildblocks[ui.selected_buildblock];
-    auto& model = asset.data;
+    auto& model = project.buildblocks[ui.selected_buildblock].data;
     bool changed = false;
 
-    if (model.layers.empty()) {
-        ImGui::TextDisabled("This buildblock has no faces.");
-        if (ImGui::Button(ICON_FA_PLUS " Add face")) {
-            SblLayer face{};
-            face.bounds = {0, 1, 0, 1};
-            model.layers.push_back(face);
-            mark_buildblock_changed(project, ui);
+    // Faces as previews; click one to edit it.
+    const float thumb = ImGui::GetFrameHeight() * 1.6F;
+    const float spacing = ImGui::GetStyle().ItemSpacing.x;
+    const int per_row = std::max(1, static_cast<int>((ImGui::GetContentRegionAvail().x + spacing) / (thumb + spacing)));
+    for (std::size_t i = 0; i < model.layers.size(); ++i) {
+        ImGui::PushID(static_cast<int>(i));
+        if (i != 0U && i % static_cast<std::size_t>(per_row) == 0U) ImGui::NewLine();
+        if (buildblock_layer_button("##face", model.layers[i], thumb, i == ui.selected_buildblock_layer)) {
+            ui.selected_buildblock_layer = i;
+            select_item(ui, 0, 0);
         }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Face %zu (wall type %zu)\n%zu windows, %zu beams, %zu doors", i + 1, i + 3,
+                model.layers[i].windows.size(), model.layers[i].beams.size(), model.layers[i].doors.size());
+        }
+        ImGui::PopID();
+        ImGui::SameLine();
+    }
+    if (!model.layers.empty() && model.layers.size() % static_cast<std::size_t>(per_row) == 0U) ImGui::NewLine();
+    ImGui::BeginDisabled(model.layers.size() >= 16);
+    if (ImGui::Button(ICON_FA_PLUS "##bbk_add_face", ImVec2(thumb, thumb))) {
+        SblLayer face{};
+        face.index = model.layers.size();
+        face.bounds = {0.25F, 0.5F, 0.25F, 0.5F};
+        model.layers.push_back(face);
+        ui.selected_buildblock_layer = model.layers.size() - 1;
+        select_item(ui, 0, 0);
+        changed = true;
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Add a face (at most 16)");
+    if (model.layers.empty()) {
+        if (changed) mark_buildblock_changed(project, ui);
         return;
     }
     ui.selected_buildblock_layer = std::min(ui.selected_buildblock_layer, model.layers.size() - 1U);
-    ImGui::SetNextItemWidth(-90.0F);
-    const auto face_name = "Face " + std::to_string(ui.selected_buildblock_layer + 1);
-    if (ImGui::BeginCombo("Face##bbk_face", face_name.c_str())) {
-        for (std::size_t i = 0; i < model.layers.size(); ++i) {
-            if (ImGui::Selectable(("Face " + std::to_string(i + 1)).c_str(), i == ui.selected_buildblock_layer)) {
-                ui.selected_buildblock_layer = i;
-                ui.bb_selected_kind = 0;
-                ui.bb_selected_index = 0;
-            }
-        }
-        ImGui::EndCombo();
-    }
-    ImGui::BeginDisabled(model.layers.size() >= 16);
-    if (ImGui::Button(ICON_FA_PLUS " Add face##bbk_add_face")) {
-        SblLayer face{};
-        face.index = model.layers.size();
-        face.bounds = {0, 1, 0, 1};
-        model.layers.push_back(face);
-        ui.selected_buildblock_layer = model.layers.size() - 1;
-        changed = true;
-    }
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    if (ImGui::Button(ICON_FA_ERASER " Clear face##bbk_clear_face")) {
-        // Face numbers are referenced by buildings: clear in place, never shift.
-        model.layers[ui.selected_buildblock_layer] = SblLayer{};
-        model.layers[ui.selected_buildblock_layer].index = ui.selected_buildblock_layer;
-        ui.bb_selected_kind = 0;
-        ui.bb_selected_index = 0;
-        changed = true;
-    }
     auto& layer = model.layers[ui.selected_buildblock_layer];
-    if (layer.portal_type <= 1) {
-        bool mirrored = layer.portal_type == 1;
-        if (ImGui::Checkbox("Mirror on opposite sides##bbk_mirror", &mirrored)) {
-            layer.portal_type = mirrored ? 1 : 0;
-            changed = true;
-        }
-    }
 
-    ImGui::SeparatorText("Add");
-    ImGui::BeginDisabled(layer.doors.size() >= 2);
-    if (ImGui::Button(ICON_FA_DOOR_OPEN " Add door##bbk_add_door")) {
-        layer.doors.push_back({0, 0.5F, 0.0F});
-        ui.bb_selected_kind = 3;
-        ui.bb_selected_index = static_cast<int>(layer.doors.size()) - 1;
-        changed = true;
+    // editor.exe's portal editor has Exterior and Interior buttons for the portal type:
+    // exterior (0) gets an outside face and its windows on every side; interior (1)
+    // is an open doorway with no outside face, mirrored on the south and west sides.
+    if (layer.portal_type <= 1U) {
+        int type = static_cast<int>(layer.portal_type);
+        changed |= ImGui::RadioButton("Exterior", &type, 0);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("A wall with an outside face; windows show on every side.");
+        ImGui::SameLine();
+        changed |= ImGui::RadioButton("Interior", &type, 1);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("An inside opening such as a doorway: no outside face, mirrored on the south and west sides.");
+        layer.portal_type = static_cast<std::uint32_t>(type);
+    } else {
+        ImGui::TextDisabled("Portal type %u", layer.portal_type);
     }
-    ImGui::EndDisabled();
-    ImGui::SameLine();
+    ImGui::SameLine(0.0F, 16.0F);
     ImGui::BeginDisabled(layer.windows.size() >= 16);
-    if (ImGui::Button(ICON_FA_WINDOW_MAXIMIZE " Add window##bbk_add_window")) {
-        layer.windows.push_back({0, 0.375F, 0.25F, 0.375F, 0.25F});
-        ui.bb_selected_kind = 1;
-        ui.bb_selected_index = static_cast<int>(layer.windows.size()) - 1;
-        changed = true;
-    }
+    if (ImGui::Button(ICON_FA_WINDOW_MAXIMIZE " Window")) changed |= add_item(layer, ui, 1);
     ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::BeginDisabled(layer.beams.size() >= 16);
-    if (ImGui::Button(ICON_FA_GRIP_LINES " Add beam##bbk_add_beam")) {
-        layer.beams.push_back({0, 0.0F, 1.0F, 0.9F, 0.1F});
-        ui.bb_selected_kind = 2;
-        ui.bb_selected_index = static_cast<int>(layer.beams.size()) - 1;
-        changed = true;
-    }
+    if (ImGui::Button(ICON_FA_GRIP_LINES " Beam")) changed |= add_item(layer, ui, 2);
     ImGui::EndDisabled();
-
-    ImGui::SeparatorText("Snap");
-    const char* snap_items[] = {"Free", "1/8 cell", "1/16 cell", "1/32 cell"};
+    ImGui::SameLine();
+    ImGui::BeginDisabled(layer.doors.size() >= 2);
+    if (ImGui::Button(ICON_FA_DOOR_OPEN " Door")) changed |= add_item(layer, ui, 3, 0.5F, layer.bounds[2]);
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    const char* snap_items[] = {"Free", "1/8", "1/16", "1/32"};
     int snap_index = ui.bb_snap_steps == 0 ? 0 : ui.bb_snap_steps == 8 ? 1 : ui.bb_snap_steps == 16 ? 2 : 3;
-    ImGui::SetNextItemWidth(-90.0F);
-    if (ImGui::Combo("Grid##bbk_snap", &snap_index, snap_items, 4)) {
+    ImGui::SetNextItemWidth(ImGui::CalcTextSize("1/16").x + ImGui::GetFrameHeight() * 1.8F);
+    if (ImGui::Combo("##bbk_snap", &snap_index, snap_items, 4)) {
         ui.bb_snap_steps = snap_index == 0 ? 0 : snap_index == 1 ? 8 : snap_index == 2 ? 16 : 32;
     }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Snap grid. Hold Shift while dragging to move freely.");
+    ImGui::SameLine();
+    ImGui::TextDisabled(ICON_FA_CIRCLE_QUESTION);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Click an item to select it; drag it to move, drag a corner to resize.\n"
+                          "Drag the opening's edge to change the wall's opening.\n"
+                          "Right-click for more. Delete removes, Ctrl+D copies, arrows nudge.\n"
+                          "Grey: wall. Blue glass: window. Darker strips: beams. Purple: door.");
+    }
 
-    ImGui::SeparatorText("Legend");
-    const auto legend = [](ImU32 color, const char* text) {
-        const auto p = ImGui::GetCursorScreenPos();
-        ImGui::GetWindowDrawList()->AddRectFilled(p, ImVec2(p.x + 12.0F, p.y + 12.0F), color, 2.0F);
-        ImGui::Dummy(ImVec2(16.0F, 12.0F));
+    // The selected item's numbers, all in cell fractions.
+    if (auto r = rect_ref(layer, ui.bb_selected_kind, ui.bb_selected_index); r && ui.bb_selected_kind != 3) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(ui.bb_selected_kind == 0 ? "Opening" : ui.bb_selected_kind == 1 ? "Window" : "Beam");
         ImGui::SameLine();
-        ImGui::TextWrapped("%s", text);
-    };
-    legend(kColBounds, "Face bounds: the wall area this face covers (blue outline)");
-    legend(kColWindow, "Window: glass opening (orange)");
-    legend(kColBeam, "Beam: solid strip across the face (green)");
-    legend(kColDoor, "Door: entrance point (purple dot)");
-    legend(kColSelected, "Selected item and its drag handles (yellow)");
-
-    ImGui::SeparatorText("Items");
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-    ImGui::TextWrapped("Click an item here or in the canvas. Drag corners to resize, the inside to move.");
-    ImGui::PopStyleColor();
-    if (ImGui::BeginTable("##bbk_items", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollY, ImVec2(0.0F, 0.0F))) {
-        ImGui::TableSetupColumn("Item");
-        // Wide enough for four "0.000" values; 150 px clipped the last one.
-        ImGui::TableSetupColumn("x, y, w, h (cells)", ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize("0.000, 0.000, 0.000, 0.000").x + 8.0F);
-        ImGui::TableSetupColumn("##rm", ImGuiTableColumnFlags_WidthFixed, 30.0F);
-        ImGui::TableHeadersRow();
-        const auto row = [&](int kind, int index, float x, float y, float w, float h, bool removable, auto&& remove) {
-            ImGui::PushID(kind * 1000 + index);
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            const bool selected = ui.bb_selected_kind == kind && ui.bb_selected_index == index;
-            const std::string label = kind == 0 ? std::string{kind_name(kind)} : std::string{kind_name(kind)} + " " + std::to_string(index + 1);
-            if (ImGui::Selectable(label.c_str(), selected, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
-                ui.bb_selected_kind = kind;
-                ui.bb_selected_index = index;
-            }
-            ImGui::TableNextColumn();
-            if (kind == 3) {
-                ImGui::Text("%.3f, %.3f", x, y);
-            } else {
-                ImGui::Text("%.3f, %.3f, %.3f, %.3f", x, y, w, h);
-            }
-            ImGui::TableNextColumn();
-            if (removable && ImGui::SmallButton(ICON_FA_XMARK)) {
-                remove();
+        std::array<float, 4> v{*r->x, *r->y, *r->w, *r->h};
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18.0F);
+        if (ImGui::DragFloat4("##bbk_rect", v.data(), 0.005F, 0.0F, 1.0F, "%.3f")) {
+            *r->x = std::clamp(v[0], 0.0F, 1.0F);
+            *r->y = std::clamp(v[1], 0.0F, 1.0F);
+            *r->w = std::clamp(v[2], 0.0F, 1.0F - *r->x);
+            *r->h = std::clamp(v[3], 0.0F, 1.0F - *r->y);
+            changed = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("x, y, width, height (1 = the whole cell)");
+        if (ui.bb_selected_kind == 2) {
+            auto& beam = layer.beams[static_cast<std::size_t>(ui.bb_selected_index)];
+            int type = static_cast<int>(std::min<std::uint32_t>(beam.type, 3U));
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9.0F);
+            if (ImGui::Combo("##beam_type", &type, kBeamTypes, 4)) {
+                beam.type = static_cast<std::uint32_t>(type);
                 changed = true;
             }
-            ImGui::PopID();
-        };
-        row(0, 0, layer.bounds[0], layer.bounds[2], layer.bounds[1], layer.bounds[3], false, [] {});
-        for (std::size_t i = 0; i < layer.windows.size(); ++i) {
-            const auto& r = layer.windows[i];
-            row(1, static_cast<int>(i), r.x, r.y, r.width, r.height, true, [&] { layer.windows.erase(layer.windows.begin() + static_cast<std::ptrdiff_t>(i)); });
-            if (changed) break;
         }
-        if (!changed) for (std::size_t i = 0; i < layer.beams.size(); ++i) {
-            const auto& r = layer.beams[i];
-            row(2, static_cast<int>(i), r.x, r.y, r.width, r.height, true, [&] { layer.beams.erase(layer.beams.begin() + static_cast<std::ptrdiff_t>(i)); });
-            if (changed) break;
+    } else if (ui.bb_selected_kind == 3 && static_cast<std::size_t>(ui.bb_selected_index) < layer.doors.size()) {
+        auto& door = layer.doors[static_cast<std::size_t>(ui.bb_selected_index)];
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Door");
+        ImGui::SameLine();
+        std::array<float, 2> v{door.x, door.y};
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10.0F);
+        if (ImGui::DragFloat2("##bbk_door", v.data(), 0.005F, 0.0F, 1.0F, "%.3f")) {
+            door.x = std::clamp(v[0], 0.0F, 1.0F);
+            door.y = std::clamp(v[1], 0.0F, 1.0F);
+            changed = true;
         }
-        if (!changed) for (std::size_t i = 0; i < layer.doors.size(); ++i) {
-            const auto& d = layer.doors[i];
-            row(3, static_cast<int>(i), d.x, d.y, 0.0F, 0.0F, true, [&] { layer.doors.erase(layer.doors.begin() + static_cast<std::ptrdiff_t>(i)); });
-            if (changed) break;
-        }
-        ImGui::EndTable();
     }
-    if (changed) {
-        ui.bb_selected_index = 0;
-        if (ui.bb_selected_kind == 1 && layer.windows.empty()) ui.bb_selected_kind = 0;
-        if (ui.bb_selected_kind == 2 && layer.beams.empty()) ui.bb_selected_kind = 0;
-        if (ui.bb_selected_kind == 3 && layer.doors.empty()) ui.bb_selected_kind = 0;
-        mark_buildblock_changed(project, ui);
+    if (ui.bb_selected_kind != 0) {
+        ImGui::SameLine();
+        if (ImGui::Button(ICON_FA_TRASH "##bbk_delete")) changed |= delete_item(layer, ui);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete (Delete key)");
     }
+    if (changed) mark_buildblock_changed(project, ui);
 }
 
 void draw_buildblock_face_canvas(EditorProject& project, EditorUi& ui) {
     if (project.buildblocks.empty()) return;
     ui.selected_buildblock = std::min(ui.selected_buildblock, project.buildblocks.size() - 1U);
     auto& model = project.buildblocks[ui.selected_buildblock].data;
-    if (model.layers.empty()) return;
+    if (model.layers.empty()) {
+        ImGui::TextDisabled("This buildblock has no faces. Add one with +.");
+        return;
+    }
     ui.selected_buildblock_layer = std::min(ui.selected_buildblock_layer, model.layers.size() - 1U);
     auto& layer = model.layers[ui.selected_buildblock_layer];
 
-    ImGui::Text("%s  face %zu", project.buildblocks[ui.selected_buildblock].name.c_str(), ui.selected_buildblock_layer + 1);
-    ImGui::SameLine();
-    ImGui::TextDisabled("(1 cell = the whole square)");
+    // The canvas is always square and centred in the space left.
     const auto avail = ImGui::GetContentRegionAvail();
     const float side = std::max(120.0F, std::min(avail.x, avail.y));
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0F, (avail.x - side) * 0.5F));
     const auto origin = ImGui::GetCursorScreenPos();
-    ImGui::InvisibleButton("##bbk_canvas", ImVec2(side, side), ImGuiButtonFlags_MouseButtonLeft);
+    ImGui::InvisibleButton("##bbk_canvas", ImVec2(side, side), ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
     const bool hovered = ImGui::IsItemHovered();
     const bool active = ImGui::IsItemActive();
     auto* dl = ImGui::GetWindowDrawList();
-    const float pad = 10.0F;
+    const float pad = 12.0F;
     const float cell = side - pad * 2.0F;
     const ImVec2 c0{origin.x + pad, origin.y + pad};
     const auto to_screen = [&](float x, float y) { return ImVec2{c0.x + x * cell, c0.y + (1.0F - y) * cell}; };
     const auto to_cell = [&](ImVec2 p) { return std::pair{(p.x - c0.x) / cell, 1.0F - (p.y - c0.y) / cell}; };
 
     dl->AddRectFilled(origin, ImVec2(origin.x + side, origin.y + side), IM_COL32(18, 20, 24, 255), 4.0F);
-    // Cell border and snap grid.
+    draw_buildblock_layer(dl, c0, cell, layer);
+    // Snap grid over the face.
     if (ui.bb_snap_steps > 0) {
         for (int i = 1; i < ui.bb_snap_steps; ++i) {
             const float t = static_cast<float>(i) / ui.bb_snap_steps;
-            const ImU32 col = (ui.bb_snap_steps % 4 == 0 && i % (ui.bb_snap_steps / 4) == 0) ? IM_COL32(70, 76, 84, 255) : IM_COL32(40, 44, 50, 255);
+            const ImU32 col = (ui.bb_snap_steps % 4 == 0 && i % (ui.bb_snap_steps / 4) == 0) ? IM_COL32(0, 0, 0, 70) : IM_COL32(0, 0, 0, 28);
             dl->AddLine(to_screen(t, 0.0F), to_screen(t, 1.0F), col);
             dl->AddLine(to_screen(0.0F, t), to_screen(1.0F, t), col);
         }
     }
-    dl->AddRect(to_screen(0.0F, 1.0F), to_screen(1.0F, 0.0F), IM_COL32(200, 205, 210, 255), 0.0F, 0, 2.0F);
 
-    // Hit testing on press.
     const auto mouse = ImGui::GetIO().MousePos;
     const float handle = 6.0F;
     struct Hit { int kind; int index; int corner; };
@@ -371,46 +459,62 @@ void draw_buildblock_face_canvas(EditorProject& project, EditorUi& ui) {
         }
         const auto a = to_screen(*r.x, *r.y + *r.h);
         const auto b = to_screen(*r.x + *r.w, *r.y);
+        if (kind == 0) {
+            // The opening is picked on its edge, so clicks inside it reach the items.
+            const bool inside = mouse.x >= a.x - 4.0F && mouse.x <= b.x + 4.0F && mouse.y >= a.y - 4.0F && mouse.y <= b.y + 4.0F;
+            const bool deep = mouse.x >= a.x + 4.0F && mouse.x <= b.x - 4.0F && mouse.y >= a.y + 4.0F && mouse.y <= b.y - 4.0F;
+            if (inside && !deep) return Hit{kind, index, -1};
+            return std::nullopt;
+        }
         if (mouse.x >= a.x && mouse.x <= b.x && mouse.y >= a.y && mouse.y <= b.y) return Hit{kind, index, -1};
         return std::nullopt;
     };
-    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+    const auto hit_test = [&]() -> std::optional<Hit> {
         std::optional<Hit> hit;
-        // Doors first (small), then the selected item, then windows/beams, then bounds.
+        // Doors first (they are small), then the selected item, then windows and beams,
+        // then the opening's edge.
         for (std::size_t i = 0; i < layer.doors.size() && !hit; ++i) {
             const auto p = to_screen(layer.doors[i].x, layer.doors[i].y);
-            if (std::abs(mouse.x - p.x) <= handle + 3.0F && std::abs(mouse.y - p.y) <= handle + 3.0F) hit = Hit{3, static_cast<int>(i), -1};
+            const float dh = std::max(7.0F, cell * 0.13F);
+            if (std::abs(mouse.x - p.x) <= handle + 3.0F && mouse.y <= p.y + 3.0F && mouse.y >= p.y - dh - 3.0F) hit = Hit{3, static_cast<int>(i), -1};
         }
         if (!hit && ui.bb_selected_kind != 3) {
             if (auto r = rect_ref(layer, ui.bb_selected_kind, ui.bb_selected_index)) hit = rect_hit(ui.bb_selected_kind, ui.bb_selected_index, *r);
         }
         for (int kind = 1; kind <= 2 && !hit; ++kind) {
             auto& rects = kind == 1 ? layer.windows : layer.beams;
-            for (std::size_t i = 0; i < rects.size() && !hit; ++i) {
+            for (std::size_t i = rects.size(); i-- > 0 && !hit;) {
                 if (auto r = rect_ref(layer, kind, static_cast<int>(i))) hit = rect_hit(kind, static_cast<int>(i), *r);
             }
         }
         if (!hit) {
             if (auto r = rect_ref(layer, 0, 0)) hit = rect_hit(0, 0, *r);
         }
-        if (hit) {
-            ui.bb_selected_kind = hit->kind;
-            ui.bb_selected_index = hit->index;
-            ui.bb_drag_kind = hit->kind;
-            ui.bb_drag_index = hit->index;
-            ui.bb_drag_corner = hit->corner;
-            const auto [mx, my] = to_cell(mouse);
-            if (hit->kind == 3) {
-                ui.bb_drag_off_x = layer.doors[static_cast<std::size_t>(hit->index)].x - mx;
-                ui.bb_drag_off_y = layer.doors[static_cast<std::size_t>(hit->index)].y - my;
-            } else if (auto r = rect_ref(layer, hit->kind, hit->index)) {
-                ui.bb_drag_off_x = *r->x - mx;
-                ui.bb_drag_off_y = *r->y - my;
+        return hit;
+    };
+    const auto hover = hovered ? hit_test() : std::nullopt;
+    if (hovered && (ImGui::IsMouseClicked(ImGuiMouseButton_Left) || ImGui::IsMouseClicked(ImGuiMouseButton_Right))) {
+        if (const auto hit = hover) {
+            select_item(ui, hit->kind, hit->index);
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                ui.bb_drag_kind = hit->kind;
+                ui.bb_drag_index = hit->index;
+                ui.bb_drag_corner = hit->corner;
+                const auto [mx, my] = to_cell(mouse);
+                if (hit->kind == 3) {
+                    ui.bb_drag_off_x = layer.doors[static_cast<std::size_t>(hit->index)].x - mx;
+                    ui.bb_drag_off_y = layer.doors[static_cast<std::size_t>(hit->index)].y - my;
+                } else if (auto r = rect_ref(layer, hit->kind, hit->index)) {
+                    ui.bb_drag_off_x = *r->x - mx;
+                    ui.bb_drag_off_y = *r->y - my;
+                }
+                ui.bb_drag_changed = false;
             }
-            ui.bb_drag_changed = false;
+        } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            select_item(ui, 0, 0);
         }
     }
-    // Drag.
+    // Dragging.
     if (active && ui.bb_drag_kind >= 0 && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0F)) {
         const auto [mx, my] = to_cell(mouse);
         const bool free = ImGui::GetIO().KeyShift;
@@ -429,7 +533,7 @@ void draw_buildblock_face_canvas(EditorProject& project, EditorUi& ui) {
                 *r->x = std::clamp(snap_value(mx + ui.bb_drag_off_x, steps), 0.0F, 1.0F - w);
                 *r->y = std::clamp(snap_value(my + ui.bb_drag_off_y, steps), 0.0F, 1.0F - h);
             } else {
-                // Corner drag: the opposite corner stays fixed.
+                // Dragging a corner: the opposite corner stays where it is.
                 float x0 = *r->x, y0 = *r->y, x1 = *r->x + *r->w, y1 = *r->y + *r->h;
                 const float sx = snap_value(mx, steps);
                 const float sy = snap_value(my, steps);
@@ -453,40 +557,118 @@ void draw_buildblock_face_canvas(EditorProject& project, EditorUi& ui) {
         ui.bb_drag_changed = false;
     }
 
-    // Draw items.
-    const auto draw_rect = [&](int kind, int index, const RectRef& r, ImU32 color, bool fill) {
-        const bool selected = ui.bb_selected_kind == kind && ui.bb_selected_index == index;
-        const auto a = to_screen(*r.x, *r.y + *r.h);
-        const auto b = to_screen(*r.x + *r.w, *r.y);
-        if (fill) dl->AddRectFilled(a, b, (color & 0x00FFFFFF) | 0x50000000);
-        dl->AddRect(a, b, selected ? kColSelected : color, 0.0F, 0, selected ? 2.5F : 1.5F);
-        if (selected) {
-            const ImVec2 corners[4] = {to_screen(*r.x, *r.y), to_screen(*r.x + *r.w, *r.y), to_screen(*r.x + *r.w, *r.y + *r.h), to_screen(*r.x, *r.y + *r.h)};
-            for (const auto& c : corners) {
-                dl->AddRectFilled(ImVec2(c.x - handle, c.y - handle), ImVec2(c.x + handle, c.y + handle), kColSelected);
-                dl->AddRect(ImVec2(c.x - handle, c.y - handle), ImVec2(c.x + handle, c.y + handle), IM_COL32(0, 0, 0, 255));
+    // Keys while the mouse is over the canvas.
+    bool changed = false;
+    if (hovered) {
+        const auto& io = ImGui::GetIO();
+        const bool command = io.KeyCtrl || io.KeySuper;
+        if (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace)) changed |= delete_item(layer, ui);
+        if (command && ImGui::IsKeyPressed(ImGuiKey_D)) changed |= duplicate_item(layer, ui);
+        const float step = io.KeyShift ? 1.0F / 64.0F : 1.0F / static_cast<float>(ui.bb_snap_steps > 0 ? ui.bb_snap_steps : 64);
+        const float dx = ImGui::IsKeyPressed(ImGuiKey_RightArrow) ? step : ImGui::IsKeyPressed(ImGuiKey_LeftArrow) ? -step : 0.0F;
+        const float dy = ImGui::IsKeyPressed(ImGuiKey_UpArrow) ? step : ImGui::IsKeyPressed(ImGuiKey_DownArrow) ? -step : 0.0F;
+        if (dx != 0.0F || dy != 0.0F) {
+            if (ui.bb_selected_kind == 3 && static_cast<std::size_t>(ui.bb_selected_index) < layer.doors.size()) {
+                auto& d = layer.doors[static_cast<std::size_t>(ui.bb_selected_index)];
+                d.x = std::clamp(d.x + dx, 0.0F, 1.0F);
+                d.y = std::clamp(d.y + dy, 0.0F, 1.0F);
+                changed = true;
+            } else if (auto r = rect_ref(layer, ui.bb_selected_kind, ui.bb_selected_index)) {
+                *r->x = std::clamp(*r->x + dx, 0.0F, 1.0F - *r->w);
+                *r->y = std::clamp(*r->y + dy, 0.0F, 1.0F - *r->h);
+                changed = true;
             }
         }
+        if (ImGui::IsKeyPressed(ImGuiKey_Tab)) {
+            // Tab steps through the opening, the windows, the beams, and the doors.
+            std::vector<std::pair<int, int>> order{{0, 0}};
+            for (int i = 0; i < static_cast<int>(layer.windows.size()); ++i) order.emplace_back(1, i);
+            for (int i = 0; i < static_cast<int>(layer.beams.size()); ++i) order.emplace_back(2, i);
+            for (int i = 0; i < static_cast<int>(layer.doors.size()); ++i) order.emplace_back(3, i);
+            const auto it = std::ranges::find(order, std::pair{ui.bb_selected_kind, ui.bb_selected_index});
+            const auto next = it == order.end() ? 0U : static_cast<std::size_t>(it - order.begin() + 1) % order.size();
+            select_item(ui, order[next].first, order[next].second);
+        }
+    }
+    // Right-click menu: add at the cursor, or act on the item under it.
+    static std::pair<float, float> menu_at{0.5F, 0.5F};
+    if (hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Right)) {
+        menu_at = to_cell(mouse);
+        ImGui::OpenPopup("##bbk_canvas_menu");
+    }
+    if (ImGui::BeginPopup("##bbk_canvas_menu")) {
+        const auto [mx, my] = menu_at;
+        if (ui.bb_selected_kind != 0) {
+            ImGui::TextDisabled("%s %d", kind_name(ui.bb_selected_kind), ui.bb_selected_index + 1);
+            if (ImGui::MenuItem(ICON_FA_COPY " Duplicate", "Ctrl+D")) changed |= duplicate_item(layer, ui);
+            if (ui.bb_selected_kind == 2 && static_cast<std::size_t>(ui.bb_selected_index) < layer.beams.size() && ImGui::BeginMenu("Beam type")) {
+                auto& beam = layer.beams[static_cast<std::size_t>(ui.bb_selected_index)];
+                for (std::uint32_t t = 0; t < 4; ++t) {
+                    if (ImGui::MenuItem(kBeamTypes[t], nullptr, std::min<std::uint32_t>(beam.type, 3U) == t)) {
+                        beam.type = t;
+                        changed = true;
+                    }
+                }
+                ImGui::EndMenu();
+            }
+            if (ImGui::MenuItem(ICON_FA_TRASH " Delete", "Delete")) changed |= delete_item(layer, ui);
+            ImGui::Separator();
+        }
+        if (ImGui::MenuItem(ICON_FA_WINDOW_MAXIMIZE " Add window here", nullptr, false, layer.windows.size() < 16)) changed |= add_item(layer, ui, 1, mx, my);
+        if (ImGui::MenuItem(ICON_FA_GRIP_LINES " Add beam here", nullptr, false, layer.beams.size() < 16)) changed |= add_item(layer, ui, 2, mx, my);
+        if (ImGui::MenuItem(ICON_FA_DOOR_OPEN " Add door here", nullptr, false, layer.doors.size() < 2)) changed |= add_item(layer, ui, 3, mx, my);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Opening fills the face")) {
+            layer.bounds = {0.0F, 1.0F, 0.0F, 1.0F};
+            changed = true;
+        }
+        if (ImGui::MenuItem("Clear this face")) {
+            // Buildings refer to faces by number: clear in place, never move the others down.
+            layer = SblLayer{};
+            layer.index = ui.selected_buildblock_layer;
+            select_item(ui, 0, 0);
+            changed = true;
+        }
+        ImGui::EndPopup();
+    }
+    if (changed) mark_buildblock_changed(project, ui);
+
+    // Selection and hover outlines with drag handles.
+    const auto outline = [&](int kind, int index, ImU32 color, bool handles) {
+        if (kind == 3) {
+            if (static_cast<std::size_t>(index) >= layer.doors.size()) return;
+            const auto p = to_screen(layer.doors[static_cast<std::size_t>(index)].x, layer.doors[static_cast<std::size_t>(index)].y);
+            const float dw = std::max(4.0F, cell * 0.07F), dh = std::max(7.0F, cell * 0.13F);
+            dl->AddRect(ImVec2(p.x - dw * 0.5F - 2.0F, p.y - dh - 2.0F), ImVec2(p.x + dw * 0.5F + 2.0F, p.y + 2.0F), color, 2.0F, 0, 2.5F);
+            return;
+        }
+        const auto r = rect_ref(layer, kind, index);
+        if (!r) return;
+        const auto a = to_screen(*r->x, *r->y + *r->h);
+        const auto b = to_screen(*r->x + *r->w, *r->y);
+        dl->AddRect(a, b, color, 0.0F, 0, 2.5F);
+        if (!handles) return;
+        const ImVec2 corners[4] = {to_screen(*r->x, *r->y), to_screen(*r->x + *r->w, *r->y), to_screen(*r->x + *r->w, *r->y + *r->h), to_screen(*r->x, *r->y + *r->h)};
+        for (const auto& c : corners) {
+            dl->AddRectFilled(ImVec2(c.x - handle, c.y - handle), ImVec2(c.x + handle, c.y + handle), color);
+            dl->AddRect(ImVec2(c.x - handle, c.y - handle), ImVec2(c.x + handle, c.y + handle), IM_COL32(0, 0, 0, 255));
+        }
     };
-    if (auto r = rect_ref(layer, 0, 0)) draw_rect(0, 0, *r, kColBounds, false);
-    for (std::size_t i = 0; i < layer.beams.size(); ++i) {
-        if (auto r = rect_ref(layer, 2, static_cast<int>(i))) draw_rect(2, static_cast<int>(i), *r, kColBeam, true);
+    // The opening's edge is always shown, so it can be found and dragged.
+    if (auto r = rect_ref(layer, 0, 0)) {
+        dl->AddRect(to_screen(*r->x, *r->y + *r->h), to_screen(*r->x + *r->w, *r->y), kColBounds, 0.0F, 0, 1.5F);
     }
-    for (std::size_t i = 0; i < layer.windows.size(); ++i) {
-        if (auto r = rect_ref(layer, 1, static_cast<int>(i))) draw_rect(1, static_cast<int>(i), *r, kColWindow, true);
+    if (hover && !(hover->kind == ui.bb_selected_kind && hover->index == ui.bb_selected_index)) {
+        outline(hover->kind, hover->index, IM_COL32(120, 200, 255, 255), false);
     }
-    for (std::size_t i = 0; i < layer.doors.size(); ++i) {
-        const auto p = to_screen(layer.doors[i].x, layer.doors[i].y);
-        const bool selected = ui.bb_selected_kind == 3 && ui.bb_selected_index == static_cast<int>(i);
-        dl->AddCircleFilled(p, handle + 1.0F, selected ? kColSelected : kColDoor);
-        dl->AddCircle(p, handle + 1.0F, IM_COL32(0, 0, 0, 255));
-    }
-    // Cursor readout.
+    outline(ui.bb_selected_kind, ui.bb_selected_index, kColSelected, true);
     if (hovered) {
         const auto [mx, my] = to_cell(mouse);
-        dl->AddText(ImVec2(origin.x + 4.0F, origin.y + side - 18.0F), IM_COL32(200, 205, 210, 255),
-            (std::to_string(std::round(mx * 1000.0F) / 1000.0F).substr(0, 5) + ", " + std::to_string(std::round(my * 1000.0F) / 1000.0F).substr(0, 5)).c_str());
+        char text[48];
+        std::snprintf(text, sizeof(text), "%.3f, %.3f", std::clamp(mx, 0.0F, 1.0F), std::clamp(my, 0.0F, 1.0F));
+        dl->AddText(ImVec2(origin.x + 4.0F, origin.y + side - ImGui::GetFontSize() - 2.0F), IM_COL32(200, 205, 210, 255), text);
+        if (hover) ImGui::SetMouseCursor(hover->corner >= 0 ? ImGuiMouseCursor_ResizeAll : ImGuiMouseCursor_Hand);
     }
 }
 
-} // namespace map_editor::app_internal
+} // namespace pafta::app_internal

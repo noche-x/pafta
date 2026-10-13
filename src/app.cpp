@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #include "app.hpp"
 #include "app_internal.hpp"
 #include "mesh_export.hpp"
@@ -15,7 +16,6 @@
 
 #ifndef __EMSCRIPTEN__
 #include "file_dialogs.hpp"
-#include <nfd.hpp>
 #endif
 
 #include <algorithm>
@@ -49,42 +49,45 @@
 #include <emscripten/emscripten.h>
 #endif
 
-// raylib's bundled GLFW desktop backend exports these (they are defined in
-// libraylib.a and raylib calls glfwGetKeyName internally), but raylib does not
-// re-export them. Forward-declaring lets us show layout-correct key labels
-// without pulling in the GLFW header or touching the build graph.
+// raylib's bundled GLFW desktop backend defines these in libraylib.a and calls
+// glfwGetKeyName itself, but raylib does not re-export them. Declaring them
+// here lets us show key labels for the user's layout without including the
+// GLFW header or changing the build.
 #ifndef __EMSCRIPTEN__
 extern "C" const char* glfwGetKeyName(int key, int scancode);
 extern "C" int glfwGetKeyScancode(int key);
 #endif
 
-namespace map_editor::app_internal {
+namespace pafta::app_internal {
 
-#ifndef __EMSCRIPTEN__
-std::string path_utf8(const std::filesystem::path& path) {
-    const auto bytes = path.u8string();
-    return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
-}
-#endif
-
-// A failure the user must see: status keeps showing it, and the "Operation
-// failed" popup opens once for it. Plain status text never opens the popup.
+// An error the user has to see. The status bar keeps showing it, and the
+// "Operation failed" popup opens once for it. Plain status text never opens
+// the popup.
 std::string g_failure_message;
 void report_failure(std::string& status, std::string message) {
     status = message;
     g_failure_message = std::move(message);
 }
 
+void release_web_project(const std::filesystem::path& root) {
 #ifdef __EMSCRIPTEN__
-// Filled by web/file_upload.js after the browser copies a selected directory
-// into Emscripten's virtual filesystem. The editor consumes it at the same
-// deferred point as a native folder drop, after the current frame is presented.
+    const auto path = root.string();
+    EM_ASM({ window.paftaBrowserReleaseProject(UTF8ToString($0)); }, path.c_str());
+#else
+    (void)root;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+// Set by web/file_upload.js once the browser has copied the chosen folder into
+// Emscripten's virtual file system. The editor picks it up at the same point as
+// a native folder drop, after the current frame is shown.
 std::optional<std::filesystem::path> g_web_uploaded_folder;
 
-// Loading a project is deliberately synchronous because raylib texture uploads
-// must run on the browser's GL thread. The caller yields once before loading;
-// nested Asyncify sleeps here accumulate suspended C++ parser stacks and can
-// fail to resume on large projects.
+// Loading runs on one thread on purpose, because raylib texture uploads have to
+// happen on the browser's GL thread. The caller yields once before loading.
+// Yielding again in here (nested Asyncify sleeps) piles up paused parser stacks,
+// which can fail to resume on big projects.
 void report_web_load_progress(std::string_view stage, int percent) {
     const auto message = std::string{"Loading "} + std::string{stage} + "... "
         + std::to_string(std::clamp(percent, 0, 100)) + "%";
@@ -94,7 +97,7 @@ void report_web_load_progress(std::string_view stage, int percent) {
     }, message.c_str());
 }
 
-// The browser build has no writable disk; saved files go to the user as
+// The browser build cannot write to disk, so saved files reach the user as
 // downloads.
 void web_download(const std::string& name, const std::vector<std::uint8_t>& bytes) {
     EM_ASM({
@@ -109,19 +112,20 @@ void web_download(const std::string& name, const std::vector<std::uint8_t>& byte
     }, name.c_str(), bytes.data(), bytes.size());
 }
 
-extern "C" EMSCRIPTEN_KEEPALIVE void map_editor_web_files_ready(const char* root) {
+extern "C" EMSCRIPTEN_KEEPALIVE void pafta_web_files_ready(const char* root) {
     if (root != nullptr && root[0] != '\0') {
+        if (g_web_uploaded_folder) release_web_project(*g_web_uploaded_folder);
         g_web_uploaded_folder = std::filesystem::path{root};
     }
 }
 #endif
 
-// Display label for a key, localized to the user's keyboard layout. raylib's
-// IsKeyPressed checks physical key POSITION (US-QWERTY scancodes), so the
-// movement/edit keys keep the same physical spots on every layout; this only
-// changes what we PRINT, e.g. the physical W position shows "Z" on AZERTY.
-// glfwGetKeyName returns the layout label for printable keys and null for
-// non-printable ones (arrows, Tab, Delete...), which fall back to a fixed name.
+// The label for a key, in the user's keyboard layout. raylib's IsKeyPressed
+// checks where a key physically is (US-QWERTY scancodes), so movement and edit
+// keys stay in the same place on every layout. This only changes the text we
+// show: for example the key in the W position shows "Z" on AZERTY.
+// glfwGetKeyName gives the layout's label for printable keys and null for the
+// rest (arrows, Tab, Delete...), which use a fixed name instead.
 std::string key_label(int key) {
 #ifdef __EMSCRIPTEN__
     switch (key) {
@@ -144,9 +148,9 @@ std::string key_label(int key) {
 #else
     if (const char* name = glfwGetKeyName(key, glfwGetKeyScancode(key)); name != nullptr && name[0] != '\0') {
         std::string label{name};
-        // glfwGetKeyName returns UTF-8; only uppercase plain ASCII bytes so a
-        // multi-byte sequence (e.g. an accented layout key) is never split into
-        // an invalid byte that the font then renders as a box.
+        // glfwGetKeyName returns UTF-8. Only plain ASCII bytes are uppercased, so a
+        // multi-byte character (such as an accented key) is never split into a broken
+        // byte that the font would draw as a box.
         for (auto& ch : label) {
             const auto byte = static_cast<unsigned char>(ch);
             if (byte < 0x80U) {
@@ -358,755 +362,9 @@ void draw_graphics_debug_window(bool& open, GfxDebugStats& stats) {
     ImGui::End();
 }
 
-std::string lower_extension(const std::filesystem::path& path) {
-    auto extension = path.extension().string();
-    std::ranges::transform(extension, extension.begin(), [](unsigned char value) {
-        return static_cast<char>(std::tolower(value));
-    });
-    return extension;
-}
-
-std::string stem_name(const std::filesystem::path& path) {
-    return path.stem().string();
-}
-
-std::vector<std::filesystem::path> files_with_extension(const std::filesystem::path& dir, std::string_view extension);
-
-// World_LoadMapAndInitializeTerrain @56980 changes into data/<map> and opens
-// the fixed name "test.csx" (Csx_OpenAndIndexAssetArchive @1979d0); no other
-// archive is read. Folders without one fall back to every .csx they hold, so
-// archives saved under other names by older editor builds still open.
-constexpr const char* kGameArchiveName = "test.csx";
-
-// isMapAutoGenerated: _resetgame sets it when the map is named "round".
-bool project_is_auto_generated(const EditorProject& project) {
-    return project.root.filename() == "round";
-}
-
-std::vector<std::filesystem::path> project_archive_paths(const EditorProject& project) {
-    const auto game_archive = project.root / kGameArchiveName;
-    if (std::filesystem::exists(game_archive)) return {game_archive};
-    return files_with_extension(project.root, ".csx");
-}
-
-std::string lower_name(std::string_view value) {
-    std::string lowered{value};
-    std::ranges::transform(lowered, lowered.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-    return lowered;
-}
-
-std::string city_block_label(const SbcCityBlock& city_block) {
-    return std::string{city_block_display_name(city_block)};
-}
-
-std::uint32_t read_le_u32(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
-    if (offset + 4U > bytes.size()) {
-        return 0U;
-    }
-    return static_cast<std::uint32_t>(bytes[offset]) |
-        (static_cast<std::uint32_t>(bytes[offset + 1U]) << 8U) |
-        (static_cast<std::uint32_t>(bytes[offset + 2U]) << 16U) |
-        (static_cast<std::uint32_t>(bytes[offset + 3U]) << 24U);
-}
-
-void configure_texture(Texture2D& texture) {
-    GenTextureMipmaps(&texture);
-    SetTextureWrap(texture, TEXTURE_WRAP_REPEAT);
-    SetTextureFilter(texture, TEXTURE_FILTER_TRILINEAR);
-    rlTextureParameters(texture.id, RL_TEXTURE_FILTER_ANISOTROPIC, g_render_settings.anisotropy);
-}
-
-// Runs body(i) for i in [0, count) across a bounded set of worker threads (capped
-// at hardware_concurrency, min 1), blocking until all complete. body must be
-// thread-safe for distinct i. Used to fan out the CPU-bound load-time work (PNG
-// decode, CSX parse) without spawning one thread per item.
-template <typename Body>
-void parallel_for(std::size_t count, Body&& body) {
-    if (count == 0) {
-        return;
-    }
-#ifdef __EMSCRIPTEN__
-    // This target does not enable pthreads. std::async workers cannot run while
-    // the main browser thread waits on their futures, so load assets serially.
-    for (std::size_t i = 0; i < count; ++i) {
-        body(i);
-    }
-    return;
-#else
-    const unsigned hw = std::max(1U, std::thread::hardware_concurrency());
-    const std::size_t workers = std::min<std::size_t>(count, hw);
-    if (workers <= 1) {
-        for (std::size_t i = 0; i < count; ++i) {
-            body(i);
-        }
-        return;
-    }
-    std::atomic<std::size_t> next{0};
-    std::vector<std::future<void>> futures;
-    futures.reserve(workers);
-    for (std::size_t w = 0; w < workers; ++w) {
-        futures.push_back(std::async(std::launch::async, [&next, count, &body] {
-            for (std::size_t i = next.fetch_add(1); i < count; i = next.fetch_add(1)) {
-                body(i);
-            }
-        }));
-    }
-    for (auto& future : futures) {
-        future.get();
-    }
-#endif
-}
-
-// editor.exe LoadTexture_PNG_ToBuffer @14003ab40 writes each source row into dest
-// row (height-1 - row), i.e. it flips PNGs vertically at load for OpenGL's
-// bottom-left texture origin. Block UVs are authored against that flipped image, so
-// raylib (which uploads PNG rows top-down) must flip too or every texture is
-// upside-down. Only obvious on textures with vertical orientation (text/figures).
-//
-// CPU-only decode stage (no GL): produces a flipped raylib Image. Safe to run on a
-// worker thread; raylib's LoadImage*/ImageFlipVertical touch only local pixel data
-// (stbi has no shared state in the default config). The GL upload stays on the main
-// thread in upload_decoded_image.
-Image decode_flipped_png_from_file(const std::filesystem::path& path) {
-    Image image = LoadImage(path.string().c_str());
-    if (!IsImageValid(image)) {
-        return Image{};
-    }
-    ImageFlipVertical(&image);
-    return image;
-}
-
-Image decode_flipped_embedded_png(const std::vector<std::uint8_t>& payload, bool material) {
-    if (payload.size() < 0x4cU || read_le_u32(payload, 0U) != 1U) {
-        return Image{};
-    }
-    const auto color_size = static_cast<std::size_t>(read_le_u32(payload, 0x44U));
-    const auto material_size = static_cast<std::size_t>(read_le_u32(payload, 0x48U));
-    const auto image_offset = 0x4cU + (material ? color_size : 0U);
-    const auto image_size = material ? material_size : color_size;
-    if (image_size == 0U || image_offset > payload.size() || image_size > payload.size() - image_offset) {
-        return Image{};
-    }
-    const auto* image_bytes = payload.data() + image_offset;
-    if (image_size < 2U || image_bytes[0] != 0x89U || image_bytes[1] != 0x50U) {
-        return Image{};
-    }
-    Image image = LoadImageFromMemory(".png", image_bytes, static_cast<int>(image_size));
-    if (!IsImageValid(image)) {
-        return Image{};
-    }
-    ImageFlipVertical(&image);
-    return image;
-}
-
-// GL upload stage (main thread only). Consumes the decoded Image and returns a
-// Texture2D (id==0 on failure, which the registration pass skips). Frees the image.
-Texture2D upload_decoded_image(Image image) {
-    if (!IsImageValid(image)) {
-        return Texture2D{};
-    }
-    Texture2D texture = LoadTextureFromImage(image);
-    UnloadImage(image);
-    return texture;
-}
-
-const Texture2D* texture_for_material(const EditorProject& project, std::string_view material_name) {
-    if (material_name.empty()) {
-        return nullptr;
-    }
-    const auto lowered = lower_name(material_name);
-    for (const auto& tex : project.textures) {
-        if (lower_name(tex.name) == lowered) {
-            return &tex.texture;
-        }
-    }
-    return nullptr;
-}
-
-void load_project_textures(EditorProject& project) {
-    MAPED_PROFILE_FUNCTION();
-#ifdef __EMSCRIPTEN__
-    report_web_load_progress("textures", 63);
-#endif
-    std::unordered_map<std::string, std::size_t> loaded_names;
-    std::unordered_map<std::string, std::size_t> loaded_material_names;
-
-    // One decode task: a name, whether it overrides (CSX-wins upsert) or only adds,
-    // and a closure that produces the flipped Image off the main thread. The decode
-    // (PNG/stbi) is CPU-bound and dominated load time; the GL upload below stays
-    // serial on the main thread. Order is preserved exactly: texture/*.png, then
-    // root *.png, then CSX-embedded textures in archive order — texture indices and
-    // the CSX-wins merge depend on this sequence.
-    struct DecodeTask {
-        std::string name;
-        bool upsert;
-        bool material;
-        std::function<Image()> decode;
-    };
-    std::vector<DecodeTask> tasks;
-
-    for (const auto& path : files_with_extension(project.root / "texture", ".png")) {
-        tasks.push_back({stem_name(path), false, false, [path] { return decode_flipped_png_from_file(path); }});
-    }
-    for (const auto& path : files_with_extension(project.root / "texturematerial", ".png")) {
-        tasks.push_back({stem_name(path), false, true, [path] { return decode_flipped_png_from_file(path); }});
-    }
-    for (const auto& path : files_with_extension(project.root, ".png")) {
-        auto name = stem_name(path);
-        const auto material = name.ends_with("_material");
-        if (material) {
-            name.resize(name.size() - std::string_view{"_material"}.size());
-        }
-        tasks.push_back({std::move(name), false, material, [path] { return decode_flipped_png_from_file(path); }});
-    }
-    // CSX archives are parsed in parallel; the texture entries they expose are then
-    // appended as decode tasks in archive order (matching the previous serial walk).
-    {
-        MAPED_PROFILE_BLOCK("parse csx archives (textures)");
-        const auto csx_paths = project_archive_paths(project);
-        std::vector<CsxArchive> archives(csx_paths.size());
-        parallel_for(csx_paths.size(), [&](std::size_t i) { archives[i] = parse_csx_file(csx_paths[i]); });
-        for (auto& archive : archives) {
-            for (const auto& entry : archive.entries) {
-                if (entry.kind != CsxEntryKind::Texture) {
-                    continue;
-                }
-                tasks.push_back({entry.name, true, false, [payload = entry.payload] {
-                                     return decode_flipped_embedded_png(payload, false);
-                                 }});
-                tasks.push_back({entry.name, true, true, [payload = entry.payload] {
-                                     return decode_flipped_embedded_png(payload, true);
-                                 }});
-            }
-        }
-    }
-
-#ifdef __EMSCRIPTEN__
-    report_web_load_progress("decode textures", 68);
-#endif
-
-    // Parallel decode stage: each task's PNG is decoded + flipped on a worker. The
-    // results are collected in task order so the serial upload below is identical to
-    // the old single-threaded order.
-    std::vector<Image> decoded(tasks.size());
-    {
-        MAPED_PROFILE_BLOCK("parallel png decode");
-        const bool half = g_render_settings.half_textures;
-        parallel_for(tasks.size(), [&](std::size_t i) {
-            decoded[i] = tasks[i].decode();
-            // Preferences > Performance: quarter the texture memory (min 16 px).
-            if (half && IsImageValid(decoded[i]) && decoded[i].width >= 32 && decoded[i].height >= 32) {
-                ImageResize(&decoded[i], decoded[i].width / 2, decoded[i].height / 2);
-            }
-        });
-    }
-
-    // Serial GL upload + registration on the main thread, in original order.
-    MAPED_PROFILE_BLOCK("upload textures");
-    for (std::size_t i = 0; i < tasks.size(); ++i) {
-        Texture2D texture = upload_decoded_image(decoded[i]);
-        auto& target = tasks[i].material ? project.material_textures : project.textures;
-        auto& names = tasks[i].material ? loaded_material_names : loaded_names;
-        if (tasks[i].upsert) {
-            if (texture.id != 0U) {
-                const auto key = lower_name(tasks[i].name);
-                configure_texture(texture);
-                if (const auto existing = names.find(key); existing != names.end()) {
-                    target[existing->second] = LoadedTexture{std::move(tasks[i].name), texture};
-                } else {
-                    names.emplace(key, target.size());
-                    target.emplace_back(std::move(tasks[i].name), texture);
-                }
-            }
-        } else {
-            if (texture.id == 0U) {
-                continue;
-            }
-            const auto key = lower_name(tasks[i].name);
-            if (names.contains(key)) {
-                UnloadTexture(texture);
-                continue;
-            }
-            configure_texture(texture);
-            names.emplace(key, target.size());
-            target.emplace_back(std::move(tasks[i].name), texture);
-        }
-    }
-
-#ifdef __EMSCRIPTEN__
-    report_web_load_progress("upload textures", 73);
-#endif
-}
-
-std::vector<std::filesystem::path> files_with_extension(const std::filesystem::path& dir, std::string_view extension) {
-    std::vector<std::filesystem::path> files;
-    if (!std::filesystem::is_directory(dir)) {
-        return files;
-    }
-
-    for (const auto& entry : std::filesystem::directory_iterator{dir}) {
-        if (entry.is_regular_file() && lower_extension(entry.path()) == extension) {
-            files.push_back(entry.path());
-        }
-    }
-    std::ranges::sort(files);
-    return files;
-}
-
-// A .csx-packed .sbb begins with the container version sentinel 1 (verified
-// against subrosa.exe SbbContainer_ReadWrite @00196d60, which hard-checks the
-// leading dword == 1), whereas a loose building/*.sbb begins with its real
-// version 12-14 (Sbb_LoadFromFile @00026830 gates `version - 12 < 3`). The packed
-// body is otherwise laid out exactly like a loose version-14 file: anchors at
-// +0x4c/+0x50/+0x54 and the trailing aux/LOD records are always present. So a
-// packed SBB is parsed by rewriting its leading sentinel to 14 and handing it to
-// the unchanged loose-file parser. Returns the payload unchanged when the leading
-// word is not the container sentinel (already a real loose-version file).
-std::vector<std::uint8_t> normalize_packed_sbb_bytes(const std::vector<std::uint8_t>& payload) {
-    constexpr std::uint32_t container_sentinel = 1U;
-    constexpr std::uint32_t loose_version_14 = 0x0eU;
-    if (payload.size() < 4U || read_le_u32(payload, 0U) != container_sentinel) {
-        return payload;
-    }
-    std::vector<std::uint8_t> normalized = payload;
-    normalized[0] = static_cast<std::uint8_t>(loose_version_14 & 0xFFU);
-    normalized[1] = static_cast<std::uint8_t>((loose_version_14 >> 8U) & 0xFFU);
-    normalized[2] = static_cast<std::uint8_t>((loose_version_14 >> 16U) & 0xFFU);
-    normalized[3] = static_cast<std::uint8_t>((loose_version_14 >> 24U) & 0xFFU);
-    return normalized;
-}
-
-// CSX-packed .sbl blocks/buildblocks carry the same container sentinel version 1,
-// but their body is the loose version-2 layout (with the trailing light/exterior
-// face section). parse_sbl only reads that section when version > 1, so a sentinel-1
-// block loses its exterior faces (renders as a single authored patch or nothing).
-// Rewrite the leading sentinel 1 -> 2 so the loose parser reads the full mesh.
-// Leaves real loose-version files (2) untouched.
-std::vector<std::uint8_t> normalize_packed_sbl_bytes(const std::vector<std::uint8_t>& payload) {
-    constexpr std::uint32_t container_sentinel = 1U;
-    constexpr std::uint32_t loose_version_2 = 2U;
-    if (payload.size() < 4U || read_le_u32(payload, 0U) != container_sentinel) {
-        return payload;
-    }
-    if (!parse_sbl(payload).block) return payload;
-    std::vector<std::uint8_t> normalized = payload;
-    normalized[0] = static_cast<std::uint8_t>(loose_version_2 & 0xFFU);
-    normalized[1] = 0U;
-    normalized[2] = 0U;
-    normalized[3] = 0U;
-    return normalized;
-}
-
-// Loads SBB buildings and SBL blocks/buildblocks packed inside .csx archives in
-// the project root, the same way a distributed map ships its geometry (sbl + sbb
-// + png; never the city .sbc). Textures are already pulled from .csx by
-// load_project_textures, so this only handles the geometry entries.
-//
-// Merge policy is CSX-wins: a CSX entry whose name matches an already-loaded
-// loose-folder asset overrides that slot in place, keeping the asset vector and
-// its parallel *_bytes vector index-aligned (placement resolution and the SBB
-// patch/rebuild writers index them together).
-void load_project_csx_geometry(EditorProject& project) {
-    MAPED_PROFILE_FUNCTION();
-#ifdef __EMSCRIPTEN__
-    report_web_load_progress("archives", 76);
-#endif
-    // Upserts data + raw bytes keyed by lowercased stem, preserving index
-    // alignment between the asset vector and its parallel bytes vector.
-    const auto upsert = [](auto& assets, auto& bytes_list, const std::string& name,
-                           const std::filesystem::path& source, auto data,
-                           std::vector<std::uint8_t> bytes) {
-        const auto key = lower_name(name);
-        for (std::size_t i = 0; i < assets.size(); ++i) {
-            if (lower_name(assets[i].name) == key) {
-                assets[i].path = source;
-                assets[i].name = name;
-                assets[i].data = std::move(data);
-                bytes_list[i] = std::move(bytes);
-                return;
-            }
-        }
-        assets.push_back({source, name, std::move(data)});
-        bytes_list.push_back(std::move(bytes));
-    };
-
-#ifdef __EMSCRIPTEN__
-    // A browser has one GL thread and a much tighter linear-memory budget. Do
-    // not retain every archive payload plus every parsed SBB/SBL at once; merge
-    // each entry immediately in the same archive order as the desktop path.
-    for (const auto& path : project_archive_paths(project)) {
-        try {
-            auto archive = parse_csx_file(path);
-            for (const auto& entry : archive.entries) {
-                const auto name = std::filesystem::path{entry.name}.stem().string();
-                if (name.empty()) {
-                    continue;
-                }
-                try {
-                    if (entry.kind == CsxEntryKind::Sbb) {
-                        auto bytes = normalize_packed_sbb_bytes(entry.payload);
-                        const auto existing = std::ranges::find_if(project.buildings, [&name](const auto& asset) {
-                            return lower_name(asset.name) == lower_name(name);
-                        });
-                        if (existing != project.buildings.end()) {
-                            const auto index = static_cast<std::size_t>(std::distance(project.buildings.begin(), existing));
-                            if (index < project.building_bytes.size() && project.building_bytes[index] == bytes) {
-                                continue;
-                            }
-                        }
-                        auto building = parse_sbb(bytes);
-                        upsert(project.buildings, project.building_bytes, name, path,
-                               std::move(building), std::move(bytes));
-                    } else if (entry.kind == CsxEntryKind::Sbl) {
-                        auto bytes = normalize_packed_sbl_bytes(entry.payload);
-                        const auto block = std::ranges::find_if(project.blocks, [&name](const auto& asset) {
-                            return lower_name(asset.name) == lower_name(name);
-                        });
-                        if (block != project.blocks.end()) {
-                            const auto index = static_cast<std::size_t>(std::distance(project.blocks.begin(), block));
-                            if (index < project.block_bytes.size() && project.block_bytes[index] == bytes) {
-                                continue;
-                            }
-                        }
-                        const auto buildblock = std::ranges::find_if(project.buildblocks, [&name](const auto& asset) {
-                            return lower_name(asset.name) == lower_name(name);
-                        });
-                        if (buildblock != project.buildblocks.end()) {
-                            const auto index = static_cast<std::size_t>(std::distance(project.buildblocks.begin(), buildblock));
-                            if (index < project.buildblock_bytes.size() && project.buildblock_bytes[index] == bytes) {
-                                continue;
-                            }
-                        }
-                        auto parsed = parse_sbl(bytes);
-                        if (parsed.block.has_value()) {
-                            upsert(project.blocks, project.block_bytes, name, path,
-                                   *parsed.block, std::move(bytes));
-                        } else if (!parsed.layers.empty()) {
-                            upsert(project.buildblocks, project.buildblock_bytes, name, path,
-                                   std::move(parsed), std::move(bytes));
-                        }
-                    }
-                } catch (const std::exception& error) {
-                    project.load_warnings.push_back(
-                        path.filename().string() + " [" + name + "]: " + error.what());
-                }
-            }
-        } catch (const std::exception& error) {
-            project.load_warnings.push_back(path.filename().string() + ": " + error.what());
-        }
-    }
-    return;
-#endif
-
-    // One parsed geometry entry, ready to upsert. Parsing (parse_sbb/parse_sbl) is
-    // CPU-bound and done off the main thread; the upsert below is serial because the
-    // CSX-wins merge is order-dependent (it overrides matching slots in place).
-    enum class GeometryKind { None, Sbb, Sbl };
-    struct ParsedGeometry {
-        GeometryKind kind{GeometryKind::None};
-        std::string name;
-        std::filesystem::path source;
-        std::vector<std::uint8_t> bytes;
-        std::optional<SbbBuilding> building;
-        std::optional<SblTemplate> sbl;
-        std::string warning;  // non-empty => push to load_warnings, skip the upsert
-    };
-
-    // Flatten every CSX entry across all archives into a work list (in archive +
-    // entry order), parsing the archives themselves in parallel first.
-    const auto csx_paths = project_archive_paths(project);
-    std::vector<CsxArchive> archives(csx_paths.size());
-    std::vector<std::string> archive_warnings(csx_paths.size());
-    parallel_for(csx_paths.size(), [&](std::size_t i) {
-        try {
-            archives[i] = parse_csx_file(csx_paths[i]);
-        } catch (const std::exception& error) {
-            archive_warnings[i] = csx_paths[i].filename().string() + ": " + error.what();
-        }
-    });
-
-    struct EntryRef {
-        std::size_t archive_index;
-        std::size_t entry_index;
-    };
-    std::vector<EntryRef> entry_refs;
-    for (std::size_t a = 0; a < archives.size(); ++a) {
-        if (!archive_warnings[a].empty()) {
-            project.load_warnings.push_back(std::move(archive_warnings[a]));
-            continue;
-        }
-        for (std::size_t e = 0; e < archives[a].entries.size(); ++e) {
-            entry_refs.push_back({a, e});
-        }
-    }
-
-    // Parse SBB/SBL geometry for every entry in parallel into an order-preserving
-    // result buffer.
-    std::vector<ParsedGeometry> parsed(entry_refs.size());
-    parallel_for(entry_refs.size(), [&](std::size_t i) {
-        const auto& ref = entry_refs[i];
-        const auto& entry = archives[ref.archive_index].entries[ref.entry_index];
-        const auto& path = csx_paths[ref.archive_index];
-        const auto name = std::filesystem::path{entry.name}.stem().string();
-        if (name.empty()) {
-            return;
-        }
-        ParsedGeometry out;
-        out.name = name;
-        out.source = path;
-        try {
-            if (entry.kind == CsxEntryKind::Sbb) {
-                out.bytes = normalize_packed_sbb_bytes(entry.payload);
-                out.building = parse_sbb(out.bytes);
-                out.kind = GeometryKind::Sbb;
-            } else if (entry.kind == CsxEntryKind::Sbl) {
-                out.bytes = normalize_packed_sbl_bytes(entry.payload);
-                out.sbl = parse_sbl(out.bytes);
-                out.kind = GeometryKind::Sbl;
-            }
-        } catch (const std::exception& error) {
-            out.kind = GeometryKind::None;
-            out.warning = path.filename().string() + " [" + name + "]: " + error.what();
-        }
-        parsed[i] = std::move(out);
-    });
-
-    // Serial merge in original order (CSX-wins upsert is order-dependent).
-    for (auto& item : parsed) {
-        if (!item.warning.empty()) {
-            project.load_warnings.push_back(std::move(item.warning));
-            continue;
-        }
-        if (item.kind == GeometryKind::Sbb) {
-            upsert(project.buildings, project.building_bytes, item.name, item.source,
-                   std::move(*item.building), std::move(item.bytes));
-        } else if (item.kind == GeometryKind::Sbl) {
-            if (item.sbl->block.has_value()) {
-                upsert(project.blocks, project.block_bytes, item.name, item.source,
-                       *item.sbl->block, std::move(item.bytes));
-            } else if (!item.sbl->layers.empty()) {
-                upsert(project.buildblocks, project.buildblock_bytes, item.name, item.source,
-                       std::move(*item.sbl), std::move(item.bytes));
-            }
-        }
-    }
-
-}
-
-std::optional<EditorProject> load_project_folder(const std::filesystem::path& folder, std::string& error,
-    bool load_textures = true, std::atomic<int>* stage = nullptr) {
-    MAPED_PROFILE_FUNCTION();
-    const auto input = std::filesystem::weakly_canonical(folder);
-    const bool map_file = std::filesystem::is_regular_file(input) && lower_extension(input) == ".sbc";
-    const auto root = map_file ? input.parent_path() : input;
-    if (!std::filesystem::is_directory(root)) {
-        error = "not a folder: " + root.string();
-        return std::nullopt;
-    }
-
-    EditorProject project;
-    project.root = root;
-
-#ifdef __EMSCRIPTEN__
-    report_web_load_progress("map", 5);
-#endif
-
-    auto city_path = map_file ? input : root / "city2.sbc";
-    if (!std::filesystem::exists(city_path)) {
-        const auto maps = files_with_extension(root, ".sbc");
-        if (maps.size() == 1) city_path = maps.front();
-        else if (maps.size() > 1) project.load_warnings.push_back("Multiple city files: keep one SBC per map folder.");
-    }
-    if (std::filesystem::exists(city_path)) {
-        MAPED_PROFILE_BLOCK("load city2.sbc");
-        try {
-            project.city_bytes = read_file_bytes(city_path);
-            project.city = LoadedAsset<SbcMap>{city_path, city_path.stem().string(), parse_sbc(*project.city_bytes)};
-        } catch (const std::exception& error) {
-            project.city_bytes.reset();
-            project.city.reset();
-            project.load_warnings.push_back(city_path.filename().string() + ": " + error.what());
-        }
-        MAPED_PROFILE_END_BLOCK;
-    }
-    if (stage) stage->store(1);
-#ifdef __EMSCRIPTEN__
-    report_web_load_progress("buildings", 20);
-#endif
-
-    // Loose assets are read+parsed in parallel into an order-preserving buffer, then
-    // appended in directory order (asset/byte vectors stay index-aligned, and other
-    // code indexes them positionally). read_file_bytes + parse_sbb/parse_sbl are
-    // CPU/IO-bound and were the heaviest serial load steps (loose building SBBs in
-    // particular). One result slot per file; failures carry a warning instead.
-    MAPED_PROFILE_BLOCK("load loose building sbb");
-    {
-        const auto paths = files_with_extension(root / "building", ".sbb");
-        struct LooseSbb {
-            std::filesystem::path path;
-            std::optional<SbbBuilding> building;
-            std::vector<std::uint8_t> bytes;
-            std::string warning;
-        };
-        std::vector<LooseSbb> results(paths.size());
-        parallel_for(paths.size(), [&](std::size_t i) {
-            results[i].path = paths[i];
-            try {
-                results[i].bytes = read_file_bytes(paths[i]);
-                results[i].building = parse_sbb(results[i].bytes);
-            } catch (const std::exception& error) {
-                results[i].building.reset();
-                results[i].warning = paths[i].filename().string() + ": " + error.what();
-            }
-        });
-        for (auto& r : results) {
-            if (!r.warning.empty()) {
-                project.load_warnings.push_back(std::move(r.warning));
-                continue;
-            }
-            project.buildings.push_back({r.path, stem_name(r.path), std::move(*r.building)});
-            project.building_bytes.push_back(std::move(r.bytes));
-        }
-    }
-    MAPED_PROFILE_END_BLOCK;
-    if (stage) stage->store(2);
-#ifdef __EMSCRIPTEN__
-    report_web_load_progress("blocks", 38);
-#endif
-
-    MAPED_PROFILE_BLOCK("load loose block sbl");
-    {
-        const auto paths = files_with_extension(root / "block", ".sbl");
-        struct LooseSbl {
-            std::filesystem::path path;
-            std::optional<SblTemplate> parsed;
-            std::vector<std::uint8_t> bytes;
-            std::string warning;
-        };
-        std::vector<LooseSbl> results(paths.size());
-        parallel_for(paths.size(), [&](std::size_t i) {
-            results[i].path = paths[i];
-            try {
-                results[i].bytes = read_file_bytes(paths[i]);
-                results[i].parsed = parse_sbl(results[i].bytes);
-            } catch (const std::exception& error) {
-                results[i].parsed.reset();
-                results[i].warning = paths[i].filename().string() + ": " + error.what();
-            }
-        });
-        for (auto& r : results) {
-            if (!r.warning.empty()) {
-                project.load_warnings.push_back(std::move(r.warning));
-                continue;
-            }
-            if (r.parsed->block.has_value()) {
-                project.blocks.push_back({r.path, stem_name(r.path), *r.parsed->block});
-                project.block_bytes.push_back(std::move(r.bytes));
-            }
-        }
-    }
-    MAPED_PROFILE_END_BLOCK;
-    if (stage) stage->store(3);
-#ifdef __EMSCRIPTEN__
-    report_web_load_progress("buildblocks", 50);
-#endif
-
-    MAPED_PROFILE_BLOCK("load loose buildblock sbl");
-    {
-        const auto paths = files_with_extension(root / "buildblock", ".sbl");
-        struct LooseSbl {
-            std::filesystem::path path;
-            std::optional<SblTemplate> parsed;
-            std::vector<std::uint8_t> bytes;
-            std::string warning;
-        };
-        std::vector<LooseSbl> results(paths.size());
-        parallel_for(paths.size(), [&](std::size_t i) {
-            results[i].path = paths[i];
-            try {
-                results[i].bytes = read_file_bytes(paths[i]);
-                results[i].parsed = parse_sbl(results[i].bytes);
-            } catch (const std::exception& error) {
-                results[i].parsed.reset();
-                results[i].warning = paths[i].filename().string() + ": " + error.what();
-            }
-        });
-        for (auto& r : results) {
-            if (!r.warning.empty()) {
-                project.load_warnings.push_back(std::move(r.warning));
-                continue;
-            }
-            if (!r.parsed->layers.empty()) {
-                project.buildblocks.push_back({r.path, stem_name(r.path), std::move(*r.parsed)});
-                project.buildblock_bytes.push_back(std::move(r.bytes));
-            }
-        }
-    }
-    MAPED_PROFILE_END_BLOCK;
-    if (stage) stage->store(4);
-
-    // Item sets are loose game assets beside a map folder (data/itemset), or
-    // inside a self-contained map folder. SBB stores their names and placements.
-    for (const auto& dir : {root / "itemset", root.parent_path() / "itemset"}) {
-        for (const auto& path : files_with_extension(dir, ".sis")) {
-            const auto name = stem_name(path);
-            if (std::ranges::none_of(project.item_set_catalog, [&](const std::string& loaded) {
-                    return lower_name(loaded) == lower_name(name);
-                })) project.item_set_catalog.push_back(name);
-            if (project.item_sets.contains(lower_name(name))) continue;
-            try {
-                auto items = parse_sis(read_file_bytes(path));
-                for (const auto& item : items) {
-                    const auto type = lower_name(item.type);
-                    if (project.item_meshes.contains(type)) continue;
-                    // Only types with a data/item mesh draw; the rest keep the guide.
-                    for (const auto& mesh : {root / "item" / (item.type + ".it3"), root.parent_path() / "item" / (item.type + ".it3")}) {
-                        if (!std::filesystem::exists(mesh)) continue;
-                        project.item_meshes[type] = parse_it3(read_file_bytes(mesh));
-                        break;
-                    }
-                }
-                project.item_sets[lower_name(name)] = std::move(items);
-            } catch (const std::exception& error) {
-                project.load_warnings.push_back(path.filename().string() + ": " + error.what());
-            }
-        }
-    }
-
-    if (load_textures) {
-        MAPED_PROFILE_BLOCK("load project textures");
-        load_project_textures(project);
-        MAPED_PROFILE_END_BLOCK;
-    }
-    MAPED_PROFILE_BLOCK("load project csx geometry");
-    load_project_csx_geometry(project);
-    MAPED_PROFILE_END_BLOCK;
-    if (stage) stage->store(5);
-
-    if (!project.city && project.buildings.empty() && project.blocks.empty() && project.buildblocks.empty()) {
-        error = "folder does not look like a map folder: " + root.string();
-        return std::nullopt;
-    }
-
-    project.render_buffers_dirty = true;
-    project.status = "loaded " + root.filename().string()
-        + " (" + std::to_string(project.buildings.size()) + " buildings, "
-        + std::to_string(project.blocks.size()) + " blocks, "
-        + std::to_string(project.textures.size()) + " color maps, "
-        + std::to_string(project.material_textures.size()) + " material maps)";
-    if (!project.load_warnings.empty()) {
-        project.status += " | " + std::to_string(project.load_warnings.size()) + " skipped";
-        for (const auto& warning : project.load_warnings) {
-            project.render_logs.push_back("skipped " + warning);
-        }
-    }
-    return project;
-}
-
-// Builds the block-mesh catalog from the loaded SBL blocks (a native built-in set
-// prepended via build_native_block_mesh_catalog). Pure function of project.blocks.
+// Builds the block mesh catalog from the loaded SBL blocks, with the game's
+// built-in set added first (build_native_block_mesh_catalog). It only depends on
+// project.blocks.
 std::vector<NamedBlockMesh> build_block_meshes(const EditorProject& project) {
     std::vector<NamedBlockMesh> meshes;
     meshes.reserve(project.blocks.size());
@@ -1125,31 +383,17 @@ std::vector<NamedBuildblockTemplate> build_buildblock_templates(const EditorProj
     return templates;
 }
 
-// Loaded texture names in load order. v10 district pieces index this list via the
-// legacy texture grid to resolve per-face materials.
-std::vector<std::string> build_texture_names(const EditorProject& project) {
-    std::vector<std::string> names;
-    names.reserve(project.textures.size());
-    for (const auto& texture : project.textures) {
-        names.push_back(texture.name);
-    }
-    return names;
-}
-
-// Fills the derived render-input caches (block meshes, buildblock templates,
-// texture names) once. Cheap to call every frame: it returns immediately when the
-// cache is already valid. The grid texture names parse CSX archives from disk, so
-// they have their own validity flag and are only rebuilt when invalidated.
+// Editing an asset clears the mesh and template cache. Grid texture names come
+// from the archive order on disk and stay the same while the project is open.
 void ensure_render_input_cache(EditorProject& project) {
     if (!project.render_input_cache_valid) {
-        MAPED_PROFILE_BLOCK("rebuild render input cache");
+        PAFTA_PROFILE_BLOCK("rebuild render input cache");
         project.cached_block_meshes = build_block_meshes(project);
         project.cached_buildblock_templates = build_buildblock_templates(project);
-        project.cached_texture_names = build_texture_names(project);
         project.render_input_cache_valid = true;
     }
     if (!project.grid_texture_names_valid) {
-        MAPED_PROFILE_BLOCK("rebuild grid texture names");
+        PAFTA_PROFILE_BLOCK("rebuild grid texture names");
         project.cached_grid_texture_names = build_grid_texture_names(project);
         project.grid_texture_names_valid = true;
     }
@@ -1169,66 +413,34 @@ const std::vector<NamedBuildblockTemplate>& buildblock_templates(EditorProject& 
     return project.cached_buildblock_templates;
 }
 
-const std::vector<std::string>& project_texture_names(EditorProject& project) {
-    ensure_render_input_cache(project);
-    return project.cached_texture_names;
-}
-
 const std::vector<std::string>& project_grid_texture_names(EditorProject& project) {
     ensure_render_input_cache(project);
     return project.cached_grid_texture_names;
 }
 
-// The v10 district legacy texture grid stores ABSOLUTE indices into the game's
-// runtime texture table, whose order is fixed by World_InitResourcePoolsAndCatalogs
-// @0x13e408 + World_LoadMapAndInitializeTerrain @0x56b10:
-//   index 0      = "concrete"  (built-in, texture/concrete.png)
-//   index 1,2    = reserved built-in slots
+// The old v10 district texture grid stores ABSOLUTE numbers into the game's
+// texture table. World_InitResourcePoolsAndCatalogs @0x13e408 and
+// World_LoadMapAndInitializeTerrain @0x56b10 fix its order:
+//   index 0      = "concrete" (built in, texture/concrete.png)
+//   index 1,2    = built-in slots kept free
 //   index 3      = the generated default texture (DAT_64cff7e4 = 3)
-//   index 4..N   = the map's CSX 0x585a0004 textures IN ARCHIVE ORDER
-//     (DAT_64cff560 starts at 4 and increments per CSX texture entry).
-// asphalt2.png / asphalt2_material.png / map.png load into fixed model slots, NOT
-// this indexed table, so they must NOT shift the indices. This builds the matching
-// name list so a district cell's grid index resolves to the same texture the game
-// uses. Built-in indices 0-3 are the game's "concrete" + default grey, which live
-// in the game's base data/texture dir (not the map folder), so the editor can't
-// load them by name; map them to "asphalt2" — the grey road texture the editor
-// does have — so plaza/sidewalk cells read grey like in-game. CSX names follow in
-// archive order.
+//   index 4..N   = the map's CSX 0x585a0004 textures, in archive order
+//     (DAT_64cff560 starts at 4 and goes up by one for each CSX texture).
+// asphalt2.png, asphalt2_material.png, and map.png load into fixed model slots,
+// not this table, so they must not shift the numbers. This builds the same name
+// list, so a district cell's grid number finds the same texture the game uses.
+// Numbers 0 to 3 are the game's "concrete" and default grey. They live in the
+// game's own data/texture folder, not the map folder, so the editor can't load
+// them by name. We map them to "asphalt2", the grey road texture the editor does
+// have, so plazas and sidewalks look grey like in the game. CSX names come next,
+// in archive order.
 //
-// This parses every CSX archive from disk, so it is only run when the project's
-// CSX set changes (load). The result is cached in project.cached_grid_texture_names
-// by ensure_render_input_cache; the per-frame render path reads the cache.
+// The source order is captured at load, so saving never changes this table.
 std::vector<std::string> build_grid_texture_names(const EditorProject& project) {
-    MAPED_PROFILE_FUNCTION();
+    if (project.grid_texture_names_valid) return project.cached_grid_texture_names;
     std::vector<std::string> names = {"asphalt2", "asphalt2", "asphalt2", "asphalt2"};
-    for (const auto& path : project_archive_paths(project)) {
-        const auto archive = parse_csx_file(path);
-        for (const auto& entry : archive.entries) {
-            if (entry.kind == CsxEntryKind::Texture) {
-                names.push_back(entry.name);
-            }
-        }
-    }
-    return names;
-}
-
-void write_file_bytes(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes) {
-    if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
-    std::ofstream file{path, std::ios::binary | std::ios::trunc};
-    if (!file) {
-        throw std::runtime_error("could not open output file: " + path.string());
-    }
-    file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    if (!file) {
-        throw std::runtime_error("could not write output file: " + path.string());
-    }
-}
-
-std::vector<std::string> building_names(const EditorProject& project) {
-    std::vector<std::string> names;
-    for (const auto& building : project.buildings) {
-        names.push_back(building.name);
+    for (const auto& entry : project.archive_entries) {
+        if (entry.kind == CsxEntryKind::Texture) names.push_back(entry.name);
     }
     return names;
 }
@@ -1260,9 +472,9 @@ std::vector<std::string> city_building_names(const SbcMap& map) {
     return names;
 }
 
-// Resolves each city placement to its loaded .sbb (nullptr when the name does
-// not resolve), parallel to map.buildings. Shared by the scene-cache rebuild and
-// the viewport building picker so both see the same footprint geometry.
+// Finds the loaded .sbb for each city placement (nullptr when the name is not
+// found), in the same order as map.buildings. The scene cache rebuild and the
+// viewport's building picker both use it, so they agree on footprints.
 std::vector<const SbbBuilding*> resolve_placement_buildings(const EditorProject& project) {
     std::vector<const SbbBuilding*> placement_buildings;
     if (!project.city) {
@@ -1294,9 +506,9 @@ void edit_city_building(EditorProject& project, EditorUi& ui, std::size_t placem
     if (asset != nullptr) edit_building(project, ui, static_cast<std::size_t>(asset - project.buildings.data()));
 }
 
-// Suggested default .gltf output path for the active view, or empty with a reason
-// in `reason` when the current tab has nothing to export. No OS dialog (pfd's
-// osascript save dialog is unreliable on macOS); the path is chosen in-app.
+// A suggested .gltf path for the current view. When the current tab has nothing to
+// export, it returns empty and puts the reason in `reason`. The caller opens the
+// native dialog after the options popup closes.
 std::filesystem::path default_export_path(const EditorProject& project, const EditorUi& ui, std::string& reason) {
     auto make_path = [&project](const std::string& name) {
         const auto safe = name.empty() ? std::string("export") : name;
@@ -1330,11 +542,9 @@ std::filesystem::path default_export_path(const EditorProject& project, const Ed
     return {};
 }
 
-// Exports the active view to glTF at an explicit path (no dialog). Builds the right
-// geometry and writes <path>.gltf + .bin + .png. Sets `status` to the result.
-// A mesh export in flight. Geometry is built on a worker from copies of the
-// inputs, texture PNGs are read back on this (the GL) thread a few per frame,
-// and the glTF/bin files are written on a worker; a modal shows the progress.
+// A mesh export that is running. Geometry is built on a worker from copies of the
+// inputs, texture PNGs are read back on this (the GL) thread a few each frame,
+// and the glTF and bin files are written on a worker. A popup shows progress.
 struct MeshExportTask {
     struct Built {
         GltfExportPtr job;
@@ -1352,7 +562,7 @@ struct MeshExportTask {
 std::optional<MeshExportTask> start_mesh_export(EditorProject& project, const EditorUi& ui,
                                                 const std::filesystem::path& path, const ExportOptions& options,
                                                 std::string& status) {
-    MAPED_PROFILE_FUNCTION();
+    PAFTA_PROFILE_FUNCTION();
     if (path.empty()) {
         report_failure(status, "Export failed: empty path.");
         return std::nullopt;
@@ -1416,7 +626,7 @@ std::optional<MeshExportTask> start_mesh_export(EditorProject& project, const Ed
                 return std::nullopt;
             }
         }
-        // One copy per distinct building asset; placements index into it.
+        // One copy of each building asset; placements point into it.
         std::vector<SbbBuilding> assets;
         std::vector<std::size_t> placement_asset(placement_buildings.size(), SIZE_MAX);
         std::unordered_map<const SbbBuilding*, std::size_t> copied;
@@ -1427,14 +637,14 @@ std::optional<MeshExportTask> start_mesh_export(EditorProject& project, const Ed
             placement_asset[i] = it->second;
         }
         task.what = project.city->path.stem().string();
-        // Scene, one mesh per building asset, and the pieces.
+        // The scene, one mesh for each building asset, and the pieces.
         task.steps_total = assets.size() + 2U;
         task.build = std::async(std::launch::async,
             [path, options, done, map = project.city->data, assets = std::move(assets),
              auto_generated = project_is_auto_generated(project),
              placement_asset = std::move(placement_asset), blocks = std::move(blocks),
              templates = std::move(templates), texture_names = project_grid_texture_names(project)] {
-                MAPED_PROFILE_THREAD("Mesh export");
+                PAFTA_PROFILE_THREAD("Mesh export");
                 MeshExportTask::Built built;
                 std::vector<const SbbBuilding*> placements(placement_asset.size(), nullptr);
                 for (std::size_t i = 0; i < placements.size(); ++i) {
@@ -1453,8 +663,8 @@ std::optional<MeshExportTask> start_mesh_export(EditorProject& project, const Ed
                 for (std::size_t i = 0; i < placements.size(); ++i) {
                     if (placement_asset[i] != SIZE_MAX) placement_buffers[i] = &asset_buffers[placement_asset[i]];
                 }
-                // Piece/portal geometry (districts placed with the Piece tool), the same
-                // textured buffer the city view draws via the portal render model.
+                // Piece and portal geometry (districts placed with the Piece tool): the same
+                // textured buffer the city view draws through the portal render model.
                 const auto piece_buffer = options.include_pieces
                     ? build_native_portal_render_buffer(map, blocks, std::nullopt, templates, texture_names, placements)
                     : BuildingRenderBuffer{};
@@ -1470,52 +680,64 @@ std::optional<MeshExportTask> start_mesh_export(EditorProject& project, const Ed
     return std::nullopt;
 }
 
-// Advances an export one frame and draws its progress modal. Resets the task
-// when it finishes.
+// Moves an export forward by one frame and draws its progress popup. Clears the
+// task when it is done.
 void service_mesh_export(std::optional<MeshExportTask>& task, const EditorProject& project, std::string& status) {
     if (!task) return;
     const auto ready = [](auto& future) {
         return future.valid() && future.wait_for(std::chrono::milliseconds{0}) == std::future_status::ready;
     };
+    const auto close_progress = [] {
+        if (ImGui::IsPopupOpen("Exporting") &&
+            ImGui::BeginPopupModal("Exporting", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+    };
     std::string stage;
     float fraction = 0.0F;
-    if (task->build.valid()) {
-        if (ready(task->build)) {
-            auto built = task->build.get();
-            if (!built.job) {
-                report_failure(status, "Export failed: " + built.error.message);
+    try {
+        if (task->build.valid()) {
+            if (ready(task->build)) {
+                auto built = task->build.get();
+                if (!built.job) throw std::runtime_error(built.error.message);
+                task->job = std::move(built.job);
+            } else {
+                stage = "Building meshes";
+                fraction = static_cast<float>(task->steps_done->load()) / static_cast<float>(std::max<std::size_t>(1U, task->steps_total));
+            }
+        }
+        if (task->job && !task->write.valid()) {
+            // Reading textures back needs the GL thread, so spend part of each frame on it.
+            const auto start = std::chrono::steady_clock::now();
+            while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds{8} &&
+                   write_next_gltf_texture(*task->job, project)) {}
+            const auto total = gltf_export_texture_count(*task->job);
+            const auto written = gltf_export_textures_done(*task->job);
+            if (written >= total) {
+                task->write = std::async(std::launch::async, [job = task->job.get()] { return write_gltf_export(*job); });
+            } else {
+                stage = "Writing textures (" + std::to_string(written) + " of " + std::to_string(total) + ")";
+                fraction = static_cast<float>(written) / static_cast<float>(std::max<std::size_t>(1U, total));
+            }
+        }
+        if (task->write.valid()) {
+            if (ready(task->write)) {
+                const auto result = task->write.get();
+                if (!result.ok) throw std::runtime_error(result.message);
+                status = result.message;
                 task.reset();
+                close_progress();
                 return;
             }
-            task->job = std::move(built.job);
-        } else {
-            stage = "Building meshes";
-            fraction = static_cast<float>(task->steps_done->load()) / static_cast<float>(std::max<std::size_t>(1U, task->steps_total));
+            stage = "Writing file";
+            fraction = 1.0F;
         }
-    }
-    if (task->job && !task->write.valid()) {
-        // Texture readback needs the GL thread; spend a slice of each frame on it.
-        const auto start = std::chrono::steady_clock::now();
-        while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds{8} &&
-               write_next_gltf_texture(*task->job, project)) {}
-        const auto total = gltf_export_texture_count(*task->job);
-        const auto written = gltf_export_textures_done(*task->job);
-        if (written >= total) {
-            task->write = std::async(std::launch::async, [job = task->job.get()] { return write_gltf_export(*job); });
-        } else {
-            stage = "Writing textures (" + std::to_string(written) + " of " + std::to_string(total) + ")";
-            fraction = static_cast<float>(written) / static_cast<float>(std::max<std::size_t>(1U, total));
-        }
-    }
-    if (task->write.valid()) {
-        if (ready(task->write)) {
-            const auto result = task->write.get();
-            if (result.ok) status = result.message; else report_failure(status, "Export failed: " + result.message);
-            task.reset();
-            return;
-        }
-        stage = "Writing file";
-        fraction = 1.0F;
+    } catch (const std::exception& error) {
+        task.reset();
+        close_progress();
+        report_failure(status, std::string{"Export failed: "} + error.what());
+        return;
     }
     if (!ImGui::IsPopupOpen("Exporting")) ImGui::OpenPopup("Exporting");
     ImGui::SetNextWindowSize(ImVec2(420.0F, 0.0F));
@@ -1528,19 +750,19 @@ void service_mesh_export(std::optional<MeshExportTask>& task, const EditorProjec
 }
 #endif
 
-// Launches a background rebuild of the city scene (roads + terrain field +
-// footprint stamping) for the given fingerprint. The worker owns copies of the
-// map and the resolved .sbb data so nothing it touches can be mutated or freed by
-// the main thread mid-build. GPU upload stays on the main thread (see the caller).
+// Starts rebuilding the city scene in the background (roads, terrain, and the
+// footprint stamps) for the given fingerprint. The worker owns copies of the map
+// and the .sbb data, so the main thread can't change or free anything it uses
+// halfway through. GPU uploads stay on the main thread (see the caller).
 void start_city_scene_rebuild(EditorProject& project, std::uint64_t fingerprint) {
-    MAPED_PROFILE_FUNCTION();
+    PAFTA_PROFILE_FUNCTION();
     if (!project.city) {
         return;
     }
     auto map_copy = project.city->data;
-    // Copy each resolved building asset once; the worker rebuilds the pointer
-    // view over its own copies so the pointers cannot dangle. resolved[i] is
-    // placement i's index into `owned` plus one, or 0 when it has no .sbb.
+    // Copy each building asset once. The worker rebuilds its pointers over its own
+    // copies, so they can't dangle. resolved[i] is placement i's index into `owned`
+    // plus one, or 0 when it has no .sbb.
     auto owned = std::make_shared<std::vector<SbbBuilding>>();
     std::vector<std::size_t> resolved;
     resolved.reserve(project.city->data.buildings.size());
@@ -1556,16 +778,16 @@ void start_city_scene_rebuild(EditorProject& project, std::uint64_t fingerprint)
         resolved.push_back(it->second);
     }
 
-    // v10 district cells under a building are replaced by it, so the portal
-    // buffer follows building changes.
+    // v10 district cells under a building are replaced by it, so the portal buffer
+    // has to follow building changes.
     if (project.city->data.city_blocks.empty()) invalidate_portal_render_models(project);
     project.city_scene_build_in_progress = true;
     project.city_scene_build_target_fingerprint = fingerprint;
     const auto generation = ++project.city_scene_build_generation;
     auto build_scene = [map = std::move(map_copy), owned, resolved = std::move(resolved), generation,
                         auto_generated = project_is_auto_generated(project)]() {
-            MAPED_PROFILE_THREAD("City scene rebuild");
-            MAPED_PROFILE_BLOCK("build async map scene");
+            PAFTA_PROFILE_THREAD("City scene rebuild");
+            PAFTA_PROFILE_BLOCK("build async map scene");
             std::vector<const SbbBuilding*> placement_buildings;
             placement_buildings.reserve(resolved.size());
             for (std::size_t i = 0; i < resolved.size(); ++i) {
@@ -1595,16 +817,17 @@ void draw_city_building_models_full_detail(EditorProject& project, const Camera3
         return;
     }
 
-    // Extract the 6 world-space frustum planes from the camera's view-projection
-    // matrix (Gribb-Hartmann), once per frame. A sphere is culled only when it is
-    // fully outside one plane, which is exact at every angle — no cone approximation
-    // like the previous hand-rolled test that blinked buildings out at grazing views.
+    // Get the camera's 6 world-space frustum planes from its view-projection matrix
+    // (Gribb-Hartmann), once per frame. A sphere is only culled when it is fully
+    // outside one plane. That is exact from every angle, so a box that crosses a
+    // plane at a grazing angle is never thrown away by mistake.
     struct Plane {
         float a, b, c, d;
     };
     std::array<Plane, 6> frustum_planes{};
     bool frustum_valid = false;
-    if (viewport_size.x > 0.0F && viewport_size.y > 0.0F) {
+    // Orthographic views skip culling; their box isn't a perspective frustum.
+    if (viewport_size.x > 0.0F && viewport_size.y > 0.0F && camera.projection == CAMERA_PERSPECTIVE) {
         const auto aspect = viewport_size.x / viewport_size.y;
         const auto view = GetCameraMatrix(camera);
         const auto proj = MatrixPerspective(
@@ -1613,8 +836,8 @@ void draw_city_building_models_full_detail(EditorProject& project, const Camera3
             rlGetCullDistanceNear(),
             rlGetCullDistanceFar());
         const auto m = MatrixMultiply(view, proj);
-        // Rows of the view-proj give the planes; m is column-major in raylib's
-        // Matrix (m0,m4,m8,m12 = first column).
+        // The planes come from the rows of the view-projection matrix. raylib's Matrix is
+        // column-major (m0, m4, m8, m12 are the first column).
         auto make = [](float a, float b, float c, float d) {
             const auto len = std::sqrt(a * a + b * b + c * c);
             const auto inv = len > 1e-8F ? 1.0F / len : 0.0F;
@@ -1629,7 +852,7 @@ void draw_city_building_models_full_detail(EditorProject& project, const Camera3
         frustum_valid = true;
     }
 
-    // Nearest distance from the camera to the last tested placement's bounds.
+    // The closest distance from the camera to the bounds of the last placement tested.
     float placement_distance = 0.0F;
     auto visible_in_viewport = [&](const SbbBuilding& building, const SbcBuilding& placement) {
         if (!frustum_valid) {
@@ -1682,9 +905,9 @@ void draw_city_building_models_full_detail(EditorProject& project, const Camera3
             const auto dz = center.z - camera.position.z;
             placement_distance = std::max(0.0F, std::sqrt(dx * dx + dy * dy + dz * dz) - radius);
         }
-        // Building draw distance (Preferences > Performance), 0 = unlimited.
+        // How far buildings are drawn (Preferences > Performance); 0 means no limit.
         if (const auto far = g_render_settings.building_distance; far > 0.0F && placement_distance > far) return false;
-        // Cull only if the bounding sphere is fully on the outside of any plane.
+        // Only cull when the bounding sphere is fully outside one of the planes.
         for (const auto& p : frustum_planes) {
             const auto distance = p.a * center.x + p.b * center.y + p.c * center.z + p.d;
             if (distance < -radius) {
@@ -1694,8 +917,8 @@ void draw_city_building_models_full_detail(EditorProject& project, const Camera3
         return true;
     };
 
-    // Every visible placement of a template is one instanced draw per material
-    // part, so draw calls scale with templates, not placements.
+    // All visible placements of one template are drawn with one instanced draw per
+    // material, so the number of draw calls grows with templates, not placements.
     refresh_placement_override_models(project);
     const auto& placement_asset_indices = resolve_placement_asset_indices(project);
     std::vector<std::pair<const GpuMesh*, Matrix>> overridden;
@@ -1711,8 +934,8 @@ void draw_city_building_models_full_detail(EditorProject& project, const Camera3
             continue;
         }
         const auto asset_index = *placement_asset_indices[placement_index];
-        // A missing GPU model means this asset is still being prepared; it
-        // appears as soon as its render model is uploaded.
+        // No GPU model yet means the asset is still being prepared. It shows up as soon
+        // as its render model is uploaded.
         if (asset_index >= project.building_gpu_models.size() || project.building_gpu_models[asset_index].empty() ||
             !visible_in_viewport(project.buildings[asset_index].data, placement)) {
             continue;
@@ -1721,11 +944,14 @@ void draw_city_building_models_full_detail(EditorProject& project, const Camera3
             overridden.push_back({&found->second.mesh, city_placement_matrix(placement)});
             continue;
         }
-        // The game's near LOD (_render_buildsectorlist): within kNearLodDistance
-        // the rooms, open doorways and glass replace the reflective shell.
-        // Near meshes are built on demand, one template per frame; until then
-        // the shell stands in.
-        if (g_render_settings.near_lod && placement_distance < kNearLodDistance) {
+        // The game's near view (_render_buildsectorlist): within kNearLodDistance, the
+        // rooms, open doorways, and glass replace the reflective shell. With
+        // "selected buildings only", the selection decides instead of the distance. Near meshes are
+        // built when needed, one template per frame, and the shell is shown until then.
+        const bool near = g_render_settings.interiors_selected_only
+            ? std::ranges::find(g_render_settings.interior_placements, placement_index) != g_render_settings.interior_placements.end()
+            : placement_distance < kNearLodDistance;
+        if (g_render_settings.near_lod && near) {
             if (const auto* near = building_near_mesh(project, asset_index, near_builds_left)) {
                 near_by_asset[near].push_back(city_placement_matrix(placement));
                 near_lod_placements().push_back({asset_index, city_placement_matrix(placement)});
@@ -1746,7 +972,7 @@ void draw_city_building_models_full_detail(EditorProject& project, const Camera3
     draw_gpu_mesh_batch(draws, GpuSurface::Building);
     draw_gpu_mesh_batch(near_draws, GpuSurface::Building, GpuPartFilter::Opaque);
     set_game_render_depth_output(false);
-    // Glass last, blended over whatever is behind it.
+    // Glass goes last, blended over whatever is behind it.
     draw_gpu_mesh_batch(near_draws, GpuSurface::Building, GpuPartFilter::Glass);
     evict_building_near_models(project);
 }
@@ -1784,45 +1010,6 @@ std::vector<std::string> city_street_names(const SbcMap& map) {
     return names;
 }
 
-std::vector<std::string> city_intersection_names(const SbcMap& map) {
-    std::vector<std::string> names;
-    names.reserve(map.intersections.size());
-    for (const auto& intersection : map.intersections) {
-        names.push_back(
-            std::to_string(intersection.index) + " (" +
-            std::to_string(intersection.x) + ", " +
-            std::to_string(intersection.y) + ", " +
-            std::to_string(intersection.z) + ")");
-    }
-    return names;
-}
-
-std::vector<std::string> city_block_names(const SbcMap& map) {
-    std::vector<std::string> names;
-    names.reserve(map.city_blocks.size());
-    for (const auto& city_block : map.city_blocks) {
-        names.push_back(std::to_string(city_block.index) + " " + city_block_label(city_block));
-    }
-    return names;
-}
-
-std::vector<std::string> portal_names(const SbcMap& map) {
-    std::vector<std::string> names;
-    names.reserve(map.portals.size());
-    for (const auto& portal : map.portals) {
-        const auto placed = std::ranges::count_if(portal.blocks, [](std::uint32_t word) {
-            return word != 0U;
-        });
-        names.push_back(
-            std::to_string(portal.index) + " [" +
-            std::to_string(portal.fields[1]) + "," +
-            std::to_string(portal.fields[2]) + "," +
-            std::to_string(portal.fields[3]) + "] voxels " +
-            std::to_string(placed));
-    }
-    return names;
-}
-
 std::optional<std::filesystem::path> dropped_folder() {
     if (!IsFileDropped()) {
         return std::nullopt;
@@ -1837,240 +1024,6 @@ std::optional<std::filesystem::path> dropped_folder() {
     return folder;
 }
 
-// Names the next city undo step. The step itself is recorded by
-// commit_city_edits once the edit finishes, and only if the map changed.
-constexpr std::size_t kMaxUndo = 100;
-void begin_city_action(EditorProject& project, EditorUi& ui, std::string label) {
-    if (project.pending_city_label.empty()) {
-        project.pending_city_label = std::move(label);
-    }
-    (void)ui;
-}
-
-namespace {
-
-void record_action(EditorProject& project, std::string label) {
-    project.action_log.push_back(std::move(label));
-    if (project.action_log.size() > 500U) {
-        project.action_log.erase(project.action_log.begin());
-    }
-}
-
-// Pushes the committed map as an undo step when the live map differs from it.
-void commit_city_edits(EditorProject& project) {
-    if (!project.city) {
-        project.city_baseline.reset();
-        project.pending_city_label.clear();
-        return;
-    }
-    if (project.city_baseline.has_value() && *project.city_baseline != project.city->data) {
-        auto label = project.pending_city_label.empty() ? std::string{"edit"} : project.pending_city_label;
-        // Editing after undoing past the save discards the redo path back to it.
-        if (project.saved_undo_depth && *project.saved_undo_depth > project.undo_stack.size()) {
-            project.saved_undo_depth.reset();
-        }
-        project.undo_stack.emplace_back(label, std::move(*project.city_baseline));
-        if (project.undo_stack.size() > kMaxUndo) {
-            project.undo_stack.erase(project.undo_stack.begin());
-            if (project.saved_undo_depth) {
-                if (*project.saved_undo_depth == 0U) project.saved_undo_depth.reset();
-                else --*project.saved_undo_depth;
-            }
-        }
-        project.redo_stack.clear();
-        record_action(project, std::move(label));
-        project.city_baseline.reset();
-    }
-    if (!project.city_baseline.has_value()) {
-        project.city_baseline = project.city->data;
-    }
-    project.pending_city_label.clear();
-}
-
-// Runs `apply(saved, live)` on the live asset a history entry names. False when
-// that asset was removed or renamed since.
-template <typename F>
-bool with_live_asset(EditorProject& project, AssetSnapshot& snapshot, F&& apply) {
-    return std::visit([&](auto& saved) {
-        using T = std::decay_t<decltype(saved)>;
-        const auto find = [&](auto& assets) -> T* {
-            return snapshot.index < assets.size() && assets[snapshot.index].name == snapshot.name
-                ? &assets[snapshot.index].data : nullptr;
-        };
-        T* live = nullptr;
-        if constexpr (std::is_same_v<T, SbbBuilding>) live = find(project.buildings);
-        else if constexpr (std::is_same_v<T, SblTemplate>) live = find(project.buildblocks);
-        else live = find(project.blocks);
-        if (live == nullptr) return false;
-        apply(saved, *live);
-        return true;
-    }, snapshot.data);
-}
-
-// Selected asset index per history kind (building, buildblock, block mesh).
-std::optional<std::size_t> selected_asset_index(const EditorProject& project, const EditorUi& ui, std::size_t kind) {
-    const auto clamp = [](std::size_t selected, std::size_t size) -> std::optional<std::size_t> {
-        if (size == 0U) return std::nullopt;
-        return std::min(selected, size - 1U);
-    };
-    switch (kind) {
-        case 0: return clamp(ui.selected_building, project.buildings.size());
-        case 1: return clamp(ui.selected_buildblock, project.buildblocks.size());
-        default: return clamp(ui.selected_block, project.blocks.size());
-    }
-}
-
-AssetSnapshot snapshot_asset(const EditorProject& project, std::size_t kind, std::size_t index) {
-    switch (kind) {
-        case 0: return {index, project.buildings[index].name, project.buildings[index].data};
-        case 1: return {index, project.buildblocks[index].name, project.buildblocks[index].data};
-        default: return {index, project.blocks[index].name, project.blocks[index].data};
-    }
-}
-
-void commit_asset_edits(EditorProject& project, const EditorUi& ui) {
-    for (std::size_t kind = 0; kind < project.asset_baselines.size(); ++kind) {
-        auto& baseline = project.asset_baselines[kind];
-        if (baseline.has_value()) {
-            bool changed = false;
-            if (!with_live_asset(project, *baseline, [&](const auto& saved, const auto& live) { changed = saved != live; })) {
-                baseline.reset();
-            } else if (changed) {
-                record_action(project, "edit " + baseline->name);
-                auto& undo = project.asset_undo_stacks[kind];
-                undo.push_back(std::move(*baseline));
-                if (undo.size() > kMaxUndo) {
-                    undo.erase(undo.begin());
-                }
-                project.asset_redo_stacks[kind].clear();
-                baseline.reset();
-            }
-        }
-        const auto selected = selected_asset_index(project, ui, kind);
-        if (!selected.has_value()) {
-            baseline.reset();
-        } else if (!baseline.has_value() || baseline->index != *selected) {
-            baseline = snapshot_asset(project, kind, *selected);
-        }
-    }
-}
-
-void step_asset_history(EditorProject& project, EditorUi& ui, std::string& status, std::size_t kind, bool redo) {
-    auto& from = redo ? project.asset_redo_stacks[kind] : project.asset_undo_stacks[kind];
-    auto& to = redo ? project.asset_undo_stacks[kind] : project.asset_redo_stacks[kind];
-    const std::string verb = redo ? "redo" : "undo";
-    if (from.empty()) {
-        status = "nothing to " + verb;
-        return;
-    }
-    auto step = std::move(from.back());
-    from.pop_back();
-    if (!with_live_asset(project, step, [](auto& saved, auto& live) { std::swap(saved, live); })) {
-        status = verb + " skipped: " + step.name + " was removed or renamed";
-        return;
-    }
-    switch (kind) {
-        case 0:
-            ui.selected_building = step.index;
-            mark_building_changed(project, ui);
-            break;
-        case 1:
-            ui.selected_buildblock = step.index;
-            mark_buildblock_changed(project, ui);
-            break;
-        default:
-            ui.selected_block = step.index;
-            mark_block_changed(project, ui, project.blocks[step.index].data);
-            break;
-    }
-    record_action(project, verb + ": " + step.name);
-    status = verb + " " + step.name;
-    project.asset_baselines[kind] = snapshot_asset(project, kind, step.index);
-    to.push_back(std::move(step));
-}
-
-// Asset history the current context edits, or nullopt for city history.
-std::optional<std::size_t> active_asset_history(const EditorUi& ui) {
-    if (ui.buildblock_window_focused || ui.tab == EditorTab::Buildblocks) return 1U;
-    if (ui.tab == EditorTab::Buildings) return 0U;
-    if (ui.tab == EditorTab::Blocks) return 2U;
-    return std::nullopt;
-}
-
-} // namespace
-
-void commit_pending_edits(EditorProject& project, const EditorUi& ui) {
-    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) || ImGui::IsAnyItemActive() || ui.gizmo_active != GizmoAxis::None) {
-        return;
-    }
-    commit_city_edits(project);
-    commit_asset_edits(project, ui);
-}
-
-bool can_undo(const EditorProject& project, const EditorUi& ui, bool redo) {
-    if (const auto kind = active_asset_history(ui)) {
-        return !(redo ? project.asset_redo_stacks[*kind] : project.asset_undo_stacks[*kind]).empty();
-    }
-    return !(redo ? project.redo_stack : project.undo_stack).empty();
-}
-
-void undo_edit(EditorProject& project, EditorUi& ui, std::string& status, bool redo) {
-    if (const auto kind = active_asset_history(ui)) {
-        commit_asset_edits(project, ui);
-        step_asset_history(project, ui, status, *kind, redo);
-    } else if (redo) {
-        redo_city(project, ui, status);
-    } else {
-        undo_city(project, ui, status);
-    }
-}
-
-// Reverts the last action: the pre-edit snapshot becomes current, and the current
-// state is pushed to the redo stack so it can be reapplied.
-void undo_city(EditorProject& project, EditorUi& ui, std::string& status) {
-    commit_city_edits(project);
-    if (!project.city || project.undo_stack.empty()) {
-        status = "nothing to undo";
-        return;
-    }
-    auto [label, snapshot] = std::move(project.undo_stack.back());
-    project.undo_stack.pop_back();
-    project.redo_stack.emplace_back(label, project.city->data);
-    project.city->data = std::move(snapshot);
-    project.city_baseline = project.city->data;
-    record_action(project, "undo: " + label);
-    invalidate_city_block_preview_scene(project);
-    invalidate_portal_render_models(project);
-    ui.city_selection = CitySelectionKind::None;
-    ui.selected_city_buildings.clear();
-    ui.selected_portals.clear();
-    ui.pending_road_start.reset();
-    ui.city_dirty = true;
-    status = "undo " + label;
-}
-
-void redo_city(EditorProject& project, EditorUi& ui, std::string& status) {
-    commit_city_edits(project);
-    if (!project.city || project.redo_stack.empty()) {
-        status = "nothing to redo";
-        return;
-    }
-    auto [label, snapshot] = std::move(project.redo_stack.back());
-    project.redo_stack.pop_back();
-    project.undo_stack.emplace_back(label, project.city->data);
-    project.city->data = std::move(snapshot);
-    project.city_baseline = project.city->data;
-    record_action(project, "redo: " + label);
-    invalidate_city_block_preview_scene(project);
-    invalidate_portal_render_models(project);
-    ui.city_selection = CitySelectionKind::None;
-    ui.selected_city_buildings.clear();
-    ui.selected_portals.clear();
-    ui.pending_road_start.reset();
-    ui.city_dirty = true;
-    status = "redo " + label;
-}
-
 void set_status(EditorProject& project) {
     project.status =
         std::to_string(project.city.has_value() ? 1 : 0) + " city | " +
@@ -2082,7 +1035,7 @@ void set_status(EditorProject& project) {
     }
 }
 
-// Locates a cell by grid coordinate in the dense y->z->x cell array, or nullptr.
+// Finds a cell by grid position in the y->z->x cell array, or returns nullptr.
 SbbCell* building_cell_at(SbbBuilding& building, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
     for (auto& cell : building.cells) {
         if (cell.x == x && cell.y == y && cell.z == z) {
@@ -2092,30 +1045,53 @@ SbbCell* building_cell_at(SbbBuilding& building, std::uint32_t x, std::uint32_t 
     return nullptr;
 }
 
-// Face index (0..5) for the hit point on a cell, from the dominant axis of the
-// offset between the hit and the cell centre. Order matches the renderer's
-// BuildingFaceSide->slot map: 0 Down(-Y), 1 South(-Z), 2 West(-X), 3 North(+Z),
-// Native solid-cell tag the building renderer keys off:
-// is_solid_building_cell tests exterior_block>>29 == 2 (the 0x40000000 class),
-// and interior_block == 0xffff marks a fully-faced solid box (the same words
-// native_city_block_solid_cell() uses). A bare index word is NOT solid and would
-// render nothing, which is why placement looked broken before.
+// The solid-cell marker the building renderer looks for:
+// is_solid_building_cell checks exterior_block>>29 == 2 (the 0x40000000 kind),
+// and interior_block == 0xffff picks the generated room. A plain block number
+// has no solid-cell marker and does not get this geometry.
 constexpr std::uint32_t kSolidExteriorBlock = 0x40000000U;
 constexpr std::uint32_t kSolidInteriorBlock = 0x0000FFFFU;
 
-// Writes the enabled layers of the Place Block config into a cell, as
+// Check both mesh references before a placement changes the grid, the cell, or
+// the name list. Each packed reference has a 10-bit name index.
+std::string block_config_problem(const SbbBuilding& building, const BlockToolConfig& config, const EditorProject& project) {
+    std::vector<std::string> new_names;
+    for (const auto& [enabled, index] : {
+            std::pair{config.exterior && config.exterior_piece, config.exterior_piece_block},
+            std::pair{config.interior && config.interior_piece, config.interior_piece_block}}) {
+        if (!enabled) continue;
+        if (index >= project.blocks.size()) return "the selected piece mesh is no longer available";
+        const auto name = lower_name(project.blocks[index].name);
+        const auto existing = std::ranges::find_if(building.piece_names, [&](const auto& candidate) {
+            return lower_name(candidate) == name;
+        });
+        if (existing != building.piece_names.end()) {
+            if (existing - building.piece_names.begin() > 0x3ff) return "the piece-name index exceeds the 1024-name limit";
+        } else if (std::ranges::find(new_names, name) == new_names.end()) {
+            new_names.push_back(name);
+        }
+    }
+    if (building.piece_names.size() + new_names.size() > 1024) {
+        return "the building's 1024-entry piece-name table is full";
+    }
+    return {};
+}
+
+// Writes the turned-on layers of the Place Block settings into a cell, like
 // BuildingTool_WriteCellFromCurrentSelection @1400672a0 does: the exterior word
-// and its texture set (slots 0..7); the interior word, cell type, placed flag
-// (bit 0: the room's floor) and interior set (slots 8..15). Shipped rooms carry
-// placed flag 1; without it a room has no floor.
+// and its texture set (slots 0..7), then the interior word, cell type, placed
+// flag (bit 0 is the room's floor), and interior set (slots 8..15). Rooms in the
+// game's buildings have placed flag 1; without it a room has no floor. The Floor
+// setting can leave it off to join a room with the one below.
 void apply_block_config(SbbCell& cell, const BlockToolConfig& config, SbbBuilding& building, const EditorProject& project) {
     const auto word = [&](bool piece, std::size_t block, std::uint32_t normal) {
-        if (!piece || project.blocks.empty()) return normal;
-        const auto key = lower_name(project.blocks[std::min(block, project.blocks.size() - 1U)].name);
+        if (!piece) return normal;
+        if (block >= project.blocks.size()) throw std::runtime_error("Selected piece mesh is unavailable");
+        const auto key = lower_name(project.blocks[block].name);
         auto it = std::ranges::find_if(building.piece_names, [&](const std::string& n) { return lower_name(n) == key; });
         if (it == building.piece_names.end()) {
-            if (building.piece_names.size() > 0x3ffU) return normal;  // the word holds a 10-bit index
-            building.piece_names.push_back(project.blocks[std::min(block, project.blocks.size() - 1U)].name);
+            if (building.piece_names.size() > 0x3ffU) throw std::runtime_error("Building piece-name table is full");
+            building.piece_names.push_back(project.blocks[block].name);
             it = std::prev(building.piece_names.end());
         }
         const auto index = static_cast<std::uint32_t>(it - building.piece_names.begin());
@@ -2132,15 +1108,15 @@ void apply_block_config(SbbCell& cell, const BlockToolConfig& config, SbbBuildin
         cell.interior_block() = word(config.interior_piece, config.interior_piece_block, kSolidInteriorBlock);
         cell.cell_type() = static_cast<std::uint32_t>(
             building.block_names.empty() ? 0U : std::min(config.buildblock_index, building.block_names.size() - 1U));
-        cell.placed_flag() = 1U;
+        cell.placed_flag() = config.room_floor ? 1U : 0U;
         for (std::size_t slot = 0; slot < 8; ++slot) cell.shorts[8 + slot] = material(config.interior_textures[slot]);
     }
     refresh_sbb_cell_payloads(cell);
 }
 
-// Place Block: extrude a new cell into the empty neighbour of the picked face,
-// writing the staged block config (exterior/interior shells, buildblock, textures).
-// Returns the filled cell's index, or nullopt when nothing was placed.
+// Place Block: fills the empty cell in front of the face you clicked with the
+// current block settings (outside and inside shells, buildblock, textures).
+// Returns the new cell's index, or nullopt when nothing was placed.
 std::optional<std::size_t> place_building_block(EditorProject& project, EditorUi& ui, const BuildingFacePick& pick, Vec3 ray_dir,
                                                 float unit_size, std::string& status) {
     if (project.buildings.empty()) {
@@ -2155,6 +1131,10 @@ std::optional<std::size_t> place_building_block(EditorProject& project, EditorUi
     if (pick.cell_index >= building.cells.size()) {
         return std::nullopt;
     }
+    if (const auto problem = block_config_problem(building, ui.block_config, project); !problem.empty()) {
+        status = problem;
+        return std::nullopt;
+    }
     if (ui.block_config.apply_to_clicked) {
         auto& clicked = building.cells[pick.cell_index];
         apply_block_config(clicked, ui.block_config, building, project);
@@ -2162,24 +1142,25 @@ std::optional<std::size_t> place_building_block(EditorProject& project, EditorUi
         status = "changed block at [" + std::to_string(clicked.x) + "," + std::to_string(clicked.y) + "," + std::to_string(clicked.z) + "]";
         return pick.cell_index;
     }
-    // The empty cell in front of the clicked face: a step back along the ray
-    // from the hit, in anchor-relative cells (the edit view's space).
+    // The empty cell in front of the clicked face: one step back along the ray from
+    // the hit, in cells relative to the anchor (the edit view's space).
     const Vec3 front{pick.hit_world.x - ray_dir.x * 0.05F, pick.hit_world.y - ray_dir.y * 0.05F, pick.hit_world.z - ray_dir.z * 0.05F};
     const std::int64_t nx = static_cast<std::int64_t>(std::floor(front.x / unit_size)) + building.anchor_x;
     const std::int64_t ny = static_cast<std::int64_t>(std::floor(front.y / unit_size)) + building.anchor_y;
     const std::int64_t nz = static_cast<std::int64_t>(std::floor(front.z / unit_size)) + building.anchor_z;
-    const auto sx = static_cast<std::uint32_t>(std::max<std::int64_t>(0, -nx));
-    const auto sy = static_cast<std::uint32_t>(std::max<std::int64_t>(0, -ny));
-    const auto sz = static_cast<std::uint32_t>(std::max<std::int64_t>(0, -nz));
-    for (auto& cell : building.cells) { cell.x += sx; cell.y += sy; cell.z += sz; }
-    building.anchor_x += sx; building.anchor_y += sy; building.anchor_z += sz;
-    auto* target = building_cell_at(building, nx + sx, ny + sy, nz + sz);
+    const auto coordinate = shift_sbb_grid_for_cell(building, nx, ny, nz);
+    if (!coordinate) {
+        status = "placement would exceed the supported 64-cell building grid";
+        return std::nullopt;
+    }
+    const auto [x, y, z] = *coordinate;
+    auto* target = building_cell_at(building, x, y, z);
     if (target == nullptr) {
         SbbCell cell{};
         cell.index = building.cells.size();
-        cell.x = static_cast<std::uint32_t>(nx + sx);
-        cell.y = static_cast<std::uint32_t>(ny + sy);
-        cell.z = static_cast<std::uint32_t>(nz + sz);
+        cell.x = x;
+        cell.y = y;
+        cell.z = z;
         cell.shorts.fill(0xffffU);
         building.cells.push_back(cell);
         target = &building.cells.back();
@@ -2222,8 +1203,8 @@ void place_building_item_set(EditorProject& project, EditorUi& ui, std::size_t c
         std::to_string(cell.x) + "," + std::to_string(cell.y) + "," + std::to_string(cell.z) + "]";
 }
 
-// Paint Texture: write the chosen material into the texture slot of the face
-// that was clicked (cell.shorts 0..7 outer, 8..15 inner), as its mesh tag says.
+// Paint Texture: writes the chosen material into the texture slot of the face you
+// clicked (cell.shorts 0..7 outside, 8..15 inside), as its mesh tag says.
 void paint_building_face(EditorProject& project, EditorUi& ui, std::size_t cell_index, std::uint32_t slot, std::string& status) {
     if (project.buildings.empty()) {
         return;
@@ -2247,11 +1228,11 @@ void paint_building_face(EditorProject& project, EditorUi& ui, std::size_t cell_
     status = std::string(slot >= 8U ? "interior" : "exterior") + " face painted " + name;
 }
 
-// Paint Wall type: write ui.paint_code into the side-code word the renderer
-// reads for the clicked wall, the same word for its outside face and its room
-// face (Sbb_BuildBuildingConnectivityMetadata / the room key): north is the
-// cell's +0x0c, west its +0x10, east the +x cell's +0x10, south the +z cell's
-// +0x0c. Shell slots 1..4 are S/W/N/E; room slots 9..12 are N/E/S/W.
+// Paint Wall type: writes ui.paint_code into the side-code word the renderer
+// reads for the clicked wall. Its outside face and its room face use the same word
+// (Sbb_BuildBuildingConnectivityMetadata and the room key): north is the cell's
+// +0x0c, west its +0x10, east the +x cell's +0x10, and south the +z cell's +0x0c.
+// Shell slots 1..4 are S/W/N/E and room slots 9..12 are N/E/S/W.
 // A layer code also points the cell at the chosen buildblock.
 void paint_building_side_code(EditorProject& project, EditorUi& ui, std::size_t cell_index, std::uint32_t slot, std::string& status) {
     if (project.buildings.empty()) return;
@@ -2293,9 +1274,9 @@ void paint_building_side_code(EditorProject& project, EditorUi& ui, std::size_t 
 
 BoundingBox city_building_bounds(const SbcBuilding& placement, const SbbBuilding& asset, float unit);
 
-// Middle of a placed building's footprint at its render-origin height: where
-// the gizmo sits and what rotation turns about. Falls back to the render origin
-// when the template is not loaded.
+// The middle of a placed building's footprint, at its render-origin height. The
+// gizmo sits here and rotation turns around it. Uses the render origin when the
+// template is not loaded.
 Vector3 city_building_center(const EditorProject& project, const SbcBuilding& placement) {
     const auto o = native_city_building_render_origin(placement, 4.0F);
     const auto* asset = find_building_asset(project, placement.name);
@@ -2304,15 +1285,15 @@ Vector3 city_building_center(const EditorProject& project, const SbcBuilding& pl
     return {(bounds.min.x + bounds.max.x) * 0.5F, o.y, (bounds.min.z + bounds.max.z) * 0.5F};
 }
 
-// Gizmo position relative to the render origin (see city_building_center).
+// Where the gizmo sits relative to the render origin (see city_building_center).
 Vector3 city_building_gizmo_offset(const EditorProject& project, const SbcBuilding& placement) {
     const auto o = native_city_building_render_origin(placement, 4.0F);
     const auto c = city_building_center(project, placement);
     return {c.x - o.x, 0.0F, c.z - o.z};
 }
 
-// Turns a building in quarter steps about its footprint centre, so it spins in
-// place instead of swinging around its anchor corner.
+// Turns a building in quarter turns around the middle of its footprint, so it spins
+// in place instead of swinging around its anchor corner.
 void rotate_city_building_in_place(const EditorProject& project, SbcBuilding& building, int drot) {
     const auto before = city_building_center(project, building);
     building.rotation = (building.rotation + drot) & 3;
@@ -2387,23 +1368,14 @@ void duplicate_city_building(EditorProject& project, EditorUi& ui) {
     ui.city_dirty = true;
 }
 
-void place_city_building_copy(EditorProject& project, EditorUi& ui, CityGridPoint point) {
-    if (!project.city || project.city->data.buildings.empty()) {
-        return;
-    }
-
-    duplicate_city_building(project, ui);
-    set_city_building_position(project, ui, point);
-}
-
 void delete_city_building(EditorProject& project, EditorUi& ui) {
     if (!project.city || project.city->data.buildings.empty()) {
         return;
     }
 
     auto& map = project.city->data;
-    // Delete the whole multi-selection if there is one (descending order keeps the
-    // remaining indices valid), else just the active building.
+    // Delete everything selected if several buildings are selected (going from the
+    // highest index down keeps the other indices valid), otherwise just the active one.
     std::vector<std::size_t> targets = ui.selected_city_buildings.size() > 1U
         ? ui.selected_city_buildings
         : std::vector<std::size_t>{std::min(ui.selected_city_building, map.buildings.size() - 1U)};
@@ -2423,7 +1395,7 @@ void delete_city_building(EditorProject& project, EditorUi& ui) {
     ui.city_dirty = true;
 }
 
-// World bounds of a placed building's full cell volume.
+// World bounds of all the cells of a placed building.
 BoundingBox city_building_bounds(const SbcBuilding& placement, const SbbBuilding& asset, float unit) {
     BoundingBox bounds{{FLT_MAX, FLT_MAX, FLT_MAX}, {-FLT_MAX, -FLT_MAX, -FLT_MAX}};
     for (int corner = 0; corner < 8; ++corner) {
@@ -2438,20 +1410,20 @@ BoundingBox city_building_bounds(const SbcBuilding& placement, const SbbBuilding
     return bounds;
 }
 
-// The placement the Building tool would make at the cursor: the chosen template
+// What the Building tool would place at the cursor: the chosen template
 // (ui.place_building_template) turned by ui.place_building_rotation, with its
 // footprint centred on the cursor and its lowest floor on the clicked surface.
-// The ghost preview and the click both use this, so what you see is what lands.
+// The ghost preview and the click both use this, so it lands where you see it.
 SbcBuilding city_building_placement_at(const EditorProject& project, const EditorUi& ui, CityGridPoint point) {
     constexpr float unit = 4.0F;
     const auto& tmpl = project.buildings[std::min(ui.place_building_template, project.buildings.size() - 1U)];
     SbcBuilding placement{};
     placement.name = tmpl.name;
     placement.x = point.x;
-    // The record's y is the level of the ANCHOR layer (CitySbc_Load pairs
-    // size_z with anchor_y). Floors below the anchor are foundation, so to
-    // stand the lowest floor on the clicked surface the anchor goes anchor_y
-    // levels above it. Without this, houses with anchor_y 1..2 sank that much.
+    // The record's y is the level of the ANCHOR layer (CitySbc_Load pairs size_z with
+    // anchor_y). Floors below the anchor are foundation. To stand the lowest floor on
+    // the clicked surface, the anchor goes anchor_y levels above it. Without this,
+    // houses with anchor_y 1 or 2 sank by that much.
     placement.y = point.y + static_cast<std::int32_t>(tmpl.data.anchor_y);
     placement.z = point.z;
     placement.rotation = ui.place_building_rotation & 3;
@@ -2461,9 +1433,9 @@ SbcBuilding city_building_placement_at(const EditorProject& project, const Edito
     return placement;
 }
 
-// What a Building-tool placement would overlap: another building's volume or
-// a road's surface. Empty when the spot is clear. Placing is still allowed;
-// this only drives the red preview and the warning text.
+// What a Building-tool placement would overlap: another building or the surface of
+// a road. Empty when the spot is clear. You can still place there; this only turns
+// the preview red and shows the warning.
 std::string city_building_placement_conflict(EditorProject& project, const SbcBuilding& ghost) {
     constexpr float unit = 4.0F;
     const auto* tmpl = find_building_asset(project, ghost.name);
@@ -2486,7 +1458,7 @@ std::string city_building_placement_conflict(EditorProject& project, const SbcBu
             static_cast<std::size_t>(street.to_intersection) >= map.intersections.size()) continue;
         const auto& a = map.intersections[static_cast<std::size_t>(street.from_intersection)];
         const auto& b = map.intersections[static_cast<std::size_t>(street.to_intersection)];
-        // Roads are axis-aligned; pad the centreline by half the total width.
+        // Roads run along an axis; widen the centre line by half the total width.
         const float half = static_cast<float>(street.left_width + street.right_width) * 0.5F * unit;
         const BoundingBox road{
             {std::min(a.x, b.x) * unit - half, std::min(a.y, b.y) * unit - unit, std::min(a.z, b.z) * unit - half},
@@ -2498,7 +1470,7 @@ std::string city_building_placement_conflict(EditorProject& project, const SbcBu
     return {};
 }
 
-// Drops a NEW placement of the chosen building template at the cursor.
+// Places a NEW copy of the chosen building template at the cursor.
 void place_city_building_from_template(EditorProject& project, EditorUi& ui, CityGridPoint point) {
     if (!project.city || project.buildings.empty()) {
         return;
@@ -2514,19 +1486,6 @@ void place_city_building_from_template(EditorProject& project, EditorUi& ui, Cit
 }
 
 
-void nudge_city_street_endpoint(EditorProject& project, EditorUi& ui, int endpoint, int delta) {
-    if (!project.city || project.city->data.streets.empty() || project.city->data.intersections.empty()) {
-        return;
-    }
-
-    ui.selected_city_street = std::min(ui.selected_city_street, project.city->data.streets.size() - 1U);
-    auto& street = project.city->data.streets[ui.selected_city_street];
-    auto& value = endpoint == 0 ? street.from_intersection : street.to_intersection;
-    const auto max_index = static_cast<int>(project.city->data.intersections.size() - 1U);
-    value = std::clamp(value + delta, 0, max_index);
-    ui.city_dirty = true;
-}
-
 void nudge_city_street_width(EditorProject& project, EditorUi& ui, int side, int delta) {
     if (!project.city || project.city->data.streets.empty()) {
         return;
@@ -2536,17 +1495,6 @@ void nudge_city_street_width(EditorProject& project, EditorUi& ui, int side, int
     auto& street = project.city->data.streets[ui.selected_city_street];
     auto& value = side == 0 ? street.left_width : street.right_width;
     value = std::max(0, value + delta);
-    ui.city_dirty = true;
-}
-
-void nudge_city_street_district(EditorProject& project, EditorUi& ui, int delta) {
-    if (!project.city || project.city->data.streets.empty()) {
-        return;
-    }
-
-    ui.selected_city_street = std::min(ui.selected_city_street, project.city->data.streets.size() - 1U);
-    auto& street = project.city->data.streets[ui.selected_city_street];
-    street.district = std::max(0, street.district + delta);
     ui.city_dirty = true;
 }
 
@@ -2564,9 +1512,9 @@ void duplicate_city_street(EditorProject& project, EditorUi& ui) {
     ui.city_dirty = true;
 }
 
-// Nearest existing intersection to a grid point within snap_cells, or nullopt.
-// Lets a road click reuse an existing junction instead of stacking a new node on
-// top of it (editor.exe behavior).
+// The closest existing intersection to a grid point within snap_cells, or nullopt.
+// Lets a road click reuse a junction that is already there instead of stacking a
+// new node on it (as editor.exe does).
 std::optional<std::size_t> nearest_city_intersection(const SbcMap& map, CityGridPoint point, std::int32_t snap_cells) {
     std::optional<std::size_t> best;
     std::int64_t best_dist_sq = static_cast<std::int64_t>(snap_cells) * snap_cells;
@@ -2584,9 +1532,9 @@ std::optional<std::size_t> nearest_city_intersection(const SbcMap& map, CityGrid
     return best;
 }
 
-// Constrains an end point to be axis-aligned with a start node: locks whichever
-// of X/Z moved less, so the segment runs straight along the dominant axis. Roads
-// are never diagonal.
+// Keeps an end point in line with a start node: it locks whichever of X and Z moved
+// less, so the segment runs straight along the main direction. Roads are never
+// diagonal.
 CityGridPoint snap_to_axis(CityGridPoint start, CityGridPoint target) {
     const auto dx = std::abs(target.x - start.x);
     const auto dz = std::abs(target.z - start.z);
@@ -2596,17 +1544,17 @@ CityGridPoint snap_to_axis(CityGridPoint start, CityGridPoint target) {
     return CityGridPoint{start.x, target.y, target.z};
 }
 
-// A road segment a grid point lands on, mid-span, ready to be split: the street
-// index plus the grid point projected onto the segment (axis-aligned, so the new
-// node sits exactly on the road line).
+// A road a grid point lands on, away from its ends, ready to be split: the street
+// index and the grid point moved onto the road (roads run along an axis, so the
+// new node sits exactly on the road's line).
 struct StreetSplitHit {
     std::size_t street_index{};
     CityGridPoint point{};
 };
 
-// Finds an existing road whose footprint the grid point lands on, away from its
-// endpoints, so a click there can split it into a T/4-way junction instead of
-// dropping a free-floating node. Endpoints are left to nearest_city_intersection.
+// Finds a road whose footprint the grid point lands on, away from its ends, so a
+// click there splits it into a T or 4-way junction instead of adding a loose node.
+// nearest_city_intersection handles the ends.
 std::optional<StreetSplitHit> nearest_street_split(const SbcMap& map, CityGridPoint point, bool auto_generated) {
     std::optional<StreetSplitHit> best;
     double best_dist = std::numeric_limits<double>::max();
@@ -2626,7 +1574,7 @@ std::optional<StreetSplitHit> nearest_street_split(const SbcMap& map, CityGridPo
             continue;
         }
         double u = ((point.x - a.x) * dx + (point.z - a.z) * dz) / seg_len_sq;
-        // Stay clear of the endpoints; those resolve to the existing nodes.
+        // Stay away from the ends; those snap to the existing nodes.
         const double end_margin = 0.75 / std::sqrt(seg_len_sq);
         if (u <= end_margin || u >= 1.0 - end_margin) {
             continue;
@@ -2634,14 +1582,14 @@ std::optional<StreetSplitHit> nearest_street_split(const SbcMap& map, CityGridPo
         const double cx = a.x + dx * u;
         const double cz = a.z + dz * u;
         const double dist = std::sqrt((point.x - cx) * (point.x - cx) + (point.z - cz) * (point.z - cz));
-        // Half the drawn road width, in cells, plus a cell of slack.
+        // Half the drawn road width, in cells, plus one spare cell.
         const double half_width = std::max(street.left_width, street.right_width) * 0.5 + 1.0;
         if (dist > half_width || dist >= best_dist) {
             continue;
         }
         auto road_y = static_cast<std::int32_t>(std::lround(a.y + (b.y - a.y) * u));
-        // The game ramps a street in its middle with flat ends, not straight from
-        // end to end: split at the height of the lane the game lays there
+        // The game puts a street's slope in its middle with flat ends, not as a straight
+        // ramp from end to end. So split at the height of the lane the game lays there
         // (lanes sit at level y - 1).
         if (a.y != b.y) {
             const auto gx = static_cast<std::int32_t>(std::lround(cx)), gz = static_cast<std::int32_t>(std::lround(cz));
@@ -2653,8 +1601,8 @@ std::optional<StreetSplitHit> nearest_street_split(const SbcMap& map, CityGridPo
             }
         }
         if (std::abs(road_y - point.y) > 1) continue;
-        // Snap the split node onto the exact grid cell nearest the projection so
-        // the two halves stay axis-aligned with the original road.
+        // Snap the split node onto the grid cell closest to that point, so both halves stay
+        // in line with the original road.
         best = StreetSplitHit{
             i,
             CityGridPoint{
@@ -2668,16 +1616,16 @@ std::optional<StreetSplitHit> nearest_street_split(const SbcMap& map, CityGridPo
     return best;
 }
 
-// Splits street[street_index] at a new node placed at split_point: the original
-// segment becomes from->new, and a fresh segment new->to is appended, both
-// carrying the source road's width/district/name. Returns the new node index.
+// Splits street[street_index] at a new node at split_point. The original segment
+// becomes from->new, and a new segment new->to is added. Both keep the original
+// road's width, district, and name. Returns the new node's index.
 std::size_t split_street_at(SbcMap& map, std::size_t street_index, CityGridPoint split_point) {
     const auto existing = nearest_city_intersection(map, split_point, 0);
     const auto node_index = existing ? *existing : add_city_intersection(map, split_point);
 
     auto original = map.streets[street_index];
     const auto to_index = original.to_intersection;
-    // Reuse the original for from->new; append new->to with the same profile.
+    // Reuse the original for from->new, and add new->to with the same settings.
     map.streets[street_index].to_intersection = static_cast<std::int32_t>(node_index);
 
     SbcStreet tail = original;
@@ -2692,9 +1640,9 @@ std::size_t split_street_at(SbcMap& map, std::size_t street_index, CityGridPoint
     return node_index;
 }
 
-// Resolves a click to an intersection index: snaps to a nearby existing node,
-// else splits an existing road the click lands on (forming a junction), else
-// creates a new node at the clicked surface height.
+// Turns a click into an intersection index: snaps to a nearby node if there is one,
+// or else splits a road the click lands on (making a junction), or else makes a new
+// node at the height of the clicked surface.
 std::size_t resolve_or_create_intersection(SbcMap& map, CityGridPoint point, bool auto_generated) {
     if (const auto existing = nearest_city_intersection(map, point, 1)) {
         return *existing;
@@ -2713,8 +1661,8 @@ void append_city_road_point(EditorProject& project, EditorUi& ui, CityGridPoint 
     auto& map = project.city->data;
     const bool auto_generated = project_is_auto_generated(project);
 
-    // First click only records the start, snapped to a nearby node or road so the
-    // preview matches. Nothing is created until the second click lays a segment.
+    // The first click only remembers the start, snapped to a nearby node or road so the
+    // preview matches. Nothing is made until the second click lays a segment.
     if (!ui.pending_road_start.has_value()) {
         if (const auto node = nearest_city_intersection(map, point, 1)) {
             const auto& existing = map.intersections[*node];
@@ -2733,12 +1681,12 @@ void append_city_road_point(EditorProject& project, EditorUi& ui, CityGridPoint 
     if (map.streets.size() != streets || map.intersections.size() != intersections) ui.city_dirty = true;
 }
 
-// Lays the road the Road tool lays from start_point to a click at point: snaps
-// to junctions, splits the roads it starts, ends, or crosses on, and adds the
-// segments. Shared by the click and its preview so they always agree.
+// Lays the road the Road tool would lay from start_point to a click at point. It
+// snaps to junctions, splits roads it starts on, ends on, or crosses, and adds the
+// segments. The click and its preview share this so they always agree.
 RoadLay lay_city_road(SbcMap& map, CityGridPoint start_point, CityGridPoint point, std::int32_t width, bool auto_generated) {
     RoadLay laid;
-    // Clicking the start point again ends the chain without a 0-length road.
+    // Clicking the start point again ends the chain without making a zero-length road.
     if (start_point.x == point.x && start_point.z == point.z) return {};
 
     // Axis-lock the end relative to the start, then resolve/create that node.
@@ -2759,8 +1707,8 @@ RoadLay lay_city_road(SbcMap& map, CityGridPoint start_point, CityGridPoint poin
             return {node_point(end_index), std::nullopt};
         }
     }
-    // New roads use the Tools width and continue the district of a road already
-    // meeting the start node.
+    // New roads use the width set in Tools, and carry on the district of a road that
+    // already meets the start node.
     SbcStreet street{};
     street.name = "Street";
     street.left_width = width / 2;
@@ -2771,8 +1719,8 @@ RoadLay lay_city_road(SbcMap& map, CityGridPoint start_point, CityGridPoint poin
             break;
         }
     }
-    // Split intersected roads at matching heights, then connect every junction
-    // in order. Crossings at another elevation remain bridges.
+    // Split the roads it crosses where the heights match, then join every junction in
+    // order. Where roads cross at different heights, they stay as bridges.
     const auto finish = map.intersections[end_index];
     const bool along_x = start_point.z == finish.z;
     const int from = along_x ? start_point.x : start_point.z;
@@ -2821,12 +1769,12 @@ RoadLay lay_city_road(SbcMap& map, CityGridPoint start_point, CityGridPoint poin
         map.streets.push_back(canonical_city_street_endpoint_order(map, std::move(segment)));
         laid.last_street = map.streets.size() - 1;
     }
-    // The new end node becomes the next start: chained laying.
+    // The new end node becomes the next start, so roads can be laid in a chain.
     laid.next_start = node_point(end_index);
     return laid;
 }
 
-// Ends the current road-laying chain (Esc, or mode/selection change).
+// Ends the current chain of roads (Esc, or a change of mode or selection).
 void end_road_chain(EditorUi& ui) {
     ui.pending_road_start.reset();
 }
@@ -2871,8 +1819,8 @@ std::uint32_t encode_city_piece_word(const EditorUi& ui) {
         (static_cast<std::uint32_t>(ui.selected_piece_rotation & 3U) << 24U);
 }
 
-// The city block with this mesh name (empty = the game's solid "nblock" cube)
-// and one layer of these textures; appended when no record matches.
+// The city block with this mesh name (empty means the game's solid "nblock" cube)
+// and one layer of these textures. Added if no record matches.
 std::optional<std::size_t> find_or_add_city_block(SbcMap& map, const std::string& name, const std::array<std::string, 8>& layer) {
     const auto block = std::ranges::find_if(map.city_blocks, [&](const SbcCityBlock& candidate) {
         return candidate.name == name && candidate.layers.size() == 1 && candidate.layers[0] == layer;
@@ -2906,8 +1854,8 @@ void set_city_piece_voxel(EditorProject& project, EditorUi& ui, CityGridPoint po
     ui.city_dirty = true;
 }
 
-// Repaints the selected piece: its voxel points at a city block with the same
-// mesh and these textures, keeping the rotation.
+// Repaints the selected piece: points its voxel at a city block with the same mesh
+// and these textures, and keeps the rotation.
 void repaint_city_piece(EditorProject& project, EditorUi& ui, const std::array<std::string, 8>& textures, std::string& status) {
     if (!project.city || !ui.selected_piece_voxel || project.city->data.version < 11) return;
     auto& map = project.city->data;
@@ -2927,8 +1875,8 @@ void repaint_city_piece(EditorProject& project, EditorUi& ui, const std::array<s
     ui.city_dirty = true;
 }
 
-// Moves the selected piece voxel one step, keeping its word (piece, layer,
-// rotation). Refuses to overwrite an occupied cell.
+// Moves the selected piece voxel one step and keeps its word (piece, layer,
+// rotation). Will not overwrite a cell that is already filled.
 void move_city_piece(EditorProject& project, EditorUi& ui, int dx, int dy, int dz, std::string& status) {
     if (!project.city || !ui.selected_piece_voxel || project.city->data.version < 11) return;
     auto& map = project.city->data;
@@ -2943,7 +1891,7 @@ void move_city_piece(EditorProject& project, EditorUi& ui, int dx, int dy, int d
     if (source == nullptr || source->blocks.size() < 0x200) return;
     const auto word = source->blocks[local_portal_index(from)];
     if (word == 0U) return;
-    auto& target = find_or_create_portal(map, to);  // may reallocate portals
+    auto& target = find_or_create_portal(map, to);  // can move the portals list in memory
     if (target.blocks.size() < 0x200) target.blocks.resize(0x200);
     if (target.blocks[local_portal_index(to)] != 0U) {
         status = "that cell already has a piece";
@@ -2974,16 +1922,16 @@ void select_city_piece(EditorProject& project, EditorUi& ui, const CityPiecePick
         ui.selected_piece_rotation = static_cast<std::size_t>((pick.word >> 24U) & 3U);
     }
 
-    // Resolve the picked voxel to its world grid cell so selection highlights one
-    // block, not the whole 8x8x8 portal.
+    // Find the picked voxel's world grid cell, so the selection highlights one block
+    // and not the whole 8x8x8 portal.
     const auto& portal = project.city->data.portals[pick.portal_index];
     const auto local_x = static_cast<std::int32_t>(pick.block_index & 7U);
     const auto local_z = static_cast<std::int32_t>((pick.block_index / 8U) & 7U);
     const auto local_y = static_cast<std::int32_t>((pick.block_index / 0x40U) & 7U);
     ui.selected_piece_voxel = CityGridPoint{
-        portal.fields[1] * 8 + local_x,
-        portal.fields[2] * 8 + local_y,
-        portal.fields[3] * 8 + local_z,
+        sbc_portal_cell_base(portal.fields[1]) + local_x,
+        sbc_portal_cell_base(portal.fields[2]) + local_y,
+        sbc_portal_cell_base(portal.fields[3]) + local_z,
     };
 
     status = "selected piece block [" +
@@ -3035,136 +1983,12 @@ void nudge_city_block_slot(EditorProject& project, EditorUi& ui, int delta) {
     ui.city_dirty = true;
 }
 
-void clear_city_block_slot(EditorProject& project, EditorUi& ui) {
-    if (!project.city || project.city->data.city_blocks.empty()) {
-        return;
-    }
-
-    ui.selected_city_block = std::min(ui.selected_city_block, project.city->data.city_blocks.size() - 1U);
-    auto& city_block = project.city->data.city_blocks[ui.selected_city_block];
-    if (city_block.layers.empty()) {
-        return;
-    }
-    ui.selected_city_block_layer = std::min(ui.selected_city_block_layer, city_block.layers.size() - 1U);
-    ui.selected_city_block_slot = std::min<std::size_t>(ui.selected_city_block_slot, 7U);
-    city_block.layers[ui.selected_city_block_layer][ui.selected_city_block_slot].clear();
-    invalidate_city_block_preview_scene(project);
-    invalidate_portal_render_models(project);
-    ui.city_dirty = true;
-}
-
-// v10 district cells cannot be written as v12 pieces without changing how the
-// game draws them: v12 resolves layer names against the loaded texture table
-// (RemapCityBuildingDataLayersToLoadedMaterials @e6960), where slot 1 (asphalt2,
-// which the legacy loop uses for every nonzero grid entry) has no name, and v12
-// cells are placed after the buildings instead of before them.
-bool has_legacy_district_cells(const SbcMap& map) {
-    return std::any_of(map.portals.begin(), map.portals.end(), [](const SbcPortal& portal) {
-        return std::any_of(portal.legacy_blocks.begin(), portal.legacy_blocks.end(), [](auto word) { return word != 0U; });
-    });
-}
-
-// Convert old district cells into named v12 pieces with texture layers. Built-in
-// meshes become ordinary v2 SBL assets, so saved cities do not depend on legacy
-// numeric catalog IDs. Stage the whole conversion before changing the project.
-void promote_city(EditorProject& project) {
-    if (!project.city || project.city->data.version >= 12) return;
-    auto converted = project.city->data;
-    std::vector<LoadedAsset<SblBlockMesh>> generated;
-    const auto catalog = build_native_builtin_catalog();
-    const auto& textures = project_grid_texture_names(project);
-    for (auto& portal : converted.portals) {
-        if (portal.legacy_blocks.empty()) continue;
-        if (!portal.blocks.empty()) throw std::runtime_error("City has mixed legacy and current district cells");
-        portal.blocks.resize(0x200);
-        for (std::size_t i = 0; i < std::min<std::size_t>(512, portal.legacy_blocks.size()); ++i) {
-            const auto word = portal.legacy_blocks[i];
-            if (!word) continue;
-            const auto kind = word & 0xe0000000U;
-            std::string mesh_name;
-            if (kind == 0x80000000U) {
-                const auto id = word & 0xffffU;
-                if (id == 0) continue; // Native null catalog entry.
-                if (id >= catalog.size() || catalog[id].mesh.faces.empty())
-                    throw std::runtime_error("Cannot promote unsupported legacy mesh " + std::to_string(id));
-                mesh_name = "converted_legacy_" + std::to_string(id);
-                // A previous upgrade (e.g. before an undo) already added this mesh;
-                // reuse it instead of adding a numbered duplicate every time.
-                const auto loaded = std::find_if(project.blocks.begin(), project.blocks.end(), [&](const auto& asset) {
-                    return asset.name.starts_with(mesh_name) && asset.data == catalog[id].mesh;
-                });
-                if (loaded != project.blocks.end()) {
-                    mesh_name = loaded->name;
-                } else {
-                    if (std::none_of(generated.begin(), generated.end(), [&](const auto& asset) { return asset.name == mesh_name; })) {
-                        auto name = mesh_name;
-                        // Blocks and buildblocks share the archive's SBL namespace,
-                        // which is case-insensitive (project_archive).
-                        const auto taken = [&](const std::string& candidate) {
-                            const auto lower = lower_name(candidate);
-                            const auto same = [&](const auto& asset) { return lower_name(asset.name) == lower; };
-                            return std::filesystem::exists(project.root / "block" / (candidate + ".sbl")) ||
-                                std::any_of(project.blocks.begin(), project.blocks.end(), same) ||
-                                std::any_of(project.buildblocks.begin(), project.buildblocks.end(), same) ||
-                                std::any_of(generated.begin(), generated.end(), [&](const auto& asset) {
-                                    return lower_name(asset.path.stem().string()) == lower;
-                                });
-                        };
-                        for (unsigned suffix = 1; taken(name); ++suffix)
-                            name = mesh_name + "_" + std::to_string(suffix);
-                        // Cache the chosen name by catalog ID for later cells.
-                        generated.push_back({project.root / "block" / (name + ".sbl"), mesh_name, catalog[id].mesh});
-                    }
-                    const auto asset = std::find_if(generated.begin(), generated.end(), [&](const auto& asset) { return asset.name == mesh_name; });
-                    mesh_name = asset->path.stem().string();
-                }
-            } else if (kind != 0x40000000U) {
-                throw std::runtime_error("Cannot promote unknown legacy district cell class");
-            }
-            std::array<std::string, 8> layer{};
-            for (std::size_t slot = 0; slot < 8; ++slot) {
-                const auto offset = i * 8 + slot;
-                auto texture = offset < portal.textures.size() ? portal.textures[offset] : 0;
-                if (texture >= textures.size()) texture = 0;
-                if (!textures.empty()) layer[slot] = textures[texture];
-            }
-            auto block = std::find_if(converted.city_blocks.begin(), converted.city_blocks.end(), [&](const auto& candidate) {
-                return candidate.name == mesh_name && candidate.layers.size() == 1 && candidate.layers[0] == layer;
-            });
-            if (block == converted.city_blocks.end()) {
-                if (converted.city_blocks.size() >= 4096) throw std::runtime_error("Promoted city exceeds the piece limit");
-                converted.city_blocks.push_back({converted.city_blocks.size(), mesh_name, {layer}});
-                block = std::prev(converted.city_blocks.end());
-            }
-            // Catalog geometry already contains its rotation. Preserve the
-            // texture layer and avoid rotating that baked mesh a second time.
-            portal.blocks[i] = static_cast<std::uint32_t>(block - converted.city_blocks.begin()) | 0x10000U;
-        }
-        portal.legacy_blocks.clear();
-        portal.textures.clear();
-        portal.itemsets.resize(512);
-    }
-    converted.version = 12;
-    std::vector<std::vector<std::uint8_t>> payloads;
-    for (const auto& asset : generated) payloads.push_back(rebuild_sbl_block(asset.data));
-    for (std::size_t i = 0; i < generated.size(); ++i) {
-        auto& asset = generated[i];
-        asset.name = asset.path.stem().string();
-        project.generated_city_assets.emplace_back(asset.path, payloads[i]);
-        project.block_bytes.push_back(std::move(payloads[i]));
-        project.blocks.push_back(std::move(asset));
-    }
-    project.city->data = std::move(converted);
-    invalidate_render_input_cache(project);
-    invalidate_portal_render_models(project);
-}
-
 void recalculate_building_size(SbbBuilding& building) {
     building.version = 14;
-    // Native grid rule, true of every shipped building: X/Z hold the highest
-    // cell index (the grid spans 0..size inclusive) and Y the floor count, so
-    // burger's 12x12x2 grid holds 13*13*2 = 338 cells. Measure every grid cell,
-    // not just occupied ones, so empty columns and upper floors keep the size.
+    // The game's grid rule, true for every building it ships: X and Z hold the highest
+    // cell index (the grid runs from 0 to size, both included) and Y holds the number
+    // of floors. So burger's 12x12x2 grid has 13*13*2 = 338 cells. Measure every grid
+    // cell, not just the filled ones, so empty columns and upper floors keep the size.
     building.size_x = building.size_y = 0;
     building.size_z = 1;
     for (std::size_t i = 0; i < building.cells.size(); ++i) {
@@ -3176,14 +2000,14 @@ void recalculate_building_size(SbbBuilding& building) {
     building.extent_x = std::max(1U, building.size_x - std::min(building.size_x, building.anchor_x));
     building.extent_y = std::max(1U, building.size_z - std::min(building.size_z, building.anchor_y));
     building.extent_z = std::max(1U, building.size_y - std::min(building.size_y, building.anchor_z));
-    // Edited geometry invalidates baked LODs.
+    // Changed geometry makes the saved LODs out of date.
     building.lod_tail.clear();
     building.lod_marker = 1;
     building.lod_group_count = 0;
 }
 
-// A buildblock edit only changes the meshes of buildings that reference it, so
-// rebuild those instead of dirtying every building in the project.
+// A buildblock edit only changes the meshes of buildings that use it, so rebuild
+// those instead of marking every building in the project as changed.
 void rebuild_buildings_using_buildblock(EditorProject& project, const std::string& buildblock_name) {
     invalidate_render_input_cache(project);
     for (std::size_t i = 0; i < project.buildings.size(); ++i) {
@@ -3194,67 +2018,15 @@ void rebuild_buildings_using_buildblock(EditorProject& project, const std::strin
     }
 }
 
-void mark_building_changed(EditorProject& project, EditorUi& ui) {
-    project.buildings[ui.selected_building].dirty = true;
-    recalculate_building_size(project.buildings[ui.selected_building].data);
-    ui.building_dirty = true;
-    // Only the edited building's mesh + thumbnail need rebuilding, not every city
-    // building. The Buildings-tab floor preview is its own cached model.
-    project.building_floor_preview_dirty = true;
-    rebuild_single_building_render(project, ui.selected_building);
-    invalidate_building_thumbnail(project, ui.selected_building);
-}
 
-void rename_building(EditorProject& project, EditorUi& ui, const std::string& name, std::string& status) {
-    auto& asset = project.buildings[ui.selected_building];
-    if (name == asset.name) return;
-    if (name.empty() || name.size() > 51 || name == "." || name == ".." || name.find_first_of("/\\:") != std::string::npos) {
-        status = "A building name needs 1-51 characters and no / \\ or :";
-        return;
-    }
-    for (const auto& other : project.buildings) {
-        if (&other != &asset && lower_name(other.name) == lower_name(name)) {
-            status = "Another building is already named " + other.name;
-            return;
-        }
-    }
-    // Rename its placements first: they resolve by name. The undo history gets
-    // the same rename, so undoing other edits keeps the placements resolved.
-    const auto rename_in = [&](SbcMap& map) {
-        for (auto& placement : map.buildings) {
-            if (find_building_asset(project, placement.name) == &asset) placement.name = name;
-        }
-    };
-    if (project.city) {
-        if (project.city->data.buildings.end() != std::ranges::find_if(project.city->data.buildings,
-                [&](const SbcBuilding& p) { return find_building_asset(project, p.name) == &asset; })) {
-            ui.city_dirty = true;
-        }
-        rename_in(project.city->data);
-    }
-    if (project.city_baseline) rename_in(*project.city_baseline);
-    for (auto& [label, map] : project.undo_stack) rename_in(map);
-    for (auto& [label, map] : project.redo_stack) rename_in(map);
-    // Building edit history finds its asset by index and name.
-    const auto index = static_cast<std::size_t>(&asset - project.buildings.data());
-    const auto rename_snapshot = [&](AssetSnapshot& snapshot) {
-        if (std::holds_alternative<SbbBuilding>(snapshot.data) && snapshot.index == index && snapshot.name == asset.name) snapshot.name = name;
-    };
-    for (auto* stacks : {&project.asset_undo_stacks, &project.asset_redo_stacks}) {
-        for (auto& stack : *stacks) for (auto& snapshot : stack) rename_snapshot(snapshot);
-    }
-    for (auto& baseline : project.asset_baselines) if (baseline) rename_snapshot(*baseline);
-    status = "renamed " + asset.name + " to " + name;
-    asset.name = name;
-    asset.dirty = true;
-    ui.building_dirty = true;
-    project.placement_assets_dirty = true;
+void mark_building_changed(EditorProject& project, EditorUi& ui) {
+    recalculate_building_size(project.buildings[ui.selected_building].data);
+    refresh_changed_building(project, ui);
 }
 
 void mark_buildblock_changed(EditorProject& project, EditorUi& ui) {
     project.buildblocks[ui.selected_buildblock].dirty = true;
     auto& model = project.buildblocks[ui.selected_buildblock].data;
-    model.version = 1;
     for (std::size_t i = 0; i < model.layers.size(); ++i) {
         auto& layer = model.layers[i]; layer.index = i;
         layer.door_count = static_cast<std::uint32_t>(layer.doors.size());
@@ -3271,7 +2043,7 @@ void mark_buildblock_changed(EditorProject& project, EditorUi& ui) {
 void mark_block_changed(EditorProject& project, EditorUi& ui, SblBlockMesh& block) {
     ui.block_dirty = true;
     refresh_sbl_block_faces(block);
-    // The archive is written from block_bytes; keep them the edited block.
+    // The archive is written from block_bytes, so keep them matching the edited block.
     for (std::size_t i = 0; i < project.blocks.size(); ++i) {
         if (&project.blocks[i].data != &block) continue;
         project.blocks[i].dirty = true;
@@ -3279,81 +2051,13 @@ void mark_block_changed(EditorProject& project, EditorUi& ui, SblBlockMesh& bloc
         if (i < project.block_thumbnail_ready.size()) project.block_thumbnail_ready[i] = false;
     }
     project.render_buffers_dirty = true;
-    // Editing block data invalidates the cached block-mesh catalog.
+    // Editing block data makes the cached block mesh catalog out of date.
     invalidate_render_input_cache(project);
     invalidate_city_block_preview_scene(project);
     invalidate_portal_render_models(project);
 }
 
-CsxArchive project_archive(const EditorProject& project) {
-    CsxArchive archive{0xc5f17e01U, 0, 0, {}};
-    const auto add = [&](CsxEntry entry) {
-        if (entry.name.empty() || entry.name.size() > 51 || entry.name.find_first_of("/\\:") != std::string::npos)
-            throw std::runtime_error("Invalid archive asset name: " + entry.name);
-        auto existing = std::find_if(archive.entries.begin(), archive.entries.end(), [&](const auto& other) {
-            return other.type == entry.type && lower_name(other.name) == lower_name(entry.name);
-        });
-        if (existing == archive.entries.end()) archive.entries.push_back(std::move(entry));
-        else *existing = std::move(entry);
-    };
-    // Archive textures keep their order: v10 texture grids hold absolute indices
-    // into it (see build_grid_texture_names). Loose textures only add new names
-    // after them, so the archive still wins a name clash, as in the viewport.
-    for (const auto& path : project_archive_paths(project))
-        for (auto& entry : parse_csx_file(path).entries)
-            if (entry.kind == CsxEntryKind::Texture || entry.kind == CsxEntryKind::Unknown) add(std::move(entry));
-    std::vector<std::filesystem::path> pngs = files_with_extension(project.root / "texture", ".png");
-    for (const auto& path : files_with_extension(project.root, ".png")) {
-        // The game loads these from the map folder into fixed slots, not from the archive.
-        const auto stem = path.stem().string();
-        if (stem == "asphalt2" || stem == "map") continue;
-        pngs.push_back(path);
-    }
-    for (const auto& path : pngs) {
-        const auto stem = path.stem().string();
-        if (stem.ends_with("_material")) continue;
-        const bool archived = std::any_of(archive.entries.begin(), archive.entries.end(), [&](const auto& entry) {
-            return entry.type == 0x585a0004U && lower_name(entry.name) == lower_name(stem);
-        });
-        if (archived) continue;
-        const auto color = read_file_bytes(path);
-        auto material_path = project.root / "texturematerial" / path.filename();
-        if (!std::filesystem::exists(material_path)) material_path = project.root / (stem + "_material.png");
-        const auto material = std::filesystem::exists(material_path) ? read_file_bytes(material_path) : std::vector<std::uint8_t>{};
-        CsxEntry entry{}; entry.name = stem; entry.kind = CsxEntryKind::Texture; entry.type = 0x585a0004U;
-        entry.payload.resize(0x4c, 0); entry.payload[0] = 1;
-        for (unsigned i = 0; i < 4; ++i) {
-            entry.payload[0x44+i] = static_cast<std::uint8_t>(color.size() >> (8*i));
-            entry.payload[0x48+i] = static_cast<std::uint8_t>(material.size() >> (8*i));
-        }
-        entry.payload.insert(entry.payload.end(), color.begin(), color.end());
-        entry.payload.insert(entry.payload.end(), material.begin(), material.end());
-        add(std::move(entry));
-    }
-    const auto geometry = [&](const std::string& name, CsxEntryKind kind, std::vector<std::uint8_t> bytes) {
-        CsxEntry entry{}; entry.name = name; entry.kind = kind;
-        entry.type = kind == CsxEntryKind::Sbb ? 0x585a0002U : 0x585a0001U;
-        bytes[0] = 1; bytes[1] = bytes[2] = bytes[3] = 0;
-        entry.payload = std::move(bytes); add(std::move(entry));
-    };
-    for (const auto& asset : project.buildings) geometry(asset.name, CsxEntryKind::Sbb, rebuild_sbb(asset.data));
-    for (std::size_t i = 0; i < project.blocks.size(); ++i) {
-        auto bytes = project.block_bytes.at(i);
-        if (read_le_u32(bytes, 0) == 1) bytes.resize(bytes.size() + 4, 0);
-        geometry(project.blocks[i].name, CsxEntryKind::Sbl, std::move(bytes));
-    }
-    // Buildblocks stay out of the archive: the game reads them only from loose
-    // buildblock/<name>.sbl files (BuildblockTemplate_LoadFromSbl @27200).
-    const auto rank = [](CsxEntryKind kind) {
-        return kind == CsxEntryKind::Sbb ? 0 : kind == CsxEntryKind::Sbl ? 1 : kind == CsxEntryKind::Texture ? 2 : 3;
-    };
-    std::stable_sort(archive.entries.begin(), archive.entries.end(), [&](const auto& a, const auto& b) {
-        return rank(a.kind) < rank(b.kind);
-    });
-    return archive;
-}
-
-// Saves the map screen (map image and street names) as a PNG.
+// Saves the map screen (the map image and street names) as a PNG.
 void export_map_image(EditorProject& project, const EditorUi& ui, std::string& status) {
     const auto png = map_menu_png(project, ui.map_export_size, ui.map_menu);
     if (png.empty()) {
@@ -3365,18 +2069,14 @@ void export_map_image(EditorProject& project, const EditorUi& ui, std::string& s
     web_download(name, png);
     status = "downloaded " + name;
 #else
-    NFD::Guard guard;
-    NFD::UniquePathU8 selected;
-    const nfdu8filteritem_t filters[] = {{"PNG image", "png"}};
-    const auto default_dir = path_utf8(project.root);
-    const auto result = NFD::SaveDialog(selected, filters, 1, default_dir.c_str(), name.c_str());
-    if (result == NFD_CANCEL) return;
-    if (result == NFD_ERROR) { report_failure(status, std::string{"Map image export failed: "} + NFD::GetError()); return; }
-    const auto output = std::filesystem::u8path(selected.get());
-    std::ofstream out(output, std::ios::binary);
-    out.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
-    if (!out) { report_failure(status, "Map image export failed: cannot write " + output.string()); return; }
-    status = "exported " + output.filename().string();
+    try {
+        const auto output = dialog_save_file(project.root / name, "PNG image", "png");
+        if (!output) return;
+        write_file_bytes(*output, png);
+        status = "exported " + output->filename().string();
+    } catch (const std::exception& error) {
+        report_failure(status, std::string{"Map image export failed: "} + error.what());
+    }
 #endif
 }
 
@@ -3401,8 +2101,12 @@ void draw_city_upgrade_dialogs(EditorProject& project, EditorUi& ui, std::string
         ImGui::PopTextWrapPos();
         ImGui::Spacing();
         if (ImGui::Button("Upgrade to v12")) {
-            try { promote_city(project); status = "map format upgraded from v" + std::to_string(from) + " to v12"; }
-            catch (const std::exception& error) {
+            try {
+                promote_city(project);
+                ui.city_dirty = true;
+                project.city_promotion_failed = false;
+                status = "map format upgraded from v" + std::to_string(from) + " to v12";
+            } catch (const std::exception& error) {
                 project.city_promotion_failed = true;
                 report_failure(status, std::string{"Map upgrade failed: "} + error.what());
             }
@@ -3428,131 +2132,20 @@ void draw_city_upgrade_dialogs(EditorProject& project, EditorUi& ui, std::string
     }
 }
 
-// A map is a folder: the game loads only <folder>/city2.sbc and <folder>/test.csx.
-void save_active_tab(EditorProject& project, EditorUi& ui, std::string& status) {
-#ifndef __EMSCRIPTEN__
-    NFD::Guard guard;
-    NFD::UniquePathU8 selected;
-    const auto directory = project.city ? project.city->path.parent_path() : project.root;
-    const auto default_dir = path_utf8(directory);
-    const auto result = NFD::PickFolder(selected, default_dir.c_str());
-    if (result == NFD_CANCEL) return;
-    if (result == NFD_ERROR) { report_failure(status, std::string{"Map save failed: "} + NFD::GetError()); return; }
-    const auto output = std::filesystem::u8path(selected.get());
-#else
-    // No folder dialog in the browser: the files download.
-    const auto output = project.root;
-#endif
-    save_map_to(project, ui, output, status);
-}
-
-std::vector<std::string> game_world_fit_problems(const EditorProject& project) {
-    if (!project.city_scene_cache_valid) return {};
-    const auto& fit = project.city_scene_cache.world_fit;
-    const auto pieces = [](std::size_t roads, std::size_t buildings) {
-        std::string text;
-        if (roads > 0) text = std::to_string(roads) + " road pieces";
-        if (roads > 0 && buildings > 0) text += " and ";
-        if (buildings > 0) text += std::to_string(buildings) + " building pieces";
-        return text;
-    };
-    std::vector<std::string> problems;
-    if (fit.road_tiles_outside + fit.building_cells_outside > 0) {
-        problems.push_back(pieces(fit.road_tiles_outside, fit.building_cells_outside) +
-            " are outside the game's map area and won't appear in game. The area is 16384 wide, 16384 long and 2048 high.");
-    }
-    if (fit.road_tiles_no_room + fit.building_cells_no_room > 0) {
-        problems.push_back("The game runs out of space for this map: " + pieces(fit.road_tiles_no_room, fit.building_cells_no_room) +
-            " won't appear in game. Remove roads or buildings to make room.");
-    }
-    return problems;
-}
-
-void save_map_to(EditorProject& project, EditorUi& ui, const std::filesystem::path& folder, std::string& status) {
-    try {
-        const auto output = folder / "city2.sbc";
-        // A legacy map keeps its version; its district grid is copied as loaded.
-        const bool legacy = project.city && has_legacy_district_cells(project.city->data);
-        if (legacy && !project.city_bytes) throw std::runtime_error("Legacy city has no loaded bytes to keep its district grid");
-        const auto loaded_version = project.city ? project.city->data.version : 12U;
-        if (!legacy) promote_city(project);
-        const auto archive = project_archive(project);
-        auto city = project.city ? project.city->data : SbcMap{};
-        if (!legacy) city.version = 12;
-        for (auto& placement : city.buildings) {
-            const auto asset = find_building_asset(project, placement.name);
-            if (asset == nullptr) throw std::runtime_error("Missing or ambiguous building: " + placement.name);
-            placement.name = asset->name;
-        }
-        const auto map_bytes = legacy ? rebuild_sbc_layout(*project.city_bytes, city) : rebuild_sbc(city);
-        const auto archive_bytes = build_csx(archive);
-        const auto archive_path = folder / kGameArchiveName;
-        // Buildblocks are loose files. Saving in place rewrites the edited ones;
-        // saving elsewhere writes them all so the new folder is complete.
-        const bool same_folder = std::filesystem::equivalent(output.parent_path(), project.root);
-        std::vector<std::pair<std::filesystem::path, std::vector<std::uint8_t>>> buildblock_files;
-        for (const auto& asset : project.buildblocks) {
-            if (same_folder && !asset.dirty) continue;
-            buildblock_files.emplace_back(output.parent_path() / "buildblock" / (asset.name + ".sbl"), rebuild_sbl_buildblock(asset.data));
-        }
-        // Finish serialization before touching any output file.
-#ifndef __EMSCRIPTEN__
-        write_file_bytes(archive_path, archive_bytes);
-        for (const auto& [path, bytes] : buildblock_files) {
-            std::filesystem::create_directories(path.parent_path());
-            write_file_bytes(path, bytes);
-        }
-        write_file_bytes(output, map_bytes);
-#else
-        web_download(archive_path.filename().string(), archive_bytes);
-        for (const auto& [path, bytes] : buildblock_files) web_download(path.filename().string(), bytes);
-        web_download(output.filename().string(), map_bytes);
-#endif
-        project.city = LoadedAsset<SbcMap>{output, output.stem().string(), std::move(city)};
-        project.city_promotion_failed = false;
-        project.city_bytes = map_bytes;
-        for (auto& asset : project.buildings) asset.dirty = false;
-        for (auto& asset : project.buildblocks) asset.dirty = false;
-        ui.city_dirty = ui.building_dirty = ui.block_dirty = ui.buildblock_dirty = false;
-        project.saved_undo_depth = project.undo_stack.size();
-        // Saving normalizes the map; that is not an edit to undo.
-        project.city_baseline = project.city->data;
-        status.clear();
-        if (legacy) {
-            status = "saved in format v" + std::to_string(loaded_version) + ": its legacy district cells have no v12 equivalent";
-        } else if (loaded_version < 12) {
-            status = "saved; map format upgraded from v" + std::to_string(loaded_version) + " to v12";
-        }
-        for (const auto& problem : game_world_fit_problems(project)) {
-            status = (status.empty() ? std::string{"saved"} : status) + ". " + problem;
-        }
-    } catch (const std::exception& error) {
-        report_failure(status, std::string{"Map save failed: "} + error.what());
-    }
-}
-
-bool has_unsaved_changes(const EditorUi& ui) {
-    return ui.city_dirty || ui.building_dirty || ui.block_dirty || ui.buildblock_dirty;
-}
-
-void save_all_dirty(EditorProject& project, EditorUi& ui, std::string& status) {
-    save_active_tab(project, ui, status);
-}
-
 // -----------------------------------------------------------------------------
 // Building drag gizmo
 // -----------------------------------------------------------------------------
 
-// Geometry of the gizmo handles for a selected city building, in world space.
-// Three move handles sit at the tip of short axis arms; the rotate handle is an
-// offset ring marker. Sizes scale with the unit grid so the gizmo stays readable.
+// Where the gizmo handles for a selected city building sit, in world space. Three
+// move handles sit at the ends of short axis arms, and the rotate handle is a ring
+// marker off to the side. Sizes follow the grid so the gizmo stays easy to read.
 struct GizmoLayout {
     Vector3 origin{};
     Vector3 tip_x{};
     Vector3 tip_y{};
     Vector3 tip_z{};
     Vector3 tip_rot{};
-    // XZ plane handle: a square between the X and Z arms (ImGuizmo style).
+    // XZ plane handle: a square between the X and Z arms (like ImGuizmo).
     std::array<Vector3, 4> plane_xz{};
     float handle_radius{};
     float arm_length{};
@@ -3564,7 +2157,8 @@ GizmoLayout building_gizmo_layout(const SbcBuilding& placement, const Camera3D& 
     o.x += offset.x; o.y += offset.y; o.z += offset.z;
     const Vector3 point{o.x, o.y, o.z};
     const auto distance = Vector3Distance(camera.position, point);
-    const auto arm = std::max(1.0F, distance * std::tan(camera.fovy * DEG2RAD * .5F) * 180.0F / std::max(1.0F, viewport_size.y));
+    (void)distance;
+    const auto arm = std::max(1.0F, view_half_height(camera, point) * 180.0F / std::max(1.0F, viewport_size.y));
     const Vector3 origin{o.x, o.y + unit_size * 0.5F, o.z};
     const float p0 = arm * 0.3F;
     const float p1 = arm * 0.6F;
@@ -3581,12 +2175,9 @@ GizmoLayout building_gizmo_layout(const SbcBuilding& placement, const Camera3D& 
     };
 }
 
-// Nearest gizmo handle hit by the cursor in viewport pixels. Screen-space hit
-// zones keep the gizmo selectable at every zoom level and match the visible
-// arrow shafts/heads instead of only testing tiny 3D endpoint spheres.
-// What a click would select in the unified city view. A building or piece the ray
-// passes through sits in front of the road/terrain beneath it, so volumes win over
-// the ground; among ground hits, the road/node picker already chooses nearest.
+// What a click would select in the city view. A building or piece the ray passes
+// through is in front of the road or ground below it, so those win over the
+// ground. Among ground hits, the road and node picker already picks the closest.
 struct CityAnyPick {
     CitySelectionKind kind{CitySelectionKind::None};
     std::size_t index{};
@@ -3597,12 +2188,12 @@ CityAnyPick pick_city_any(EditorProject& project, const MapScene& scene, const V
         return {};
     }
     const auto& map = project.city->data;
-    // Pick rendered triangles, so an empty cell or open doorway does not select
-    // the building behind the cursor.
+    // Pick the drawn triangles, so an empty cell or an open doorway does not select the
+    // building behind the cursor.
     const auto& asset_indices = resolve_placement_asset_indices(project);
     const Ray ray{{ro.x, ro.y, ro.z}, {rd.x, rd.y, rd.z}};
-    // Foundation floors sit under the ground; a ray that reaches the ground (or a
-    // road on it) first must not pick the building buried behind it.
+    // Foundation floors are underground. If the ray reaches the ground (or a road on
+    // it) first, it must not pick the building buried behind it.
     float ground_distance = std::numeric_limits<float>::max();
     if (scene.terrain.has_value()) {
         if (const auto ground = ray_terrain_hit(*scene.terrain, ro, rd)) {
@@ -3643,16 +2234,16 @@ CityAnyPick pick_city_any(EditorProject& project, const MapScene& scene, const V
             }
         }
     }
-    // Piece voxel volume. Whichever of the nearest building and piece the ray
-    // reaches first wins, so a piece in front of a building is pickable.
+    // Piece voxels. Whichever the ray reaches first, the closest building or the
+    // closest piece, wins, so you can pick a piece that is in front of a building.
     const auto piece = pick_city_piece(map, ro, rd, scene.unit_size);
     float piece_distance = std::numeric_limits<float>::max();
     if (piece.has_value() && piece->portal_index < map.portals.size()) {
         const auto& portal = map.portals[piece->portal_index];
         const Vector3 cell_min{
-            static_cast<float>(portal.fields[1] * 8 + static_cast<std::int32_t>(piece->block_index & 7U)) * scene.unit_size,
-            static_cast<float>(portal.fields[2] * 8 + static_cast<std::int32_t>((piece->block_index / 0x40U) & 7U)) * scene.unit_size,
-            static_cast<float>(portal.fields[3] * 8 + static_cast<std::int32_t>((piece->block_index / 8U) & 7U)) * scene.unit_size};
+            static_cast<float>(sbc_portal_cell_base(portal.fields[1]) + static_cast<std::int32_t>(piece->block_index & 7U)) * scene.unit_size,
+            static_cast<float>(sbc_portal_cell_base(portal.fields[2]) + static_cast<std::int32_t>((piece->block_index / 0x40U) & 7U)) * scene.unit_size,
+            static_cast<float>(sbc_portal_cell_base(portal.fields[3]) + static_cast<std::int32_t>((piece->block_index / 8U) & 7U)) * scene.unit_size};
         const auto cell_hit = GetRayCollisionBox(ray, {cell_min, Vector3AddValue(cell_min, scene.unit_size)});
         if (cell_hit.hit) piece_distance = cell_hit.distance;
     }
@@ -3662,7 +2253,7 @@ CityAnyPick pick_city_any(EditorProject& project, const MapScene& scene, const V
     if (piece.has_value()) {
         return {CitySelectionKind::Piece, piece->portal_index};
     }
-    // Ground: road or node (already nearest-of-the-two).
+    // Ground: a road or a node (already the closer of the two).
     const auto road = pick_city_road_or_node(map, scene, ro, rd);
     if (road.has_value()) {
         return road->kind == CityRoadPick::Kind::Node
@@ -3672,7 +2263,7 @@ CityAnyPick pick_city_any(EditorProject& project, const MapScene& scene, const V
     return {};
 }
 
-// Adds/removes an index from a selection set (multi-select toggle).
+// Adds an index to a selection set, or removes it if it is already there.
 void toggle_in_selection(std::vector<std::size_t>& set, std::size_t index) {
     const auto it = std::find(set.begin(), set.end(), index);
     if (it == set.end()) {
@@ -3682,10 +2273,11 @@ void toggle_in_selection(std::vector<std::size_t>& set, std::size_t index) {
     }
 }
 
-// Applies a Select-tool pick. Buildings and piece portals support multi-select
-// (additive = Shift/Ctrl): plain click replaces the set with the one thing,
-// additive toggles it in/out. Roads and nodes are single-select. The active
-// single index (selected_city_building / selected_portal) tracks the last click.
+// Applies a pick from the Select tool. Buildings and piece portals can be multi-
+// selected (additive = Shift or Ctrl): a plain click selects only that thing, and an
+// additive click adds or removes it. Roads and nodes are selected one at a time.
+// The single active index (selected_city_building / selected_portal) follows the
+// last click.
 void select_city_thing(
     EditorProject& project,
     EditorUi& ui,
@@ -3744,10 +2336,10 @@ void select_city_thing(
     }
 }
 
-// Rubber-band box select: every building and piece voxel whose screen point falls
-// in the rectangle joins the selection. additive keeps the existing selection;
-// otherwise the box replaces it. Buildings and piece portals can't mix, so a box
-// that catches both prefers buildings (the common case).
+// Box select: every building and piece voxel whose screen point is inside the
+// rectangle gets selected. With additive, the old selection stays; otherwise the
+// box replaces it. Buildings and piece portals can't be selected together, so a box
+// that catches both picks the buildings (the usual case).
 void box_select_city(
     EditorProject& project,
     EditorUi& ui,
@@ -3804,9 +2396,9 @@ void box_select_city(
                 continue;
             }
             const Vector3 c{
-                (static_cast<float>(portal.fields[1] * 8 + static_cast<std::int32_t>(bi & 7U)) + 0.5F) * unit,
-                (static_cast<float>(portal.fields[2] * 8 + static_cast<std::int32_t>((bi / 0x40U) & 7U)) + 0.5F) * unit,
-                (static_cast<float>(portal.fields[3] * 8 + static_cast<std::int32_t>((bi / 8U) & 7U)) + 0.5F) * unit,
+                (static_cast<float>(sbc_portal_cell_base(portal.fields[1]) + static_cast<std::int32_t>(bi & 7U)) + 0.5F) * unit,
+                (static_cast<float>(sbc_portal_cell_base(portal.fields[2]) + static_cast<std::int32_t>((bi / 0x40U) & 7U)) + 0.5F) * unit,
+                (static_cast<float>(sbc_portal_cell_base(portal.fields[3]) + static_cast<std::int32_t>((bi / 8U) & 7U)) + 0.5F) * unit,
             };
             if (in_box(c)) {
                 any = true;
@@ -3828,6 +2420,7 @@ void box_select_city(
         }
         ui.selected_portal = ui.selected_portals.back();
         ui.city_selection = CitySelectionKind::Piece;
+        ui.selected_piece_voxel.reset();
         ui.selected_city_buildings.clear();
     } else if (!additive) {
         ui.city_selection = CitySelectionKind::None;
@@ -3836,12 +2429,9 @@ void box_select_city(
     }
 }
 
-// Erase tool: delete whatever is under the cursor. Clears a piece voxel at the
-// ground cell, and deletes the nearest building or road the ray hits. Bare nodes
-// are left alone (deleting them would orphan roads).
-// Deletes exactly the one thing the Erase hover highlights (pick_city_any):
-// a building, a road, or a single piece voxel. Junctions are left alone; they
-// go away with their roads.
+// Deletes the one thing the Erase hover highlights (pick_city_any): a building, a
+// road, or a single piece voxel. Junctions are left alone; they go away with their
+// roads.
 void erase_city_thing_under_cursor(
     EditorProject& project,
     EditorUi& ui,
@@ -3855,6 +2445,7 @@ void erase_city_thing_under_cursor(
     const auto picked = pick_city_any(project, scene, ro, rd);
     if (picked.kind == CitySelectionKind::Building) {
         ui.selected_city_building = picked.index;
+        ui.selected_city_buildings = {picked.index};
         delete_city_building(project, ui);
         status = "deleted building";
     } else if (picked.kind == CitySelectionKind::Road) {
@@ -3874,6 +2465,9 @@ void erase_city_thing_under_cursor(
     }
 }
 
+// The gizmo handle under the cursor, measured in viewport pixels. Hit areas on
+// the screen keep the gizmo easy to grab at every zoom and match the arrows you
+// see, instead of only testing tiny 3D spheres at their tips.
 GizmoAxis pick_building_gizmo(
     const Camera3D& camera,
     Vector2 viewport_mouse_pos,
@@ -3882,9 +2476,9 @@ GizmoAxis pick_building_gizmo(
     const auto layout = building_gizmo_layout(placement, camera, viewport_size, offset);
     const auto width = static_cast<int>(std::max(1.0F, viewport_size.x));
     const auto height = static_cast<int>(std::max(1.0F, viewport_size.y));
-    // Forward axis, to reject points behind the camera (GetWorldToScreenEx still
-    // returns a finite but mirrored point for those, which made the gizmo pick
-    // bogus handles and feel like it "ate" the click).
+    // The forward direction, to ignore points behind the camera. GetWorldToScreenEx
+    // still returns a mirrored point for those, which made the gizmo pick wrong handles
+    // and seem to swallow the click.
     const Vector3 fwd{
         camera.target.x - camera.position.x,
         camera.target.y - camera.position.y,
@@ -3945,7 +2539,7 @@ GizmoAxis pick_building_gizmo(
     consider_arrow(GizmoAxis::MoveY, layout.tip_y);
     consider_arrow(GizmoAxis::MoveZ, layout.tip_z);
 
-    // XZ plane square: point-in-quad on the projected corners.
+    // XZ plane square: is the point inside the projected corners?
     {
         std::array<Vector2, 4> q{};
         bool ok = true;
@@ -3996,9 +2590,9 @@ GizmoAxis pick_building_gizmo(
 }
 
 void draw_building_gizmo(const SbcBuilding& placement, GizmoAxis active, const Camera3D& camera, Vector2 viewport_size, bool allow_rotation = true, Vector3 offset = {}) {
-    // ImGuizmo-style transform gizmo: constant screen size, axis arrows with
-    // cone heads, a translucent XZ plane square, and a Y rotation ring. The
-    // hovered/active handle turns yellow; everything draws over the scene.
+    // A transform gizmo like ImGuizmo's: it stays the same size on screen and has axis
+    // arrows with cone tips, a see-through XZ plane square, and a Y rotation ring. The
+    // handle under the mouse or in use turns yellow. Everything draws over the scene.
     rlDrawRenderBatchActive();
     rlDisableDepthTest();
     const auto layout = building_gizmo_layout(placement, camera, viewport_size, offset);
@@ -4028,8 +2622,8 @@ void draw_building_gizmo(const SbcBuilding& placement, GizmoAxis active, const C
     draw_arrow(layout.origin, layout.tip_y, axis_color(GizmoAxis::MoveY, green));
     draw_arrow(layout.origin, layout.tip_z, axis_color(GizmoAxis::MoveZ, blue));
 
-    // XZ plane handle: filled square (both sides) plus outline, colored by the
-    // axis it is perpendicular to.
+    // XZ plane handle: a filled square (both sides) and an outline, coloured by the
+    // axis it is at a right angle to.
     {
         const auto base = axis_color(GizmoAxis::MoveXZ, green);
         const Color fill{base.r, base.g, base.b, static_cast<unsigned char>(active == GizmoAxis::MoveXZ ? 170 : 90)};
@@ -4041,7 +2635,7 @@ void draw_building_gizmo(const SbcBuilding& placement, GizmoAxis active, const C
         for (std::size_t i = 0; i < 4; ++i) DrawLine3D(q[i], q[(i + 1) & 3], base);
     }
 
-    // Y rotation ring, drawn as a thin torus of segments so it reads at any zoom.
+    // The Y rotation ring, drawn as a thin ring of segments so it is visible at any zoom.
     if (allow_rotation) {
         const auto color = axis_color(GizmoAxis::Rotate, Color{102, 201, 61, 255});
         const float ring = layout.arm_length * 0.7F;
@@ -4055,15 +2649,15 @@ void draw_building_gizmo(const SbcBuilding& placement, GizmoAxis active, const C
         }
         DrawSphere(layout.tip_rot, r * 0.6F, color);
     }
-    // Center pivot.
+    // The centre point.
     DrawSphere(layout.origin, r * 0.5F, active == GizmoAxis::None ? Color{235, 235, 235, 255} : highlight);
     rlDrawRenderBatchActive();
     rlEnableDepthTest();
 }
 
-// Maps the cursor's ground (or vertical) position during a gizmo drag to an
-// absolute grid cell, then applies it via the existing edit functions. Uses the
-// drag-start origin captured in ui so motion is absolute, not accumulated.
+// During a gizmo drag, turns the cursor's ground (or vertical) position into a grid
+// cell and applies it with the normal edit functions. It measures from the
+// starting point saved in ui, so the move is absolute and errors don't add up.
 void apply_building_gizmo_drag(
     EditorProject& project,
     EditorUi& ui,
@@ -4080,7 +2674,7 @@ void apply_building_gizmo_drag(
     drag_start.x = ui.gizmo_drag_origin_x; drag_start.y = ui.gizmo_drag_origin_y;
     drag_start.z = ui.gizmo_drag_origin_z; drag_start.rotation = ui.gizmo_drag_origin_rot;
     constexpr auto unit_size = 4.0F;
-    // Gizmo and rotation pivot sit at the footprint centre (fixed for the drag).
+    // The gizmo and the rotation centre sit at the middle of the footprint (fixed during the drag).
     const auto gizmo_offset = city_building_gizmo_offset(project, drag_start);
     const auto pivot = city_building_center(project, drag_start);
     const auto ray = get_viewport_mouse_ray(camera, viewport_mouse_pos, viewport_size);
@@ -4162,14 +2756,9 @@ void apply_building_gizmo_drag(
         ui.city_dirty = true;
 }
 
-// Overlay (not road rendering) showing the active road-laying chain: a marker on
-// the pending start node and an axis-snapped preview line to the cursor, so you
-// see the segment before clicking. Drawn inside the City 3D pass.
-// Pick the rendered surface, not a projection onto Y=0. The same query drives
-// the preview and the click so placing and dragging agree on all three axes.
-// Piece tool preview: the chosen block mesh, turned by the brush rotation,
-// drawn see-through in the cell a click will fill (same origin and rotation as
-// the city piece renderer, which lifts pieces 0.25 above their cell).
+// Piece tool preview: the chosen block mesh, turned by the brush rotation, drawn
+// see-through in the cell a click will fill. It uses the same origin and rotation
+// as the city piece renderer, which raises pieces 0.25 above their cell.
 void draw_piece_ghost(const SblBlockMesh* mesh, CityGridPoint cell, std::int32_t rotation) {
     constexpr float unit = 4.0F;
     const Vector3 origin{cell.x * unit, cell.y * unit + 0.25F, cell.z * unit};
@@ -4191,36 +2780,25 @@ void draw_piece_ghost(const SblBlockMesh* mesh, CityGridPoint cell, std::int32_t
         }
     }
     DrawCubeWiresV({(cell.x + 0.5F) * unit, (cell.y + 0.5F) * unit, (cell.z + 0.5F) * unit}, {unit, unit, unit}, edge);
-    // A pin above the cell: one cell is only a few pixels at city zoom.
+    // A pin above the cell, because one cell is only a few pixels at city zoom.
     const Vector3 pin_base{(cell.x + 0.5F) * unit, (cell.y + 1.0F) * unit, (cell.z + 0.5F) * unit};
     const Vector3 pin_top = Vector3Add(pin_base, {0.0F, unit * 6.0F, 0.0F});
     DrawLine3D(pin_base, pin_top, edge);
     DrawSphere(pin_top, unit * 0.5F, edge);
 }
 
-// Uniform XZ grid over a render buffer's triangles (16-unit cells, each
-// triangle listed in every cell its bounds touch), so a pick ray tests only the
-// triangles along its path instead of the whole city mesh.
-struct TrianglePickGrid {
-    const RenderBufferVertex* vertices{};
-    std::size_t triangle_count{};
-    float min_x{}, min_z{};
-    std::int32_t nx{}, nz{};
-    std::vector<std::uint32_t> offsets;
-    std::vector<std::uint32_t> items;
-    std::vector<std::uint32_t> visited;
-    std::uint32_t stamp{};
-};
-
 constexpr float kPickCell = 16.0F;
 
-// Rebuilds `grid` when `buffer` changed since it was built.
-void refresh_pick_grid(TrianglePickGrid& grid, const BuildingRenderBuffer& buffer) {
-    if (grid.vertices == buffer.vertices.data() && grid.triangle_count == buffer.triangles.size()) return;
+// The buffer owns this grid. Finishing or compacting the geometry clears it, so a
+// replaced buffer at a reused address can never keep the old mesh's grid.
+void refresh_pick_grid(const BuildingRenderBuffer& buffer) {
+    auto& grid = buffer.pick_grid;
+    if (grid.ready) return;
     grid = {};
-    grid.vertices = buffer.vertices.data();
-    grid.triangle_count = buffer.triangles.size();
-    if (buffer.triangles.empty()) return;
+    if (buffer.triangles.empty()) {
+        grid.ready = true;
+        return;
+    }
     float min_x = FLT_MAX, min_z = FLT_MAX, max_x = -FLT_MAX, max_z = -FLT_MAX;
     for (const auto& v : buffer.vertices) {
         min_x = std::min(min_x, v.position.x); max_x = std::max(max_x, v.position.x);
@@ -4257,10 +2835,11 @@ void refresh_pick_grid(TrianglePickGrid& grid, const BuildingRenderBuffer& buffe
         for (auto z = z0; z <= z1; ++z) for (auto x = x0; x <= x1; ++x) grid.items[fill[static_cast<std::size_t>(z * grid.nx + x)]++] = t;
     }
     grid.visited.assign(buffer.triangles.size(), 0U);
+    grid.ready = true;
 }
 
-// Walks the ray's cells front to back (2D DDA over XZ) and reports every
-// triangle hit; stops once the nearest hit lies inside the cell just tested.
+// Walks the ray's cells from front to back (a 2D DDA over XZ) and reports every
+// triangle hit. Stops once the closest hit is inside the cell just tested.
 template <typename Consider>
 void pick_grid_ray(TrianglePickGrid& grid, const BuildingRenderBuffer& buffer, const Ray& ray, float& nearest, Consider consider) {
     if (grid.offsets.empty()) return;
@@ -4310,7 +2889,9 @@ void pick_grid_ray(TrianglePickGrid& grid, const BuildingRenderBuffer& buffer, c
     }
 }
 
-// Nearest visible surface under the cursor: the hit point and its normal.
+// The closest visible surface under the cursor: the hit point and its normal.
+// This picks the drawn surface, not a projection onto Y=0. The preview and the
+// click use the same query, so placing and dragging agree on all three axes.
 struct CitySurfaceHit {
     Vector3 point{};
     Vector3 normal{0.0F, 1.0F, 0.0F};
@@ -4349,12 +2930,11 @@ std::optional<CitySurfaceHit> city_surface_hit_under_mouse(
         const auto t = -ray.position.y / ray.direction.y;
         if (t >= 0) { nearest = t; hit = CitySurfaceHit{Vector3Add(ray.position, Vector3Scale(ray.direction, t))}; }
     }
-    // World-space meshes pick through cached grids (rebuilt when they change).
-    static TrianglePickGrid tile_grid, piece_grid;
-    refresh_pick_grid(tile_grid, scene.city_tile_buffer);
-    refresh_pick_grid(piece_grid, project.portal_render_buffer);
-    pick_grid_ray(tile_grid, scene.city_tile_buffer, ray, nearest, consider);
-    pick_grid_ray(piece_grid, project.portal_render_buffer, ray, nearest, consider);
+    // World-space meshes are picked through cached grids (rebuilt when they change).
+    refresh_pick_grid(scene.city_tile_buffer);
+    refresh_pick_grid(project.portal_render_buffer);
+    pick_grid_ray(scene.city_tile_buffer.pick_grid, scene.city_tile_buffer, ray, nearest, consider);
+    pick_grid_ray(project.portal_render_buffer.pick_grid, project.portal_render_buffer, ray, nearest, consider);
     if (project.city) {
         const auto& placement_asset_indices = resolve_placement_asset_indices(project);
         for (std::size_t placement_index = 0; placement_index < project.city->data.buildings.size(); ++placement_index) {
@@ -4363,7 +2943,7 @@ std::optional<CitySurfaceHit> city_surface_hit_under_mouse(
             const auto index = *placement_asset_indices[placement_index];
             if (index >= project.building_render_buffers.size()) continue;
             const auto& b = project.buildings[index].data;
-            // Broad phase before intersecting the actual mesh triangles.
+            // A quick bounds check before testing the mesh's real triangles.
             BoundingBox bounds{{FLT_MAX, FLT_MAX, FLT_MAX}, {-FLT_MAX, -FLT_MAX, -FLT_MAX}};
             for (int corner = 0; corner < 8; ++corner) {
                 const Vec3 local{
@@ -4380,7 +2960,7 @@ std::optional<CitySurfaceHit> city_surface_hit_under_mouse(
     return hit;
 }
 
-// Nearest grid point to the surface under the cursor: road nodes and building
+// The closest grid point to the surface under the cursor. Road nodes and building
 // anchors sit on grid points.
 std::optional<CityGridPoint> city_surface_point_under_mouse(
     EditorProject& project, const Camera3D& camera, Vector2 mouse, Vector2 size) {
@@ -4390,9 +2970,9 @@ std::optional<CityGridPoint> city_surface_point_under_mouse(
         static_cast<int>(std::lround(hit->point.y / 4)), static_cast<int>(std::lround(hit->point.z / 4))};
 }
 
-// Piece cell against the surface under the cursor. Piece cells span
-// [n*4, n*4+4) on every axis, so step a little off the surface along its normal
-// and floor: a side or top face picks the empty neighbour, never the cell itself.
+// The piece cell at the surface under the cursor. Piece cells cover [n*4, n*4+4)
+// on every axis, so step a little off the surface along its normal and round down:
+// a side or top face picks the empty cell next to it, never the cell itself.
 std::optional<CityGridPoint> city_surface_cell_under_mouse(
     EditorProject& project, const Camera3D& camera, Vector2 mouse, Vector2 size) {
     const auto hit = city_surface_hit_under_mouse(project, camera, mouse, size);
@@ -4402,12 +2982,12 @@ std::optional<CityGridPoint> city_surface_cell_under_mouse(
         static_cast<int>(std::floor(p.y / 4)), static_cast<int>(std::floor(p.z / 4))};
 }
 
-// In-game coordinates over the viewport's top-right corner (the toolbar owns
-// the top middle): the camera, and the surface under the mouse (city) or the
-// hovered block (building editor). World units are the game's (4 per cell); a
-// cell's level counts from its floor at level*4 + 0.25.
+// Game coordinates in the viewport's top-right corner (the toolbar uses the top
+// middle): the camera, and the surface under the mouse (city) or the block under the
+// mouse (building editor). These are game world units (4 per cell); a cell's level
+// counts from its floor at level*4 + 0.25.
 void draw_coordinate_readout(EditorProject& project, const EditorUi& ui, const Camera3D& camera,
-                             ImVec2 image_min, ImVec2 image_max, Vector2 mouse, Vector2 size, bool hovered) {
+                             ImVec2 image_min, ImVec2 image_max, Vector2 mouse, Vector2 size, bool hovered, float overlay_bottom) {
     const auto cell_of = [](float value) { return static_cast<int>(std::floor(value / 4.0F)); };
     const auto level_of = [](float y) { return static_cast<int>(std::floor((y - 0.25F) / 4.0F)); };
     struct Line { std::string text; ImU32 color; };
@@ -4420,13 +3000,13 @@ void draw_coordinate_readout(EditorProject& project, const EditorUi& ui, const C
         std::snprintf(text, sizeof(text), "cell %d, %d, %d", cell_of(p.x), level_of(p.y), cell_of(p.z));
         lines.push_back({text, IM_COL32(150, 160, 175, 255)});
     };
-    // Outside the city the view is the edited asset's own space, not the map's.
+    // Outside the city, the view is the edited asset's own space, not the map's.
     add_point(ui.tab == EditorTab::City ? "Camera" : "Camera (building)", camera.position, IM_COL32(255, 215, 90, 255));
     if (hovered && ui.tab == EditorTab::City && project.city) {
         if (const auto hit = city_surface_hit_under_mouse(project, camera, mouse, size)) {
             add_point("Cursor", hit->point, IM_COL32(120, 200, 255, 255));
         }
-        // The road the next click lays: '+' when the game can build its slope, '!' when not.
+        // The road the next click lays: '+' when the game can build its slope, '!' when it can't.
         if (ui.city_tool == CityTool::Road && !ui.road_preview_info.empty()) {
             const auto color = ui.road_preview_info[0] == '+' ? IM_COL32(150, 255, 165, 255) : IM_COL32(255, 115, 100, 255);
             std::string_view rest{ui.road_preview_info};
@@ -4457,21 +3037,24 @@ void draw_coordinate_readout(EditorProject& project, const EditorUi& ui, const C
     float width = 0.0F;
     for (const auto& line : lines) width = std::max(width, ImGui::CalcTextSize(line.text.c_str()).x);
     const ImVec2 box{width + padding.x * 2.0F, line_height * static_cast<float>(lines.size()) + padding.y * 2.0F};
-    const ImVec2 origin{image_max.x - box.x - 10.0F, image_min.y + 10.0F};
+    // Top left, out of the way of the view gizmo (top right) and the tool hint
+    // (bottom middle).
+    (void)image_max;
+    const ImVec2 origin{image_min.x + 10.0F, std::max(image_min.y, overlay_bottom) + 10.0F};
     draw->AddRectFilled(origin, {origin.x + box.x, origin.y + box.y}, IM_COL32(16, 19, 24, 185), 6.0F);
     for (std::size_t i = 0; i < lines.size(); ++i) {
         draw->AddText({origin.x + padding.x, origin.y + padding.y + line_height * static_cast<float>(i)}, lines[i].color, lines[i].text.c_str());
     }
 }
 
-// A placement cursor lifted by the tool's height offset.
+// A placement cursor raised by the tool's height offset.
 std::optional<CityGridPoint> raised(std::optional<CityGridPoint> point, int dy) {
     if (point) point->y += dy;
     return point;
 }
 
-// Moves road junctions up or down one cell level each step.
-void nudge_city_junction_level(EditorProject& project, EditorUi& ui, int delta) {
+// Moves road junctions up or down one cell level at a time.
+void nudge_city_junction_level(EditorProject& project, EditorUi& ui, std::int64_t delta) {
     if (!project.city || project.city->data.intersections.empty()) return;
     auto& map = project.city->data;
     std::vector<std::size_t> nodes;
@@ -4486,12 +3069,24 @@ void nudge_city_junction_level(EditorProject& project, EditorUi& ui, int delta) 
             }
         }
     }
-    for (const auto node : nodes) map.intersections[node].y += delta;
+    if (delta == 0) return;
+    for (const auto node : nodes) {
+        const auto y = static_cast<std::int64_t>(map.intersections[node].y);
+        if (delta < std::numeric_limits<std::int32_t>::min() - y ||
+            delta > std::numeric_limits<std::int32_t>::max() - y) {
+            std::string status;
+            report_failure(status, "Junction level exceeds the map's signed 32-bit field");
+            return;
+        }
+    }
+    for (const auto node : nodes) {
+        map.intersections[node].y = static_cast<std::int32_t>(map.intersections[node].y + delta);
+    }
     if (!nodes.empty()) ui.city_dirty = true;
 }
 
-// Anchor handles use screen-space drag distance: no jump when a long arrow is
-// grabbed, and the model keeps its original origin throughout the gesture.
+// Anchor handles use how far the mouse moved on screen, so a long arrow doesn't
+// jump when grabbed, and the model keeps its original origin during the drag.
 void update_anchor_gizmo(EditorProject& project, EditorUi& ui, const Camera3D& camera,
     Vector2 mouse, Vector2 size, bool hovered) {
     auto& building = project.buildings[ui.selected_building].data;
@@ -4526,240 +3121,8 @@ void update_anchor_gizmo(EditorProject& project, EditorUi& ui, const Camera3D& c
     if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) ui.anchor_axis = GizmoAxis::None;
 }
 
-// Archive workspace follows CSXWebParser's file list, texture/material pairing,
-// extraction and build workflow. Payloads stay opaque unless explicitly edited.
-void draw_csx_editor(bool& open, EditorProject* project) {
-    static CsxArchive archive{0xc5f17e01U, 0, 0, {}};
-    static std::array<char, 1024> input_path{};
-    static std::array<char, 1024> output_path{};
-    static std::vector<std::size_t> selected;
-    static std::string message;
-    static bool dirty = false;
-    if (!open) return;
-    ImGui::SetNextWindowSize(ImVec2(760, 560), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("CSX archive", &open)) { ImGui::End(); return; }
-    const auto u32 = [](const auto& bytes, std::size_t at) {
-        if (at > bytes.size() || bytes.size() - at < 4) throw std::runtime_error("Truncated texture header");
-        return static_cast<std::uint32_t>(bytes[at]) | (static_cast<std::uint32_t>(bytes[at + 1]) << 8) |
-            (static_cast<std::uint32_t>(bytes[at + 2]) << 16) | (static_cast<std::uint32_t>(bytes[at + 3]) << 24);
-    };
-    const auto put = [](auto& bytes, std::size_t at, std::uint32_t value) {
-        for (unsigned i = 0; i < 4; ++i) bytes[at + i] = static_cast<std::uint8_t>(value >> (8 * i));
-    };
-    const auto texture_parts = [&](const CsxEntry& entry) {
-        const auto image_size = u32(entry.payload, 0x44);
-        const auto material_size = u32(entry.payload, 0x48);
-        if (entry.payload.size() < 0x4c || static_cast<std::uint64_t>(image_size) + material_size > entry.payload.size() - 0x4c)
-            throw std::runtime_error("Texture payload is truncated: " + entry.name);
-        return std::pair{image_size, material_size};
-    };
-    const auto checked_name = [](const std::string& name) {
-        if (name.empty() || name.size() > 51 || name == "." || name == ".." ||
-            name.find_first_of("/\\:") != std::string::npos)
-            throw std::runtime_error("Asset name must be 1-51 characters without path separators");
-    };
-    const auto import = [&](const std::filesystem::path& path) {
-        const auto extension = lower_extension(path);
-        auto bytes = read_file_bytes(path);
-        if (extension == ".csx") {
-            auto loaded = parse_csx(bytes);
-            if (loaded.magic != 0xc5f17e01U || loaded.entries.size() != loaded.entry_count)
-                throw std::runtime_error("Invalid CSX directory");
-            for (const auto& entry : loaded.entries) {
-                checked_name(entry.name);
-                if (entry.payload.size() != entry.size) throw std::runtime_error("Truncated CSX entry: " + entry.name);
-                if (entry.kind == CsxEntryKind::Texture) texture_parts(entry);
-            }
-            archive.entries.insert(archive.entries.end(), loaded.entries.begin(), loaded.entries.end());
-        } else {
-            CsxEntry entry{};
-            entry.name = path.stem().string(); checked_name(entry.name);
-            if (extension == ".sbb") {
-                entry.kind = CsxEntryKind::Sbb; entry.type = 0x585a0002;
-                entry.payload = rebuild_sbb(parse_sbb(bytes));
-                entry.payload[0] = 1; // CSX geometry sentinel, not loose-file version.
-            } else if (extension == ".sbl") {
-                entry.kind = CsxEntryKind::Sbl; entry.type = 0x585a0001;
-                const auto model = parse_sbl(bytes);
-                if (!model.block) bytes = rebuild_sbl_buildblock(model);
-                else if (model.version == 1) {
-                    // Loose block v1 has no trailing v2 records. Materialize the
-                    // empty section before applying the archive sentinel.
-                    bytes.resize(bytes.size() + 4, 0);
-                }
-                entry.payload = std::move(bytes); entry.payload[0] = 1;
-            } else if (extension == ".png") {
-                if (bytes.size() < 8 || bytes[0] != 137 || bytes[1] != 'P' || bytes[2] != 'N' || bytes[3] != 'G')
-                    throw std::runtime_error("Expected a PNG image");
-                entry.kind = CsxEntryKind::Texture; entry.type = 0x585a0004;
-                entry.payload.resize(0x4c, 0); put(entry.payload, 0, 1);
-                put(entry.payload, 0x44, static_cast<std::uint32_t>(bytes.size()));
-                entry.payload.insert(entry.payload.end(), bytes.begin(), bytes.end());
-            } else throw std::runtime_error("Choose a CSX, SBB, SBL or PNG file");
-            archive.entries.push_back(std::move(entry));
-        }
-        dirty = true;
-        message = "Added " + path.filename().string();
-    };
-    // File operations are the external boundary: keep failures visible in the
-    // workspace and retain the archive so a bad file cannot discard other edits.
-    const auto action = [&](auto operation) {
-        try { operation(); }
-        catch (const std::exception& error) { message = error.what(); }
-    };
-    ImGui::BeginDisabled(project == nullptr);
-    if (ImGui::Button("Use open map assets")) action([&] {
-        promote_city(*project);
-        archive = project_archive(*project);
-        selected.clear(); dirty = true; message.clear();
-    });
-    ImGui::EndDisabled();
-    ImGui::TextWrapped("CSX stores assets. File > Save map writes the city layout and its asset archive together.");
-    ImGui::InputText("Input file", input_path.data(), input_path.size());
-#ifndef __EMSCRIPTEN__
-    if (ImGui::Button("Browse and add...")) action([&] {
-        const auto paths = dialog_open_archive_assets();
-        for (const auto& path : paths) import(path);
-    });
-    ImGui::SameLine();
-#endif
-    if (ImGui::Button("Add file")) action([&] { import(input_path.data()); });
-    ImGui::SameLine();
-    ImGui::BeginDisabled(selected.empty());
-    if (ImGui::Button("Remove selected")) {
-        std::sort(selected.rbegin(), selected.rend());
-        for (const auto index : selected) if (index < archive.entries.size()) archive.entries.erase(archive.entries.begin() + index);
-        selected.clear(); dirty = true;
-    }
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    if (ImGui::Button("Clear archive")) ImGui::OpenPopup("Clear archive?");
-    if (ImGui::BeginPopupModal("Clear archive?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextUnformatted("Discard all files in this archive workspace?");
-        if (ImGui::Button("Clear")) { archive.entries.clear(); selected.clear(); dirty = false; ImGui::CloseCurrentPopup(); }
-        ImGui::SameLine(); if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-    }
-    if (ImGui::BeginTable("##archive_files", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 220))) {
-        ImGui::TableSetupColumn("Name"); ImGui::TableSetupColumn("Type"); ImGui::TableSetupColumn("Bytes"); ImGui::TableSetupColumn("Material");
-        ImGui::TableHeadersRow();
-        // Parsing an SBL every frame stalled the window; cache its label per payload.
-        static std::vector<std::tuple<const std::uint8_t*, std::size_t, const char*>> sbl_labels;
-        sbl_labels.resize(archive.entries.size());
-        ImGuiListClipper clipper;
-        clipper.Begin(static_cast<int>(archive.entries.size()));
-        while (clipper.Step()) for (auto row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
-            const auto i = static_cast<std::size_t>(row);
-            const auto& entry = archive.entries[i];
-            ImGui::PushID(static_cast<int>(i)); ImGui::TableNextRow(); ImGui::TableNextColumn();
-            const auto it = std::find(selected.begin(), selected.end(), i);
-            if (ImGui::Selectable(entry.name.c_str(), it != selected.end(), ImGuiSelectableFlags_SpanAllColumns)) {
-                if (!ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeySuper) selected = {i};
-                else if (it == selected.end()) selected.push_back(i); else selected.erase(it);
-            }
-            ImGui::TableNextColumn();
-            if (entry.kind == CsxEntryKind::Sbl) {
-                auto& [data, size, label] = sbl_labels[i];
-                if (data != entry.payload.data() || size != entry.payload.size()) {
-                    data = entry.payload.data(); size = entry.payload.size();
-                    try { label = parse_sbl(entry.payload).block ? "Block mesh" : "Buildblock"; }
-                    catch (const std::exception&) { label = "Invalid SBL"; }
-                }
-                ImGui::TextUnformatted(label);
-            } else ImGui::TextUnformatted(entry.kind == CsxEntryKind::Sbb ? "Building" : entry.kind == CsxEntryKind::Texture ? "Texture" : "Unknown");
-            ImGui::TableNextColumn(); ImGui::Text("%zu", entry.payload.size()); ImGui::TableNextColumn();
-            if (entry.kind == CsxEntryKind::Texture && entry.payload.size() >= 0x4c)
-                ImGui::TextUnformatted(u32(entry.payload, 0x48) ? "Attached" : "None");
-            ImGui::PopID();
-        }
-        ImGui::EndTable();
-    }
-    if (selected.size() == 1 && selected[0] < archive.entries.size()) {
-        auto& entry = archive.entries[selected[0]];
-        std::array<char, 52> name{};
-        std::copy_n(entry.name.data(), std::min(entry.name.size(), name.size() - 1), name.data());
-        if (ImGui::InputText("Asset name", name.data(), name.size(), ImGuiInputTextFlags_EnterReturnsTrue)) action([&] {
-            checked_name(name.data()); entry.name = name.data(); dirty = true;
-        });
-        if (entry.kind == CsxEntryKind::Texture) {
-            if (ImGui::Button("Attach material PNG...")) action([&] {
-                std::filesystem::path path{input_path.data()};
-#ifndef __EMSCRIPTEN__
-                const auto paths = dialog_open_material_image();
-                if (paths.empty()) return;
-                path = paths.front();
-#endif
-                const auto bytes = read_file_bytes(path);
-                if (lower_extension(path) != ".png" || bytes.size() < 8 || bytes[0] != 137 || bytes[1] != 'P' || bytes[2] != 'N' || bytes[3] != 'G')
-                    throw std::runtime_error("Material must be a PNG image");
-                const auto [image_size, material_size] = texture_parts(entry);
-                const auto name = path.stem().string();
-                if (name.size() > 63) throw std::runtime_error("Material name is too long");
-                entry.payload.resize(0x4c + image_size);
-                std::fill(entry.payload.begin() + 4, entry.payload.begin() + 0x44, 0);
-                std::copy(name.begin(), name.end(), entry.payload.begin() + 4);
-                put(entry.payload, 0x48, static_cast<std::uint32_t>(bytes.size()));
-                entry.payload.insert(entry.payload.end(), bytes.begin(), bytes.end()); dirty = true;
-            });
-            ImGui::SameLine();
-            if (ImGui::Button("Remove material")) action([&] {
-                const auto [image_size, material_size] = texture_parts(entry);
-                entry.payload.resize(0x4c + image_size);
-                std::fill(entry.payload.begin() + 4, entry.payload.begin() + 0x44, 0);
-                put(entry.payload, 0x48, 0); dirty = true;
-            });
-        }
-    }
-    ImGui::InputText("Output path", output_path.data(), output_path.size());
-    if (ImGui::Button(dirty ? "Build CSX *" : "Build CSX")) action([&] {
-        std::filesystem::path path{output_path.data()};
-#ifndef __EMSCRIPTEN__
-        if (path.empty()) path = dialog_save_csx();
-#endif
-        if (path.empty()) return;
-        if (path.extension() != ".csx") path += ".csx";
-        for (std::size_t i = 0; i < archive.entries.size(); ++i) {
-            checked_name(archive.entries[i].name);
-            for (std::size_t j = 0; j < i; ++j)
-                if (archive.entries[j].type == archive.entries[i].type && archive.entries[j].name == archive.entries[i].name)
-                    throw std::runtime_error("Rename duplicate asset: " + archive.entries[i].name);
-        }
-        write_file_bytes(path, build_csx(archive)); dirty = false; message.clear();
-    });
-    ImGui::SameLine();
-    ImGui::BeginDisabled(selected.empty());
-    if (ImGui::Button("Extract selected to folder")) action([&] {
-        std::filesystem::path folder{output_path.data()};
-#ifndef __EMSCRIPTEN__
-        if (folder.empty()) folder = dialog_extract_folder();
-#endif
-        if (folder.empty()) return;
-        if (!std::filesystem::is_directory(folder)) throw std::runtime_error("Output must be an existing folder");
-        for (auto i : selected) {
-            const auto& entry = archive.entries[i]; checked_name(entry.name);
-            if (entry.kind == CsxEntryKind::Texture) {
-                const auto [image_size, material_size] = texture_parts(entry);
-                write_file_bytes(folder / (entry.name + ".png"), {entry.payload.begin() + 0x4c, entry.payload.begin() + 0x4c + image_size});
-                if (material_size) write_file_bytes(folder / (entry.name + ".material.png"),
-                    {entry.payload.begin() + 0x4c + image_size, entry.payload.begin() + 0x4c + image_size + material_size});
-            } else {
-                auto bytes = entry.payload;
-                if (entry.kind == CsxEntryKind::Sbb) bytes = normalize_packed_sbb_bytes(bytes);
-                if (entry.kind == CsxEntryKind::Sbl) bytes = normalize_packed_sbl_bytes(bytes);
-                write_file_bytes(folder / (entry.name + (entry.kind == CsxEntryKind::Sbb ? ".sbb" : entry.kind == CsxEntryKind::Sbl ? ".sbl" : ".bin")), bytes);
-            }
-        }
-        message = "Extracted selected files to " + folder.string();
-    });
-    ImGui::EndDisabled();
-    ImGui::TextWrapped("%s", message.c_str());
-    ImGui::End();
-}
-
-// Draws the road the next click lays and returns its description for the
-// coordinate readout (this runs in the 3D pass, outside the ImGui frame).
-// Road tile tops, tilted like the rendered road (draw_city_road_mask). Junction
-// tiles get the fainter fill and an outline.
+// Road tile tops, tilted like the drawn road (draw_city_road_mask). Junction tiles
+// get a fainter fill and an outline.
 void draw_road_tiles(const std::vector<CityTileCell>& tiles, float unit, Color fill, Color junction_fill, Color edge) {
     for (const auto& tile : tiles) {
         if (tile.kind != CityTileKind::Road) continue;
@@ -4776,6 +3139,8 @@ void draw_road_tiles(const std::vector<CityTileCell>& tiles, float unit, Color f
     }
 }
 
+// Draws the road the next click will lay and returns its description for the
+// coordinate readout (this runs in the 3D pass, outside the ImGui frame).
 std::string draw_road_lay_preview(const EditorProject& project, EditorUi& ui, std::optional<CityGridPoint> cursor) {
     ui.road_preview_cells.clear();
     if (ui.city_tool != CityTool::Road || !project.city) {
@@ -4809,9 +3174,9 @@ std::string draw_road_lay_preview(const EditorProject& project, EditorUi& ui, st
     DrawSphere(start_pos, unit * 0.8F, Color{120, 230, 130, 235});
     if (!cursor.has_value()) return {};
 
-    // Lay the road on a copy of the map with the Road tool's own code, then draw
-    // the tiles the city build places for every road it adds or changes (a road
-    // it starts, ends, or crosses on is split there).
+    // Lay the road on a copy of the map with the Road tool's own code, then draw the
+    // tiles the city build places for every road it adds or changes (a road it starts
+    // on, ends on, or crosses is split there).
     auto map_copy = map;
     const bool auto_generated = project_is_auto_generated(project);
     lay_city_road(map_copy, start, *cursor, ui.new_road_width, auto_generated);
@@ -4832,7 +3197,7 @@ std::string draw_road_lay_preview(const EditorProject& project, EditorUi& ui, st
     }
     if (previews.empty()) return {};
 
-    // The first road the game cannot build decides the message; else the longest.
+    // The first road the game can't build decides the message; otherwise the longest.
     const auto in_world = [](const StreetPreview& p) {
         return std::ranges::all_of(p.cells, [](const CityTileCell& c) { return city_cell_in_game_world(c.x, c.y, c.z); });
     };
@@ -4842,7 +3207,7 @@ std::string draw_road_lay_preview(const EditorProject& project, EditorUi& ui, st
     const bool ok = bad == previews.end();
     const Color fill = ok ? Color{120, 230, 130, 110} : Color{240, 80, 70, 130};
     const Color edge = ok ? Color{150, 255, 160, 255} : Color{255, 110, 100, 255};
-    // Curbs are left out so the road surface reads clearly.
+    // Curbs are left out so the road surface is easy to see.
     for (const auto& preview : previews) {
         ui.road_preview_cells.insert(ui.road_preview_cells.end(), preview.cells.begin(), preview.cells.end());
     }
@@ -4872,14 +3237,14 @@ struct FocusTarget {
 
 std::optional<FocusTarget> focus_target_for_selection(const EditorProject& project, const EditorUi& ui) {
     constexpr float unit = 4.0F;
-    // Pull-back so the bounding sphere of half-extent r fits a ~55deg vertical FOV
-    // with a little margin: r / sin(fov/2) * margin.
+    // Move back far enough that a bounding sphere of half-size r fits a vertical field
+    // of view of about 55 degrees, with a little room: r / sin(fov/2) * margin.
     const auto fit_radius = [](float r) { return std::max(unit * 4.0F, r / 0.46F * 1.25F); };
 
     if (ui.tab == EditorTab::City && project.city) {
         const auto& map = project.city->data;
         if (ui.city_selection == CitySelectionKind::Building && !map.buildings.empty()) {
-            // Aim at the placed building's mesh centre and fit its full extent.
+            // Aim at the middle of the placed building's mesh and fit all of it.
             const auto& b = map.buildings[std::min(ui.selected_city_building, map.buildings.size() - 1U)];
             const auto placements = resolve_placement_buildings(project);
             const auto idx = std::min(ui.selected_city_building, map.buildings.size() - 1U);
@@ -4905,7 +3270,7 @@ std::optional<FocusTarget> focus_target_for_selection(const EditorProject& proje
             return FocusTarget{center, fit_radius(r)};
         }
         if (ui.city_selection == CitySelectionKind::Piece && ui.selected_portal < map.portals.size()) {
-            // Centre of the selected portal's 8x8x8 voxel volume.
+            // The middle of the selected portal's 8x8x8 voxel volume.
             const auto& p = map.portals[ui.selected_portal];
             constexpr float span = 8.0F;
             const Vector3 c{
@@ -4949,8 +3314,8 @@ std::optional<FocusTarget> focus_target_for_selection(const EditorProject& proje
     return std::nullopt;
 }
 
-// Starts an eased camera glide to frame the given point from the camera's current
-// viewing direction (so the move feels like an orbit-in, not a teleport).
+// Starts a smooth camera move to frame the given point from the direction the
+// camera already looks, so it feels like moving in, not jumping.
 void start_focus_animation(EditorUi& ui, const Camera3D& camera, Vector3 point, float radius) {
     const Vector3 dir{
         camera.position.x - camera.target.x,
@@ -4973,8 +3338,8 @@ void start_focus_animation(EditorUi& ui, const Camera3D& camera, Vector3 point, 
     ui.focus_animating = true;
 }
 
-// Advances the focus glide; applies eased interpolation to the camera each frame
-// until done. Smoothstep easing reads as a gentle ease-in/ease-out.
+// Moves the focus glide forward, easing the camera each frame until it is done.
+// Smoothstep easing starts and stops gently.
 void update_focus_animation(EditorUi& ui, Camera3D& camera) {
     if (!ui.focus_animating) {
         return;
@@ -4993,6 +3358,7 @@ void update_focus_animation(EditorUi& ui, Camera3D& camera) {
 }
 
 void focus_current_selection(EditorProject& project, EditorUi& ui, Camera3D& camera) {
+    set_camera_perspective(camera);
     if (const auto target = focus_target_for_selection(project, ui)) {
         start_focus_animation(ui, camera, target->point, target->radius);
         return;
@@ -5002,16 +3368,24 @@ void focus_current_selection(EditorProject& project, EditorUi& ui, Camera3D& cam
     start_focus_animation(ui, camera, framed.target, 130.0F);
 }
 
-bool asset_search_matches(const EditorUi& ui, std::string_view name) {
-    const auto& query = ui.asset_search[static_cast<std::size_t>(ui.tab)];
-    if (query[0] == '\0') {
-        return true;
+// Handles global commands first, then keys that only work in the viewport. The
+// caller already skips this while a text field is active or the free camera flies.
+// Removes the selected piece voxel from its portal.
+void delete_selected_city_piece(EditorProject& project, EditorUi& ui) {
+    if (!project.city || !ui.selected_piece_voxel) return;
+    const auto cell = *ui.selected_piece_voxel;
+    const std::array<std::int32_t, 4> fields{0, floor_div8(cell.x), floor_div8(cell.y), floor_div8(cell.z)};
+    const auto portal = std::ranges::find_if(project.city->data.portals, [&](const SbcPortal& p) { return p.fields == fields; });
+    if (portal != project.city->data.portals.end()) {
+        auto& voxels = portal->blocks.empty() ? portal->legacy_blocks : portal->blocks;
+        if (local_portal_index(cell) < voxels.size()) voxels[local_portal_index(cell)] = 0U;
+        invalidate_portal_render_models(project);
+        ui.city_dirty = true;
     }
-    return lower_name(name).find(lower_name(query.data())) != std::string::npos;
+    ui.city_selection = CitySelectionKind::None;
+    ui.selected_piece_voxel.reset();
 }
 
-// Handles global commands first, then viewport-only editing keys. The caller
-// already excludes active text fields and freecam flight.
 void handle_editor_hotkeys(
     EditorProject& project,
     EditorUi& ui,
@@ -5020,13 +3394,13 @@ void handle_editor_hotkeys(
     bool viewport_hovered) {
     const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
 
-    // Global shortcuts (rebindable in Preferences).
+    // Global shortcuts (can be changed in Preferences).
     if (action_pressed(ui, EditorAction::Save)) {
         save_active_tab(project, ui, status);
         return;
     }
-    // City and asset edits keep separate histories; the current tab picks one so
-    // undo never silently reverts a different asset type.
+    // City edits and asset edits have separate histories. The current tab picks one, so
+    // undo never quietly undoes a different kind of asset.
     if (action_pressed(ui, EditorAction::Undo)) {
         undo_edit(project, ui, status, shift);
         return;
@@ -5090,7 +3464,7 @@ void handle_editor_hotkeys(
         }
     }
 
-    // Esc cancels an in-progress gizmo drag, restoring the captured position.
+    // Esc cancels a gizmo drag and puts the object back where it was.
     if (IsKeyPressed(KEY_ESCAPE) && ui.gizmo_active != GizmoAxis::None) {
         if (project.city) for (const auto& [index, start] : ui.gizmo_start_buildings)
             if (index < project.city->data.buildings.size()) project.city->data.buildings[index] = start;
@@ -5098,15 +3472,15 @@ void handle_editor_hotkeys(
         ui.gizmo_active = GizmoAxis::None;
         return;
     }
-    // Esc ends an in-progress road-laying chain.
+    // Esc ends a chain of roads being laid.
     if (IsKeyPressed(KEY_ESCAPE) && ui.pending_road_start.has_value()) {
         end_road_chain(ui);
         return;
     }
 
-    // Destructive and transform keys belong to the 3D canvas. Requiring the
-    // pointer over the rendered image prevents Delete, arrows, and placement keys
-    // from firing while the user works in another panel.
+    // Keys that delete or move things belong to the 3D view. Requiring the mouse to be
+    // over the 3D image stops Delete, the arrows, and placement keys from firing while
+    // the user works in another panel.
     if (!viewport_hovered) {
         return;
     }
@@ -5139,7 +3513,7 @@ void handle_editor_hotkeys(
         const bool rotate = !brush_tool && ui.city_selection == CitySelectionKind::Building && action_pressed(ui, EditorAction::RotateSelection);
         const bool duplicate = action_pressed(ui, EditorAction::DuplicateSelection);
         const bool erase = action_pressed(ui, EditorAction::DeleteSelection);
-        // One snapshot per editing keypress.
+        // One undo snapshot per editing key press.
         const bool edit_key = nudge_left || nudge_right || nudge_forward || nudge_back || nudge_up || nudge_down ||
             rotate || duplicate || erase ||
             IsKeyPressed(KEY_LEFT_BRACKET) || IsKeyPressed(KEY_RIGHT_BRACKET) ||
@@ -5148,7 +3522,7 @@ void handle_editor_hotkeys(
         if (edit_key && ui.city_selection != CitySelectionKind::None) {
             begin_city_action(project, ui, "edit selection");
         }
-        // Edit keys act on the current selection (Select tool), regardless of tool.
+        // Edit keys act on the current selection (Select tool), whatever the tool.
         if (ui.city_selection == CitySelectionKind::Building && !project.city->data.buildings.empty()) {
             if (nudge_left) nudge_city_building(project, ui, -1, 0, 0, 0);
             if (nudge_right) nudge_city_building(project, ui, 1, 0, 0, 0);
@@ -5177,19 +3551,7 @@ void handle_editor_hotkeys(
             if (nudge_back) move_city_piece(project, ui, 0, 0, 1, status);
             if (nudge_up) move_city_piece(project, ui, 0, 1, 0, status);
             if (nudge_down) move_city_piece(project, ui, 0, -1, 0, status);
-            if (erase) {
-                const auto cell = *ui.selected_piece_voxel;
-                const std::array<std::int32_t, 4> fields{0, floor_div8(cell.x), floor_div8(cell.y), floor_div8(cell.z)};
-                const auto portal = std::ranges::find_if(project.city->data.portals, [&](const SbcPortal& p) { return p.fields == fields; });
-                if (portal != project.city->data.portals.end()) {
-                    auto& voxels = portal->blocks.empty() ? portal->legacy_blocks : portal->blocks;
-                    if (local_portal_index(cell) < voxels.size()) voxels[local_portal_index(cell)] = 0U;
-                    invalidate_portal_render_models(project);
-                    ui.city_dirty = true;
-                }
-                ui.city_selection = CitySelectionKind::None;
-                ui.selected_piece_voxel.reset();
-            }
+            if (erase) delete_selected_city_piece(project, ui);
         }
     } else if (ui.tab == EditorTab::Buildings && !project.buildings.empty()) {
         ui.selected_building = std::min(ui.selected_building, project.buildings.size() - 1U);
@@ -5217,7 +3579,7 @@ void handle_editor_hotkeys(
             }
         }
     } else if (ui.tab == EditorTab::Blocks && !project.blocks.empty() && ui.block_element != BlockElementKind::None) {
-        // The selected patch or box: arrows move it 1/8 cell (Shift: a cell).
+        // The selected patch or box: the arrows move it 1/8 of a cell (Shift: a whole cell).
         const float step = shift ? 1.0F : 0.125F;
         Vec3f delta{};
         if (action_pressed(ui, EditorAction::NudgeLeft)) delta.x -= step;
@@ -5241,8 +3603,191 @@ void handle_editor_hotkeys(
     }
 }
 
-// Frees the thumbnail RenderTextures owned by a project before it is replaced or
-// destroyed (RenderTexture2D is a POD, so it has no destructor to do this).
+// The right-click menu of the 3D view. A quick right-click (a right drag flies)
+// first selects what is under the cursor, like a left click, then offers what can
+// be done with it. Call inside the scene canvas window.
+void draw_viewport_context_menu(EditorProject& project, EditorUi& ui, Camera3D& camera, Vector2 mouse, Vector2 viewport_size,
+                                bool open_requested, std::string& status) {
+    if (open_requested) {
+        const auto ray = get_viewport_mouse_ray(camera, mouse, viewport_size);
+        const Vec3 ro{ray.position.x, ray.position.y, ray.position.z};
+        const Vec3 rd{ray.direction.x, ray.direction.y, ray.direction.z};
+        if (ui.tab == EditorTab::City && project.city) {
+            const auto picked = pick_city_any(project, project.city_scene_cache, ro, rd);
+            const bool in_group = picked.kind == CitySelectionKind::Building && ui.city_selection == CitySelectionKind::Building &&
+                (picked.index == ui.selected_city_building || std::ranges::find(ui.selected_city_buildings, picked.index) != ui.selected_city_buildings.end());
+            if (picked.kind != CitySelectionKind::None && !in_group) select_city_thing(project, ui, picked, false, ro, rd, status);
+        } else if (ui.tab == EditorTab::Buildings && !project.buildings.empty()) {
+            std::string ignored;
+            select_building_cell_from_viewport(project, ui, camera, mouse, viewport_size, std::nullopt, ignored);
+        } else if (ui.tab == EditorTab::Blocks && !project.blocks.empty()) {
+            const auto before = std::pair{ui.block_element, ui.block_element_index};
+            pick_block_element(project, ui, ray);
+            // Right-clicking empty space keeps the selection, as in Blender.
+            if (ui.block_element == BlockElementKind::None) std::tie(ui.block_element, ui.block_element_index) = before;
+        }
+        ImGui::OpenPopup("##viewport_menu");
+    }
+    if (!ImGui::BeginPopup("##viewport_menu")) return;
+    const auto shortcut = [&](EditorAction action) { return action_shortcut_label(ui, action); };
+    if (ui.tab == EditorTab::City && project.city) {
+        auto& map = project.city->data;
+        switch (ui.city_selection) {
+            case CitySelectionKind::Building:
+                if (ui.selected_city_building < map.buildings.size()) {
+                    const auto count = std::max<std::size_t>(1U, ui.selected_city_buildings.size());
+                    ImGui::TextDisabled("%s", count > 1U ? (std::to_string(count) + " buildings").c_str() : map.buildings[ui.selected_city_building].name.c_str());
+                    if (ImGui::MenuItem(ICON_FA_PEN " Edit building")) edit_city_building(project, ui, ui.selected_city_building);
+                    if (ImGui::MenuItem(ICON_FA_CROSSHAIRS " Frame", shortcut(EditorAction::FocusSelection).c_str())) focus_current_selection(project, ui, camera);
+                    if (ImGui::MenuItem(ICON_FA_ROTATE " Turn 90 degrees", shortcut(EditorAction::RotateSelection).c_str())) {
+                        begin_city_action(project, ui, "rotate building");
+                        nudge_city_building(project, ui, 0, 0, 0, 1);
+                    }
+                    if (ImGui::MenuItem(ICON_FA_COPY " Duplicate", shortcut(EditorAction::DuplicateSelection).c_str())) {
+                        begin_city_action(project, ui, "duplicate building");
+                        duplicate_city_building(project, ui);
+                    }
+                    if (ImGui::MenuItem(ICON_FA_TRASH " Delete", shortcut(EditorAction::DeleteSelection).c_str())) {
+                        begin_city_action(project, ui, "delete building");
+                        delete_city_building(project, ui);
+                    }
+                    ImGui::Separator();
+                    bool selected_only = ui.near_lod && ui.interiors_selected_only;
+                    if (ImGui::MenuItem(ICON_FA_DOOR_OPEN " Show interiors of selected only", nullptr, &selected_only)) {
+                        ui.near_lod = true;
+                        ui.interiors_selected_only = selected_only;
+                        save_preferences(ui);
+                    }
+                }
+                break;
+            case CitySelectionKind::Road:
+                ImGui::TextDisabled("Road");
+                if (ImGui::MenuItem(ICON_FA_CROSSHAIRS " Frame", shortcut(EditorAction::FocusSelection).c_str())) focus_current_selection(project, ui, camera);
+                if (ImGui::MenuItem(ICON_FA_ARROW_UP " Raise")) { begin_city_action(project, ui, "raise road"); nudge_city_junction_level(project, ui, 1); }
+                if (ImGui::MenuItem(ICON_FA_ARROW_DOWN " Lower")) { begin_city_action(project, ui, "lower road"); nudge_city_junction_level(project, ui, -1); }
+                if (ImGui::MenuItem(ICON_FA_COPY " Duplicate", shortcut(EditorAction::DuplicateSelection).c_str())) {
+                    begin_city_action(project, ui, "duplicate road");
+                    duplicate_city_street(project, ui);
+                }
+                if (ImGui::MenuItem(ICON_FA_TRASH " Delete", shortcut(EditorAction::DeleteSelection).c_str())) {
+                    begin_city_action(project, ui, "delete road");
+                    delete_city_street(project, ui);
+                }
+                break;
+            case CitySelectionKind::Node:
+                if (ui.selected_city_intersection < map.intersections.size()) {
+                    const auto& node = map.intersections[ui.selected_city_intersection];
+                    ImGui::TextDisabled("Junction");
+                    if (ImGui::MenuItem(ICON_FA_ROAD " Start a road here")) {
+                        ui.city_tool = CityTool::Road;
+                        ui.pending_road_start = CityGridPoint{node.x, node.y, node.z};
+                    }
+                    if (ImGui::MenuItem(ICON_FA_ARROW_UP " Raise")) { begin_city_action(project, ui, "move junction"); nudge_city_junction_level(project, ui, 1); }
+                    if (ImGui::MenuItem(ICON_FA_ARROW_DOWN " Lower")) { begin_city_action(project, ui, "move junction"); nudge_city_junction_level(project, ui, -1); }
+                }
+                break;
+            case CitySelectionKind::Piece:
+                ImGui::TextDisabled("Piece");
+                if (ImGui::MenuItem(ICON_FA_CROSSHAIRS " Frame", shortcut(EditorAction::FocusSelection).c_str())) focus_current_selection(project, ui, camera);
+                if (ImGui::MenuItem(ICON_FA_TRASH " Delete", shortcut(EditorAction::DeleteSelection).c_str())) {
+                    begin_city_action(project, ui, "delete piece");
+                    delete_selected_city_piece(project, ui);
+                }
+                break;
+            case CitySelectionKind::None:
+                break;
+        }
+        if (ui.city_selection != CitySelectionKind::None) ImGui::Separator();
+        if (ImGui::BeginMenu(ICON_FA_TOOLBOX " Tool")) {
+            constexpr std::pair<CityTool, const char*> tools[] = {{CityTool::Select, "Select"}, {CityTool::Building, "Place building"},
+                {CityTool::Road, "Lay road"}, {CityTool::Piece, "Stamp piece"}, {CityTool::Erase, "Erase"}};
+            for (const auto& [tool, name] : tools) {
+                if (ImGui::MenuItem(name, nullptr, ui.city_tool == tool)) {
+                    ui.city_tool = tool;
+                    if (tool != CityTool::Road) ui.pending_road_start.reset();
+                }
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::MenuItem(ICON_FA_EXPAND " Show the whole city", shortcut(EditorAction::FrameCity).c_str())) focus_camera_on_city(camera, project);
+    } else if (ui.tab == EditorTab::Buildings && !project.buildings.empty()) {
+        auto& building = project.buildings[std::min(ui.selected_building, project.buildings.size() - 1U)].data;
+        const auto occupied = occupied_cell_indices(building);
+        if (!occupied.empty()) {
+            auto& cell = building.cells[occupied[std::min(ui.selected_building_cell, occupied.size() - 1U)]];
+            ImGui::TextDisabled("Block %u, %u, %u", cell.x, cell.y, cell.z);
+            if (cell.interior_block() == 0xffffU) {
+                bool floor = (cell.placed_flag() & 1U) != 0U;
+                if (ImGui::MenuItem(ICON_FA_LAYER_GROUP " Room floor", nullptr, &floor)) {
+                    cell.placed_flag() = floor ? (cell.placed_flag() | 1U) : (cell.placed_flag() & ~1U);
+                    refresh_sbb_cell_payloads(cell);
+                    mark_building_changed(project, ui);
+                }
+                if (const auto* buildblock = buildblock_for_cell(project, building, cell)) {
+                    if (ImGui::MenuItem(ICON_FA_TABLE_CELLS " Edit its buildblock")) {
+                        ui.selected_buildblock = static_cast<std::size_t>(buildblock - project.buildblocks.data());
+                        ui.selected_buildblock_layer = 0;
+                        ui.show_buildblock_window = true;
+                    }
+                }
+            }
+            if (ImGui::MenuItem(ICON_FA_TRASH " Delete block", shortcut(EditorAction::DeleteSelection).c_str())) {
+                cell.words.fill(0); cell.item_set_index = 0; cell.payloads.clear(); cell.occupied = false;
+                cell.shorts.fill(0xffffU);
+                mark_building_changed(project, ui);
+            }
+            ImGui::Separator();
+        }
+        if (ImGui::BeginMenu(ICON_FA_TOOLBOX " Tool")) {
+            constexpr std::pair<BuildingTool, const char*> tools[] = {{BuildingTool::Select, "Select block"}, {BuildingTool::PlaceBlock, "Add block"},
+                {BuildingTool::PaintTexture, "Paint faces"}, {BuildingTool::Anchor, "Move anchor"}, {BuildingTool::ItemSet, "Place item set"}};
+            for (const auto& [tool, name] : tools) {
+                if (ImGui::MenuItem(name, nullptr, ui.building_tool == tool)) ui.building_tool = tool;
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::MenuItem(ICON_FA_HOUSE " Hide roofs", nullptr, &ui.building_hide_roofs)) project.building_floor_preview_dirty = true;
+        if (ImGui::MenuItem(ICON_FA_LAYER_GROUP " One floor at a time", nullptr, &ui.building_view_floor_only)) project.building_floor_preview_dirty = true;
+        if (ImGui::MenuItem(ICON_FA_CROSSHAIRS " Frame", shortcut(EditorAction::FocusSelection).c_str())) focus_current_selection(project, ui, camera);
+    } else if (ui.tab == EditorTab::Blocks && !project.blocks.empty()) {
+        if (ui.block_element != BlockElementKind::None) {
+            ImGui::TextDisabled("%s %zu", ui.block_element == BlockElementKind::Patch ? "Patch" : "Box", ui.block_element_index + 1U);
+            const auto mouse_now = mouse;
+            if (ImGui::MenuItem(ICON_FA_ARROWS_UP_DOWN_LEFT_RIGHT " Move", "G")) start_block_transform(project, ui, BlockTransform::Grab, mouse_now);
+            if (ImGui::MenuItem(ICON_FA_UP_RIGHT_AND_DOWN_LEFT_FROM_CENTER " Scale", "S")) start_block_transform(project, ui, BlockTransform::Scale, mouse_now);
+            if (ImGui::MenuItem(ICON_FA_ROTATE " Rotate", "R")) start_block_transform(project, ui, BlockTransform::Rotate, mouse_now);
+            if (ImGui::MenuItem(ICON_FA_COPY " Duplicate", shortcut(EditorAction::DuplicateSelection).c_str())) duplicate_block_element(project, ui);
+            if (ImGui::MenuItem(ICON_FA_TRASH " Delete", shortcut(EditorAction::DeleteSelection).c_str())) delete_block_element(project, ui);
+            ImGui::Separator();
+        }
+        if (ImGui::MenuItem(ICON_FA_PLUS " Add patch")) add_block_patch(project, ui);
+        if (ImGui::MenuItem(ICON_FA_PLUS " Add box")) add_block_box(project, ui);
+        if (ImGui::MenuItem(ICON_FA_EXPAND " Frame the block")) frame_block_camera(project, ui, camera);
+    }
+    ImGui::Separator();
+    if (ImGui::BeginMenu(ICON_FA_EYE " View")) {
+        if (ImGui::MenuItem("Front", "Numpad 1")) snap_view(camera, ui, {0.0F, 0.0F, 1.0F});
+        if (ImGui::MenuItem("Back", "Ctrl+Numpad 1")) snap_view(camera, ui, {0.0F, 0.0F, -1.0F});
+        if (ImGui::MenuItem("Right", "Numpad 3")) snap_view(camera, ui, {1.0F, 0.0F, 0.0F});
+        if (ImGui::MenuItem("Left", "Ctrl+Numpad 3")) snap_view(camera, ui, {-1.0F, 0.0F, 0.0F});
+        if (ImGui::MenuItem("Top", "Numpad 7")) snap_view(camera, ui, {0.0F, 1.0F, 0.0F});
+        if (ImGui::MenuItem("Bottom", "Ctrl+Numpad 7")) snap_view(camera, ui, {0.0F, -1.0F, 0.0F});
+        ImGui::Separator();
+        bool ortho = camera.projection == CAMERA_ORTHOGRAPHIC;
+        if (ImGui::MenuItem("Orthographic", "Numpad 5", &ortho)) {
+            ui.view_snap_active = false;
+            if (ortho) set_camera_orthographic(camera); else set_camera_perspective(camera);
+        }
+        ImGui::EndMenu();
+    }
+    if (ImGui::MenuItem(ICON_FA_ROTATE_LEFT " Undo", shortcut(EditorAction::Undo).c_str(), false, can_undo(project, ui, false))) undo_edit(project, ui, status, false);
+    if (ImGui::MenuItem(ICON_FA_ROTATE_RIGHT " Redo", shortcut(EditorAction::Redo).c_str(), false, can_undo(project, ui, true))) undo_edit(project, ui, status, true);
+    ImGui::EndPopup();
+}
+
+// Frees a project's thumbnail RenderTextures before the project is replaced or
+// destroyed. RenderTexture2D is plain data with no destructor, so this has to be done
+// by hand.
 void free_project_thumbnails(EditorProject& project) {
     for (auto& rt : project.building_thumbnails) {
         if (rt.id != 0U) {
@@ -5267,11 +3812,11 @@ void free_project_thumbnails(EditorProject& project) {
     project.block_thumbnail_ready.clear();
 }
 
-// Warms the thumbnail caches a few entries per frame after load so the galleries
-// open instantly, then clears the pregenerating flag. Thumbnails need the GL
-// context, so this runs on the main thread, paced to avoid a long stall.
+// Fills the thumbnail caches a few at a time each frame after loading, so the
+// galleries open straight away, then clears the pregenerating flag. Thumbnails need
+// the GL context, so this runs on the main thread, spread out to avoid a long pause.
 void service_pregeneration(EditorProject& project) {
-    MAPED_PROFILE_FUNCTION();
+    PAFTA_PROFILE_FUNCTION();
     if (!project.pregenerating) {
         return;
     }
@@ -5288,11 +3833,11 @@ void service_pregeneration(EditorProject& project) {
     }
 }
 
-// Centered loading overlay with progress bars while the project warms up (render
-// buffers building/uploading, thumbnails pregenerating). Hidden once everything is
-// ready so it never blocks normal editing.
-// Roads and terrain only build while the City view is open, so outside it
-// that step is not waited on (it would otherwise sit "Queued" forever).
+// A loading screen in the middle with progress bars while the project gets ready
+// (render buffers building and uploading, thumbnails being made). It hides once
+// everything is ready, so it never gets in the way of normal editing. Roads and
+// terrain are only built while the City view is open, so outside it that step is
+// not waited on (or it would stay "Queued" forever).
 void draw_loading_overlay(EditorProject& project, bool city_view) {
     const bool buffers_ready =
         !project.render_build_in_progress &&
@@ -5327,8 +3872,8 @@ void draw_loading_overlay(EditorProject& project, bool city_view) {
     ImGui::End();
 }
 
-// Deferred and background work in progress, for the status bar. fraction < 0
-// means no measurable progress (a single worker step).
+// Delayed and background work that is running, for the status bar. fraction < 0
+// means the progress can't be measured (a single worker step).
 struct BackgroundJob {
     std::string label;
     float fraction{-1.0F};
@@ -5381,13 +3926,11 @@ std::vector<BackgroundJob> background_jobs(const EditorProject& project, bool ci
     return jobs;
 }
 
-// Paints one standalone frame with a centered "Parsing <folder>..." message.
-// load_project_folder parses every asset synchronously on the main thread (and
-// uploads textures via the GPU), so it cannot move to a worker; presenting this
-// frame just before the blocking call gives the user a painted load screen
-// instead of a frozen/blank window during the parse.
+#ifdef __EMSCRIPTEN__
+// In the browser, loading runs on the GL thread. Show this frame before its single
+// Asyncify yield, so parsing starts after the browser has drawn the message.
 void present_parsing_frame(const std::filesystem::path& folder) {
-    MAPED_PROFILE_FUNCTION();
+    PAFTA_PROFILE_FUNCTION();
     BeginDrawing();
     ClearBackground(DARKGRAY);
     rlImGuiBegin();
@@ -5411,37 +3954,40 @@ void present_parsing_frame(const std::filesystem::path& folder) {
     EndDrawing();
 }
 
+#endif
 
-} // namespace map_editor::app_internal
 
-namespace map_editor {
+} // namespace pafta::app_internal
+
+namespace pafta {
 
 int run_editor_app() {
-    MAPED_PROFILE_FUNCTION();
+    PAFTA_PROFILE_FUNCTION();
     using namespace app_internal;
-    // No window MSAA: 3D renders into offscreen targets and ImGui antialiases
-    // its own shapes, so multisampling the window only cost memory.
+    // No window MSAA. 3D is drawn into offscreen targets and ImGui smooths its own
+    // shapes, so multisampling the window only cost memory.
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     InitWindow(1440, 900, "Pafta v" PAFTA_VERSION);
     SetWindowMinSize(1100, 700);
-    // MAPED_BENCH=N: uncapped frames; after the scene settles, time N frames
-    // and print the averages, then exit. Pair with MAPED_AUTOLOAD.
-    const int bench_frames = std::getenv("MAPED_BENCH") == nullptr ? 0 : std::max(1, std::atoi(std::getenv("MAPED_BENCH")));
+    // PAFTA_BENCH=N: no frame limit. Once the scene has settled, time N frames, print
+    // the averages, and exit. Use it with PAFTA_AUTOLOAD.
+    const int bench_frames = std::getenv("PAFTA_BENCH") == nullptr ? 0 : std::max(1, std::atoi(std::getenv("PAFTA_BENCH")));
     SetTargetFPS(bench_frames > 0 ? 0 : 60);
-    // Esc must not quit the app: it is used to cancel a gizmo drag, and closing
-    // is gated by the unsaved-changes prompt below. KEY_NULL also removes Esc
-    // from WindowShouldClose().
+    // Esc must not quit the app. It cancels gizmo drags, and closing has to go through
+    // the unsaved-changes prompt below. KEY_NULL also stops Esc from triggering
+    // WindowShouldClose().
     SetExitKey(KEY_NULL);
-    // Push the far clip plane way out (default is 1000). The city spans thousands
-    // of world units at 4 units/cell, so the default plane clips distant terrain
-    // and buildings. rlgl reads these on every BeginMode3D, so one call sticks.
+    // Push the far clip plane a long way out (the default is 1000). The city is
+    // thousands of world units across at 4 units per cell, so the default cuts off far
+    // terrain and buildings. rlgl reads these on every BeginMode3D, so one call is enough.
     rlSetClipPlanes(0.05, 100000.0);
 
     EditorUi ui;
+    ArchiveWorkspace archive_workspace;
     load_preferences(ui);
 #ifdef __EMSCRIPTEN__
-    // ImGui reads imgui.ini on its first frame; bring back the saved layout.
-    web_restore_file("imgui.ini", "map_editor.imgui_ini");
+    // ImGui reads imgui.ini on its first frame, which restores the saved layout.
+    web_restore_file("imgui.ini", "pafta.imgui_ini");
 #endif
     rlImGuiBeginInitImGui();
     apply_editor_style(ui.ui_font_size);
@@ -5463,32 +4009,36 @@ int run_editor_app() {
 
     GfxDebugStats gfx_debug_stats;
 
-    // Close gating: a close request (window X, Alt+F4, Exit menu) sets this; with
-    // unsaved changes it opens a save prompt and blocks exit until resolved.
+    // Guarding close: a close request (the window X, Alt+F4, or the Exit menu) sets
+    // this. With unsaved changes it opens a save prompt and waits for an answer before
+    // quitting.
     bool running = true;
     bool close_requested = false;
+    bool open_archive_close_prompt = false;
     bool open_unsaved_prompt = false;
+    bool unsaved_prompt_for_open = false;
+    bool open_project_approved = false;
+    std::optional<EditorProject> project_to_open;
 
-    // Deferred project load. A drag-drop / Open Folder sets pending_load_folder;
-    // the loop then presents one "Parsing..." frame before running the blocking
-    // synchronous parse, so the load screen actually paints instead of freezing
-    // on a blank window.
+    // Opening or dropping a map queues it to replace the current one. On desktop,
+    // parsing runs on a worker; in the browser, a progress frame is shown first. The
+    // current project stays here until the new one is fully loaded and unsaved edits
+    // are dealt with.
     std::optional<std::filesystem::path> pending_load_folder;
 #ifndef __EMSCRIPTEN__
     std::optional<std::future<std::pair<std::optional<EditorProject>, std::string>>> load_future;
     auto load_stage = std::make_shared<std::atomic<int>>(0);
 #endif
-    // Optional auto-load: if MAPED_AUTOLOAD names a map folder, queue it at
-    // startup. Convenient for profiling/screenshot runs that need a known map
-    // open without the manual Open Folder step; no effect when the var is unset.
+    // Optional autoload: if PAFTA_AUTOLOAD names a map folder, it is queued at start.
+    // Useful for profiling and screenshot runs that need a known map open without
+    // clicking Open Folder. Does nothing when the variable is not set.
 #ifdef __EMSCRIPTEN__
     EM_ASM({
-        // The editor owns the keyboard: no browser shortcut acts while it is
-        // open (Ctrl+S save page, Ctrl+W close, Ctrl+R/F5 reload, Ctrl+1 tab
-        // switch, Tab focus moves, F3 or ' or / find...). The editor still
-        // receives every key. Plain typing is left alone (text reaches the
-        // editor through the keypress that a blocked keydown would cancel), and
-        // Ctrl+C/V/X pass through, since the browser's clipboard events are how
+        // The editor owns the keyboard: no browser shortcut works while it is open
+        // (Ctrl+S save page, Ctrl+W close, Ctrl+R/F5 reload, Ctrl+1 switch tab, Tab focus,
+        // F3 or ' or / find...). The editor still gets every key. Plain typing is left
+        // alone (text reaches the editor through the keypress that a blocked keydown would
+        // cancel), and Ctrl+C/V/X still work, because the browser's clipboard events are how
         // paste reaches the page.
         window.addEventListener('keydown', (event) => {
             const key = event.key.toLowerCase();
@@ -5497,53 +4047,55 @@ int run_editor_app() {
             const browser_key = key === 'tab' || /^f[0-9]+$/.test(key) || key === "'" || key === '/';
             if ((modified && !clipboard) || browser_key) event.preventDefault();
         }, true);
-        // Chrome and Firefox never hand Ctrl+W/T/N (Cmd+W/T/N/Q on macOS) to a
-        // page outside fullscreen; Keyboard Lock takes them while fullscreen.
-        // Otherwise always ask before the tab closes or reloads.
+        // Outside fullscreen, Chrome and Firefox never pass Ctrl+W/T/N (Cmd+W/T/N/Q on
+        // macOS) to a page; Keyboard Lock catches them in fullscreen. Otherwise, always ask
+        // before the tab closes or reloads.
         document.addEventListener('fullscreenchange', () => {
-            if (document.fullscreenElement && navigator.keyboard && navigator.keyboard.lock) navigator.keyboard.lock().catch(() => {});
+            if (document.fullscreenElement && navigator.keyboard && navigator.keyboard.lock) {
+                navigator.keyboard.lock().catch(error => console.warn('Keyboard lock failed:', error));
+            }
         });
-        window.addEventListener('beforeunload', (event) => { event.preventDefault(); event.returnValue = ''; });
+        window.addEventListener('beforeunload', (event) => { event.preventDefault(); event.returnValue = ""; });
     });
 #endif
-    if (const char* env = std::getenv("MAPED_AUTOLOAD")) {
+    if (const char* env = std::getenv("PAFTA_AUTOLOAD")) {
         pending_load_folder = std::filesystem::path{env};
     }
 #ifdef __EMSCRIPTEN__
-#ifdef MAP_EDITOR_CPP_WEB_PRELOAD_ROOT
-    // Only QA builds define this path. The normal browser build stays empty and
+#ifdef PAFTA_WEB_PRELOAD_ROOT
+    // Only test builds define this path. The normal browser build leaves it empty and
     // asks the user to choose or drop a project folder.
     if (!pending_load_folder) {
-        pending_load_folder = std::filesystem::path{MAP_EDITOR_CPP_WEB_PRELOAD_ROOT};
+        pending_load_folder = std::filesystem::path{PAFTA_WEB_PRELOAD_ROOT};
     }
 #endif
 #endif
-    // Repeatable visual QA: capture the loaded editor after 300 frames. The
-    // optional tab selects city, buildings, pieces, buildblocks, or blocks.
+    // Repeatable visual testing: capture the loaded editor after 300 frames. The
+    // optional tab picks city, buildings, pieces, buildblocks, or blocks.
     std::optional<std::filesystem::path> screenshot_path;
-    if (const char* env = std::getenv("MAPED_SCREENSHOT")) {
+    if (const char* env = std::getenv("PAFTA_SCREENSHOT")) {
         screenshot_path = std::filesystem::path{env};
     }
-    const std::string screenshot_tab = std::getenv("MAPED_SCREENSHOT_TAB") == nullptr
+    const std::string screenshot_tab = std::getenv("PAFTA_SCREENSHOT_TAB") == nullptr
         ? std::string{}
-        : std::getenv("MAPED_SCREENSHOT_TAB");
-    const int screenshot_frame_target = std::getenv("MAPED_SCREENSHOT_FRAMES") == nullptr
+        : std::getenv("PAFTA_SCREENSHOT_TAB");
+    const int screenshot_frame_target = std::getenv("PAFTA_SCREENSHOT_FRAMES") == nullptr
         ? 300
-        : std::max(1, std::atoi(std::getenv("MAPED_SCREENSHOT_FRAMES")));
+        : std::max(1, std::atoi(std::getenv("PAFTA_SCREENSHOT_FRAMES")));
     int screenshot_ready_frames = 0;
 
-    // Mesh-export options dialog. Opened by File > Export Mesh; the popup shows a
-    // context-aware title + what-to-export checkboxes, then runs the native save
-    // dialog. Options persist across exports during the session.
+    // Mesh export options. File > Export Mesh opens this popup, which shows a title for
+    // the current view and checkboxes for what to export, then opens the native save
+    // dialog. The options are remembered for the rest of the session.
     bool open_export_popup = false;
     ExportOptions export_options{};
 #ifndef __EMSCRIPTEN__
     std::optional<MeshExportTask> mesh_export_task;
 #endif
-    // Frames left to redraw the 3D view after the last change (see redraw_3d).
+    // How many more frames to redraw the 3D view after the last change (see redraw_3d).
     int redraw_frames = 60;
     while (running) {
-        MAPED_PROFILE_BLOCK("editor frame");
+        PAFTA_PROFILE_BLOCK("editor frame");
         gfx_debug_stats.reset_frame();
         gfx_debug_stats.push_frame_time(GetFrameTime() * 1000.0F);
         gfx_debug_stats.add_phase_ms(GfxDebugTimingPhase::TotalFrame, GetFrameTime() * 1000.0);
@@ -5551,12 +4103,19 @@ int run_editor_app() {
         g_render_settings.building_distance = ui.building_distance;
         g_render_settings.half_textures = ui.half_textures;
         g_render_settings.near_lod = ui.near_lod;
+        // Selected-only interiors: the placements whose rooms are drawn at any distance.
+        g_render_settings.interior_placements.clear();
+        if (ui.interiors_selected_only && ui.city_selection == CitySelectionKind::Building) {
+            g_render_settings.interior_placements = ui.selected_city_buildings;
+            g_render_settings.interior_placements.push_back(ui.selected_city_building);
+        }
+        g_render_settings.interiors_selected_only = ui.interiors_selected_only;
         g_render_settings.street_objects = ui.street_objects;
         g_render_settings.live_reflections = ui.live_reflections;
         if (project && g_render_settings.anisotropy != ui.anisotropy) apply_texture_anisotropy(*project, ui.anisotropy);
         g_render_settings.anisotropy = ui.anisotropy;
 #ifndef __EMSCRIPTEN__
-        // Frame pacing: V-Sync, the limit, and a low rate behind other windows.
+        // Frame pacing: V-Sync, the frame limit, and a low rate when behind other windows.
         if (bench_frames == 0) {
             static bool vsync_on = false;
             if (ui.vsync != vsync_on) {
@@ -5573,9 +4132,9 @@ int run_editor_app() {
 #endif
 
 #ifdef __EMSCRIPTEN__
-        // raylib's browser resize handler resizes the canvas but not GLFW's
-        // window, and Emscripten's GLFW scales mouse input by window / CSS size,
-        // so clicks drift after any resize. Keep GLFW's size in step.
+        // raylib's browser resize handler resizes the canvas but not GLFW's window, and
+        // Emscripten's GLFW scales mouse input by window size / CSS size, so clicks drift
+        // after any resize. Keep GLFW's size matched.
         static Vector2 glfw_size{1440.0F, 900.0F};
         if (glfw_size.x != static_cast<float>(GetScreenWidth()) || glfw_size.y != static_cast<float>(GetScreenHeight())) {
             glfw_size = {static_cast<float>(GetScreenWidth()), static_cast<float>(GetScreenHeight())};
@@ -5583,8 +4142,12 @@ int run_editor_app() {
         }
 #endif
 
-        // The OS close button / Alt+F4 raise WindowShouldClose(); route it through
-        // the same gate as the Exit menu instead of quitting immediately.
+        // NewFrame works out the current mouse and capture state from the last layout,
+        // before camera movement and editing use it.
+        rlImGuiBegin();
+
+        // The OS close button and Alt+F4 trigger WindowShouldClose(). Send that through the
+        // same check as the Exit menu instead of quitting right away.
         if (WindowShouldClose()) {
             close_requested = true;
         }
@@ -5592,15 +4155,27 @@ int run_editor_app() {
         if (!io.WantCaptureKeyboard && action_pressed(ui, EditorAction::GraphicsDebug)) {
             ui.show_graphics_debug = !ui.show_graphics_debug;
         }
-        // Tab switches requested by the tab bar, shortcuts, or tool windows.
+        // Tab switches asked for by the tab bar, shortcuts, or tool windows.
         if (ui.requested_tab.has_value()) {
             const auto next = *ui.requested_tab;
             ui.requested_tab.reset();
             if (next != ui.tab) {
+                // Each mode keeps its own camera, so switching back returns to where
+                // you were. Building and Block mode only reuse it for the same asset.
+                const auto asset_of = [&](EditorTab tab) {
+                    return tab == EditorTab::Buildings ? ui.selected_building : tab == EditorTab::Blocks ? ui.selected_block : std::size_t{0};
+                };
+                const auto old_slot = static_cast<std::size_t>(ui.tab);
+                ui.tab_cameras[old_slot] = std::pair{camera, asset_of(ui.tab)};
                 ui.tab = next;
                 ui.gizmo_active = GizmoAxis::None;
                 ui.box_select_active = false;
-                if (project) {
+                ui.view_snap_active = false;
+                ui.focus_animating = false;
+                const auto& saved = ui.tab_cameras[static_cast<std::size_t>(next)];
+                if (project && saved && saved->second == asset_of(next)) {
+                    camera = saved->first;
+                } else if (project) {
                     if (next == EditorTab::City) {
                         focus_camera_on_city(camera, *project);
                     } else {
@@ -5620,26 +4195,48 @@ int run_editor_app() {
         }
 #ifdef __EMSCRIPTEN__
         if (g_web_uploaded_folder.has_value()) {
+            if (pending_load_folder) release_web_project(*pending_load_folder);
             pending_load_folder = std::move(g_web_uploaded_folder);
             g_web_uploaded_folder.reset();
         }
 #endif
 
-        // Recent status/action messages, newest first, for the status bar.
+        // Recent status and action messages, newest first, for the status bar.
         static std::deque<std::string> status_history;
         static Vector2 viewport_mouse_pos = {0, 0};
+        static Vector2 viewport_origin = {0, 0};
         static bool is_viewport_hovered = false;
+        const auto* scene_window = ImGui::FindWindowByName("##SceneCanvas");
+        is_viewport_hovered = scene_window != nullptr && ImGui::GetCurrentContext()->HoveredWindow == scene_window;
+        viewport_mouse_pos = get_viewport_mouse_position(viewport_origin, last_viewport_size);
         const bool show_3d_viewport = true;
 
-        if (is_viewport_hovered && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+        // Right button: held, it flies the camera; a quick click without moving
+        // opens the context menu instead (drawn in the scene canvas below).
+        static Vector2 right_click_at{};
+        static double right_click_time = 0.0;
+        static float right_click_moved = 0.0F;
+        bool viewport_menu_requested = false;
+        if (is_viewport_hovered && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && ui.block_transform == BlockTransform::None) {
+            right_click_at = viewport_mouse_pos;
+            right_click_time = GetTime();
+            right_click_moved = 0.0F;
+            set_camera_perspective(camera);
             DisableCursor();
+        }
+        if (IsCursorHidden()) {
+            right_click_moved += Vector2Length(GetMouseDelta());
+            const auto fly = read_fly_input();
+            if (fly.forward || fly.back || fly.left || fly.right || fly.up || fly.down) right_click_moved += 100.0F;
         }
         if (IsMouseButtonReleased(MOUSE_BUTTON_RIGHT) && IsCursorHidden()) {
             EnableCursor();
+            viewport_menu_requested = right_click_moved < 6.0F && GetTime() - right_click_time < 0.4;
         }
         if (IsCursorHidden()) {
-            // Manual fly cancels any in-progress focus glide so they never fight.
-            // While flying, the wheel sets fly speed; otherwise it zooms.
+            ui.view_snap_active = false;
+            // Flying by hand cancels any focus glide so the two never fight. While flying,
+            // the wheel sets the flying speed; otherwise it zooms.
             ui.camera_fly_speed = adjust_camera_fly_speed(ui.camera_fly_speed, GetMouseWheelMove());
             ui.focus_animating = false;
             update_free_fly_camera(camera, ui.camera_fly_speed, read_fly_input());
@@ -5654,19 +4251,19 @@ int run_editor_app() {
         update_focus_animation(ui, camera);
         ui.view_camera_position = camera.position;
         ui.view_camera_target = camera.target;
-        // Visual QA: MAPED_CAMERA="px,py,pz,tx,ty,tz" pins the camera.
-        if (const char* pose = std::getenv("MAPED_CAMERA"); pose && (screenshot_path || bench_frames > 0)) {
+        // Visual testing: PAFTA_CAMERA="px,py,pz,tx,ty,tz" fixes the camera in place.
+        if (const char* pose = std::getenv("PAFTA_CAMERA"); pose && (screenshot_path || bench_frames > 0)) {
             float v[6]{};
             if (std::sscanf(pose, "%f,%f,%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) {
                 camera.position = {v[0], v[1], v[2]};
                 camera.target = {v[3], v[4], v[5]};
             }
         }
-        // Visual QA: MAPED_FLY="w,space,..." holds those fly keys (w a s d space
-        // ctrl shift z) for the last MAPED_FLY_FRAMES (60) screenshot frames and
-        // prints the distance flown, on top of any pinned MAPED_CAMERA.
-        if (const char* keys = std::getenv("MAPED_FLY"); keys && screenshot_path && project) {
-            const int fly_frames = std::getenv("MAPED_FLY_FRAMES") ? std::atoi(std::getenv("MAPED_FLY_FRAMES")) : 60;
+        // Visual testing: PAFTA_FLY="w,space,..." holds those fly keys (w a s d space ctrl
+        // shift z) for the last PAFTA_FLY_FRAMES (60) screenshot frames and prints how far
+        // the camera flew, starting from PAFTA_CAMERA if that is set.
+        if (const char* keys = std::getenv("PAFTA_FLY"); keys && screenshot_path && project) {
+            const int fly_frames = std::getenv("PAFTA_FLY_FRAMES") ? std::atoi(std::getenv("PAFTA_FLY_FRAMES")) : 60;
             static Vector3 flown{};
             static double fly_seconds = 0.0;
             if (screenshot_ready_frames >= screenshot_frame_target - fly_frames) {
@@ -5691,17 +4288,17 @@ commit_pending_edits(*project, ui);
         }
 #ifdef __EMSCRIPTEN__
         {
-            // ImGui rewrites imgui.ini in memory; mirror it every few seconds.
+            // ImGui rewrites imgui.ini in memory; copy it to disk every few seconds.
             static double last_layout_store = 0.0;
             if (GetTime() - last_layout_store > 5.0) {
                 last_layout_store = GetTime();
-                web_store_file("imgui.ini", "map_editor.imgui_ini");
+                web_store_file("imgui.ini", "pafta.imgui_ini");
             }
         }
 #endif
-        // Editor hotkeys: only when ImGui is not capturing the keyboard (no active
-        // text field) and the freecam is not flying, so they never collide with
-        // typing or WASD movement.
+        // Editor hotkeys only run when ImGui is not using the keyboard (no active text field)
+        // and the free camera is not flying, so they never clash with typing or WASD
+        // movement.
         if (project && !io.WantCaptureKeyboard && !IsCursorHidden()) {
             handle_editor_hotkeys(*project, ui, camera, status, is_viewport_hovered);
         }
@@ -5716,24 +4313,27 @@ commit_pending_edits(*project, ui);
         const SbcBuilding* outline_selected_building = nullptr;
         const SbcBuilding* outline_hovered_building = nullptr;
         std::optional<SbcBuilding> ghost_building;
-        // Pixel size of the 3D render target (the panel times render scale).
+        // Size in pixels of the 3D render target (the panel size times the render scale).
         const Vector2 render_size{static_cast<float>(viewport_texture.texture.width), static_cast<float>(viewport_texture.texture.height)};
-        // Idle: an unchanged view keeps its last frame instead of being redrawn.
-        // Any input, background work, or a map change since the last scene
-        // build keeps it redrawing, and so does a short settle after them.
+        // When idle, a view that hasn't changed keeps its last frame instead of being
+        // redrawn. Any input, background work, or map change since the last scene build
+        // keeps it redrawing, and so does a short wait after them.
         {
             bool input = GetMouseDelta().x != 0.0F || GetMouseDelta().y != 0.0F || GetMouseWheelMove() != 0.0F ||
                 IsMouseButtonDown(MOUSE_BUTTON_LEFT) || IsMouseButtonDown(MOUSE_BUTTON_RIGHT) || IsMouseButtonDown(MOUSE_BUTTON_MIDDLE) ||
                 IsWindowResized();
             for (int key = KEY_SPACE; key <= KEY_KB_MENU && !input; ++key) input = IsKeyDown(key);
-            const bool working = project && (project->render_build_in_progress || !project->pending_gpu_upload_indices.empty() ||
+            bool working = project && (project->render_build_in_progress || !project->pending_gpu_upload_indices.empty() ||
                 project->city_scene_build_in_progress || !project->city_scene_gpu_valid ||
                 project->city_scene_current_fingerprint != project->city_scene_cache_fingerprint ||
                 !project->building_near_jobs.empty() || project->portal_rebuild_future.has_value() || !ui.road_ghost.empty());
+#ifndef __EMSCRIPTEN__
+            working = working || load_future.has_value() || mesh_export_task.has_value();
+#endif
             if (input || working || bench_frames > 0 || screenshot_path.has_value()) redraw_frames = 60;
 #ifndef __EMSCRIPTEN__
-            // Settled with nothing running: sleep until the next input event
-            // instead of redrawing the interface at the frame-rate limit.
+            // Settled and nothing running: sleep until the next input event instead of
+            // redrawing the interface at the frame limit.
             static bool waiting = false;
             if ((redraw_frames == 0) != waiting) {
                 waiting = redraw_frames == 0;
@@ -5751,6 +4351,7 @@ commit_pending_edits(*project, ui);
         if (redraw_3d && show_3d_viewport && last_viewport_size.x > 0 && last_viewport_size.y > 0) {
             set_game_world_time(ui.world_time_hours);
             update_environment_cubemap(project && project->terrain_gpu_valid ? &project->terrain_gpu_model.mesh : nullptr,
+                project && project->terrain_gpu_valid ? project->terrain_gpu_fingerprint : 0U,
                 camera.position, g_render_settings.live_reflections);
             begin_game_texture_mode(viewport_texture);
             ClearBackground(BLACK);
@@ -5772,15 +4373,16 @@ service_render_rebuild(*project);
                         const auto* selected_building = project->city->data.buildings.empty()
                             ? nullptr
                             : &project->city->data.buildings[std::min(ui.selected_city_building, project->city->data.buildings.size() - 1U)];
-                        const auto* selected_street = project->city->data.streets.empty()
-                            ? nullptr
-                            : &project->city->data.streets[std::min(ui.selected_city_street, project->city->data.streets.size() - 1U)];
-                        const auto scene_fingerprint = city_scene_fingerprint(project->city->data);
+                        std::optional<std::size_t> selected_street;
+                        if (!project->city->data.streets.empty()) {
+                            selected_street = std::min(ui.selected_city_street, project->city->data.streets.size() - 1U);
+                        }
+                        const auto scene_fingerprint = city_scene_fingerprint(project->city->data, project->city_building_revision);
                         project->city_scene_current_fingerprint = scene_fingerprint;
-                        // Any building, road or piece change moves the fingerprint, and a
-                        // rebuild regenerates the whole city's roads and terrain. Wait for
-                        // the gesture to end and the map to hold still briefly, so a drag
-                        // or a burst of nudges costs one rebuild instead of one per frame.
+                        // Any change to a building, road, or piece changes the fingerprint, and a
+                        // rebuild remakes the whole city's roads and terrain. Wait for the
+                        // gesture to end and the map to stay still for a moment, so a drag or a
+                        // quick series of nudges costs one rebuild instead of one per frame.
                         static std::uint64_t pending_fingerprint = 0;
                         static double pending_since = 0.0;
                         if (scene_fingerprint != pending_fingerprint) {
@@ -5791,15 +4393,15 @@ service_render_rebuild(*project);
                         if ((!project->city_scene_cache_valid ||
                              (project->city_scene_cache_fingerprint != scene_fingerprint && scene_settled)) &&
                                    !project->city_scene_build_in_progress) {
-                            // The map changed: rebuild the scene (roads + terrain
-                            // field + footprint stamping) on a worker thread. The
-                            // last-good scene keeps rendering until it is ready.
+                            // The map changed: rebuild the scene (roads, terrain, and
+                            // footprint stamps) on a worker thread. The last good scene
+                            // keeps drawing until the new one is ready.
 start_city_scene_rebuild(*project, scene_fingerprint);
                         }
 
-                        // Adopt a finished background rebuild if it still matches
-                        // the current map; otherwise discard it as stale and let the
-                        // next frame kick a fresh build.
+                        // Use a finished background rebuild if it still matches the
+                        // current map. Otherwise throw it away as out of date and let
+                        // the next frame start a fresh build.
                         if (project->city_scene_build_future.has_value() &&
                             project->city_scene_build_future->wait_for(std::chrono::milliseconds{0}) == std::future_status::ready) {
                             auto built = project->city_scene_build_future->get();
@@ -5814,11 +4416,11 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                             }
                         }
                         if (project->city_scene_cache_valid && !project->city_scene_gpu_valid) {
-                            // Re-upload only what changed: the road/curb tiles when
-                            // their cells differ (a building edit leaves them alone),
-                            // the heavy terrain mesh when terrain-affecting inputs
-                            // (intersections/buildings/pieces) changed.
-                            MAPED_PROFILE_BLOCK("upload city scene gpu models");
+                            // Upload again only what changed: the road and curb tiles
+                            // when their cells differ (a building edit leaves them alone),
+                            // and the heavy terrain mesh when its inputs
+                            // (intersections, buildings, pieces) changed.
+                            PAFTA_PROFILE_BLOCK("upload city scene gpu models");
                             if (project->city_tile_gpu_fingerprint != project->city_scene_cache.city_tile_fingerprint) {
                                 unload_city_render_model(project->city_tile_gpu_model);
                                 project->city_tile_gpu_model =
@@ -5828,7 +4430,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                                 project->city_tile_gpu_fingerprint = project->city_scene_cache.city_tile_fingerprint;
                             }
 
-                            const auto terrain_fp = city_terrain_fingerprint(project->city->data);
+                            const auto terrain_fp = city_terrain_fingerprint(project->city->data, project->city_building_revision);
                             if (!project->terrain_gpu_valid || terrain_fp != project->terrain_gpu_fingerprint) {
                                 unload_city_render_model(project->terrain_gpu_model);
                                 if (project->city_scene_cache.terrain.has_value()) {
@@ -5837,6 +4439,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                                 }
                                 project->terrain_gpu_fingerprint = terrain_fp;
                                 project->terrain_gpu_valid = true;
+                                invalidate_environment_cubemap();
                             }
                             project->city_scene_gpu_valid = true;
                         }
@@ -5846,9 +4449,10 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                         if (!game_preview) {
                             draw_city_editor_overlay(*project, city_scene);
                         }
-                        // Unified hover: the Select tool (or Erase) highlights
-                        // whatever is under the cursor - building, road, node, or
-                        // piece - so a click is predictable. nearest wins.
+                        // One hover for everything: the Select tool (or Erase)
+                        // highlights whatever is under the cursor (building, road,
+                        // node, or piece), so you know what a click will do. The
+                        // closest one wins.
                         const SbcBuilding* hovered_building = nullptr;
                         ui.hover_city_intersection.reset();
                         ui.hover_city_street.reset();
@@ -5858,8 +4462,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                             const auto pick_ray = get_viewport_mouse_ray(camera, viewport_mouse_pos, last_viewport_size);
                             const Vec3 ro{pick_ray.position.x, pick_ray.position.y, pick_ray.position.z};
                             const Vec3 rd{pick_ray.direction.x, pick_ray.direction.y, pick_ray.direction.z};
-                            // The pick tests every building triangle along the ray; reuse
-                            // last frame's answer while the ray and the map are unchanged.
+                            // The pick tests every building triangle along the ray, so
+                            // reuse last frame's answer while the ray and map are the same.
                             static Ray last_ray{};
                             static std::uint64_t last_map = 0;
                             static CityAnyPick last_pick{};
@@ -5877,14 +4481,14 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                             } else if (hov.kind == CitySelectionKind::Node) {
                                 ui.hover_city_intersection = hov.index;
                             } else if (hov.kind == CitySelectionKind::Piece) {
-                                // Resolve the hovered piece to its single world voxel.
+                                // Find the single world voxel of the piece under the mouse.
                                 if (const auto p = pick_city_piece(project->city->data, ro, rd, city_scene.unit_size);
                                     p.has_value() && p->portal_index < project->city->data.portals.size()) {
                                     const auto& portal = project->city->data.portals[p->portal_index];
                                     ui.hover_piece_voxel = CityGridPoint{
-                                        portal.fields[1] * 8 + static_cast<std::int32_t>(p->block_index & 7U),
-                                        portal.fields[2] * 8 + static_cast<std::int32_t>((p->block_index / 0x40U) & 7U),
-                                        portal.fields[3] * 8 + static_cast<std::int32_t>((p->block_index / 8U) & 7U),
+                                        sbc_portal_cell_base(portal.fields[1]) + static_cast<std::int32_t>(p->block_index & 7U),
+                                        sbc_portal_cell_base(portal.fields[2]) + static_cast<std::int32_t>((p->block_index / 0x40U) & 7U),
+                                        sbc_portal_cell_base(portal.fields[3]) + static_cast<std::int32_t>((p->block_index / 8U) & 7U),
                                     };
                                 }
                             }
@@ -5911,18 +4515,18 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                         }
 
                         // Road and Building previews snap to the grid point on the
-                        // nearest visible surface; the Piece preview casts for its own
-                        // cell below, and Select/Erase use the hover pick instead.
+                        // closest visible surface. The Piece preview finds its own cell
+                        // below, and Select and Erase use the hover pick instead.
                         const auto needs_city_cursor = ui.city_tool == CityTool::Road || ui.city_tool == CityTool::Building;
                         const std::optional<CityGridPoint> city_cursor = needs_city_cursor
                             ? raised(city_surface_point_under_mouse(*project, camera, viewport_mouse_pos, last_viewport_size),
                                 ui.place_height_offset)
                             : std::nullopt;
-                        // Node selection/hover glow (roads get the silhouette outline).
+                        // Glow for selected or hovered nodes (roads get the outline instead).
 
                         // Placement previews: the road node, the building's footprint
-                        // (its silhouette is outlined below), and the piece itself, all
-                        // computed exactly as the click will place them. Erase relies on
+                        // (its outline is drawn below), and the piece itself, all
+                        // worked out exactly as the click will place them. Erase uses
                         // the hover highlight above.
                         if (city_cursor.has_value() && ui.city_tool == CityTool::Road) {
                             draw_city_cursor(*city_cursor, city_scene.unit_size, ui.city_tool);
@@ -5957,15 +4561,15 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                             ? nullptr
                             : &project->buildings[ui.selected_building].data.cells[occupied[std::min(ui.selected_building_cell, occupied.size() - 1U)]];
                         if (ui.selected_building < project->buildings.size()) {
-                            // Whole building (nullopt) or a single chosen floor.
+                            // The whole building (nullopt) or one chosen floor.
                             const std::optional<std::uint32_t> preview_floor = ui.building_view_floor_only
                                 ? std::optional<std::uint32_t>(static_cast<std::uint32_t>(std::max(0, ui.building_view_floor)))
                                 : std::nullopt;
-                            // Cell under the cursor, for the silhouette hover outline.
+                            // The cell under the cursor, for the hover outline.
                             ui.building_hover_cell.reset();
                             ui.building_hover_face.reset();
                             if (is_viewport_hovered && !IsCursorHidden()) {
-                                // The face actually under the cursor, from the edit view's mesh.
+                                // The face that is really under the cursor, from the edit view's mesh.
                                 const auto pr = get_viewport_mouse_ray(camera, viewport_mouse_pos, last_viewport_size);
                                 const Vec3 ro{pr.position.x, pr.position.y, pr.position.z};
                                 const Vec3 rd{pr.direction.x, pr.direction.y, pr.direction.z};
@@ -6023,9 +4627,9 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             }
             end_game_texture_mode();
 
-            // Generic silhouette-outline: render a shape into the mask, then trace
-            // a colored outline from it. Buildings, roads, and building cells all
-            // use this so hover/selection feedback looks the same everywhere.
+            // General outline: draw a shape into the mask, then trace a
+            // coloured outline around it. Buildings, roads, and building cells
+            // all use this, so hover and selection look the same everywhere.
             auto composite_outline = [&](const std::function<void()>& draw_mask, Color tint) {
                 GfxDebugScopedTimer timer{gfx_debug_stats, GfxDebugTimingPhase::OutlineDraw};
                 begin_game_texture_mode(building_outline_mask_texture);
@@ -6041,7 +4645,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             };
 
             const Color select_tint{220, 32, 32, 255};
-            // Erase shows what it will delete in red, not the neutral hover blue.
+            // Erase shows what it will delete in red, not the normal hover blue.
             const bool erase_hover = ui.tab == EditorTab::City && ui.city_tool == CityTool::Erase;
             const Color hover_tint = erase_hover ? Color{255, 80, 70, 255} : Color{120, 200, 255, 255};
 
@@ -6049,8 +4653,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 // Outline every selected building (the whole multi-selection).
                 if (ui.city_selection == CitySelectionKind::Building) {
                     if (ui.selected_city_buildings.size() > 1U) {
-                        // One mask pass covering the whole multi-selection, then one
-                        // outline pass, instead of a full mask+outline round trip per
+                        // One mask pass for the whole multi-selection, then one
+                        // outline pass, instead of a full mask and outline for every
                         // selected building.
                         composite_outline([&] {
                             for (const auto idx : ui.selected_city_buildings) {
@@ -6073,8 +4677,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                             ui.placement_conflict.empty() ? Color{235, 190, 78, 255} : Color{230, 70, 60, 255});
                     }
                 }
-                // Road outline: selected road (when a road is selected) + hover,
-                // same silhouette look as buildings.
+                // Road outline: the selected road (if a road is selected) and the
+                // hover, with the same outline look as buildings.
                 if (ui.city_selection == CitySelectionKind::Road && !project->city->data.streets.empty()) {
                     const auto sel = std::min(ui.selected_city_street, project->city->data.streets.size() - 1U);
                     composite_outline([&] { draw_city_road_mask(*project, project->city_scene_cache, sel); }, select_tint);
@@ -6083,7 +4687,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     const auto h = *ui.hover_city_street;
                     composite_outline([&] { draw_city_road_mask(*project, project->city_scene_cache, h); }, hover_tint);
                 }
-                // Junctions and single piece voxels: the same silhouette, traced
+                // Junctions and single piece voxels: the same outline, traced
                 // from their real tiles and faces.
                 const auto& map_intersections = project->city->data.intersections;
                 if (ui.city_selection == CitySelectionKind::Node && !map_intersections.empty()) {
@@ -6111,7 +4715,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     const auto& sel_cell = building.cells[occupied[std::min(ui.selected_building_cell, occupied.size() - 1U)]];
                     composite_outline([&] { draw_building_cell_mask(project->building_floor_preview_render_buffer, building, sel_cell); }, select_tint);
                 }
-                // Paint highlights the target face instead of the whole block.
+                // Paint highlights the face it will paint instead of the whole block.
                 if (ui.building_tool != BuildingTool::PaintTexture &&
                     ui.building_hover_cell.has_value() && *ui.building_hover_cell < building.cells.size() &&
                     (occupied.empty() || building.cells[*ui.building_hover_cell].index != building.cells[occupied[std::min(ui.selected_building_cell, occupied.size() - 1U)]].index)) {
@@ -6121,14 +4725,17 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             }
         }
 
+        if (project) {
+            block_editor_update(*project, ui, camera, viewport_mouse_pos, last_viewport_size, is_viewport_hovered && !IsCursorHidden());
+        }
         if (show_3d_viewport && project && is_viewport_hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !IsCursorHidden() &&
             ui.camera_drag == CameraDrag::None) {
             if (ui.tab == EditorTab::Blocks && !project->blocks.empty()) {
-                pick_block_element(*project, ui, get_viewport_mouse_ray(camera, viewport_mouse_pos, last_viewport_size));
+                block_editor_press(*project, ui, camera, viewport_mouse_pos, last_viewport_size);
             }
             if (ui.tab == EditorTab::City && project->city) {
-                // Name the undo step. Select only mutates if it grabs a gizmo
-                // (handled by the gizmo-drag start), so it is excluded here.
+                // Name the undo step. Select only changes things when it grabs a
+                // gizmo (handled where the gizmo drag starts), so it is left out here.
                 switch (ui.city_tool) {
                     case CityTool::Piece: begin_city_action(*project, ui, "place piece"); break;
                     case CityTool::Erase: begin_city_action(*project, ui, "erase"); break;
@@ -6136,7 +4743,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     case CityTool::Road:
                     case CityTool::Select: break;
                 }
-                // Placement preview and clicks use the same surface intersection.
+                // The placement preview and clicks use the same surface hit.
                 const auto city_cursor = city_surface_point_under_mouse(*project, camera, viewport_mouse_pos, last_viewport_size);
                 const auto pick_ray = get_viewport_mouse_ray(camera, viewport_mouse_pos, last_viewport_size);
                 const Vec3 ray_origin{pick_ray.position.x, pick_ray.position.y, pick_ray.position.z};
@@ -6144,13 +4751,18 @@ start_city_scene_rebuild(*project, scene_fingerprint);
 
                 if (ui.city_tool == CityTool::Piece && project->city->data.version < 11 && !ui.confirm_piece_upgrade &&
                     !project->city_promotion_failed) {
-                    // Converting legacy district cells changes what the game draws,
+                    // Converting old district cells changes what the game draws,
                     // so that upgrade waits for the user (draw_city_upgrade_dialogs).
                     if (has_legacy_district_cells(project->city->data)) {
                         ui.confirm_piece_upgrade = true;
                     } else {
                         const auto from = project->city->data.version;
-                        try { promote_city(*project); ui.city_upgrade_notice = city_upgrade_notice(from); }
+                        try {
+                            promote_city(*project);
+                            ui.city_dirty = true;
+                            project->city_promotion_failed = false;
+                            ui.city_upgrade_notice = city_upgrade_notice(from);
+                        }
                         catch (const std::exception& error) {
                             project->city_promotion_failed = true;
                             report_failure(status, std::string{"Piece placement blocked: "} + error.what());
@@ -6158,8 +4770,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     }
                 }
                 if (ui.city_tool == CityTool::Select) {
-                    // First test the selected building's gizmo handles (drag if hit);
-                    // otherwise select whatever is under the cursor (nearest wins).
+                    // First check the selected building's gizmo handles (drag if one is
+                    // hit); otherwise select whatever is under the cursor (closest wins).
                     GizmoAxis gizmo_hit = GizmoAxis::None;
                     if (ui.city_selection == CitySelectionKind::Building && !project->city->data.buildings.empty()) {
                         const auto sel = std::min(ui.selected_city_building, project->city->data.buildings.size() - 1U);
@@ -6192,26 +4804,26 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                         if (std::none_of(ui.gizmo_start_buildings.begin(), ui.gizmo_start_buildings.end(), [&](const auto& saved) { return saved.first == ui.selected_city_building; }))
                             ui.gizmo_start_buildings.emplace_back(ui.selected_city_building, placement);
                     } else {
-                        // Begin a potential box-select. On release we decide: a tiny
-                        // drag is a single click (pick under cursor), a real drag is a
-                        // rubber-band box. This lets one gesture do both.
+                        // Maybe start a box select. On release we decide: a tiny drag
+                        // counts as a single click (pick what is under the cursor), and a
+                        // real drag is a selection box. One gesture can do either.
                         ui.box_select_active = true;
                         ui.box_select_start = viewport_mouse_pos;
                     }
                 } else if (ui.city_tool == CityTool::Building || ui.city_tool == CityTool::Road) {
-                    // Placed on release (below), so a misclick can be dragged away.
+                    // Placed on release (below), so you can drag away from a misclick.
                     ui.place_click_pending = true;
                     ui.place_click_start = viewport_mouse_pos;
                 } else if (ui.city_tool == CityTool::Piece) {
-                    // Seeds the drag stroke, whose layer stays at this cell's height.
+                    // Starts the drag stroke, which stays on this cell's layer.
                     if (const auto cell = raised(city_surface_cell_under_mouse(*project, camera, viewport_mouse_pos, last_viewport_size),
                             ui.place_height_offset)) {
                         set_city_piece_voxel(*project, ui, *cell);
                         ui.drag_stamp_cell = *cell;
                     }
                 } else if (ui.city_tool == CityTool::Erase) {
-                    // Delete the highlighted thing; the drag pass continues only
-                    // once the cursor reaches another cell.
+                    // Delete the highlighted thing. The drag pass only continues once
+                    // the cursor reaches another cell.
                     erase_city_thing_under_cursor(*project, ui, project->city_scene_cache, ray_origin, ray_dir, status);
                     ui.drag_stamp_cell = city_cursor;
                 }
@@ -6231,7 +4843,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 if (ui.building_tool == BuildingTool::Select) {
                     select_building_cell_from_viewport(*project, ui, camera, viewport_mouse_pos, last_viewport_size, pick_floor, status);
                 } else if (ui.building_tool != BuildingTool::Anchor) {
-                    // These tools use the face hit to identify the cell to edit.
+                    // These tools use the face hit to find the cell to edit.
                     ui.selected_building = std::min(ui.selected_building, project->buildings.size() - 1U);
                     const auto& building = project->buildings[ui.selected_building].data;
                     const auto pick_ray = get_viewport_mouse_ray(camera, viewport_mouse_pos, last_viewport_size);
@@ -6245,9 +4857,9 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                             if (const auto placed = place_building_block(*project, ui, *pick, rd, unit_size, status)) {
                                 ui.stroke_block_cells.push_back(*placed);
                             }
-                            // Seed the drag dedupe so the held-stamp pass below does
-                            // not place a second block into the same neighbour cell
-                            // on this very frame.
+                            // Mark this cell for the drag, so the hold-to-stamp pass below
+                            // doesn't place a second block in the same neighbouring cell
+                            // in this same frame.
                             ui.drag_stamp_cell = CityGridPoint{
                                 static_cast<std::int32_t>(building.cells[pick->cell_index].x),
                                 static_cast<std::int32_t>(building.cells[pick->cell_index].y),
@@ -6269,16 +4881,24 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                             const auto x = static_cast<int>(std::floor((ro.x + rd.x * t) / unit_size)) + static_cast<int>(edited.anchor_x);
                             const auto z = static_cast<int>(std::floor((ro.z + rd.z * t) / unit_size)) + static_cast<int>(edited.anchor_z);
                             if (t >= 0 && x >= 0 && z >= 0 && (ui.block_config.exterior || ui.block_config.interior)) {
-                                auto* cell = building_cell_at(edited, x, floor, z);
-                                if (!cell) {
-                                    SbbCell fresh{};
-                                    fresh.index = edited.cells.size(); fresh.x = x; fresh.y = floor; fresh.z = z;
-                                    fresh.shorts.fill(0xffffU);
-                                    edited.cells.push_back(fresh); cell = &edited.cells.back();
+                                const auto problem = block_config_problem(edited, ui.block_config, *project);
+                                if (x >= static_cast<int>(supported_sbb_grid_side) ||
+                                    z >= static_cast<int>(supported_sbb_grid_side) || floor >= supported_sbb_grid_side) {
+                                    status = "placement would exceed the supported 64-cell building grid";
+                                } else if (!problem.empty()) {
+                                    status = problem;
+                                } else {
+                                    auto* cell = building_cell_at(edited, x, floor, z);
+                                    if (!cell) {
+                                        SbbCell fresh{};
+                                        fresh.index = edited.cells.size(); fresh.x = x; fresh.y = floor; fresh.z = z;
+                                        fresh.shorts.fill(0xffffU);
+                                        edited.cells.push_back(fresh); cell = &edited.cells.back();
+                                    }
+                                    apply_block_config(*cell, ui.block_config, edited, *project);
+                                    ui.stroke_block_cells.assign(1, static_cast<std::size_t>(cell - edited.cells.data()));
+                                    mark_building_changed(*project, ui);
                                 }
-                                apply_block_config(*cell, ui.block_config, edited, *project);
-                                ui.stroke_block_cells.assign(1, static_cast<std::size_t>(cell - edited.cells.data()));
-                                mark_building_changed(*project, ui);
                             }
                         } else if (ui.building_tool == BuildingTool::ItemSet) {
                             status = "Click a block to place or clear its item set.";
@@ -6292,8 +4912,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             update_anchor_gizmo(*project, ui, camera, viewport_mouse_pos, last_viewport_size, is_viewport_hovered && !IsCursorHidden());
         }
 
-        // Gizmo drag: while the mouse is held after grabbing a handle, map the
-        // cursor to the building's new grid position; release ends the drag.
+        // Gizmo drag: while the mouse is held after grabbing a handle, turn the
+        // cursor into the building's new grid position. Letting go ends the drag.
         if (ui.gizmo_active != GizmoAxis::None) {
             if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && project && project->city) {
                 apply_building_gizmo_drag(*project, ui, camera, viewport_mouse_pos, last_viewport_size);
@@ -6303,8 +4923,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             }
         }
 
-        // Building/Road placement fires on release, and only if the cursor stayed
-        // put; dragging away from a misclick cancels it.
+        // Building and Road placement happen on release, and only if the cursor
+        // stayed still. Dragging away from a misclick cancels it.
         if (ui.place_click_pending && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
             ui.place_click_pending = false;
             if (show_3d_viewport && project && project->city && ui.tab == EditorTab::City && is_viewport_hovered &&
@@ -6312,14 +4932,14 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 const auto city_cursor = raised(city_surface_point_under_mouse(*project, camera, viewport_mouse_pos, last_viewport_size),
                     ui.place_height_offset);
                 if (ui.city_tool == CityTool::Building) {
-                    // Drop the chosen building template at the cursor.
+                    // Place the chosen building template at the cursor.
                     if (city_cursor.has_value()) {
                         begin_city_action(*project, ui, "place building");
                         place_city_building_from_template(*project, ui, *city_cursor);
                     }
                 } else if (ui.city_tool == CityTool::Road) {
-                    // Continue from an existing node when the ray hits one, else lay
-                    // a segment to the cursor cell.
+                    // Carry on from an existing node when the ray hits one, otherwise
+                    // lay a segment to the cursor's cell.
                     const auto pick_ray = get_viewport_mouse_ray(camera, viewport_mouse_pos, last_viewport_size);
                     const Vec3 ray_origin{pick_ray.position.x, pick_ray.position.y, pick_ray.position.z};
                     const Vec3 ray_dir{pick_ray.direction.x, pick_ray.direction.y, pick_ray.direction.z};
@@ -6332,7 +4952,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     } else if (city_cursor.has_value()) {
                         append_city_road_point(*project, ui, *city_cursor);
                     }
-                    // Show the laid road until the rebuilt scene draws it.
+                    // Show the new road until the rebuilt scene draws it.
                     if (project->city->data.streets.size() != streets_before) {
                         ui.road_ghost.insert(ui.road_ghost.end(), ui.road_preview_cells.begin(), ui.road_preview_cells.end());
                     }
@@ -6340,9 +4960,9 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             }
         }
 
-        // Box-select release: decide click vs rubber-band box. A tiny drag is a
-        // single click (pick under cursor); a real drag selects everything whose
-        // screen point falls inside the rectangle.
+        // Box select on release: was it a click or a box? A tiny drag is a single
+        // click (pick what is under the cursor); a real drag selects everything whose
+        // screen point is inside the rectangle.
         if (ui.box_select_active && IsMouseButtonReleased(MOUSE_BUTTON_LEFT) && project && project->city) {
             const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
             const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)
@@ -6365,10 +4985,10 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             ui.box_select_active = false;
         }
 
-        // Click-and-hold stamping for the placement tools: while the button is held
-        // and the cursor crosses into a new grid cell, stamp again. The per-cell
-        // dedupe (drag_stamp_cell) keeps a held drag from re-stamping the same cell
-        // every frame, so dragging lays a fast run of pieces/blocks.
+        // Click and hold to keep placing with the placement tools: while the button
+        // is held and the cursor moves into a new grid cell, place again. drag_stamp_cell
+        // stops a held drag from placing in the same cell every frame, so dragging
+        // quickly lays a row of pieces or blocks.
         if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
             ui.drag_stamp_cell.reset();
             ui.stroke_block_cells.clear();
@@ -6384,7 +5004,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     cursor = city_surface_point_under_mouse(*project, camera, viewport_mouse_pos, last_viewport_size);
                 } else if (ui.drag_stamp_cell.has_value()) {
                     // A stroke stays on its first cell's layer, so dragging over the
-                    // pieces it just placed does not stack new ones on top.
+                    // pieces it just placed doesn't stack new ones on top.
                     cursor = raised(city_surface_cell_under_mouse(*project, camera, viewport_mouse_pos, last_viewport_size),
                         ui.place_height_offset);
                     if (cursor.has_value() && cursor->y != ui.drag_stamp_cell->y) cursor.reset();
@@ -6418,8 +5038,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                         static_cast<std::int32_t>(building.cells[pick->cell_index].y),
                         static_cast<std::int32_t>(building.cells[pick->cell_index].z),
                     };
-                    // Never build against a block this drag placed: the cursor stays
-                    // on it, so that would grow a column toward the camera every frame.
+                    // Never build onto a block this drag placed. The cursor stays on it,
+                    // so that would grow a column toward the camera every frame.
                     const bool placed_this_drag = std::ranges::find(ui.stroke_block_cells, pick->cell_index) != ui.stroke_block_cells.end();
                     if (!placed_this_drag && (!ui.drag_stamp_cell.has_value() || !(*ui.drag_stamp_cell == cell))) {
                         if (const auto placed = place_building_block(*project, ui, *pick, rd, unit_size, status)) {
@@ -6456,7 +5076,6 @@ start_city_scene_rebuild(*project, scene_fingerprint);
         ClearBackground(DARKGRAY);
 
         const auto imgui_begin = std::chrono::steady_clock::now();
-        rlImGuiBegin();
 
         static bool show_csx_editor = false;
         bool open_folder_requested = open_folder_hotkey_requested;
@@ -6468,13 +5087,51 @@ start_city_scene_rebuild(*project, scene_fingerprint);
         if (ImGui::BeginMainMenuBar()) {
             ImGui::TextDisabled("Pafta v" PAFTA_VERSION);
             if (ImGui::BeginMenu("File")) {
-                // Built from the shortcut formatter so macOS shows Cmd.
+                // Made with the shortcut formatter, so macOS shows Cmd.
                 if (ImGui::MenuItem(ICON_FA_FOLDER_OPEN " Open map folder...", shortcut_label(Shortcut{KEY_O, true, false, false}).c_str())) open_folder_requested = true;
+                // Which copy wins when a map has an asset both loose and in test.csx.
+                if (ImGui::BeginMenu(ICON_FA_LAYER_GROUP " When loading, prefer")) {
+                    bool changed = false;
+                    if (ImGui::MenuItem("test.csx archive first", nullptr, !ui.loose_files_win)) { ui.loose_files_win = false; changed = true; }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Archive copies replace loose files with the same name (what the game does).");
+                    if (ImGui::MenuItem("Loose folders first", nullptr, ui.loose_files_win)) { ui.loose_files_win = true; changed = true; }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Files in building/, block/, buildblock/, and texture/ replace\narchive copies with the same name.");
+                    if (changed) save_preferences(ui);
+                    if (project) {
+                        ImGui::Separator();
+                        const bool differs = project->loose_files_win != ui.loose_files_win;
+                        if (ImGui::MenuItem(ICON_FA_ROTATE " Reopen this map", nullptr, false, differs)) pending_load_folder = project->root;
+                        if (!differs && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                            ImGui::SetTooltip("The open map already uses this choice.");
+                        }
+                    }
+                    ImGui::EndMenu();
+                }
                 ImGui::Separator();
                 if (ImGui::MenuItem(ICON_FA_FLOPPY_DISK " Save map...", action_shortcut_label(ui, EditorAction::Save).c_str(), false, project.has_value())) save_active_tab(*project, ui, status);
                 ImGui::MenuItem(ICON_FA_BOX_ARCHIVE " CSX archive...", nullptr, &show_csx_editor);
+                {
+                    // The building being edited, or else the selected city building's template.
+                    std::optional<std::size_t> building;
+                    if (project && !project->buildings.empty()) {
+                        if (ui.tab == EditorTab::Buildings) {
+                            building = std::min(ui.selected_building, project->buildings.size() - 1U);
+                        } else if (project->city && ui.city_selection == CitySelectionKind::Building &&
+                                   ui.selected_city_building < project->city->data.buildings.size()) {
+                            if (const auto* asset = find_building_asset(*project, project->city->data.buildings[ui.selected_city_building].name)) {
+                                building = static_cast<std::size_t>(asset - project->buildings.data());
+                            }
+                        }
+                    }
+                    const auto label = std::string{ICON_FA_BUILDING " Export building"} +
+                        (building ? " " + project->buildings[*building].name : std::string{}) + " (.sbb)...";
+                    if (ImGui::MenuItem(label.c_str(), nullptr, false, building.has_value())) export_building_sbb(*project, *building, status);
+                    if (!building && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                        ImGui::SetTooltip("Edit a building, or select one in the city, to export it");
+                    }
+                }
 #ifndef __EMSCRIPTEN__
-                // Mesh export and quitting are desktop-only; the browser tab closes itself.
+                // Mesh export and quitting are desktop only; in the browser you close the tab.
                 if (ImGui::MenuItem(ICON_FA_FILE_EXPORT " Export mesh...", nullptr, false, project != std::nullopt)) {
                     export_mesh_requested = true;
                 }
@@ -6512,6 +5169,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     building.materials = {"default"};
                     project->building_bytes.push_back(rebuild_sbb(building));
                     project->buildings.push_back({project->root / "building" / (building.name + ".sbb"), building.name, building, true, true});
+                    ++project->city_building_revision;
                     ui.selected_building = project->buildings.size() - 1;
                     ui.tab = EditorTab::Buildings; ui.building_tool = BuildingTool::PlaceBlock;
                     ui.building_dirty = true;
@@ -6540,7 +5198,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             if (ImGui::BeginMenu("Edit", project.has_value())) {
                 if (ImGui::MenuItem(ICON_FA_ROTATE_LEFT " Undo", action_shortcut_label(ui, EditorAction::Undo).c_str(), false, can_undo(*project, ui, false))) undo_edit(*project, ui, status, false);
                 if (ImGui::MenuItem(ICON_FA_ROTATE_RIGHT " Redo", action_shortcut_label(ui, EditorAction::Redo).c_str(), false, can_undo(*project, ui, true))) undo_edit(*project, ui, status, true);
-                // City selection actions, mirroring their keys so they are discoverable.
+                // City selection actions, matching their keys so people can find them.
                 const bool city_edit = ui.tab == EditorTab::City && project->city;
                 const bool building_selected = city_edit && ui.city_selection == CitySelectionKind::Building && !project->city->data.buildings.empty();
                 const bool road_selected = city_edit && (ui.city_selection == CitySelectionKind::Road || ui.city_selection == CitySelectionKind::Node) &&
@@ -6582,14 +5240,18 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 if (ImGui::MenuItem(ICON_FA_CROSSHAIRS " Frame selection", action_shortcut_label(ui, EditorAction::FocusSelection).c_str())) focus_current_selection(*project, ui, camera);
                 if (ImGui::MenuItem(ICON_FA_EXPAND " Whole city", action_shortcut_label(ui, EditorAction::FrameCity).c_str(), false, project->city.has_value())) focus_camera_on_city(camera, *project);
                 if (ImGui::MenuItem(ICON_FA_LOCATION_CROSSHAIRS " Coordinates", nullptr, &ui.show_coordinates)) save_preferences(ui);
+                if (draw_interior_mode(ui)) save_preferences(ui);
                 ImGui::Separator();
                 if (draw_world_time_slider(ui)) save_preferences(ui);
                 ImGui::EndMenu();
             }
             if (ImGui::BeginMenu("Windows")) {
-                ImGui::MenuItem(ICON_FA_LIST " Outliner", action_shortcut_label(ui, EditorAction::WindowLibrary).c_str(), &ui.show_library_window);
-                ImGui::MenuItem(ICON_FA_SLIDERS " Properties", action_shortcut_label(ui, EditorAction::WindowProperties).c_str(), &ui.show_properties_window);
-                ImGui::MenuItem(ICON_FA_IMAGES " Asset drawer", action_shortcut_label(ui, EditorAction::WindowTools).c_str(), &ui.show_asset_drawer);
+                bool windows_changed = false;
+                windows_changed |= ImGui::MenuItem(ICON_FA_TOOLBOX " Toolbar", nullptr, &ui.show_toolbar_window);
+                windows_changed |= ImGui::MenuItem(ICON_FA_LIST " Outliner", action_shortcut_label(ui, EditorAction::WindowLibrary).c_str(), &ui.show_library_window);
+                windows_changed |= ImGui::MenuItem(ICON_FA_SLIDERS " Properties", action_shortcut_label(ui, EditorAction::WindowProperties).c_str(), &ui.show_properties_window);
+                windows_changed |= ImGui::MenuItem(ICON_FA_IMAGES " Assets", action_shortcut_label(ui, EditorAction::WindowTools).c_str(), &ui.show_asset_drawer);
+                if (windows_changed) save_preferences(ui);
                 ImGui::Separator();
                 ImGui::MenuItem(ICON_FA_BUILDING " Building browser", action_shortcut_label(ui, EditorAction::WindowBuildingBrowser).c_str(), &ui.show_building_browser, project.has_value());
                 ImGui::MenuItem(ICON_FA_CUBES " Block browser", action_shortcut_label(ui, EditorAction::WindowBlockBrowser).c_str(), &ui.show_block_browser, project.has_value());
@@ -6597,13 +5259,16 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 ImGui::MenuItem(ICON_FA_CLOCK_ROTATE_LEFT " Changes since save", action_shortcut_label(ui, EditorAction::WindowChanges).c_str(), &ui.show_changes_window, project.has_value());
                 ImGui::MenuItem(ICON_FA_MAP " Map image", nullptr, &ui.show_map_image_window, project.has_value());
                 ImGui::Separator();
-                // Preferences lives under Edit; the graphics debug overlay is a
-                // developer tool, still on its key (listed under Shortcuts).
+                // Preferences is under Edit. The graphics debug overlay is a developer
+                // tool, so it stays on its key only (listed under Shortcuts).
                 ImGui::MenuItem(ICON_FA_KEYBOARD " Keyboard shortcuts", action_shortcut_label(ui, EditorAction::WindowShortcuts).c_str(), &ui.show_shortcuts_window);
                 ImGui::Separator();
+                ImGui::TextDisabled("Drag a window's title or tab to move or dock it.");
                 if (ImGui::MenuItem(ICON_FA_TABLE_COLUMNS " Reset window layout")) {
-                    ui.show_asset_drawer = ui.show_library_window = ui.show_properties_window = true;
+                    ui.show_asset_drawer = ui.show_properties_window = ui.show_toolbar_window = true;
+                    ui.show_library_window = false;
                     ui.reset_layout = true;
+                    save_preferences(ui);
                 }
                 ImGui::EndMenu();
             }
@@ -6611,10 +5276,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
         }
 
 
-        // The scene is the workspace itself. Do not put it in a dock node because
-        // a docked ImGui window always exposes a tab, even when it is the only one.
-        // Warm the thumbnail caches a few per frame after load, and show a loading
-        // overlay with progress until render buffers + thumbnails are all ready.
+        // Fill the thumbnail caches a few at a time each frame after loading, and show
+        // a loading screen with progress until the render buffers and thumbnails are ready.
         if (project) {
             service_pregeneration(*project);
             draw_loading_overlay(*project, ui.tab == EditorTab::City);
@@ -6638,15 +5301,9 @@ start_city_scene_rebuild(*project, scene_fingerprint);
         }
 #endif
 
-        is_viewport_hovered = false;
-        // Dockspace over the whole work area. The scene canvas lives in the
-        // central node (no tab bar), so tool windows dock around it and the 3D
-        // view always fills whatever space is left. The first run (or Windows >
-        // Reset layout) builds Tools + Library on the left and Properties on
-        // the right; everything can be dragged out, re-docked, or closed.
-        // Status bar along the bottom: the latest message stays readable after
-        // its 2.5 s pop-up fades; hovering lists the recent ones. Drawn before
-        // the dockspace so the panels sit above it.
+        // Status bar along the bottom. The latest message stays readable after its
+        // 2.5 s pop-up fades, and hovering lists the recent ones. It is drawn before the
+        // dockspace so the panels sit above it.
         if (ImGui::BeginViewportSideBar("##StatusBar", ImGui::GetMainViewport(), ImGuiDir_Down, ImGui::GetFrameHeight(),
                 ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_MenuBar)) {
             if (ImGui::BeginMenuBar()) {
@@ -6656,8 +5313,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     for (const auto& message : status_history) ImGui::TextUnformatted(message.c_str());
                     ImGui::EndTooltip();
                 }
-                // Background work, right-aligned: the first job inline, all of
-                // them with progress on hover.
+                // Background work, on the right: the first job shown inline, and all
+                // of them with their progress on hover.
                 auto jobs = project ? background_jobs(*project, ui.tab == EditorTab::City) : std::vector<BackgroundJob>{};
 #ifndef __EMSCRIPTEN__
                 if (load_future) {
@@ -6703,25 +5360,33 @@ start_city_scene_rebuild(*project, scene_fingerprint);
         ImGui::End();
         {
             const auto* dock_viewport = ImGui::GetMainViewport();
-            // A new id (v2) so layouts saved with the old left-hand Tools/Library
-            // column are not restored; the viewport now takes everything but a
-            // right-hand column.
-            const ImGuiID dock_id = ImGui::DockSpaceOverViewport(ImGui::GetID("MainDockV2"), dock_viewport, ImGuiDockNodeFlags_None);
+            // A dockspace over the whole work area. The scene canvas sits in the central
+            // node with no tab bar, so tool windows dock around it and the 3D view fills
+            // whatever space is left. The default layout (first run, or Windows > Reset
+            // layout) puts Properties and the Outliner on the right and Assets under the
+            // view. After that the saved layout is kept as you arranged it; windows can be
+            // dragged out, docked anywhere around the view, or closed.
+            const ImGuiID dock_id = ImGui::DockSpaceOverViewport(ImGui::GetID("MainDockV3"), dock_viewport, ImGuiDockNodeFlags_None);
+            static bool layout_checked = false;
             const ImGuiDockNode* dock_node = ImGui::DockBuilderGetNode(dock_id);
-            if (ui.reset_layout || dock_node == nullptr || !dock_node->IsSplitNode()) {
+            const bool first_run = !layout_checked && (dock_node == nullptr || !dock_node->IsSplitNode());
+            layout_checked = true;
+            if (ui.reset_layout || first_run) {
                 ImGui::DockBuilderRemoveNode(dock_id);
                 ImGui::DockBuilderAddNode(dock_id, ImGuiDockNodeFlags_DockSpace);
                 ImGui::DockBuilderSetNodeSize(dock_id, dock_viewport->WorkSize);
                 ImGuiID center = dock_id;
                 ImGuiID right = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.24F, nullptr, &center);
                 const ImGuiID right_top = ImGui::DockBuilderSplitNode(right, ImGuiDir_Up, 0.38F, nullptr, &right);
+                const ImGuiID bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.22F, nullptr, &center);
                 if (auto* center_node = ImGui::DockBuilderGetNode(center)) {
                     center_node->LocalFlags |= ImGuiDockNodeFlags_NoTabBar | ImGuiDockNodeFlags_NoDockingOverMe;
                 }
                 ImGui::DockBuilderDockWindow("##SceneCanvas", center);
                 ImGui::DockBuilderDockWindow("###Outliner", right_top);
                 ImGui::DockBuilderDockWindow("###Properties", right);
-                // Small reference windows open as tabs beside Properties.
+                ImGui::DockBuilderDockWindow("###Assets", bottom);
+                // Small reference windows open as tabs next to Properties.
                 ImGui::DockBuilderDockWindow("###Changes", right);
                 ImGui::DockBuilderDockWindow("###Shortcuts", right);
                 ImGui::DockBuilderDockWindow("###Preferences", right);
@@ -6740,8 +5405,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 ImVec2 size = ImGui::GetContentRegionAvail();
                 static double last_viewport_resize = 0.0;
                 static float last_render_scale = 1.0F;
-                // The 3D view renders at render_scale of the panel and is
-                // stretched to fill it; mouse picking keeps panel coordinates.
+                // The 3D view is drawn at render_scale of the panel and stretched to
+                // fill it. Mouse picking keeps using panel coordinates.
                 const auto render_scale = std::clamp(ui.render_scale, 0.5F, 1.0F);
                 if ((static_cast<int>(size.x) != static_cast<int>(last_viewport_size.x) ||
                      static_cast<int>(size.y) != static_cast<int>(last_viewport_size.y) ||
@@ -6761,8 +5426,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
 
                 if (redraw_3d) resolve_game_render_texture(viewport_texture);
                 const auto* display_texture = game_render_display_texture(viewport_texture);
-                // Handles belong above the finished scene, including shadows,
-                // atmosphere and outlines. They must never be tone-mapped away.
+                // Handles go on top of the finished scene, including shadows,
+                // atmosphere, and outlines. Tone mapping must never hide them.
                 if (project && redraw_3d) {
                     const auto target = display_texture ? *display_texture : viewport_texture;
                     begin_game_texture_mode(target);
@@ -6770,14 +5435,16 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     if (ui.tab == EditorTab::City && project->city && ui.city_selection == CitySelectionKind::Building &&
                         ui.selected_city_building < project->city->data.buildings.size()) {
                         const auto& placement = project->city->data.buildings[ui.selected_city_building];
-                        // At the footprint centre, which rotation keeps fixed.
+                        // At the middle of the footprint, which rotation keeps still.
                         const auto offset = city_building_gizmo_offset(*project, placement);
                         const auto hovered = ui.gizmo_active != GizmoAxis::None ? ui.gizmo_active :
                             (is_viewport_hovered ? pick_building_gizmo(camera, viewport_mouse_pos, last_viewport_size, placement, true, offset) : GizmoAxis::None);
                         draw_building_gizmo(placement, hovered, camera, last_viewport_size, true, offset);
+                    } else if (ui.tab == EditorTab::Blocks) {
+                        draw_block_editor_handles(*project, ui, camera);
                     } else if (ui.tab == EditorTab::Buildings && !project->buildings.empty() &&
                                ui.building_tool == BuildingTool::Anchor) {
-                        // Only the Anchor tool can drag it; elsewhere it read as draggable.
+                        // Only the Anchor tool can drag it; in other tools it looked draggable but wasn't.
                         draw_building_gizmo(SbcBuilding{}, ui.anchor_axis, camera, last_viewport_size, false);
                     }
                     EndMode3D();
@@ -6785,15 +5452,13 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 }
                 {
                     const auto* shown = display_texture == nullptr ? &viewport_texture : display_texture;
-                    // Stretched to the panel (render scale), flipped as render textures are.
+                    // Stretched to fill the panel (render scale), and flipped like all render textures.
                     rlImGuiImageRect(&shown->texture, static_cast<int>(last_viewport_size.x), static_cast<int>(last_viewport_size.y),
                         Rectangle{0.0F, 0.0F, static_cast<float>(shown->texture.width), -static_cast<float>(shown->texture.height)});
                 }
                 is_viewport_hovered = ImGui::IsItemHovered();
-                if (project && ui.show_coordinates) {
-                    draw_coordinate_readout(*project, ui, camera, ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
-                        viewport_mouse_pos, last_viewport_size, is_viewport_hovered);
-                }
+                const ImVec2 image_min = ImGui::GetItemRectMin();
+                const ImVec2 image_max = ImGui::GetItemRectMax();
                 if (project && project->city && ui.tab == EditorTab::City && ImGui::BeginDragDropTarget()) {
                     if (const auto* payload = ImGui::AcceptDragDropPayload("MAP_BUILDING")) {
                         if (payload->DataSize == sizeof(std::size_t)) {
@@ -6817,10 +5482,11 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 min_pos.x += ImGui::GetWindowContentRegionMin().x;
                 min_pos.y += ImGui::GetWindowContentRegionMin().y;
 
-                viewport_mouse_pos = get_viewport_mouse_position(Vector2{min_pos.x, min_pos.y}, Vector2{size.x, size.y});
+                viewport_origin = {min_pos.x, min_pos.y};
+                viewport_mouse_pos = get_viewport_mouse_position(viewport_origin, last_viewport_size);
 
-                // Rubber-band selection rectangle (drawn in screen space over the
-                // image while a box drag is in progress).
+                // The box selection rectangle (drawn in screen space over the
+                // image while a box drag is going on).
                 if (ui.box_select_active && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
                     const ImVec2 p0{min_pos.x + ui.box_select_start.x, min_pos.y + ui.box_select_start.y};
                     const ImVec2 p1{min_pos.x + viewport_mouse_pos.x, min_pos.y + viewport_mouse_pos.y};
@@ -6828,11 +5494,21 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     dl->AddRectFilled(p0, p1, IM_COL32(120, 180, 255, 40));
                     dl->AddRect(p0, p1, IM_COL32(150, 200, 255, 220));
                 }
-                draw_viewport_overlays(project ? &*project : nullptr, ui, camera, status, open_folder_requested);
+                const auto overlay_bottom = draw_viewport_overlays(project ? &*project : nullptr, ui);
+                draw_view_gizmo(camera, ui, is_viewport_hovered && !IsCursorHidden());
+                if (project) {
+                    draw_viewport_context_menu(*project, ui, camera, right_click_at, last_viewport_size, viewport_menu_requested, status);
+                }
+                if (project && ui.show_coordinates) {
+                    draw_coordinate_readout(*project, ui, camera, image_min, image_max,
+                        viewport_mouse_pos, last_viewport_size, is_viewport_hovered, overlay_bottom);
+                }
             }
             ImGui::End();
 
         }
+        draw_toolbar_window(project ? &*project : nullptr, ui, camera, status, open_folder_requested);
+        draw_asset_drawer_window(project ? &*project : nullptr, ui, status);
         draw_outliner_window(project ? &*project : nullptr, ui);
         draw_properties_window(project ? &*project : nullptr, ui, status);
 
@@ -6849,7 +5525,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
         }
         draw_shortcuts_window(ui);
         draw_preferences_window(ui);
-        // Cleared after every window drew, so the floating ones also reset.
+        // Cleared after every window has drawn, so floating windows reset too.
         ui.reset_layout = false;
 
         if (project && !project->action_log.empty() &&
@@ -6882,8 +5558,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
 
         if (project && project->city && ui.city_dirty && project->city->data.version < 12 && !project->city_promotion_failed &&
             !has_legacy_district_cells(project->city->data)) {
-            // An upgrade right after undo (map equals the committed state) is not
-            // a new edit; otherwise it folds into the pending edit's undo step.
+            // An upgrade right after an undo (the map equals the committed state) is not
+            // a new edit; otherwise it joins the undo step of the edit in progress.
             const bool at_baseline = project->city_baseline == project->city->data;
             const auto from = project->city->data.version;
             try {
@@ -6897,14 +5573,14 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             }
         }
         if (project) draw_city_upgrade_dialogs(*project, ui, status);
-        draw_csx_editor(show_csx_editor, project ? &*project : nullptr);
+        draw_csx_editor(archive_workspace, show_csx_editor, project ? &*project : nullptr);
         static std::string shown_error;
         if (!g_failure_message.empty() && !ImGui::IsPopupOpen("Operation failed")) {
             shown_error = std::move(g_failure_message);
             g_failure_message.clear();
             ImGui::OpenPopup("Operation failed");
         }
-        // Auto-resize with wrapped text collapses to a sliver; give it a width.
+        // Auto-resize with wrapped text shrinks to a sliver, so give it a width.
         ImGui::SetNextWindowSizeConstraints(ImVec2(420.0F, 0.0F), ImVec2(720.0F, FLT_MAX));
         if (ImGui::BeginPopupModal("Operation failed", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 400.0F);
@@ -6925,15 +5601,14 @@ start_city_scene_rebuild(*project, scene_fingerprint);
         if (open_folder_requested) {
 #ifdef __EMSCRIPTEN__
             EM_ASM({
-                if (typeof window.mapEditorBrowserOpenPicker === 'function') {
-                    window.mapEditorBrowserOpenPicker();
-                }
+                window.paftaBrowserOpenPicker();
             });
             status = "Choose a Sub Rosa map folder in the browser picker.";
 #else
-            auto result = dialog_open_map_folder();
-            if (!result.empty()) {
-                pending_load_folder = std::filesystem::path{result};
+            try {
+                if (const auto folder = dialog_pick_folder()) pending_load_folder = *folder;
+            } catch (const std::exception& error) {
+                report_failure(status, std::string{"Open map failed: "} + error.what());
             }
 #endif
         }
@@ -6950,12 +5625,26 @@ start_city_scene_rebuild(*project, scene_fingerprint);
 #ifndef __EMSCRIPTEN__
         if (project) service_mesh_export(mesh_export_task, *project, status);
 #endif
+        // Where the export goes: the remembered folder plus the default name for this
+        // view. The field can be edited by hand or set with Browse.
+        static std::array<char, 1024> export_path_text{};
+#ifndef __EMSCRIPTEN__
+        static bool export_browse_requested = false;
+#endif
+        if (open_export_popup && project) {
+            std::string reason;
+            auto path = default_export_path(*project, ui, reason);
+            if (!ui.mesh_export_folder.empty()) path = std::filesystem::path{ui.mesh_export_folder} / path.filename();
+            const auto text = path.string();
+            export_path_text.fill('\0');
+            std::copy_n(text.data(), std::min(text.size(), export_path_text.size() - 1U), export_path_text.data());
+        }
         if (open_export_popup) {
             ImGui::OpenPopup("Export Mesh");
             open_export_popup = false;
         }
         if (project && ImGui::BeginPopupModal("Export Mesh", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            // Context-aware title + options for the active view.
+            // A title and options that fit the current view.
             const char* scope =
                 ui.tab == EditorTab::City ? "City" :
                 ui.tab == EditorTab::Buildings ? "Building" :
@@ -6978,13 +5667,22 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             }
 
             ImGui::Spacing();
+            ImGui::SeparatorText("Save to");
+            ImGui::SetNextItemWidth(420.0F);
+            ImGui::InputText("##export_path", export_path_text.data(), export_path_text.size());
+#ifndef __EMSCRIPTEN__
+            ImGui::SameLine();
+            // The native dialog runs after the popup has finished drawing.
+            if (ImGui::Button("Browse...")) export_browse_requested = true;
+#endif
+            ImGui::TextDisabled("A .gltf file; its textures are written next to it.");
             ImGui::Separator();
-            // Defer the native save dialog until after the popup finishes rendering;
-            // NFD blocks the main thread and must not run mid-ImGui-frame.
+            ImGui::BeginDisabled(export_path_text[0] == '\0');
             if (ImGui::Button("Export", ImVec2(120, 0))) {
                 run_export_after_popup = true;
                 ImGui::CloseCurrentPopup();
             }
+            ImGui::EndDisabled();
             ImGui::SameLine();
             if (ImGui::Button("Cancel", ImVec2(120, 0))) {
                 ImGui::CloseCurrentPopup();
@@ -6992,37 +5690,92 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             ImGui::EndPopup();
         }
 
+#ifndef __EMSCRIPTEN__
+        if (export_browse_requested) {
+            export_browse_requested = false;
+            try {
+                if (const auto output = dialog_save_file(export_path_text.data(), "glTF", "gltf")) {
+                    const auto text = output->string();
+                    export_path_text.fill('\0');
+                    std::copy_n(text.data(), std::min(text.size(), export_path_text.size() - 1U), export_path_text.data());
+                }
+            } catch (const std::exception& error) {
+                report_failure(status, std::string{"Choosing the export file failed: "} + error.what());
+            }
+        }
+#endif
         if (run_export_after_popup && project) {
 #ifndef __EMSCRIPTEN__
-            MAPED_PROFILE_BLOCK("export mesh dialog result");
-            std::string reason;
-            const auto default_path = default_export_path(*project, ui, reason);
-            // Native save dialog (NFD-e: Cocoa NSSavePanel on macOS, not osascript).
-            NFD::Guard nfd_guard;
-            NFD::UniquePathU8 out_path;
-            const nfdu8filteritem_t filters[1] = {{"glTF", "gltf"}};
-            const auto default_dir = path_utf8(default_path.parent_path());
-            const auto default_name = path_utf8(default_path.filename());
-            const auto result = NFD::SaveDialog(
-                out_path, filters, 1, default_dir.c_str(), default_name.c_str());
-            if (result == NFD_OKAY) {
-                mesh_export_task = start_mesh_export(*project, ui, std::filesystem::u8path(out_path.get()), export_options, status);
-            } else if (result == NFD_ERROR) {
-                report_failure(status, std::string("Export: dialog error: ") + NFD::GetError());
+            PAFTA_PROFILE_BLOCK("export mesh");
+            std::filesystem::path output{export_path_text.data()};
+            if (lower_extension(output) != ".gltf") output += ".gltf";
+            try {
+                if (!output.parent_path().empty() && !std::filesystem::is_directory(output.parent_path())) {
+                    throw std::runtime_error("the folder " + output.parent_path().string() + " does not exist");
+                }
+                ui.mesh_export_folder = output.parent_path().string();
+                save_preferences(ui);
+                mesh_export_task = start_mesh_export(*project, ui, output, export_options, status);
+            } catch (const std::exception& error) {
+                report_failure(status, std::string{"Mesh export failed: "} + error.what());
             }
 #else
             status = "Export is available in the desktop editor.";
 #endif
         }
 
-        // Resolve a pending close request. Clean -> exit now. Dirty -> raise the
-        // save prompt (once) and keep running until the user resolves it.
+        // Deal with a waiting close request. No unsaved changes: quit now. Unsaved
+        // changes: show the save prompt (once) and keep running until the user answers.
+        if (close_requested && archive_workspace.dirty) {
+            open_archive_close_prompt = true;
+            close_requested = false;
+        }
+        if (open_archive_close_prompt) {
+            ImGui::OpenPopup("Unsaved archive");
+            open_archive_close_prompt = false;
+        }
+        if (ImGui::BeginPopupModal("Unsaved archive", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextUnformatted("Save the archive workspace before exiting?");
+            if (ImGui::Button("Save archive")) {
+                try {
+                    if (save_archive_workspace(archive_workspace)) {
+                        close_requested = true;
+                        ImGui::CloseCurrentPopup();
+                    }
+                } catch (const std::exception& error) {
+                    report_failure(status, std::string{"Archive save failed: "} + error.what());
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Discard archive")) {
+                archive_workspace.dirty = false;
+                close_requested = true;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
         if (close_requested) {
             close_requested = false;
+            if (project_to_open) release_web_project(project_to_open->root);
+            project_to_open.reset();
+            open_project_approved = false;
+            unsaved_prompt_for_open = false;
             if (project && has_unsaved_changes(ui)) {
                 open_unsaved_prompt = true;
             } else {
                 running = false;
+            }
+        }
+        // Keep the current project until its replacement has loaded successfully
+        // and the user has dealt with any edits, including ones made while loading.
+        if (project_to_open && !open_project_approved && !ImGui::IsPopupOpen("Unsaved Changes")) {
+            if (project && has_unsaved_changes(ui)) {
+                unsaved_prompt_for_open = true;
+                open_unsaved_prompt = true;
+            } else {
+                open_project_approved = true;
             }
         }
         if (open_unsaved_prompt) {
@@ -7030,24 +5783,32 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             open_unsaved_prompt = false;
         }
         if (ImGui::BeginPopupModal("Unsaved Changes", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::TextUnformatted("You have unsaved changes. Save before exiting?");
+            ImGui::TextUnformatted(unsaved_prompt_for_open
+                ? "You have unsaved changes. Save before opening another map?"
+                : "You have unsaved changes. Save before exiting?");
             ImGui::Spacing();
-            if (ImGui::Button("Save & Exit", ImVec2(120, 0))) {
+            if (ImGui::Button(unsaved_prompt_for_open ? "Save & Open" : "Save & Exit", ImVec2(120, 0))) {
                 if (project) {
                     save_all_dirty(*project, ui, status);
                 }
                 if (!has_unsaved_changes(ui)) {
-                    running = false;
+                    if (unsaved_prompt_for_open) open_project_approved = true;
+                    else running = false;
                     ImGui::CloseCurrentPopup();
                 }
             }
             ImGui::SameLine();
-            if (ImGui::Button("Discard & Exit", ImVec2(120, 0))) {
-                running = false;
+            if (ImGui::Button(unsaved_prompt_for_open ? "Discard & Open" : "Discard & Exit", ImVec2(120, 0))) {
+                if (unsaved_prompt_for_open) open_project_approved = true;
+                else running = false;
                 ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine();
             if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                if (unsaved_prompt_for_open && project_to_open) {
+                    release_web_project(project_to_open->root);
+                    project_to_open.reset();
+                }
                 ImGui::CloseCurrentPopup();
             }
             ImGui::EndPopup();
@@ -7057,8 +5818,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
         render_imgui_draw_data(ImGui::GetDrawData());
         EndDrawing();
         g_gfx_debug_stats = nullptr;
-        // Background builds (scene, near detail, pieces) free large buffers at
-        // any time; return those pages to the OS now and then.
+        // Background builds (scene, near detail, pieces) free big buffers at any
+        // time, so hand that memory back to the OS every so often.
         if (static double last_release = 0.0; GetTime() - last_release > 10.0) {
             last_release = GetTime();
             release_free_memory();
@@ -7089,7 +5850,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                         std::printf("  %s: %.0f tris\n", gfx_draw_category_name(static_cast<GfxDebugDrawCategory>(i)),
                             static_cast<double>(bench_category_tris[i]) / bench_count);
                     }
-                    // Measured frames only (the running averages include loading).
+                    // Only the measured frames (the running averages include loading).
                     for (std::size_t i = 0; i < bench_phase_ms.size(); ++i) {
                         std::printf("  %s: %.3f ms\n", gfx_timing_phase_name(static_cast<GfxDebugTimingPhase>(i)), bench_phase_ms[i] / bench_count);
                     }
@@ -7097,10 +5858,10 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 }
             }
         }
-        // Round-trip QA: MAPED_SAVE=<folder> saves the loaded map there and
-        // exits; MAPED_SAVE_NUDGE=1 first moves building 0 up and back down.
-        if (const char* save_to = std::getenv("MAPED_SAVE"); save_to && project && project->city) {
-            if (std::getenv("MAPED_SAVE_NUDGE") && !project->city->data.buildings.empty()) {
+        // Save round-trip test: PAFTA_SAVE=<folder> saves the loaded map there and
+        // quits. PAFTA_SAVE_NUDGE=1 first moves building 0 up and back down.
+        if (const char* save_to = std::getenv("PAFTA_SAVE"); save_to && project && project->city) {
+            if (std::getenv("PAFTA_SAVE_NUDGE") && !project->city->data.buildings.empty()) {
                 ui.city_selection = CitySelectionKind::Building;
                 ui.selected_city_building = 0;
                 begin_city_action(*project, ui, "edit selection");
@@ -7119,43 +5880,85 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             running = false;
         }
 
-        // Run a deferred load now that the normal frame has been presented. Paint
-        // a dedicated "Parsing..." frame first so the screen shows progress, then
-        // run the blocking synchronous parse and apply the result.
-        if (pending_load_folder
+        // Parse the new map without changing the current project. On desktop,
+        // workers do the CPU work; textures are uploaded here on the GL thread.
+        if (pending_load_folder && !project_to_open
 #ifndef __EMSCRIPTEN__
             && !load_future
 #endif
         ) {
-            MAPED_PROFILE_BLOCK("load pending project");
+            PAFTA_PROFILE_BLOCK("load pending project");
             const auto folder = *pending_load_folder;
             pending_load_folder.reset();
+            try {
 #ifndef __EMSCRIPTEN__
-            load_stage->store(0);
-            load_future = std::async(std::launch::async, [folder, load_stage] {
-                std::string error;
-                auto loaded = load_project_folder(folder, error, false, load_stage.get());
-                return std::make_pair(std::move(loaded), std::move(error));
-            });
-        }
-        if (load_future && load_future->wait_for(std::chrono::milliseconds{0}) == std::future_status::ready) {
-            auto [loaded, error] = load_future->get();
-            load_future.reset();
-            if (!loaded && !error.empty()) report_failure(status, std::move(error));
-            else status = std::move(error);
-            if (loaded) load_project_textures(*loaded);
+                load_stage->store(0);
+                load_future = std::async(std::launch::async, [folder, load_stage, loose_first = ui.loose_files_win] {
+                    std::string error;
+                    auto loaded = load_project_folder(folder, error, false, load_stage.get(), loose_first);
+                    return std::make_pair(std::move(loaded), std::move(error));
+                });
 #else
-            present_parsing_frame(folder);
-            // Let the browser present the parsing frame before the synchronous
-            // virtual-filesystem scan begins.
-            emscripten_sleep(0);
-            auto loaded = load_project_folder(folder, status, true);
-            if (!loaded && !status.empty()) report_failure(status, std::string{status});
+                present_parsing_frame(folder);
+                emscripten_sleep(0);
+                std::string error;
+                auto loaded = load_project_folder(folder, error, true, nullptr, ui.loose_files_win);
+                if (loaded) {
+                    project_to_open = std::move(loaded);
+                    status = std::move(error);
+                } else {
+                    release_web_project(folder);
+                    report_failure(status, std::move(error));
+                }
 #endif
+            } catch (const std::exception& error) {
+                release_web_project(folder);
+                report_failure(status, "Open map failed: " + folder.string() + ": " + error.what());
+            }
+        }
+#ifndef __EMSCRIPTEN__
+        if (load_future && load_future->wait_for(std::chrono::milliseconds{0}) == std::future_status::ready) {
+            try {
+                auto [loaded, error] = load_future->get();
+                load_future.reset();
+                if (loaded) {
+                    load_project_textures(*loaded);
+                    project_to_open = std::move(loaded);
+                    status = std::move(error);
+                } else {
+                    report_failure(status, std::move(error));
+                }
+            } catch (const std::exception& error) {
+                load_future.reset();
+                report_failure(status, std::string{"Open map failed: "} + error.what());
+            }
+        }
+#endif
+        // An export's geometry belongs to the current map, and its texture readbacks
+        // must finish on that same map before it is replaced.
+        if (project_to_open && open_project_approved
+#ifndef __EMSCRIPTEN__
+            && !mesh_export_task
+#endif
+        ) {
             if (project) {
                 free_project_thumbnails(*project);
+                release_web_project(project->root);
             }
-            project = std::move(loaded);
+            unload_preview_views(ui);
+            project = std::move(project_to_open);
+            project_to_open.reset();
+            open_project_approved = false;
+            ui.city_dirty = ui.building_dirty = ui.block_dirty = ui.buildblock_dirty = false;
+            ui.city_selection = CitySelectionKind::None;
+            ui.selected_city_buildings.clear();
+            ui.selected_portals.clear();
+            ui.selected_materials.clear();
+            ui.selected_piece_voxel.reset();
+            ui.pending_road_start.reset();
+            ui.gizmo_active = GizmoAxis::None;
+            ui.box_select_active = false;
+            ui.place_click_pending = false;
             if (project) {
 #ifdef __EMSCRIPTEN__
                 EM_ASM({
@@ -7165,17 +5968,11 @@ start_city_scene_rebuild(*project, scene_fingerprint);
 #endif
                 set_status(*project);
                 status = "loaded " + project->root.filename().string();
-#ifdef MAP_EDITOR_CPP_WEB_QA_START_BUILDINGS
-                ui.tab = EditorTab::Buildings;
-                const auto qa_building = std::ranges::find_if(project->buildings, [](const auto& asset) {
-                    return lower_name(asset.name) == "burger";
-                });
-                if (qa_building != project->buildings.end()) {
-                    const auto index = static_cast<std::size_t>(std::distance(project->buildings.begin(), qa_building));
-                    std::swap(project->buildings[0], project->buildings[index]);
-                    std::swap(project->building_bytes[0], project->building_bytes[index]);
-                }
-#endif
+                // A newly opened map always starts in the City view.
+                ui.tab = EditorTab::City;
+                ui.city_tool = CityTool::Select;
+                ui.city_selection = CitySelectionKind::None;
+                ui.selected_city_buildings.clear();
                 if (screenshot_tab == "buildings" || screenshot_tab == "buildings_open") ui.tab = EditorTab::Buildings;
                 if (screenshot_tab == "buildings_open") ui.building_hide_roofs = true;
                 if (screenshot_tab == "buildings_walls") {
@@ -7183,7 +5980,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     ui.building_tool = BuildingTool::PaintTexture;
                     ui.paint_side_code = true;
                 }
-                if (const char* name = std::getenv("MAPED_SCREENSHOT_BUILDING")) {
+                if (const char* name = std::getenv("PAFTA_SCREENSHOT_BUILDING")) {
                     if (const auto* asset = find_building_asset(*project, name)) {
                         ui.selected_building = static_cast<std::size_t>(asset - project->buildings.data());
                     }
@@ -7197,7 +5994,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 if (screenshot_tab == "buildblocks") ui.tab = EditorTab::Buildblocks;
                 if (screenshot_tab == "blocks") {
                     ui.tab = EditorTab::Blocks;
-                    // Show a selection: the first patch, else the first box.
+                    // Show a selection: the first patch, or else the first box.
                     if (!project->blocks.empty()) {
                         const auto& block = project->blocks[std::min(ui.selected_block, project->blocks.size() - 1U)].data;
                         if (!block.authored_patches.empty()) ui.block_element = BlockElementKind::Patch;
@@ -7211,6 +6008,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 if (screenshot_tab == "win_changes") ui.show_changes_window = true;
                 if (screenshot_tab == "win_preferences") ui.show_preferences_window = true;
                 if (screenshot_tab == "win_map") ui.show_map_image_window = true;
+                if (screenshot_tab == "win_csx") show_csx_editor = true;
                 if (screenshot_tab == "win_shortcuts") ui.show_shortcuts_window = true;
                 if (screenshot_path && project->city && !project->city->data.buildings.empty() && screenshot_tab != "pieces") {
                     ui.city_tool = CityTool::Select;
@@ -7220,6 +6018,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                         ui.selected_city_buildings = {0U};
                     }
                 }
+                ui.tab_cameras = {};  // a new map starts every mode framed
                 if (ui.tab == EditorTab::City) {
                     focus_camera_on_city(camera, *project);
                 } else {
@@ -7233,9 +6032,9 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             }
         }
 #ifdef __EMSCRIPTEN__
-        // Keep the single desktop-style loop usable in a browser. Asyncify
-        // yields to the browser event loop without duplicating the application
-        // state into a second web-only frame implementation.
+        // Keep the one desktop-style loop working in a browser. Asyncify yields to the
+        // browser's event loop, so we don't need a second, web-only copy of the frame
+        // code and its state.
         emscripten_sleep(0);
 #endif
     }
@@ -7243,6 +6042,12 @@ start_city_scene_rebuild(*project, scene_fingerprint);
     if (project) {
         free_project_thumbnails(*project);
     }
+    if (project_to_open) release_web_project(project_to_open->root);
+    if (project) release_web_project(project->root);
+    if (pending_load_folder) release_web_project(*pending_load_folder);
+    project_to_open.reset();
+    project.reset();
+    archive_workspace.texture_previews.clear();  // GL textures, freed before the window closes
     unload_preview_views(ui);
     unload_game_render_texture(viewport_texture);
     UnloadRenderTexture(building_outline_mask_texture);
@@ -7254,4 +6059,4 @@ start_city_scene_rebuild(*project, scene_fingerprint);
     return 0;
 }
 
-} // namespace map_editor
+} // namespace pafta

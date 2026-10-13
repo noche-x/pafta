@@ -1,10 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #include "app_internal.hpp"
 #include "profiler.hpp"
 
 #include <rlgl.h>
 #include <imgui.h>
 
-// rlImGui's texture upload (rlImGui.cpp); its draw loop is replaced below.
+// rlImGui's texture upload (rlImGui.cpp). Its draw loop is replaced below.
 void ImGui_ImplRaylib_UpdateTexture(ImTextureData* tex);
 #include <raymath.h>
 #ifdef __EMSCRIPTEN__
@@ -33,35 +34,36 @@ void ImGui_ImplRaylib_UpdateTexture(ImTextureData* tex);
 #include <limits>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #ifdef __EMSCRIPTEN__
-#define MAPED_GLSL_VERSION "#version 300 es\nprecision highp float;\nprecision highp int;\n"
+#define PAFTA_GLSL_VERSION "#version 300 es\nprecision highp float;\nprecision highp int;\n"
 #else
-#define MAPED_GLSL_VERSION "#version 330 core\n"
+#define PAFTA_GLSL_VERSION "#version 330 core\n"
 #endif
 
-namespace map_editor::app_internal {
+namespace pafta::app_internal {
 
 GfxDebugStats* g_gfx_debug_stats = nullptr;
 RenderSettings g_render_settings;
-// Turns on the room-glass branch; the shader computes the pane's alpha itself.
+// Turns on the room-glass branch; the shader works out the pane's alpha itself.
 constexpr float kRoomGlassAlpha = 1.0F;
-// _resetgame starts the clock at 0x244140 = 11:00.
+// _resetgame starts the clock at 0x244140, which is 11:00.
 float g_world_time_hours = 11.0F;
 
 Vector3 game_light_direction() {
-    // Game_RunFixedStep: angle = pi + t*2pi/5616000 in World mode (type 4),
-    // pi + t*2pi/5184000 in the others; DrawGameInfo shows t/216000 as the
-    // hour. So World's sun runs a 26-hour cycle against the 24-hour clock.
-    // The client reads the type as 4 bits (Net_ProcessServerSnapshotStream), so
-    // World-based modes such as Ultimate (type 4 + 16) also get the 26 hours.
-    // ponytail: World only; Round/Race/other types would need 24 here.
-    // Math_Vec3RotateAroundAxis @7b4d0 turns by -angle (v.cos + (v x a).sin),
-    // the opposite sense to raylib's rotation.
+    // Game_RunFixedStep: angle = pi + t*2pi/5616000 in World mode (type 4), and
+    // pi + t*2pi/5184000 in the others. DrawGameInfo shows t/216000 as the hour, so
+    // World's sun runs a 26-hour day against a 24-hour clock. The client reads the
+    // type as 4 bits (Net_ProcessServerSnapshotStream), so modes built on World, like
+    // Ultimate (type 4 + 16), get the 26 hours too.
+    // ponytail: World only; Round, Race, and other types would need 24 here.
+    // Math_Vec3RotateAroundAxis @7b4d0 turns by -angle (v.cos + (v x a).sin), the
+    // opposite way to raylib's rotation.
     constexpr float kSunCycleHours = 26.0F;
     const float angle = PI + g_world_time_hours*(2.0F*PI/kSunCycleHours);
     return Vector3RotateByAxisAngle(
@@ -92,24 +94,10 @@ std::string format_bytes(std::size_t bytes) {
     return stream.str();
 }
 
-Color lerp_color(Color from, Color to, float t) {
-    auto lerp_channel = [t](unsigned char a, unsigned char b) {
-        return static_cast<unsigned char>(
-            static_cast<float>(a) + (static_cast<float>(b) - static_cast<float>(a)) * t);
-    };
-    return {
-        lerp_channel(from.r, to.r),
-        lerp_channel(from.g, to.g),
-        lerp_channel(from.b, to.b),
-        lerp_channel(from.a, to.a),
-    };
-}
-
 struct GameRenderResources {
     Texture2D packed_depth{};
     Texture2D shadow_factor{};
     RenderTexture2D display{};
-    unsigned int stencil_buffer{};
     Texture2D direct_light{};
 };
 
@@ -119,19 +107,20 @@ std::unordered_map<unsigned int, GameRenderResources>& game_render_resources() {
 }
 
 namespace {
-// The bound game target has the packed-depth/direct-light attachments, and how
-// many draw buffers are enabled on it. Tracked here instead of queried: glGet*
-// forces a pipeline sync on some drivers (Apple's GL-on-Metal in particular).
+// Whether the bound game target has the packed-depth and direct-light attachments,
+// and how many draw buffers are on. We track this ourselves instead of asking GL,
+// because glGet* makes some drivers wait for the GPU (Apple's GL-on-Metal
+// especially).
 bool g_target_has_mrt = false;
 int g_draw_buffer_count = 1;
 }  // namespace
 
 void set_game_render_depth_output(bool enabled) {
-    // The game surface shader writes the lit color, the packed linear distance
-    // used by the atmosphere pass, and the direct light the shadow resolve
-    // removes. WebGL2 requires every active draw buffer to have a matching
-    // fragment output, so all three are enabled only while that shader submits
-    // geometry; raylib's utility shaders (grids, lines, ImGui) write color 0.
+    // The game surface shader writes the lit colour, the packed straight-line
+    // distance the atmosphere pass uses, and the direct light the shadow pass
+    // removes. WebGL2 needs a fragment output for every active draw buffer, so all
+    // three are only on while that shader draws. raylib's helper shaders (grids,
+    // lines, ImGui) only write colour 0.
     const int wanted = enabled && g_target_has_mrt ? 3 : 1;
     if (wanted == g_draw_buffer_count) return;
     rlDrawRenderBatchActive();
@@ -141,9 +130,10 @@ void set_game_render_depth_output(bool enabled) {
 }
 
 #ifdef __EMSCRIPTEN__
-// WebGL2 renders to half floats only with EXT_color_buffer_float (all current
-// desktop browsers). With it the web target matches native: HDR scene color,
-// then the Reinhard + sRGB resolve. Without it colors stay 8-bit, untonemapped.
+// WebGL2 can only draw to half floats with EXT_color_buffer_float (every current
+// desktop browser has it). With it, the web build matches desktop: HDR scene colour,
+// then the Reinhard and sRGB step. Without it, colours stay 8-bit with no tone
+// mapping.
 bool web_hdr_targets() {
     static const bool supported =
         emscripten_webgl_enable_extension(emscripten_webgl_get_current_context(), "EXT_color_buffer_float");
@@ -152,98 +142,63 @@ bool web_hdr_targets() {
 #endif
 
 RenderTexture2D load_game_render_texture(int width, int height) {
-#ifdef __EMSCRIPTEN__
-    // WebGL2 supports the same two color outputs as the native path.  Raylib's
-    // default web target only has a depth renderbuffer, so replace it with one
-    // packed depth/stencil renderbuffer before adding the depth color map.
     auto target = LoadRenderTexture(width, height);
-    if (target.id == 0U) return target;
+    if (target.id == 0U) throw std::runtime_error("Could not allocate Pafta viewport framebuffer");
 
+#ifdef __EMSCRIPTEN__
+    const bool hdr = web_hdr_targets();
+#else
+    constexpr bool hdr = true;
+#endif
     glBindFramebuffer(GL_FRAMEBUFFER, target.id);
-    if (web_hdr_targets()) {
+    if (hdr) {
         rlUnloadTexture(target.texture.id);
         target.texture = {rlLoadTexture(nullptr, width, height, PIXELFORMAT_UNCOMPRESSED_R16G16B16A16, 1),
             width, height, 1, PIXELFORMAT_UNCOMPRESSED_R16G16B16A16};
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.texture.id, 0);
     }
-    if (target.depth.id != 0U) {
-        glDeleteRenderbuffers(1, &target.depth.id);
-    }
+
+    // One packed depth and stencil attachment is used for depth tests and shadow volumes.
+    if (target.depth.id != 0U) glDeleteRenderbuffers(1, &target.depth.id);
     glGenRenderbuffers(1, &target.depth.id);
     glBindRenderbuffer(GL_RENDERBUFFER, target.depth.id);
     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, target.depth.id);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, target.depth.id);
 
-    Texture2D packed_depth{
-        rlLoadTexture(nullptr, width, height, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1),
-        width,
-        height,
-        1,
-        PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
-    };
-    Texture2D shadow_factor{
-        rlLoadTexture(nullptr, width, height, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1),
-        width,
-        height,
-        1,
-        PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
-    };
+    Texture2D packed_depth{rlLoadTexture(nullptr, width, height, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1),
+        width, height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+    Texture2D shadow_factor{rlLoadTexture(nullptr, width, height, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1),
+        width, height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+    Texture2D direct_light{rlLoadTexture(nullptr, width, height, target.texture.format, 1),
+        width, height, 1, target.texture.format};
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, packed_depth.id, 0);
-    const GLenum draw_buffers[] = {GL_COLOR_ATTACHMENT0};
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, direct_light.id, 0);
+    const GLenum draw_buffers[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+#ifdef __EMSCRIPTEN__
     glDrawBuffers(1, draw_buffers);
+#else
+    glDrawBuffers(2, draw_buffers);
+#endif
+    const auto scene_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        TRACELOG(LOG_WARNING, "MAP EDITOR: WebGL2 game render target is incomplete");
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, 0, 0);
+    auto display = LoadRenderTexture(width, height);
+    glBindFramebuffer(GL_FRAMEBUFFER, display.id);
+    const auto display_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (target.depth.id == 0U || packed_depth.id == 0U || shadow_factor.id == 0U || direct_light.id == 0U ||
+        display.id == 0U || scene_status != GL_FRAMEBUFFER_COMPLETE || display_status != GL_FRAMEBUFFER_COMPLETE) {
         UnloadTexture(packed_depth);
         UnloadTexture(shadow_factor);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        return target;
+        UnloadTexture(direct_light);
+        UnloadRenderTexture(display);
+        UnloadRenderTexture(target);
+        throw std::runtime_error("Pafta viewport render target is incomplete (" +
+            std::to_string(width) + "x" + std::to_string(height) + ")");
     }
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    game_render_resources()[target.id] = {packed_depth, shadow_factor, LoadRenderTexture(width, height), 0};
+    game_render_resources()[target.id] = {packed_depth, shadow_factor, display, direct_light};
     return target;
-#else
-    auto target = LoadRenderTexture(width, height);
-    rlUnloadTexture(target.texture.id);
-    target.texture = {
-        rlLoadTexture(nullptr, width, height, PIXELFORMAT_UNCOMPRESSED_R16G16B16A16, 1),
-        width,
-        height,
-        1,
-        PIXELFORMAT_UNCOMPRESSED_R16G16B16A16,
-    };
-    Texture2D packed_depth{
-        rlLoadTexture(nullptr, width, height, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1),
-        width,
-        height,
-        1,
-        PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
-    };
-    Texture2D shadow_factor{
-        rlLoadTexture(nullptr, width, height, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1),
-        width,
-        height,
-        1,
-        PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
-    };
-    glBindFramebuffer(GL_FRAMEBUFFER, target.id);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.texture.id, 0);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, packed_depth.id, 0);
-    glDeleteRenderbuffers(1, &target.depth.id);
-    glGenRenderbuffers(1, &target.depth.id);
-    glBindRenderbuffer(GL_RENDERBUFFER, target.depth.id);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, target.depth.id);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, target.depth.id);
-    const unsigned int stencil_buffer = 0; // Owned by target.depth and released with the target.
-    const GLenum draw_buffers[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
-    glDrawBuffers(2, draw_buffers);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    game_render_resources()[target.id] = {packed_depth, shadow_factor, LoadRenderTexture(width, height), stencil_buffer};
-    return target;
-#endif
 }
 
 void begin_game_texture_mode(RenderTexture2D target) {
@@ -251,18 +206,8 @@ void begin_game_texture_mode(RenderTexture2D target) {
     g_target_has_mrt = game_render_resources().contains(target.id);
     BeginTextureMode(target);
     rlDrawRenderBatchActive();
-#ifdef __EMSCRIPTEN__
-    // Raylib's rlEnableFramebuffer() omits GRAPHICS_API_OPENGL_ES3 in this
-    // bundled release. BeginTextureMode still sets the viewport and matrices,
-    // but leaves the default framebuffer bound, so explicitly bind the target.
-    glBindFramebuffer(GL_FRAMEBUFFER, target.id);
-#else
-    glBindFramebuffer(GL_FRAMEBUFFER, target.id);
-#endif
-    // The sky pass detaches color attachment 1 so it can sample the packed
-    // scene depth without an attachment feedback loop. Reattach it at the
-    // start of every frame on every platform. Previously this happened only
-    // on WebGL, leaving native sky and shadow composition stuck on frame one.
+    // The sky and shadow passes read these textures. Put their output attachments back
+    // before drawing geometry; they have to be detached to be read.
     if (const auto it = game_render_resources().find(target.id); it != game_render_resources().end()) {
         glFramebufferTexture2D(
             GL_FRAMEBUFFER,
@@ -270,16 +215,12 @@ void begin_game_texture_mode(RenderTexture2D target) {
             GL_TEXTURE_2D,
             it->second.packed_depth.id,
             0);
-        if (it->second.direct_light.id == 0U) {
-            it->second.direct_light = {rlLoadTexture(nullptr, target.texture.width, target.texture.height, target.texture.format, 1),
-                target.texture.width, target.texture.height, 1, target.texture.format};
-        }
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, it->second.direct_light.id, 0);
         const GLenum color_only[] = {GL_COLOR_ATTACHMENT0};
         glDrawBuffers(1, color_only);
     }
-    // A tab change can interrupt the city shadow pass. Never carry its write
-    // masks or stencil test into the next viewport frame.
+    // Changing tabs can interrupt the city shadow pass. Never carry its write masks or
+    // stencil test into the next viewport frame.
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDepthMask(GL_TRUE);
     glStencilMask(0xff);
@@ -297,9 +238,6 @@ void end_game_texture_mode() {
         const GLenum color_only[] = {GL_COLOR_ATTACHMENT0};
         glDrawBuffers(1, color_only);
     }
-#ifdef __EMSCRIPTEN__
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-#endif
     EndTextureMode();
 }
 
@@ -307,7 +245,6 @@ void unload_game_render_texture(RenderTexture2D target) {
     if (target.id == 0U) return;
     auto& resources = game_render_resources();
     if (const auto it = resources.find(target.id); it != resources.end()) {
-        glDeleteRenderbuffers(1, &it->second.stencil_buffer);
         UnloadTexture(it->second.packed_depth);
         UnloadTexture(it->second.shadow_factor);
         UnloadTexture(it->second.direct_light);
@@ -373,7 +310,7 @@ struct GameTonemapShader {
 GameTonemapShader& game_tonemap_shader_cache() {
     static GameTonemapShader cache = [] {
         GameTonemapShader value;
-        value.shader = LoadShaderFromMemory(nullptr, MAPED_GLSL_VERSION R"glsl(
+        value.shader = LoadShaderFromMemory(nullptr, PAFTA_GLSL_VERSION R"glsl(
 in vec2 fragTexCoord;
 uniform sampler2D texture0;
 uniform sampler2D shadowFactor;
@@ -389,12 +326,12 @@ vec3 convertToSrgb(vec3 linearColor) {
     return mix(higher,lower,cutoff);
 }
 vec3 sceneColor(vec2 uv) {
-    // Native world.frag shadows direct diffuse/specular only. Preserve sky,
-    // ambient light and reflections instead of darkening the final image.
+    // The game's world.frag only shadows direct diffuse and specular light. Keep the
+    // sky, ambient light, and reflections instead of darkening the whole image.
     return max(texture(texture0, uv).rgb - texture(directLight, uv).rgb * (1.0-texture(shadowFactor, uv).r), vec3(0.0));
 }
 void main() {
-    // hdr_composite.frag: Reinhard then sRGB, no anti-aliasing pass.
+    // hdr_composite.frag: Reinhard, then sRGB, with no anti-aliasing pass.
     vec3 color=sceneColor(fragTexCoord);
     if (applyTonemap==1) {
         color=color/(color+vec3(1.0));
@@ -506,7 +443,7 @@ void drain_render_build_progress(EditorProject& project) {
 }
 
 void start_async_render_buffer_rebuild(EditorProject& project) {
-    MAPED_PROFILE_FUNCTION();
+    PAFTA_PROFILE_FUNCTION();
     auto buildings = project.buildings;
     auto blocks = block_meshes(project);
     auto templates = buildblock_templates(project);
@@ -519,8 +456,8 @@ void start_async_render_buffer_rebuild(EditorProject& project) {
     project.render_build_in_progress = true;
     project.building_render_buffers.clear();
     project.building_render_buffers.resize(buildings.size());
-    // Keep the current models drawing until each replacement uploads (the
-    // upload move-assigns over them); clearing here blanked the whole city.
+    // Keep the current models drawing until each new one uploads (the upload
+    // move-assigns over them). Clearing them here made the whole city go blank.
     project.building_gpu_models.resize(buildings.size());
     project.building_floor_preview_dirty = true;
     project.pending_gpu_upload_indices.clear();
@@ -533,8 +470,8 @@ void start_async_render_buffer_rebuild(EditorProject& project) {
         templates = std::move(templates),
         generation,
         progress]() {
-        MAPED_PROFILE_THREAD("Building render rebuild");
-        MAPED_PROFILE_BLOCK("build async building render buffers");
+        PAFTA_PROFILE_THREAD("Building render rebuild");
+        PAFTA_PROFILE_BLOCK("build async building render buffers");
         using Clock = std::chrono::steady_clock;
         RenderBuildResult result;
         result.generation = generation;
@@ -547,35 +484,35 @@ void start_async_render_buffer_rebuild(EditorProject& project) {
         workers.reserve(worker_count);
         for (std::size_t worker = 0; worker < worker_count; ++worker) {
             workers.push_back(std::async(std::launch::async, [&] {
-            for (auto building_index = next_building.fetch_add(1);
-                 building_index < buildings.size();
-                 building_index = next_building.fetch_add(1)) {
-            const auto& building = buildings[building_index];
-            {
-                std::scoped_lock lock(progress->mutex);
-                progress->current = building.name;
-            }
-            const auto begin = Clock::now();
-            auto city_buffer = build_city_building_full_render_buffer(building.data, blocks, templates, BuildingLod::Far);
-            bake_shadow_volume(city_buffer);
-            const auto end = Clock::now();
-            const auto ms = std::chrono::duration<double, std::milli>(end - begin).count();
-            const auto expanded_vertex_count = city_buffer.triangles.size() * 3U;
-            {
-                std::scoped_lock lock(progress->mutex);
-                ++progress->completed;
-                progress->logs.push_back(
-                    "cpu buffer " + building.name +
-                    ": " + std::to_string(city_buffer.vertices.size()) + " city verts, " +
-                    std::to_string(city_buffer.triangles.size()) + " city tris, " +
-                    std::to_string(expanded_vertex_count > city_buffer.vertices.size() ? expanded_vertex_count - city_buffer.vertices.size() : 0U) + " verts avoided, " +
-                    format_ms(ms));
-                progress->ready_buffers.push_back({
-                    building_index,
-                    std::move(city_buffer),
-                });
-            }
-            }
+                for (auto building_index = next_building.fetch_add(1);
+                     building_index < buildings.size();
+                     building_index = next_building.fetch_add(1)) {
+                    const auto& building = buildings[building_index];
+                    {
+                        std::scoped_lock lock(progress->mutex);
+                        progress->current = building.name;
+                    }
+                    const auto begin = Clock::now();
+                    auto city_buffer = build_city_building_full_render_buffer(building.data, blocks, templates, BuildingLod::Far);
+                    bake_shadow_volume(city_buffer);
+                    const auto end = Clock::now();
+                    const auto ms = std::chrono::duration<double, std::milli>(end - begin).count();
+                    const auto expanded_vertex_count = city_buffer.triangles.size() * 3U;
+                    {
+                        std::scoped_lock lock(progress->mutex);
+                        ++progress->completed;
+                        progress->logs.push_back(
+                            "cpu buffer " + building.name +
+                            ": " + std::to_string(city_buffer.vertices.size()) + " city verts, " +
+                            std::to_string(city_buffer.triangles.size()) + " city tris, " +
+                            std::to_string(expanded_vertex_count > city_buffer.vertices.size() ? expanded_vertex_count - city_buffer.vertices.size() : 0U) + " verts avoided, " +
+                            format_ms(ms));
+                        progress->ready_buffers.push_back({
+                            building_index,
+                            std::move(city_buffer),
+                        });
+                    }
+                }
             }));
         }
         for (auto& worker : workers) worker.get();
@@ -603,7 +540,7 @@ void start_incremental_render_buffer_rebuild(EditorProject& project) {
     project.render_build_in_progress = !project.buildings.empty();
     project.building_render_buffers.clear();
     project.building_render_buffers.resize(project.buildings.size());
-    // Keep the current models drawing until each replacement uploads.
+    // Keep the current models drawing until each new one uploads.
     project.building_gpu_models.resize(project.buildings.size());
     project.building_floor_preview_dirty = true;
     project.pending_gpu_upload_indices.clear();
@@ -649,7 +586,7 @@ void accept_render_build_result(EditorProject& project, RenderBuildResult result
 }
 
 void upload_next_pending_building(EditorProject& project) {
-    MAPED_PROFILE_FUNCTION();
+    PAFTA_PROFILE_FUNCTION();
     if (project.pending_gpu_upload_indices.empty()) {
         return;
     }
@@ -667,7 +604,7 @@ void upload_next_pending_building(EditorProject& project) {
     }
     project.building_gpu_models[index] = upload_building_render_model(project.building_render_buffers[index], project.buildings[index].data, project);
     keep_pick_data_only(project.building_render_buffers[index]);
-    // Loading peaks far above what the editor keeps: hand the freed pages back.
+    // Loading uses far more memory than the editor keeps, so hand the freed pages back.
     if (project.pending_gpu_upload_indices.empty()) release_free_memory();
     const auto end = Clock::now();
     const auto ms = std::chrono::duration<double, std::milli>(end - begin).count();
@@ -694,7 +631,7 @@ void invalidate_city_block_preview_scene(EditorProject& project) {
 }
 
 void service_render_rebuild(EditorProject& project) {
-    MAPED_PROFILE_FUNCTION();
+    PAFTA_PROFILE_FUNCTION();
     if (project.render_buffers_dirty && !project.render_build_in_progress) {
 #ifdef __EMSCRIPTEN__
         start_incremental_render_buffer_rebuild(project);
@@ -704,8 +641,8 @@ void service_render_rebuild(EditorProject& project) {
     }
 
 #ifdef __EMSCRIPTEN__
-    // No worker threads here: build and upload buildings until ~12 ms of this
-    // frame is spent, so loading is bound by work rather than frame pacing.
+    // No worker threads here: build and upload buildings until about 12 ms of this
+    // frame is used, so loading speed depends on the work, not on frame pacing.
     const auto budget_end = std::chrono::steady_clock::now() + std::chrono::milliseconds{12};
     do {
         build_next_browser_render_buffer(project);
@@ -725,8 +662,8 @@ void service_render_rebuild(EditorProject& project) {
 #endif
 
     if (!project.pending_gpu_upload_indices.empty()) {
-        // Upload for up to ~8 ms of the frame rather than one building per
-        // frame, so loading is bound by the work, not the frame rate.
+        // Upload for up to about 8 ms of the frame instead of one building per frame,
+        // so loading speed depends on the work, not the frame rate.
         std::optional<GfxDebugScopedTimer> timer;
         if (g_gfx_debug_stats != nullptr) timer.emplace(*g_gfx_debug_stats, GfxDebugTimingPhase::GpuUpload);
         const auto budget_end = std::chrono::steady_clock::now() + std::chrono::milliseconds{8};
@@ -751,10 +688,10 @@ Vector3 to_raylib(Vec3 value) {
     return {value.x, value.y, value.z};
 }
 
-// Unified selection highlight: a pulsing, layered wireframe box that reads as a
-// glow without needing a framebuffer bloom pass (which would mean a shader over
-// the whole scene and a fragile cross-platform GL path). Drawn for the selected
-// building, road, and piece so selection feedback is consistent everywhere.
+// The selection highlight: a pulsing, layered wireframe box that looks like a glow
+// without a bloom pass (which would need a shader over the whole scene and fragile
+// GL code on each platform). Used for the selected building, road, and piece, so
+// selection looks the same everywhere.
 
 Vector3 scaled(Vec3f value, Vec3 origin, float scale) {
     return {
@@ -863,10 +800,10 @@ const Texture2D* find_project_material_texture(const EditorProject& project, std
 
 const Texture2D& generated_game_landscape_color_texture() {
     static Texture2D texture = [] {
-        // client/src/hooks/landscapeGenerateTexture.hpp reproduces the game's
-        // generated 0x400-square green landscape color texture as RGBA
-        // (0x40, 0x54, 0x26, 0xff). bc_grass01b is a building texture and was
-        // the source of the bright green distant landscape patches.
+        // client/src/hooks/landscapeGenerateTexture.hpp recreates the game's generated
+        // 0x400-square green landscape colour texture as RGBA (0x40, 0x54, 0x26, 0xff).
+        // bc_grass01b is a building texture, and it caused the bright green patches in
+        // the distant landscape.
         Image image = GenImageColor(0x400, 0x400, Color{0x40, 0x54, 0x26, 0xff});
         auto loaded = LoadTextureFromImage(image);
         UnloadImage(image);
@@ -879,14 +816,14 @@ const Texture2D& generated_game_landscape_color_texture() {
     return texture;
 }
 
-// The game's texture slot 0 ("concrete"), which curbs, sidewalks and legacy
-// district pieces with face texture 0 use. No file backs it:
-// Texture_GenerateProceduralNoise(0) @99730 fills 128x128 RGBA with a
-// hashed value noise n() (cosine-interpolated, ~[-1,1]) summed at four
-// frequencies, R = G = 168 + 2*sum, B = 167 + 1.75*sum, alpha 0x20, and
-// _settexture gives it a flat material map (0x60, 0xc0, 0).
-// ponytail: our hash differs from the game's, so the speckle pattern is not
-// pixel-identical; the colour, range and frequencies are.
+// The game's texture slot 0 ("concrete"), used by curbs, sidewalks, and old
+// district pieces with face texture 0. No file holds it:
+// Texture_GenerateProceduralNoise(0) @99730 fills 128x128 RGBA with hashed value
+// noise n() (cosine-blended, about [-1,1]) added up at four frequencies:
+// R = G = 168 + 2*sum, B = 167 + 1.75*sum, alpha 0x20. _settexture gives it a flat
+// material map (0x60, 0xc0, 0).
+// ponytail: our hash is not the game's, so the speckles don't match pixel for
+// pixel; the colour, range, and frequencies do.
 const Texture2D& game_slot0_texture(bool material) {
     static const std::array<Texture2D, 2> textures = [] {
         constexpr int size = 128;
@@ -917,7 +854,7 @@ const Texture2D& game_slot0_texture(bool material) {
                 const auto n4 = noise(fx * 2.0F + 1235.0F, fy + 123.0F);
                 const auto grey = static_cast<unsigned char>(std::clamp(168.0F + 2.0F * (n1 + n2 + n3 + n4), 0.0F, 255.0F));
                 const auto blue = static_cast<unsigned char>(std::clamp(167.0F + 1.75F * (n1 + n2 + n3 + n4), 0.0F, 255.0F));
-                // Alpha stays opaque here: world.frag writes alpha 1 regardless.
+                // Alpha stays opaque here: world.frag always writes alpha 1.
                 pixels[y * size + x] = Color{grey, grey, blue, 0xff};
             }
         }
@@ -997,8 +934,8 @@ void GpuMesh::unload() {
 
 namespace {
 
-// Vertex attribute locations shared by every GpuMesh program. 3..6 are the
-// per-instance model matrix columns, read from the instance stream.
+// Vertex attribute locations every GpuMesh program shares. 3..6 are the columns
+// of each instance's model matrix, read from the instance stream.
 constexpr GLuint kAttribPosition = 0;
 constexpr GLuint kAttribTexCoord = 1;
 constexpr GLuint kAttribNormal = 2;
@@ -1010,8 +947,8 @@ struct GpuVertex {
     float normal[3];
 };
 
-// Uploads interleaved vertices + 32-bit indices into a fresh VAO whose instance
-// attributes (divisor 1) are pointed at the instance stream per draw.
+// Uploads interleaved vertices and 32-bit indices into a new VAO. Its per-instance
+// attributes (divisor 1) are pointed at the instance stream for each draw.
 GpuMesh upload_gpu_vertices(const std::vector<GpuVertex>& vertices, const std::vector<std::uint32_t>& indices) {
     GpuMesh mesh;
     if (vertices.empty() || indices.empty()) return mesh;
@@ -1041,8 +978,8 @@ GpuMesh upload_gpu_vertices(const std::vector<GpuVertex>& vertices, const std::v
     return mesh;
 }
 
-// IEEE half from a float in [-1, 1]; magnitudes below the half range flush
-// to a signed zero.
+// An IEEE half float from a float in [-1, 1]. Values too small for a half become
+// a signed zero.
 std::uint16_t half_from_unit_float(float value) {
     std::uint32_t bits = 0;
     std::memcpy(&bits, &value, sizeof(bits));
@@ -1084,7 +1021,7 @@ GpuMesh upload_shadow_volume(const std::vector<ShadowVertex>& vertices, const st
     glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(ShadowVertex)), vertices.data(), GL_STATIC_DRAW);
     glEnableVertexAttribArray(kAttribPosition);
     glVertexAttribPointer(kAttribPosition, 3, GL_FLOAT, GL_FALSE, sizeof(ShadowVertex), reinterpret_cast<void*>(offsetof(ShadowVertex, position)));
-    // The kind arrives as vertexTexCoord.x, the normal as vertexNormal.
+    // The kind arrives as vertexTexCoord.x, and the normal as vertexNormal.
     glEnableVertexAttribArray(kAttribTexCoord);
     glVertexAttribPointer(kAttribTexCoord, 1, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(ShadowVertex), reinterpret_cast<void*>(offsetof(ShadowVertex, kind)));
     glEnableVertexAttribArray(kAttribNormal);
@@ -1106,9 +1043,9 @@ GpuMesh upload_shadow_volume(const std::vector<ShadowVertex>& vertices, const st
 } // namespace
 
 // One VAO for the whole buffer, one part per material run. Normals are smoothed
-// per shared vertex; flat-shaded surfaces derive theirs in the shader instead.
-// flat_faces emits three unique vertices per triangle carrying the face normal,
-// for surfaces lit from the vertex normal that must keep hard edges.
+// over shared vertices; flat-shaded surfaces work theirs out in the shader instead.
+// flat_faces makes three separate vertices per triangle with the face normal, for
+// surfaces lit by the vertex normal that need to keep hard edges.
 GpuMesh upload_gpu_mesh(const BuildingRenderBuffer& buffer, const std::function<void(GpuMeshPart&)>& describe_part, bool flat_faces = false) {
     std::vector<GpuVertex> vertices(flat_faces ? 0U : buffer.vertices.size());
     for (std::size_t i = 0; i < vertices.size(); ++i) {
@@ -1119,14 +1056,20 @@ GpuMesh upload_gpu_mesh(const BuildingRenderBuffer& buffer, const std::function<
     indices.reserve(buffer.triangles.size() * 3U);
     std::vector<GpuMeshPart> parts;
     for (const auto& run : buffer.material_runs) {
-        const auto end = std::min<std::size_t>(run.first_triangle + run.triangle_count, buffer.triangles.size());
+        const auto first = static_cast<std::size_t>(run.first_triangle);
+        if (first > buffer.triangles.size() || run.triangle_count > buffer.triangles.size() - first) {
+            throw std::runtime_error("GPU mesh material run exceeds its triangle buffer");
+        }
+        const auto end = first + run.triangle_count;
         GpuMeshPart part;
         part.first_index = static_cast<std::uint32_t>(indices.size());
         part.material_id = run.material;
         part.window_material = run.city_window_surface;
         for (std::size_t t = run.first_triangle; t < end; ++t) {
             const auto& tri = buffer.triangles[t];
-            if (tri.indices[0] >= buffer.vertices.size() || tri.indices[1] >= buffer.vertices.size() || tri.indices[2] >= buffer.vertices.size()) continue;
+            if (tri.indices[0] >= buffer.vertices.size() || tri.indices[1] >= buffer.vertices.size() || tri.indices[2] >= buffer.vertices.size()) {
+                throw std::runtime_error("GPU mesh triangle " + std::to_string(t) + " exceeds its vertex buffer");
+            }
             const auto& a = buffer.vertices[tri.indices[0]].position;
             const auto& b = buffer.vertices[tri.indices[1]].position;
             const auto& c = buffer.vertices[tri.indices[2]].position;
@@ -1164,8 +1107,8 @@ GpuMesh upload_gpu_mesh(const BuildingRenderBuffer& buffer, const std::function<
     return mesh;
 }
 
-// Shared by building, portal, and city models: the part's textures come from the
-// resolver, its fallback color from the native material palette.
+// Used by building, portal, and city models: the part's textures come from the
+// resolver, and its fallback colour from the game's material palette.
 void describe_textured_part(GpuMeshPart& part, const Texture2D* texture, const Texture2D* material_texture) {
     part.material_texture = material_texture != nullptr && material_texture->id != 0U
         ? material_texture->id
@@ -1189,19 +1132,19 @@ GpuBuildingRenderModel upload_city_buffer_model(
         describe_textured_part(part,
             texture_for_buffer_material(project, buffer, part.material_id),
             material_texture_for_buffer_material(project, buffer, part.material_id));
-        // City surfaces tint their texture with the material color (terrain
-        // uses it as the generated landscape color map).
+        // City surfaces tint their texture with the material colour (the terrain
+        // uses it as the generated landscape colour map).
         part.color = color_for_material(part.material_id);
     }, flat_faces);
     model.uploaded_bytes = model.mesh.vertex_count * sizeof(GpuVertex) + model.mesh.index_count * sizeof(std::uint32_t);
     return model;
 }
 
-// chunked: the volume is world-space and large (roads, pieces); its triangles
-// are grouped into 256-unit ground chunks, one part each with its bounds, so
-// draws can skip the chunks outside the view.
+// chunked: for large world-space volumes (roads, pieces). Their triangles are
+// grouped into 256-unit ground chunks, one part each with its own bounds, so draws
+// can skip the chunks that are out of view.
 void build_shadow_volume(GpuBuildingRenderModel& model, const BuildingRenderBuffer& buffer, bool chunked = false) {
-    // Workers bake the volume with the buffer (bake_shadow_volume); small
+    // Workers bake the volume together with the buffer (bake_shadow_volume). Small
     // buffers built on this thread are baked here.
     const BuildingRenderBuffer* baked = &buffer;
     BuildingRenderBuffer local;
@@ -1257,19 +1200,19 @@ void build_shadow_volume(GpuBuildingRenderModel& model, const BuildingRenderBuff
 }
 
 namespace {
-// View frustum and extrusion for culling chunked shadow volume parts.
+// The view frustum and stretch direction, for culling chunked shadow volume parts.
 struct ShadowCull {
     std::array<std::array<float, 4>, 6> planes{};
     Vector3 extrusion{};
 };
 std::optional<ShadowCull> g_shadow_cull;
 
-// Whether the box swept along the extrusion can reach the view.
+// Whether the box, stretched along the shadow direction, can reach the view.
 bool shadow_part_visible(const ShadowCull& cull, const GpuMeshPart& part) {
     const auto lo = Vector3Min(part.bounds_min, Vector3Add(part.bounds_min, cull.extrusion));
     const auto hi = Vector3Max(part.bounds_max, Vector3Add(part.bounds_max, cull.extrusion));
     for (const auto& p : cull.planes) {
-        // The box corner farthest along the plane normal.
+        // The box corner furthest along the plane's normal.
         const Vector3 corner{p[0] >= 0.0F ? hi.x : lo.x, p[1] >= 0.0F ? hi.y : lo.y, p[2] >= 0.0F ? hi.z : lo.z};
         if (p[0] * corner.x + p[1] * corner.y + p[2] * corner.z + p[3] < 0.0F) return false;
     }
@@ -1292,7 +1235,7 @@ void render_imgui_draw_data(ImDrawData* draw_data) {
     static int projection_loc = -1;
     static GLuint vao = 0, vbo = 0, ibo = 0;
     if (vao == 0) {
-        shader = LoadShaderFromMemory(MAPED_GLSL_VERSION R"glsl(
+        shader = LoadShaderFromMemory(PAFTA_GLSL_VERSION R"glsl(
 layout(location=0) in vec2 position;
 layout(location=1) in vec2 uv;
 layout(location=2) in vec4 color;
@@ -1304,7 +1247,7 @@ void main() {
     frag_color = color;
     gl_Position = projection * vec4(position, 0.0, 1.0);
 }
-)glsl", MAPED_GLSL_VERSION R"glsl(
+)glsl", PAFTA_GLSL_VERSION R"glsl(
 in vec2 frag_uv;
 in vec4 frag_color;
 uniform sampler2D texture0;
@@ -1351,8 +1294,8 @@ void main() { out_color = frag_color * texture(texture0, frag_uv); }
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
     const auto scale = draw_data->FramebufferScale;
     for (const ImDrawList* list : draw_data->CmdLists) {
-        // Fresh storage per list: the GPU may still read the previous contents,
-        // and writing into them would make the driver wait for it.
+        // New storage for each list: the GPU may still be reading the old contents,
+        // and writing over them would make the driver wait.
         glBufferData(GL_ARRAY_BUFFER, list->VtxBuffer.Size * static_cast<GLsizeiptr>(sizeof(ImDrawVert)), list->VtxBuffer.Data, GL_STREAM_DRAW);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, list->IdxBuffer.Size * static_cast<GLsizeiptr>(sizeof(ImDrawIdx)), list->IdxBuffer.Data, GL_STREAM_DRAW);
         for (const auto& cmd : list->CmdBuffer) {
@@ -1424,16 +1367,16 @@ Matrix city_placement_matrix(const SbcBuilding& placement) {
     return building_transform_matrix({origin.x, origin.y, origin.z}, placement.rotation);
 }
 
-// Vertex stage shared by every GpuMesh program: per-instance model matrix at
-// attribute 3..6, one view-projection uniform per draw.
-#define MAPED_INSTANCED_VS MAPED_GLSL_VERSION R"glsl(
+// The vertex stage every GpuMesh program shares: each instance's model matrix in
+// attributes 3..6, and one view-projection uniform per draw.
+#define PAFTA_INSTANCED_VS PAFTA_GLSL_VERSION R"glsl(
 layout(location=0) in vec3 vertexPosition;
 layout(location=1) in vec3 vertexTexCoord;
 layout(location=2) in vec3 vertexNormal;
 layout(location=3) in mat4 instanceTransform;
 uniform mat4 viewProjection;
-// Shadow volume caps reuse the render triangles; invariance keeps their
-// depth identical to the surface they lie on.
+// Shadow volume caps reuse the render triangles; invariant keeps their depth
+// exactly the same as the surface they lie on.
 invariant gl_Position;
 out vec3 fragTexCoord;
 out vec3 fragNormal;
@@ -1441,15 +1384,15 @@ out vec3 fragPosition;
 void main() {
     vec4 world = instanceTransform * vec4(vertexPosition, 1.0);
     fragTexCoord = vertexTexCoord;
-    // Placements only rotate in quarter turns, so the upper 3x3 is orthonormal.
+    // Placements only turn in quarter turns, so the top-left 3x3 is orthonormal.
     fragNormal = mat3(instanceTransform) * vertexNormal;
     fragPosition = world.xyz;
     gl_Position = viewProjection * world;
 }
 )glsl"
 
-// Flat mask shader used by the screen-space outline pass and the stencil shadow
-// volumes. It renders into an offscreen alpha mask (or with color writes off).
+// A flat mask shader, used by the screen-space outline pass and the stencil shadow
+// volumes. It draws into an offscreen alpha mask (or with colour writes off).
 struct MaskShader {
     Shader shader{};
     int view_projection_loc{-1};
@@ -1460,20 +1403,21 @@ MaskShader& mask_shader() {
     static MaskShader cache;
     if (!cache.loaded) {
         const char* fs =
-            MAPED_GLSL_VERSION
+            PAFTA_GLSL_VERSION
             "out vec4 finalColor;\n"
             "void main() { finalColor = vec4(1.0); }\n";
-        cache.shader = LoadShaderFromMemory(MAPED_INSTANCED_VS, fs);
+        cache.shader = LoadShaderFromMemory(PAFTA_INSTANCED_VS, fs);
         cache.view_projection_loc = GetShaderLocation(cache.shader, "viewProjection");
         cache.loaded = true;
     }
     return cache;
 }
 
-// Stencil shadow volumes (see build_shadow_volume): uv.x is the vertex kind,
-// 0 edge end, 1 open edge far end, 2 front cap, 3 back cap; the normal is the
-// owning face's (inward, faces wind clockwise). A face is extruded when it is
-// turned away from the light, as RenderQueuedShadowVolumeAdjacencyPass does.
+// Stencil shadow volumes (see build_shadow_volume). uv.x is the kind of vertex:
+// 0 edge end, 1 far end of an open edge, 2 front cap, 3 back cap. The normal is the
+// face's own (pointing inward, as faces are wound clockwise). A face is stretched
+// when it is turned away from the light, as RenderQueuedShadowVolumeAdjacencyPass
+// does.
 struct ShadowVolumeShader {
     Shader shader{};
     int view_projection_loc{-1};
@@ -1485,7 +1429,7 @@ struct ShadowVolumeShader {
 ShadowVolumeShader& shadow_volume_shader() {
     static ShadowVolumeShader cache;
     if (!cache.loaded) {
-        const char* vs = MAPED_GLSL_VERSION R"glsl(
+        const char* vs = PAFTA_GLSL_VERSION R"glsl(
 layout(location=0) in vec3 vertexPosition;
 layout(location=1) in vec3 vertexTexCoord;
 layout(location=2) in vec3 vertexNormal;
@@ -1497,7 +1441,7 @@ invariant gl_Position;
 void main() {
     int kind = int(vertexTexCoord.x + 0.5);
     bool lit = dot(mat3(instanceTransform) * vertexNormal, lightDirection) < 0.0;
-    // Caps of lit faces collapse to a clipped point.
+    // Caps of lit faces shrink to a point that gets clipped.
     if (kind >= 2 && lit) {
         gl_Position = vec4(0.0);
         return;
@@ -1508,7 +1452,7 @@ void main() {
 }
 )glsl";
         const char* fs =
-            MAPED_GLSL_VERSION
+            PAFTA_GLSL_VERSION
             "out vec4 finalColor;\n"
             "void main() { finalColor = vec4(1.0); }\n";
         cache.shader = LoadShaderFromMemory(vs, fs);
@@ -1520,7 +1464,7 @@ void main() {
     return cache;
 }
 
-// Sets the sun direction and extrusion vector for following ShadowVolume draws.
+// Sets the sun direction and the stretch vector for the ShadowVolume draws that follow.
 void set_shadow_volume_light(Vector3 light, Vector3 extrusion) {
     const auto& shader = shadow_volume_shader();
     glUseProgram(shader.shader.id);
@@ -1528,9 +1472,9 @@ void set_shadow_volume_light(Vector3 light, Vector3 extrusion) {
     glUniform3f(shader.extrusion_loc, extrusion.x, extrusion.y, extrusion.z);
 }
 
-// Sub Rosa's world shader reads color + material maps, lights them with its world
-// light, and uses the color alpha as window shine for sky reflection. The editor
-// keeps that contract and evaluates the native atmosphere used by its backdrop.
+// Sub Rosa's world shader reads the colour and material maps, lights them with its
+// world light, and uses the colour's alpha as window shine for sky reflections. The
+// editor does the same, and uses the game's atmosphere for its background.
 struct LitShader {
     Shader shader{};
     int view_projection_loc{-1};
@@ -1545,7 +1489,6 @@ struct LitShader {
     int light_direction_loc{-1};
     int light_ambient_loc{-1};
     int light_diffuse_loc{-1};
-    int environment_loc{-1};
     int cubemap_pass_loc{-1};
     bool loaded{false};
 };
@@ -1555,10 +1498,10 @@ struct GameLightColors {
     Vector3 diffuse{};
 };
 
-// Port of subrosa.exe WorldShading @0xa61f0. Optical depth through a sphere of
-// radius 512 seen from radius 496 (constants @0x278aec/@0x278ae8/@0x278958),
-// scaled by 0.029296875 (@0x278174); the fixed axis probes carry an extra
-// sqrt(0.09765625) (@0x2781e8). Wavelengths @0x2b23d0 are (0.5, 0.625, 1.0).
+// Port of subrosa.exe WorldShading @0xa61f0. The optical depth through a sphere of
+// radius 512 seen from radius 496 (constants @0x278aec/@0x278ae8/@0x278958), times
+// 0.029296875 (@0x278174). The fixed axis samples have an extra factor of
+// sqrt(0.09765625) (@0x2781e8). The wavelengths @0x2b23d0 are (0.5, 0.625, 1.0).
 GameLightColors game_light_colors(Vector3 light) {
     const auto depth = [](float dy) {
         return std::sqrt(262144.0F - (246016.0F - dy*dy*246016.0F)) - dy*496.0F;
@@ -1584,38 +1527,38 @@ GameLightColors game_light_colors(Vector3 light) {
 LitShader& lit_shader() {
     static LitShader cache;
     if (!cache.loaded) {
-        const char* vs = MAPED_INSTANCED_VS;
-        const char* fs = MAPED_GLSL_VERSION R"glsl(
+        const char* vs = PAFTA_INSTANCED_VS;
+        const char* fs = PAFTA_GLSL_VERSION R"glsl(
 in vec3 fragTexCoord;
 in vec3 fragNormal;
 in vec3 fragPosition;
 uniform sampler2D texture0;
 uniform sampler2D texture1;
-// Road-marking overlay arrays (tex_atlas_color / tex_atlas_material): layer 0 is
-// clear, so every surface samples them and only marked road faces change.
+// Road-marking overlay arrays (tex_atlas_color / tex_atlas_material). Layer 0 is
+// empty, so every surface can sample them and only marked road faces change.
 uniform highp sampler2DArray overlayColor;
 uniform highp sampler2DArray overlayMaterial;
 uniform vec4 colDiffuse;
 uniform vec3 viewPosition;
 uniform int windowSurface;
-// > 0: this window part is near-LOD room glass (the game's glass shader).
+// > 0: this window part is room glass for the near view (the game's glass shader).
 uniform float glassAlpha;
 // GenerateMapTextureFromVisibleSectors draws sectors with the image shader:
-// the base texture only, unlit.
+// only the base texture, with no lighting.
 uniform int unlitSurface;
-// model.frag surfaces (street objects): texture alpha is the shine; 1 draws
-// the texel unlit, below 0.5 is dielectric roughness 0.5, else 0.5/0.125.
+// model.frag surfaces (street objects): the texture's alpha is the shine. 1 draws
+// the texel unlit, below 0.5 is a non-metal with roughness 0.5, else 0.5/0.125.
 uniform int modelSurface;
 uniform int buildingSurface;
 uniform int terrainSurface;
 uniform vec3 lightDirection;
-// subrosa.exe WorldShading @0xa61f0 derives these from the sun height every
-// frame; the world shader only reads lightdiffuse, the landscape shader both.
+// subrosa.exe WorldShading @0xa61f0 works these out from the sun's height every
+// frame. The world shader only reads lightdiffuse; the landscape shader reads both.
 uniform vec3 lightAmbient;
 uniform vec3 lightDiffuse;
 // The blurred landscape cubemap (RenderLandscapeCubemapAndBlurCapture @93e60),
-// sampled with true world directions. cubemapPass is set while capturing it:
-// the landscape then uses the cubemap color map, grey over the city block.
+// sampled with true world directions. cubemapPass is set while capturing it; the
+// landscape then uses the cubemap colour map, grey over the city block.
 uniform samplerCube environment;
 uniform int cubemapPass;
 layout(location=0) out vec4 finalColor;
@@ -1628,10 +1571,6 @@ vec3 envDiffuse(vec3 n) {
 vec3 toLinear(vec3 color) {
     bvec3 cutoff = lessThan(color, vec3(0.04045));
     return mix(pow((color + vec3(0.055))/vec3(1.055), vec3(2.4)), color/vec3(12.92), cutoff);
-}
-vec3 toSrgb(vec3 color) {
-    bvec3 cutoff = lessThan(color, vec3(0.0031308));
-    return mix(vec3(1.055)*pow(max(color, vec3(0.0)), vec3(1.0/2.4))-vec3(0.055), color*vec3(12.92), cutoff);
 }
 vec3 fresnelFactor(vec3 f0, float product) {
     return mix(f0, vec3(1.0), pow(1.01-product, 5.0));
@@ -1647,10 +1586,10 @@ float geometrySchlick(float roughness, float ndv, float ndl) {
     return 0.25/((ndv*(1.0-k)+k)*(ndl*(1.0-k)+k));
 }
 void main() {
-    // The game uses mipmapped linear minification. Add a small distance-only
-    // bias so sub-pixel facade and window texels converge on a stable mip
-    // instead of alternating between bright and dark samples while the camera
-    // moves. Near surfaces retain their full-resolution texture.
+    // The game uses mipmapped linear minification. Add a small bias that grows with
+    // distance, so tiny far-away wall and window texels settle on one mip level instead
+    // of flickering between bright and dark while the camera moves. Close surfaces keep
+    // their full-resolution texture.
     float textureDistance = length(viewPosition-fragPosition);
     float mipBias = smoothstep(160.0, 900.0, textureDistance)*0.65;
     // landscape.vert: tex_detail at (x/32, 1-z/32) in world units.
@@ -1663,13 +1602,13 @@ void main() {
         packedDepth = vec4(1.0);
         return;
     }
-    // world.frag: the overlay blends by its alpha over the sRGB color and over
-    // the linearized material (the overlay material itself is not linearized).
+    // world.frag: the overlay blends by its alpha over the sRGB colour and over the
+    // linear material (the overlay's own material is not made linear).
     vec4 overlay = texture(overlayColor, fragTexCoord, mipBias);
     sampled.rgb = mix(sampled.rgb, overlay.rgb, overlay.a);
     vec3 albedo = toLinear(sampled.rgb);
-    // Native world.frag applies the same sRGB-to-linear conversion to the
-    // material texture before reading its metallic and roughness channels.
+    // The game's world.frag also turns the material texture from sRGB to linear
+    // before reading its metallic and roughness channels.
     vec3 material = toLinear(texture(texture1, fragTexCoord.xy, mipBias).rgb);
     material = mix(material, texture(overlayMaterial, fragTexCoord, mipBias).rgb, overlay.a);
     float metallic = clamp(material.r, 0.0, 1.0);
@@ -1678,8 +1617,8 @@ void main() {
         metallic = textureSample.a < 0.5 ? 0.0 : 0.5;
         roughness = textureSample.a < 0.5 ? 0.5 : 0.125;
     }
-    // The derivative normal already faces the viewer. Vertex normals point
-    // inward (clockwise winding), so a back-facing survivor flips them.
+    // The derivative normal already faces the viewer. Vertex normals point inward
+    // (clockwise winding), so a back-facing triangle that wasn't culled flips them.
     vec3 n = buildingSurface == 1
         ? normalize(cross(dFdx(fragPosition), dFdy(fragPosition)))
         : normalize(gl_FrontFacing ? fragNormal : -fragNormal);
@@ -1687,11 +1626,11 @@ void main() {
     vec3 color;
     vec3 direct;
     if (terrainSurface == 1) {
-        // landscape.frag: wrapped diffuse with rho=3, ambient keyed to the sun
-        // height, and a detail-driven view shine. texture0 is tex_detail and
-        // colDiffuse stands in for the generated tex_color landscape map.
-        // tex_color is flat (0x40,0x54,0x26); the cubemap copy is grey (0x54)
-        // over texels 0x100..0x1bf x 0x240..0x2ff, world x and z 0..3072.
+        // landscape.frag: wrapped diffuse with rho=3, ambient light based on the sun's
+        // height, and a view shine driven by the detail texture. texture0 is tex_detail,
+        // and colDiffuse stands in for the generated tex_color landscape map.
+        // tex_color is a flat (0x40,0x54,0x26); the cubemap copy is grey (0x54) over
+        // texels 0x100..0x1bf x 0x240..0x2ff, world x and z 0..3072.
         vec3 landColor = colDiffuse.rgb;
         if (cubemapPass == 1 && fragPosition.x >= 0.0 && fragPosition.x < 3072.0 &&
             fragPosition.z >= 0.0 && fragPosition.z < 3072.0) landColor = vec3(84.0/255.0);
@@ -1722,16 +1661,16 @@ void main() {
         specular *= lightDiffuse;
         diffuse *= lightDiffuse;
         direct = diffuse*1.5*mix(albedo, vec3(0.0), metallic)+specular;
-        // Diffuse environment: one cubemap texel per face (lod 8).
+        // Diffuse environment light: one cubemap texel per face (lod 8).
         diffuse += envDiffuse(n)*0.75;
         diffuse *= 1.5;
-        // Specular environment: lod roughness^2*8.
+        // Specular environment light: lod roughness^2*8.
         vec3 r = reflect(-v, n);
         vec3 reflected = textureLod(environment, r, roughness*roughness*8.0).rgb;
         specular += reflected*0.75*fresnelFactor(mix(vec3(0.02), albedo, metallic), ndv)*(1.0-roughness*0.5);
         color = diffuse*mix(albedo, vec3(0.0), metallic)+specular;
         if (windowSurface == 1) {
-            // array_world.frag window shine: sharp cubemap reflection faded
+            // array_world.frag window shine: a sharp cubemap reflection that fades
             // toward half the ambient blue at grazing angles.
             float scale = 1.0-abs(dot(-v, n));
             scale = 0.5+pow(scale, 2.5)*0.5;
@@ -1746,9 +1685,9 @@ void main() {
     }
     float alpha = windowSurface == 1 || modelSurface == 1 ? 1.0 : sampled.a;
     if (windowSurface == 1 && glassAlpha > 0.0) {
-        // subrosa.exe room-glass shader (vertex @0x2f9820, fragment @0x2f9a10),
-        // premultiplied: drawn with glBlendFunc(ONE, ONE_MINUS_SRC_ALPHA). The
-        // pane is wound out of its cell, so the front face is the outside.
+        // subrosa.exe room-glass shader (vertex @0x2f9820, fragment @0x2f9a10), with
+        // premultiplied alpha, drawn with glBlendFunc(ONE, ONE_MINUS_SRC_ALPHA). The pane
+        // faces out of its cell, so the front face is the outside.
         float scale = clamp((textureDistance-32.0)*0.125*0.125*0.75, 0.0, 1.0);
         float scale2 = min(0.5+pow(1.0-abs(dot(v, n)), 3.0)*0.5, 1.0);
         scale *= 1.0-scale2;
@@ -1796,9 +1735,9 @@ void main() {
 
 Texture2D default_game_material_texture() {
     static Texture2D texture = [] {
-        // The material map is decoded from sRGB by world.frag. 188 encodes a
-        // linear roughness of about 0.5; zero red keeps fallback surfaces
-        // dielectric instead of making every missing material partly metallic.
+        // world.frag decodes the material map from sRGB. 188 gives a linear roughness of
+        // about 0.5. Zero red keeps fallback surfaces non-metal, instead of making every
+        // missing material a bit metallic.
         Image image = GenImageColor(1, 1, Color{0, 188, 0, 255});
         auto loaded = LoadTextureFromImage(image);
         UnloadImage(image);
@@ -1809,7 +1748,7 @@ Texture2D default_game_material_texture() {
     return texture;
 }
 
-// Light colors at `scale` (the cubemap capture draws the landscape at 0.5).
+// Light colours at `scale` (the cubemap capture draws the landscape at 0.5).
 void set_game_surface_light(float scale) {
     auto& shader = lit_shader();
     const auto light = Vector3Normalize(game_light_direction());
@@ -1835,10 +1774,10 @@ void set_game_world_time(float hours) {
 
 namespace {
 
-// Per-instance model matrices for every GpuMesh draw. Each push re-specifies
-// the whole buffer (glBufferData with data), so the driver hands out fresh
-// storage instead of waiting for earlier draws; a glBufferSubData into storage
-// still in flight stalled every draw on Apple's GL-on-Metal.
+// Model matrices for each instance, for every GpuMesh draw. Each push re-sends the
+// whole buffer (glBufferData with data), so the driver gives us new storage instead
+// of waiting for earlier draws. A glBufferSubData into storage still in use made
+// every draw wait on Apple's GL-on-Metal.
 GLuint instance_stream() {
     static GLuint vbo = 0U;
     if (vbo == 0U) glGenBuffers(1, &vbo);
@@ -1861,13 +1800,13 @@ struct EnvironmentCubemap {
     GLuint texture{};
     GLuint framebuffer{};
     GLuint depth{};
-    // WebGL: blurred levels render here and are copied into the cube, since a
-    // cube level outside [base, max] makes the framebuffer incomplete.
+    // WebGL: blurred levels are drawn here and copied into the cube, because a cube
+    // level outside [base, max] makes the framebuffer incomplete.
     GLuint scratch{};
     Vector3 camera{};
     Vector3 light{};
-    const GpuMesh* terrain{};
-    std::uint32_t terrain_indices{};
+    std::uint64_t terrain_fingerprint{};
+    bool has_terrain{};
     bool valid{};
     bool capturing{};
 };
@@ -1880,16 +1819,17 @@ EnvironmentCubemap& environment_cubemap() {
 } // namespace
 
 // The road-marking overlay arrays the world shader samples on units 4/5
-// (texture 1's slots itemModels[0x356/0x357]), generated per layer by
-// subrosa.exe @0x98ff0 (the function Ghidra names Texture_GenerateCubemapFace):
+// (texture 1's slots itemModels[0x356/0x357]). subrosa.exe makes them one layer at
+// a time @0x98ff0 (the function Ghidra calls Texture_GenerateCubemapFace):
 // 128x128, 11 layers, with x/y the texel column/row.
-//   color: layers 1/2 a yellow (255,255,32) line on rows 5..10 / 117..122,
-//          6/7 the same on columns; 4/5 a white dash on rows 5..10 / 117..122
-//          over columns 32..95, 9/10 the same on columns 5..10 / 117..122 over
-//          rows 32..95; 3 white rows 16..31 and 96..111, 8 white columns 11..26
-//          and 91..106. Opaque only where marked; layer 0 is clear.
-//   material: (128, 130 + 2*cos(noise), 0) on marked layers, 0 on layer 0;
-//          the cosine term is not ported, only its mean.
+//   colour: layers 1/2 have a yellow (255,255,32) line on rows 5..10 / 117..122,
+//           and 6/7 the same on columns. 4/5 have a white dash on rows 5..10 /
+//           117..122 over columns 32..95, and 9/10 the same on columns 5..10 /
+//           117..122 over rows 32..95. 3 has white rows 16..31 and 96..111, and 8
+//           has white columns 11..26 and 91..106. They are only opaque where
+//           marked; layer 0 is empty.
+//   material: (128, 130 + 2*cos(noise), 0) on marked layers, 0 on layer 0. The
+//           cosine part is not ported, only its average.
 struct OverlayArrays {
     GLuint color{};
     GLuint material{};
@@ -1961,8 +1901,8 @@ void draw_gpu_mesh_batch(const std::vector<GpuMeshDraw>& draws, GpuSurface surfa
     rlDrawRenderBatchActive();
     const auto view_projection = MatrixToFloatV(MatrixMultiply(rlGetMatrixModelview(), rlGetMatrixProjection()));
     const bool lit = surface != GpuSurface::Mask && surface != GpuSurface::ShadowVolume;
-    // Created on first use, which flushes raylib's batch and unbinds the
-    // program; do it before binding ours.
+    // Made the first time it is used, which flushes raylib's batch and unbinds the
+    // program, so do it before binding ours.
     if (lit) road_overlay_arrays();
     if (surface == GpuSurface::ShadowVolume) {
         const auto& shader = shadow_volume_shader();
@@ -1981,7 +1921,7 @@ void draw_gpu_mesh_batch(const std::vector<GpuMeshDraw>& draws, GpuSurface surfa
         glUseProgram(shader.shader.id);
         glUniformMatrix4fv(shader.view_projection_loc, 1, GL_FALSE, view_projection.v);
     }
-    // Every mesh's instances go up in one buffer; each mesh reads its slice.
+    // Every mesh's instances go into one buffer; each mesh reads its own slice.
     thread_local std::vector<float16> columns;
     columns.clear();
     columns.reserve(total_instances);
@@ -1991,10 +1931,11 @@ void draw_gpu_mesh_batch(const std::vector<GpuMeshDraw>& draws, GpuSurface surfa
     }
     glBindBuffer(GL_ARRAY_BUFFER, instance_stream());
     glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(columns.size() * sizeof(float16)), columns.data(), GL_STREAM_DRAW);
-    // World geometry winds clockwise, as in the game, which draws it with
-    // glFrontFace(GL_CW) and back faces culled. Under raylib's counter-clockwise
-    // front face that is culling GL_FRONT; the lit shader flips normals on the
-    // (then always back-facing) survivors. Masks and shadow volumes stay two-sided.
+    // World geometry is wound clockwise, as in the game, which draws it with
+    // glFrontFace(GL_CW) and back faces culled. With raylib's counter-clockwise front
+    // face, that means culling GL_FRONT, and the lit shader flips the normals of the
+    // (always back-facing) triangles that are left. Masks and shadow volumes stay
+    // two-sided.
     const bool glass = filter == GpuPartFilter::Glass;
     if (lit && !glass) {
         glEnable(GL_CULL_FACE);
@@ -2005,21 +1946,21 @@ void draw_gpu_mesh_batch(const std::vector<GpuMeshDraw>& draws, GpuSurface surfa
     if (lit) glUniform1f(lit_shader().glass_alpha_loc, glass ? kRoomGlassAlpha : 0.0F);
     const bool blend_was_on = glIsEnabled(GL_BLEND) == GL_TRUE;
     if (glass) {
-        // Room glass (_block_addwindows) is see-through: blend over the room
-        // behind it and keep depth for later geometry unchanged.
+        // Room glass (_block_addwindows) is see-through: blend it over the room
+        // behind it and keep the depth unchanged for geometry drawn later.
         glEnable(GL_BLEND);
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         glDepthMask(GL_FALSE);
-        // The shadow resolve subtracts direct light per pixel after this pass,
-        // so the pane must scale the direct light behind it by (1 - alpha)
-        // like the color; the packed depth stays the surface behind.
+        // The shadow pass subtracts direct light per pixel after this pass, so
+        // the pane must scale the direct light behind it by (1 - alpha), like the
+        // colour. The packed depth stays that of the surface behind.
         if (g_target_has_mrt) {
             static constexpr GLenum glass_outputs[] = {GL_COLOR_ATTACHMENT0, GL_NONE, GL_COLOR_ATTACHMENT2};
             glDrawBuffers(3, glass_outputs);
         }
     }
     if (lit) {
-        // Unbound while capturing, so the cube is never sampled while written.
+        // Unbound while capturing, so the cube is never read while being written.
         const auto& environment = environment_cubemap();
         glActiveTexture(GL_TEXTURE4);
         glBindTexture(GL_TEXTURE_CUBE_MAP, environment.capturing ? 0U : environment.texture);
@@ -2030,7 +1971,7 @@ void draw_gpu_mesh_batch(const std::vector<GpuMeshDraw>& draws, GpuSurface surfa
         glBindTexture(GL_TEXTURE_2D_ARRAY, overlay.material);
     }
     const auto default_texture = rlGetTextureIdDefault();
-    // Parts only rebind what differs from the previous part.
+    // Each part only rebinds what is different from the part before.
     GLuint bound_texture = ~0U;
     GLuint bound_material = ~0U;
     Color bound_color{0, 0, 0, 0};
@@ -2128,7 +2069,7 @@ struct SkyShader {
 SkyShader& sky_shader() {
     static SkyShader cache;
     if (!cache.loaded) {
-        const char* vs = MAPED_GLSL_VERSION R"glsl(
+        const char* vs = PAFTA_GLSL_VERSION R"glsl(
 uniform mat4 modelviewprojectionmatrix;
 uniform vec3 lightdirection;
 layout(location=0) in vec3 position_in;
@@ -2141,7 +2082,7 @@ void main() {
     gl_Position=modelviewprojectionmatrix*vec4(position_in,1.0);
 }
 )glsl";
-        const char* fs = MAPED_GLSL_VERSION R"glsl(
+        const char* fs = PAFTA_GLSL_VERSION R"glsl(
 out vec4 finalColor;
 in vec3 lightvec;
 in vec3 viewvec;
@@ -2230,8 +2171,8 @@ void main() {
 }
 
 // Draws the atmosphere over a full-screen quad whose corners look along `rays`
-// (bottom-left, bottom-right, top-right, top-left). depth_texture holds the
-// packed scene distance; a white texel means open sky.
+// (bottom-left, bottom-right, top-right, top-left). depth_texture holds the packed
+// scene distance; a white texel means open sky.
 void draw_sky_rays(const std::array<Vector3, 4>& rays, Vector3 camera_position, Vector2 inverse_resolution,
                    GLuint depth_texture) {
     auto& sky = sky_shader();
@@ -2322,16 +2263,16 @@ void draw_game_sky(const Camera3D& camera, Vector2 viewport_size, Texture2D dept
 namespace {
 
 // RenderLandscapeCubemapAndBlurCapture @93e60: a 512 cube around the camera.
-// Each face is cleared to 0.125 grey, filled with the atmosphere
-// (_renderframeatmospherecubemap @122ca0, every texel treated as open sky),
-// then the landscape is drawn at half light with the grey-city color map.
-// _blurcubemap @1b6a0 then fills levels 1..9 (256 down to 1), each blurred from
-// the level above with the stock cubemap blur shader.
+// Each face is cleared to 0.125 grey and filled with the atmosphere
+// (_renderframeatmospherecubemap @122ca0, treating every texel as open sky), and
+// then the landscape is drawn at half light with the grey-city colour map.
+// _blurcubemap @1b6a0 then fills levels 1..9 (256 down to 1), each one a blur of
+// the level above, with the original cubemap blur shader.
 constexpr int kEnvironmentSize = 512;
 constexpr int kEnvironmentLevels = 10;
 
-// Direction through NDC (x, y) of a cube face, faces +X -X +Y -Y +Z -Z, in the
-// GL cube-map convention (so the capture samples back with true directions).
+// The direction through NDC (x, y) of a cube face (faces +X -X +Y -Y +Z -Z), using
+// GL's cube-map layout, so the capture is read back with true directions.
 Vector3 cube_face_direction(int face, float x, float y) {
     switch (face) {
         case 0: return {1.0F, -y, -x};
@@ -2353,9 +2294,9 @@ struct CubemapBlurShader {
 CubemapBlurShader& cubemap_blur_shader() {
     static CubemapBlurShader cache = [] {
         CubemapBlurShader value;
-        // Stock cubemap_blur shaders, minus the game's y/z axis flip (this cube
-        // is captured with GL cube-map directions).
-        value.shader = LoadShaderFromMemory(MAPED_GLSL_VERSION R"glsl(
+        // The original cubemap_blur shaders, without the game's y/z axis flip (this
+        // cube is captured with GL cube-map directions).
+        value.shader = LoadShaderFromMemory(PAFTA_GLSL_VERSION R"glsl(
 layout(location=0) in vec3 position_in;
 layout(location=1) in vec3 viewvec_in;
 layout(location=2) in vec3 upvec_in;
@@ -2366,7 +2307,7 @@ void main() {
     upvec = upvec_in;
     gl_Position = vec4(position_in, 1.0);
 }
-)glsl", MAPED_GLSL_VERSION R"glsl(
+)glsl", PAFTA_GLSL_VERSION R"glsl(
 uniform samplerCube tex_color;
 uniform float texlod;
 in vec3 viewvec;
@@ -2416,7 +2357,7 @@ void create_environment_cubemap(EnvironmentCubemap& cubemap) {
     glGenTextures(1, &cubemap.texture);
     glBindTexture(GL_TEXTURE_CUBE_MAP, cubemap.texture);
 #ifdef __EMSCRIPTEN__
-    // Half floats need EXT_color_buffer_float (web_hdr_targets); else 8-bit.
+    // Half floats need EXT_color_buffer_float (web_hdr_targets); otherwise 8-bit.
     const GLenum internal_format = web_hdr_targets() ? GL_RGBA16F : GL_RGBA8;
     const GLenum type = web_hdr_targets() ? GL_HALF_FLOAT : GL_UNSIGNED_BYTE;
 #else
@@ -2452,23 +2393,28 @@ void create_environment_cubemap(EnvironmentCubemap& cubemap) {
 
 } // namespace
 
-void update_environment_cubemap(const GpuMesh* terrain, Vector3 camera_position, bool follow_camera) {
+void invalidate_environment_cubemap() {
+    environment_cubemap().valid = false;
+}
+
+void update_environment_cubemap(const GpuMesh* terrain, std::uint64_t terrain_fingerprint,
+                               Vector3 camera_position, bool follow_camera) {
     auto& cubemap = environment_cubemap();
     const auto light = Vector3Normalize(game_light_direction());
-    const auto terrain_indices = terrain != nullptr ? terrain->index_count : 0U;
-    // ponytail: recaptured only when the sun, the terrain, or the camera (by more
-    // than 16 units) changes; the game recaptures more eagerly.
+    const bool has_terrain = terrain != nullptr;
+    // Capturing six faces and their blurred levels is slow. Reuse them until the
+    // scene inputs change, or until live reflections have moved 16 units.
     if (cubemap.valid && (!follow_camera || Vector3Distance(cubemap.camera, camera_position) < 16.0F) &&
         Vector3LengthSqr(Vector3Subtract(cubemap.light, light)) < 1e-10F &&
-        cubemap.terrain == terrain && cubemap.terrain_indices == terrain_indices) {
+        cubemap.has_terrain == has_terrain && cubemap.terrain_fingerprint == terrain_fingerprint) {
         return;
     }
     rlDrawRenderBatchActive();
     if (cubemap.texture == 0U) create_environment_cubemap(cubemap);
     cubemap.camera = camera_position;
     cubemap.light = light;
-    cubemap.terrain = terrain;
-    cubemap.terrain_indices = terrain_indices;
+    cubemap.has_terrain = has_terrain;
+    cubemap.terrain_fingerprint = terrain_fingerprint;
     cubemap.valid = true;
     cubemap.capturing = true;
 
@@ -2493,7 +2439,7 @@ void update_environment_cubemap(const GpuMesh* terrain, Vector3 camera_position,
         glDepthMask(GL_TRUE);
         glClearColor(0.125F, 0.125F, 0.125F, 0.0F);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        // Atmosphere: blending off, every texel open sky (white packed depth).
+        // Atmosphere: no blending, every texel open sky (white packed depth).
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
         glDepthMask(GL_FALSE);
         glDisable(GL_DEPTH_TEST);
@@ -2507,7 +2453,7 @@ void update_environment_cubemap(const GpuMesh* terrain, Vector3 camera_position,
         glDepthMask(GL_TRUE);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         if (terrain != nullptr && !terrain->empty()) {
-            // View rows: face right, face up, minus forward.
+            // View rows: the face's right, the face's up, minus forward.
             const auto forward = cube_face_direction(face, 0.0F, 0.0F);
             const auto right = Vector3Subtract(cube_face_direction(face, 1.0F, 0.0F), forward);
             const auto up = Vector3Subtract(cube_face_direction(face, 0.0F, 1.0F), forward);
@@ -2540,7 +2486,7 @@ void update_environment_cubemap(const GpuMesh* terrain, Vector3 camera_position,
     glBindVertexArray(blur.vao);
     glBindBuffer(GL_ARRAY_BUFFER, blur.vbo);
     for (int level = 1; level < kEnvironmentLevels; ++level) {
-        // Sample only the level above while writing this one.
+        // Only read the level above while writing this one.
         glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_BASE_LEVEL, level - 1);
         glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, level - 1);
         glUniform1f(blur.lod_loc, static_cast<float>(level - 1));
@@ -2598,7 +2544,7 @@ MaskOutlineShader& mask_outline_shader() {
     static MaskOutlineShader cache;
     if (!cache.loaded) {
         const char* fs =
-            MAPED_GLSL_VERSION
+            PAFTA_GLSL_VERSION
             "in vec2 fragTexCoord;\n"
             "in vec4 fragColor;\n"
             "out vec4 finalColor;\n"
@@ -2630,18 +2576,17 @@ void draw_city_building_mask(GpuBuildingRenderModel& model, const SbcBuilding& p
     draw_gpu_mesh_instances(model.mesh, {city_placement_matrix(placement)}, GpuSurface::Mask);
 }
 
-// Fills the footprint of one road into the active mask target as solid geometry,
-// so draw_outline_from_mask traces a silhouette outline around it (the same look
-// city buildings get). Drawn at the road's terrain heights.
+// Draws the footprint of one road into the active mask as solid geometry, so
+// draw_outline_from_mask traces an outline around it (the same look city buildings
+// get). Drawn at the road's terrain heights.
 void draw_city_road_mask(const EditorProject& project, const MapScene& scene, std::size_t street_index) {
     if (!project.city || street_index >= project.city->data.streets.size()) {
         return;
     }
-    // Fill the street's actual road tiles (the asphalt you clicked) into the mask,
-    // so the silhouette outline traces the real geometry, not an abstract ribbon.
+    // Draw the street's real road tiles (the asphalt you clicked) into the mask, so the
+    // outline follows the real shape, not a simplified strip.
     const auto unit = scene.unit_size > 0.0F ? scene.unit_size : 4.0F;
     rlDisableBackfaceCulling();
-    bool drew = false;
     for (const auto& tile : scene.city_tiles) {
         if (tile.kind != CityTileKind::Road || tile.street_index < 0 ||
             static_cast<std::size_t>(tile.street_index) != street_index) {
@@ -2655,10 +2600,7 @@ void draw_city_road_mask(const EditorProject& project, const MapScene& scene, st
         const float cx = x0 + unit * 0.5F;
         const float cz = z0 + unit * 0.5F;
         const float lift = unit * 0.04F;
-        // Match the real tilted asphalt top: each corner gets the tile's slope so
-        // the mask sits flush with the rendered road (a flat quad floated above the
-        // up-slope edge and below the down-slope edge, so the outline only traced
-        // part of it).
+        // Follow the road's slope so the outline covers the whole visible surface.
         const auto corner = [&](float px, float pz) {
             const float dy = tile.slope_x * ((px - cx) / unit) + tile.slope_z * ((pz - cz) / unit);
             return Vector3{px, top + dy + lift, pz};
@@ -2671,56 +2613,43 @@ void draw_city_road_mask(const EditorProject& project, const MapScene& scene, st
         DrawTriangle3D(p0, p2, p3, WHITE);
         DrawTriangle3D(p2, p1, p0, WHITE); // back face too, so it shows from any angle
         DrawTriangle3D(p3, p2, p0, WHITE);
-        drew = true;
     }
     rlEnableBackfaceCulling();
-    (void)drew;
 }
 
-// Fills one building cell (a cube at its anchored centre) into the active mask
-// target, so the cell gets the same silhouette-outline hover/selection look.
 namespace {
 
-// Triangles of `buffer` whose centroid satisfies `inside`, flattened to three
+// The triangles of `buffer` whose centre passes `inside`, flattened to three
 // vertices each. Cached per highlight key until the buffer changes, so a hover
-// outline does not rescan a city-sized mesh every frame.
-const std::vector<Vector3>& mask_triangles(std::uint64_t key, const BuildingRenderBuffer& buffer,
-                                           const std::function<bool(Vec3)>& inside) {
-    struct Entry {
-        std::uint64_t key{};
-        const RenderBufferVertex* vertices{};
-        std::size_t triangle_count{};
-        std::vector<Vector3> points;
-    };
-    static std::array<Entry, 8> entries;
-    static std::size_t next = 0;
-    for (auto& entry : entries) {
-        if (entry.key == key && entry.vertices == buffer.vertices.data() && entry.triangle_count == buffer.triangles.size()) {
-            return entry.points;
-        }
+// outline doesn't search a city-sized mesh every frame.
+const std::vector<Vec3>& mask_triangles(std::uint64_t key, const BuildingRenderBuffer& buffer,
+                                      const std::function<bool(Vec3)>& inside) {
+    auto& entries = buffer.mask_cache;
+    for (const auto& entry : entries) {
+        if (entry.key == key) return entry.points;
     }
-    auto& entry = entries[next++ % entries.size()];
-    entry = {key, buffer.vertices.data(), buffer.triangles.size(), {}};
+    if (entries.size() == 8U) entries.erase(entries.begin());
+    auto& entry = entries.emplace_back(RenderBufferMask{key, {}});
     for (const auto& tri : buffer.triangles) {
         const auto& a = buffer.vertices[tri.indices[0]].position;
         const auto& b = buffer.vertices[tri.indices[1]].position;
         const auto& c = buffer.vertices[tri.indices[2]].position;
         if (!inside({(a.x + b.x + c.x) / 3.0F, (a.y + b.y + c.y) / 3.0F, (a.z + b.z + c.z) / 3.0F})) continue;
-        entry.points.insert(entry.points.end(), {Vector3{a.x, a.y, a.z}, Vector3{b.x, b.y, b.z}, Vector3{c.x, c.y, c.z}});
+        entry.points.insert(entry.points.end(), {a, b, c});
     }
     return entry.points;
 }
 
-// Fills cached mask triangles, both windings, lifted by `offset`. The batch is
-// flushed before culling comes back on, since DrawTriangle3D draws later.
-bool draw_mask_triangles(const std::vector<Vector3>& points, Vector3 offset) {
+// Draws the cached mask triangles, both windings, raised by `offset`. The batch is
+// flushed before culling is turned back on, because DrawTriangle3D draws later.
+bool draw_mask_triangles(const std::vector<Vec3>& points, Vector3 offset) {
     if (points.empty()) return false;
     rlDrawRenderBatchActive();
     rlDisableBackfaceCulling();
     for (std::size_t i = 0; i + 2 < points.size(); i += 3) {
-        const auto a = Vector3Add(points[i], offset);
-        const auto b = Vector3Add(points[i + 1], offset);
-        const auto c = Vector3Add(points[i + 2], offset);
+        const auto a = Vector3Add(to_raylib(points[i]), offset);
+        const auto b = Vector3Add(to_raylib(points[i + 1]), offset);
+        const auto c = Vector3Add(to_raylib(points[i + 2]), offset);
         DrawTriangle3D(a, b, c, WHITE);
         DrawTriangle3D(c, b, a, WHITE);
     }
@@ -2743,9 +2672,9 @@ std::uint64_t mask_key(std::uint64_t kind, std::int64_t a, std::int64_t b = 0, s
 
 } // namespace
 
-// One building cell's rendered faces (the edit-view mesh, anchored coords) into
-// the active mask, so the outline follows the block's real shape; an empty
-// cell falls back to its cube.
+// One building cell's drawn faces (the edit view's mesh, in anchored coordinates)
+// into the active mask, so the outline follows the block's real shape. An empty
+// cell uses its cube instead.
 void draw_building_cell_mask(const BuildingRenderBuffer& buffer, const SbbBuilding& building, const SbbCell& cell) {
     constexpr auto unit_size = 4.0F;
     const auto x0 = (static_cast<float>(cell.x) - static_cast<float>(building.anchor_x)) * unit_size;
@@ -2758,8 +2687,8 @@ void draw_building_cell_mask(const BuildingRenderBuffer& buffer, const SbbBuildi
     }
 }
 
-// Tints the rendered triangles of one cell face (paint / hover target), both
-// windings, drawn over the lit mesh.
+// Tints the drawn triangles of one cell face (the paint or hover target), both
+// windings, over the lit mesh.
 void draw_building_face_highlight(const BuildingRenderBuffer& buffer, std::size_t cell, std::uint32_t slot) {
     rlDrawRenderBatchActive();
     rlDisableBackfaceCulling();
@@ -2776,8 +2705,8 @@ void draw_building_face_highlight(const BuildingRenderBuffer& buffer, std::size_
     rlEnableBackfaceCulling();
 }
 
-// One piece voxel's rendered faces into the active mask. Piece geometry sits in
-// world space and is drawn 0.25 above its cell (draw_city_piece_voxels).
+// One piece voxel's drawn faces into the active mask. Piece geometry is in world
+// space and is drawn 0.25 above its cell (draw_city_piece_voxels).
 void draw_city_piece_mask(const EditorProject& project, CityGridPoint cell) {
     constexpr auto unit_size = 4.0F;
     const auto x0 = static_cast<float>(cell.x) * unit_size;
@@ -2790,7 +2719,7 @@ void draw_city_piece_mask(const EditorProject& project, CityGridPoint cell) {
     }
 }
 
-// A road junction's road and curb tiles (those it placed) into the active mask.
+// A road junction's road and curb tiles (the ones it placed) into the active mask.
 void draw_city_intersection_mask(const MapScene& scene, std::size_t intersection) {
     std::unordered_set<std::uint64_t> cells;
     const auto cell_key = [](std::int32_t x, std::int32_t y, std::int32_t z) {
@@ -2804,7 +2733,7 @@ void draw_city_intersection_mask(const MapScene& scene, std::size_t intersection
                 if (tile.intersection_index == static_cast<std::int32_t>(intersection)) cells.insert(cell_key(tile.x, tile.y, tile.z));
             }
         }
-        // Tile cells span y*4+0.25 .. y*4+4.25.
+        // Tile cells run from y*4+0.25 to y*4+4.25.
         return cells.contains(cell_key(static_cast<std::int32_t>(std::floor(p.x / 4.0F)),
             static_cast<std::int32_t>(std::floor((p.y - 0.25F) / 4.0F)), static_cast<std::int32_t>(std::floor(p.z / 4.0F))));
     });
@@ -2853,7 +2782,7 @@ void draw_gpu_building_model(
 ) {
     const std::vector<Matrix> transform{building_transform_matrix(origin, rotation)};
     set_game_render_depth_output(true);
-    // Near-LOD meshes: their window parts are room glass, drawn see-through last.
+    // Near-view meshes: their window parts are room glass, drawn see-through last.
     draw_gpu_mesh_batch({{&model.mesh, transform}}, surface, room_glass ? GpuPartFilter::Opaque : GpuPartFilter::All);
     set_game_render_depth_output(false);
     if (room_glass) draw_gpu_mesh_batch({{&model.mesh, transform}}, surface, GpuPartFilter::Glass);
@@ -2876,7 +2805,7 @@ void draw_gpu_building_model(
 
 namespace {
 
-// View the work grids size their lines for (set_grid_view).
+// The view the work grids size their lines for (set_grid_view).
 struct GridView {
     Vector3 position{};
     float pixels_per_radian{800.0F};
@@ -2888,10 +2817,10 @@ struct GridLineStyle {
     float pixels;  // on-screen width
 };
 
-// A flat work grid: every line is a quad lying in the plane, as wide on screen
-// at any distance, split per cell so its width and fade follow the view.
-// Drawn twice: normally where nothing covers it, and faint behind geometry so
-// it still reads through walls without swamping them.
+// A flat work grid. Every line is a quad lying in the plane, the same width on
+// screen at any distance, split per cell so its width and fade follow the view.
+// It is drawn twice: normally where nothing covers it, and faintly behind geometry,
+// so it still shows through walls without drowning them out.
 struct WorkGrid {
     float y{};
     float unit{4.0F};
@@ -2952,8 +2881,8 @@ void emit_work_grid(const WorkGrid& grid, float alpha_scale) {
     rlEnd();
 }
 
-// Draws the grid over the scene without writing depth: in front of geometry at
-// full strength, behind it at a fifth.
+// Draws the grid over the scene without writing depth: at full strength in front of
+// geometry, and at a fifth behind it.
 void draw_work_grid(const WorkGrid& grid, const std::function<void(float)>& extras = {}) {
     rlDrawRenderBatchActive();
     rlDisableBackfaceCulling();
@@ -2998,13 +2927,13 @@ void draw_sbb_scene_for_app(
     const auto floor = std::min(guide_floor, building.size_z > 0U ? building.size_z - 1U : 0U);
     const auto grid_y = (static_cast<float>(floor) - static_cast<float>(building.anchor_y)) * unit_size + 0.02F;
 
-    // The runtime building mesh is anchor-relative, like the picker. It is the
-    // game's near LOD (rooms, doorways, glass), as seen standing beside it.
+    // The building mesh is relative to the anchor, like the picker. It is the game's
+    // near view (rooms, doorways, glass), as if you were standing next to it.
     draw_gpu_building_model(model, {}, 0, false, GpuSurface::Building, true);
 
-    // editor.exe's fixed 64-cell work grid (65 lines per axis) at the guide
-    // floor. Every fourth line groups blocks; the anchor's lines are the X (red)
-    // and Z (blue) axes; the authored footprint is outlined in amber.
+    // editor.exe's fixed 64-cell work grid (65 lines per axis) at the guide floor.
+    // Every fourth line groups blocks. The anchor's lines are the X (red) and Z (blue)
+    // axes, and the saved footprint is outlined in amber.
     WorkGrid grid;
     grid.unit = unit_size;
     grid.y = grid_y;
@@ -3012,7 +2941,7 @@ void draw_sbb_scene_for_app(
     grid.x1 = static_cast<std::int32_t>(grid_cells) - static_cast<std::int32_t>(building.anchor_x);
     grid.z0 = -static_cast<std::int32_t>(building.anchor_z);
     grid.z1 = static_cast<std::int32_t>(grid_cells) - static_cast<std::int32_t>(building.anchor_z);
-    // Fade the far rows so the distant lines do not crowd into a solid sheet.
+    // Fade the far rows so the distant lines don't blur into a solid sheet.
     grid.fade_center = {(static_cast<float>(building.size_x) * 0.5F - static_cast<float>(building.anchor_x)) * unit_size,
                         (static_cast<float>(building.size_y) * 0.5F - static_cast<float>(building.anchor_z)) * unit_size};
     grid.fade_radius = (std::max(building.size_x, building.size_y) * 0.5F + 20.0F) * unit_size;
@@ -3040,9 +2969,9 @@ void draw_sbb_scene_for_app(
     (void)selected;
 }
 
-// Item sets as the game poses them (setup_item_sets / entry_pose): each item
-// stands from the cell's floor centre, turned with the set by quarter turns
-// about Y. Sets whose items have no data/item mesh keep a gold diamond guide.
+// Item sets placed the way the game places them (setup_item_sets / entry_pose):
+// each item stands on the centre of the cell's floor, turned with the set in quarter
+// turns around Y. Sets whose items have no data/item mesh keep a gold diamond marker.
 void draw_building_item_set_guides(const EditorProject& project, const SbbBuilding& building, std::optional<std::uint32_t> floor) {
     constexpr float unit = 4.0F;
     constexpr Color color{250, 196, 75, 255};
@@ -3076,7 +3005,7 @@ void draw_building_item_set_guides(const EditorProject& project, const SbbBuildi
                 for (const auto& face : mesh->second.faces) {
                     if (face.size() < 3) continue;
                     const auto a = world(face[0]), b = world(face[1]), d = world(face[2]);
-                    // Untextured: shade by how much the face points up.
+                    // No texture: shade by how much the face points up.
                     const auto n = Vector3Normalize(Vector3CrossProduct(Vector3Subtract(b, a), Vector3Subtract(d, a)));
                     const auto light = static_cast<unsigned char>(120.0F + 100.0F * std::fabs(n.y) + 30.0F * std::fabs(n.x));
                     rlColor4ub(light, light, static_cast<unsigned char>(light * 0.9F), 255);
@@ -3108,18 +3037,23 @@ void invalidate_building_thumbnail(EditorProject& project, std::size_t index) {
     }
 }
 
-// Rebuilds and re-uploads just one building's city mesh, instead of dirtying the
-// whole project (which reloads every building). Used when a single building
+// Rebuilds and uploads just one building's city mesh, instead of marking the whole
+// project as changed (which reloads every building). Used when one building
 // template is edited in the Buildings tab.
 void rebuild_single_building_render(EditorProject& project, std::size_t index) {
     if (index >= project.buildings.size()) {
         return;
     }
+    // Loading owns older snapshots. Rebuild the current assets after it finishes, so a
+    // queued upload can't replace this edit with old geometry.
+    if (project.render_build_in_progress || !project.pending_gpu_upload_indices.empty()) {
+        project.render_buffers_dirty = true;
+        return;
+    }
     if (project.building_render_buffers.size() != project.buildings.size()) {
-        // A new building uploads here, outside the queue; count it as uploaded so
-        // the loading overlay (uploaded vs. buffer count) does not wait forever.
-        if (!project.render_build_in_progress && project.pending_gpu_upload_indices.empty() &&
-            project.pending_gpu_upload_index >= project.building_render_buffers.size()) {
+        // A new building uploads here, outside the queue. Count it as uploaded so the
+        // loading screen (uploaded vs. buffer count) doesn't wait forever.
+        if (project.pending_gpu_upload_index >= project.building_render_buffers.size()) {
             project.pending_gpu_upload_index = project.buildings.size();
         }
         project.building_render_buffers.resize(project.buildings.size());
@@ -3152,12 +3086,12 @@ const RenderTexture2D* building_thumbnail(EditorProject& project, std::size_t in
     }
     --project.thumbnail_budget;
 
-    constexpr int kSize = 192; // render larger than displayed for crisp downscale.
+    constexpr int kSize = 192; // draw bigger than shown, so it stays sharp when shrunk.
     constexpr float unit_size = 4.0F;
     auto& building = project.buildings[index].data;
 
-    // Reuse the city GPU model when it is already uploaded; only fall back to a
-    // fresh CPU build for buildings whose render model is not ready yet.
+    // Reuse the city GPU model if it is already uploaded. Only build a fresh copy on
+    // the CPU for buildings whose render model isn't ready yet.
     GpuBuildingRenderModel local_model;
     GpuBuildingRenderModel* model_ptr = nullptr;
     if (index < project.building_gpu_models.size() && !project.building_gpu_models[index].empty()) {
@@ -3176,7 +3110,7 @@ const RenderTexture2D* building_thumbnail(EditorProject& project, std::size_t in
         target = LoadRenderTexture(kSize, kSize);
     }
 
-    // Frame the whole building from a 3/4 view.
+    // Frame the whole building from a three-quarter view.
     const float sx = static_cast<float>(std::max(1U, building.size_x)) * unit_size;
     const float sy = static_cast<float>(std::max(1U, building.size_z)) * unit_size;
     const float sz = static_cast<float>(std::max(1U, building.size_y)) * unit_size;
@@ -3199,9 +3133,9 @@ const RenderTexture2D* building_thumbnail(EditorProject& project, std::size_t in
     BeginMode3D(cam);
     set_game_surface_camera(cam.position);
     rlEnableDepthTest();
-    // Building meshes are anchor-relative, like the picker and the city.
+    // Building meshes are relative to the anchor, like the picker and the city.
     draw_gpu_building_model(model, {}, 0, false);
-    // A subtle ground plane gives the building a sense of scale/orientation.
+    // A faint ground plane gives the building a sense of size and direction.
     DrawGrid(static_cast<int>(std::max(building.size_x, building.size_y)) + 2, unit_size);
     EndMode3D();
     end_game_texture_mode();
@@ -3269,8 +3203,8 @@ const RenderTexture2D* city_block_thumbnail(EditorProject& project, std::size_t 
 }
 
 const LoadedAsset<SbbBuilding>* find_building_asset(const EditorProject& project, std::string_view name) {
-    // Archive filenames are identities. A shared display name must never steal
-    // a placement from an exact asset-name match.
+    // Archive file names are identities. A shared display name must never take a
+    // placement away from an exact asset-name match.
     const auto key = lower_name(name);
     const auto exact = std::ranges::find_if(project.buildings, [&](const auto& asset) {
         return lower_name(asset.name) == key;
@@ -3278,7 +3212,7 @@ const LoadedAsset<SbbBuilding>* find_building_asset(const EditorProject& project
     if (exact != project.buildings.end()) return &*exact;
     const LoadedAsset<SbbBuilding>* alias = nullptr;
     for (const auto& asset : project.buildings) if (lower_name(asset.data.name) == key) {
-        if (alias != nullptr) return nullptr; // Ambiguous legacy display name.
+        if (alias != nullptr) return nullptr; // An old display name that matches more than one asset.
         alias = &asset;
     }
     return alias;
@@ -3286,8 +3220,8 @@ const LoadedAsset<SbbBuilding>* find_building_asset(const EditorProject& project
 
 const std::vector<std::optional<std::size_t>>& resolve_placement_asset_indices(EditorProject& project) {
     const auto building_count = project.city ? project.city->data.buildings.size() : 0U;
-    // Placements resolve by name, so the key is the placement names: any edit,
-    // undo, or template swap that renames or reorders placements changes it.
+    // Placements find their building by name, so the key is the placement names. Any
+    // edit, undo, or template swap that renames or reorders placements changes it.
     std::uint64_t fingerprint = 1469598103934665603ULL;
     if (project.city) {
         for (const auto& placement : project.city->data.buildings) {
@@ -3327,12 +3261,12 @@ const GpuMesh* building_near_mesh(EditorProject& project, std::size_t asset_inde
         project.building_near_models.erase(found);
     }
     if (auto job = project.building_near_jobs.find(asset_index); job != project.building_near_jobs.end()) {
-        // Deferred (the web build) runs in get() below.
+        // Deferred work (the web build) runs in get() below.
         if (job->second.buffers.wait_for(std::chrono::seconds{0}) == std::future_status::timeout) return nullptr;
         auto built = job->second.buffers.get();
         const bool stale = job->second.far_vao != far_vao;
         project.building_near_jobs.erase(job);
-        // An edit replaced the shell while this built; start over below.
+        // An edit replaced the shell while this was building; start again below.
         if (!stale) {
             const auto& building = project.buildings[asset_index].data;
             EditorProject::NearBuildingModel model;
@@ -3357,7 +3291,7 @@ const GpuMesh* building_near_mesh(EditorProject& project, std::size_t asset_inde
         std::launch::async,
 #endif
         [building = project.buildings[asset_index].data, blocks = block_meshes(project), templates = buildblock_templates(project)] {
-            MAPED_PROFILE_THREAD("Near building build");
+            PAFTA_PROFILE_THREAD("Near building build");
             auto buffer = build_city_building_full_render_buffer(building, blocks, templates, BuildingLod::Near);
             BuildingRenderBuffer rooms;
             rooms.vertices = buffer.vertices;
@@ -3366,7 +3300,8 @@ const GpuMesh* building_near_mesh(EditorProject& project, std::size_t asset_inde
                 triangle.interior = false;
                 rooms.triangles.push_back(triangle);
             }
-            EditorProject::NearBuildingBuffers built{std::move(buffer)};
+            EditorProject::NearBuildingBuffers built;
+            built.mesh = std::move(buffer);
             if (!rooms.triangles.empty()) {
                 bake_shadow_volume(rooms);
                 built.room_shadow_vertices = pack_shadow_vertices(rooms.shadow_vertices);
@@ -3387,7 +3322,7 @@ void refresh_placement_override_models(EditorProject& project) {
         project.placement_override_models.clear();
         return;
     }
-    // Wait for the template models to finish loading; overrides copy them.
+    // Wait for the template models to finish loading, because overrides copy them.
     if (project.render_build_in_progress || !project.pending_gpu_upload_indices.empty()) return;
     const auto& asset_indices = resolve_placement_asset_indices(project);
     std::uint64_t fingerprint = 1469598103934665603ULL;
@@ -3399,11 +3334,13 @@ void refresh_placement_override_models(EditorProject& project) {
         mix(static_cast<std::uint32_t>(placement.z));
         mix(static_cast<std::uint32_t>(placement.rotation));
     }
-    // A re-uploaded template model gets a new vao.
+    // A template model that was uploaded again gets a new vao.
     for (const auto& model : project.building_gpu_models) mix(model.mesh.vao);
-    // Cells the game's world storage cannot hold (GameWorldFit) are hidden too.
+    // Cells the game's world storage can't hold (GameWorldFit) are hidden too.
     const auto* dropped = project.city_scene_cache_valid ? &project.city_scene_cache.world_fit.building_cells : nullptr;
-    if (dropped != nullptr) for (const auto& cells : *dropped) mix(cells.size());
+    // The scene key changes even when different dropped cells have the same count;
+    // counts alone can't tell this geometry apart.
+    if (dropped != nullptr) mix(project.city_scene_cache_fingerprint);
     if (fingerprint == project.placement_override_fingerprint) return;
     project.placement_override_fingerprint = fingerprint;
     project.placement_override_models.clear();
@@ -3450,10 +3387,10 @@ void draw_city_shadow_volumes(EditorProject& project, const Camera3D& camera, fl
     glEnable(GL_DEPTH_TEST);
     glStencilOpSeparate(GL_FRONT, GL_KEEP, GL_DECR_WRAP, GL_KEEP);
     glStencilOpSeparate(GL_BACK, GL_KEEP, GL_INCR_WRAP, GL_KEEP);
-    // A face turned from the sun keeps its front cap on its own surface, where
-    // equal depths pass or fail at random: streaks on walls the sun grazes. Push
-    // the volumes a little deeper (slope-scaled) so that cap always fails and
-    // counts the same as the back cap; the face's lighting already darkens it.
+    // A face turned away from the sun keeps its front cap on its own surface, where
+    // equal depths pass or fail at random, which shows as streaks on walls the sun
+    // grazes. Push the volumes a little deeper (scaled by slope) so that cap always fails
+    // and counts the same as the back cap. The face's own lighting already darkens it.
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(1.0F, 4.0F);
 
@@ -3461,8 +3398,8 @@ void draw_city_shadow_volumes(EditorProject& project, const Camera3D& camera, fl
     const auto sector_extrusion = [&](std::size_t sector) {
         return Vector3Scale(light, -static_cast<float>(sector + 1U) * 32.0F / std::max(light.y, 0.125F));
     };
-    // View frustum planes (the 3D pass's matrices are current): a volume is
-    // skipped when its building swept along the extrusion is outside a plane.
+    // View frustum planes (the 3D pass's matrices are current). A volume is skipped when
+    // its building, stretched along the shadow direction, is outside a plane.
     std::array<std::array<float, 4>, 6> planes{};
     {
         const auto m = MatrixMultiply(rlGetMatrixModelview(), rlGetMatrixProjection());
@@ -3485,8 +3422,8 @@ void draw_city_shadow_volumes(EditorProject& project, const Camera3D& camera, fl
         }
         return true;
     };
-    // Group placements by (asset, top sector): each group is one instanced draw
-    // of the asset's volume with that sector's extrusion.
+    // Group placements by (asset, top sector). Each group is one instanced draw of the
+    // asset's volume with that sector's stretch length.
     std::unordered_map<std::size_t, std::vector<Matrix>> groups;
     for (std::size_t placement_index = 0; placement_index < project.city->data.buildings.size(); ++placement_index) {
         const auto& placement = project.city->data.buildings[placement_index];
@@ -3496,14 +3433,14 @@ void draw_city_shadow_volumes(EditorProject& project, const Camera3D& camera, fl
         const auto origin = native_city_building_render_origin(placement, 4.0F);
         const auto camera_delta = Vector3Subtract({origin.x, origin.y, origin.z}, camera.position);
         if (max_distance > 0.0F && Vector3LengthSqr(camera_delta) > max_distance * max_distance) continue;
-        // Sectors extrude (sector y + 1) * 32 / max(light.y, 0.125): far enough
-        // to reach the ground from the sector's absolute height. A placement
-        // extrudes by its top sector.
+        // Sectors stretch (sector y + 1) * 32 / max(light.y, 0.125), which is far
+        // enough to reach the ground from the sector's height. A placement uses its
+        // top sector.
         const auto& building = project.buildings[asset_index].data;
         const auto top_cell = placement.y + static_cast<std::int32_t>(building.size_z) - static_cast<std::int32_t>(building.anchor_y);
         const auto top_sector = static_cast<std::size_t>(std::max(0, top_cell) / 8);
         {
-            // Bounding sphere of the building's cell box, swept along its extrusion.
+            // The bounding sphere of the building's cells, stretched along the shadow.
             const auto half = Vector3Scale({static_cast<float>(building.size_x + 1U), static_cast<float>(building.size_z),
                 static_cast<float>(building.size_y + 1U)}, 2.0F);
             const auto local_center = Vec3{half.x - static_cast<float>(building.anchor_x) * 4.0F,
@@ -3523,8 +3460,8 @@ void draw_city_shadow_volumes(EditorProject& project, const Camera3D& camera, fl
         set_shadow_volume_light(light, sector_extrusion(key % 64U));
         draw_gpu_mesh_instances(project.building_gpu_models[key / 64U].shadow_volume, transforms, GpuSurface::ShadowVolume);
     }
-    // Near sectors' rooms cast too, extruded a fixed 32 units (0x2787d4), not by
-    // sector height (RenderQueuedShadowVolumeAdjacencyPass @946d0).
+    // Rooms in near sectors cast shadows too, stretched a fixed 32 units (0x2787d4),
+    // not by sector height (RenderQueuedShadowVolumeAdjacencyPass @946d0).
     std::unordered_map<std::size_t, std::vector<Matrix>> rooms_by_asset;
     for (const auto& [asset_index, transform] : near_lod_placements()) rooms_by_asset[asset_index].push_back(transform);
     set_shadow_volume_light(light, Vector3Scale(light, -32.0F));
@@ -3533,14 +3470,14 @@ void draw_city_shadow_volumes(EditorProject& project, const Camera3D& camera, fl
             draw_gpu_mesh_instances(found->second.room_shadow_volume, transforms, GpuSurface::ShadowVolume);
         }
     }
-    // Road and curb tiles are world sectors too; one volume at the highest sector.
-    // Both world volumes draw only their chunks whose shadow can reach the view.
+    // Road and curb tiles are world sectors too: one volume at the highest sector.
+    // Both world volumes only draw the chunks whose shadow can reach the view.
     const auto road_extrusion = sector_extrusion(static_cast<std::size_t>(project.city_tile_gpu_model.shadow_top / 32.0F));
     set_shadow_volume_light(light, road_extrusion);
     g_shadow_cull = ShadowCull{planes, road_extrusion};
     draw_gpu_mesh_instances(project.city_tile_gpu_model.shadow_volume, {MatrixIdentity()}, GpuSurface::ShadowVolume);
-    // Native queued district meshes use a 32-unit extrusion (0x2787d4).
-    // Vertices are already world-space, so no translation is needed.
+    // The game's queued district meshes stretch 32 units (0x2787d4).
+    // Vertices are already in world space, so they don't need moving.
     set_shadow_volume_light(light, Vector3Scale(light, -32.0F));
     g_shadow_cull = ShadowCull{planes, Vector3Scale(light, -32.0F)};
     draw_gpu_mesh_instances(project.portal_gpu_model.shadow_volume, {MatrixIdentity()}, GpuSurface::ShadowVolume);
@@ -3562,10 +3499,10 @@ void composite_city_shadows(Vector2 viewport_size) {
         return;
     }
 
-    // Native shaders consume a screen-space shadow factor texture. Preserve
-    // the completed scene color in attachment 0 and write the stencil result
-    // into a separate factor attachment instead of painting black over the
-    // frame. The resolve shader samples this factor after all scene drawing.
+    // The game's shaders read a screen-space shadow factor texture. Keep the finished
+    // scene colour in attachment 0 and write the stencil result into a separate factor
+    // attachment, instead of painting black over the frame. The final pass reads this
+    // factor after all scene drawing.
     GLint scene_color = 0;
     glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
         GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &scene_color);
@@ -3615,12 +3552,12 @@ GpuBuildingRenderModel upload_portal_render_model(const BuildingRenderBuffer& bu
 }
 
 GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool textured, std::optional<std::size_t> selected_portal) {
-    MAPED_PROFILE_FUNCTION();
-    // References into the project's cached render inputs (built once at load, not
-    // per frame). Only the async-rebuild branch below copies them, and only when a
-    // rebuild is actually queued — the steady-state path touches no allocations.
-    // v10 district pieces index the game's absolute texture table (built-ins + CSX
-    // in archive order), not the editor's load order — see project_grid_texture_names.
+    PAFTA_PROFILE_FUNCTION();
+    // References into the project's cached render inputs (built once at load, not every
+    // frame). Only the background-rebuild branch below copies them, and only when a
+    // rebuild is actually queued, so the normal path allocates nothing. v10 district
+    // pieces point into the game's absolute texture table (built-ins, then CSX in
+    // archive order), not the editor's load order; see project_grid_texture_names.
     const auto& blocks = block_meshes(project);
     const auto& bb_templates = buildblock_templates(project);
     const auto& tex_names = project_grid_texture_names(project);
@@ -3628,11 +3565,11 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
         if (project.portal_preview_render_dirty ||
             project.portal_preview_render_textured != textured ||
             project.portal_preview_index != selected_portal) {
-            MAPED_PROFILE_BLOCK("portal_render_model rebuild selected portal preview");
+            PAFTA_PROFILE_BLOCK("portal_render_model rebuild selected portal preview");
             project.portal_preview_render_buffer = build_native_portal_render_buffer(project.city->data, blocks, selected_portal, bb_templates, tex_names, resolve_placement_buildings(project));
             project.portal_preview_gpu_model = upload_portal_render_model(project.portal_preview_render_buffer, project, textured);
             release_shadow_volume(project.portal_preview_render_buffer);
-            MAPED_PROFILE_END_BLOCK;
+            PAFTA_PROFILE_END_BLOCK;
             project.portal_preview_index = selected_portal;
             project.portal_preview_render_textured = textured;
             project.portal_preview_render_dirty = false;
@@ -3640,17 +3577,16 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
         return project.portal_preview_gpu_model;
     }
 
-    // Kick a worker to rebuild the (potentially large) all-portals buffer when the
-    // pieces changed; the previous mesh keeps rendering until the new one lands, so
-    // placing a piece never blocks the frame.
-    // Rebuilding every piece is heavy, so wait for a paint stroke to finish
-    // instead of rebuilding on each stamped cell.
+    // Start a worker to rebuild the (possibly large) buffer of all portals when the
+    // pieces change. The old mesh keeps drawing until the new one is ready, so placing a
+    // piece never holds up the frame. Rebuilding every piece is slow, so wait for a paint
+    // stroke to finish instead of rebuilding for every cell it stamps.
     if ((project.portal_render_dirty || project.portal_render_textured != textured) &&
         !project.portal_rebuild_in_progress && !project.defer_heavy_rebuilds) {
-        MAPED_PROFILE_BLOCK("portal_render_model queue async rebuild");
+        PAFTA_PROFILE_BLOCK("portal_render_model queue async rebuild");
 #ifdef __EMSCRIPTEN__
         // The browser build has no pthreads (std::async aborts there), so
-        // rebuild inline.
+        // rebuild right here.
         project.portal_render_dirty = false;
         project.portal_render_textured = textured;
         project.portal_render_buffer = build_native_portal_render_buffer(project.city->data, blocks, std::nullopt, bb_templates, tex_names, resolve_placement_buildings(project));
@@ -3671,8 +3607,8 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
         project.portal_render_textured = textured;
         project.portal_rebuild_future = std::async(std::launch::async, [map, blocks_copy, bb_copy, tex_copy,
                                                                         buildings_copy = std::move(buildings_copy)]() {
-            MAPED_PROFILE_THREAD("Portal render rebuild");
-            MAPED_PROFILE_BLOCK("build async portal render buffer");
+            PAFTA_PROFILE_THREAD("Portal render rebuild");
+            PAFTA_PROFILE_BLOCK("build async portal render buffer");
             std::vector<const SbbBuilding*> buildings;
             for (const auto& building : buildings_copy) buildings.push_back(building ? &*building : nullptr);
             auto buffer = build_native_portal_render_buffer(map, blocks_copy, std::nullopt, bb_copy, tex_copy, buildings);
@@ -3680,17 +3616,22 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
             return buffer;
         });
 #endif
-        MAPED_PROFILE_END_BLOCK;
+        PAFTA_PROFILE_END_BLOCK;
     }
     if (project.portal_rebuild_future.has_value() &&
         project.portal_rebuild_future->wait_for(std::chrono::milliseconds{0}) == std::future_status::ready) {
-        MAPED_PROFILE_BLOCK("portal_render_model adopt async rebuild");
-        project.portal_render_buffer = project.portal_rebuild_future->get();
+        PAFTA_PROFILE_BLOCK("portal_render_model adopt async rebuild");
+        auto buffer = project.portal_rebuild_future->get();
         project.portal_rebuild_future.reset();
         project.portal_rebuild_in_progress = false;
-        project.portal_gpu_model = upload_portal_render_model(project.portal_render_buffer, project, textured);
-        release_shadow_volume(project.portal_render_buffer);
-        MAPED_PROFILE_END_BLOCK;
+        // An edit or texture-mode change while the worker ran needs a new build.
+        // Keep the last accepted mesh until that one is ready.
+        if (!project.portal_render_dirty && project.portal_render_textured == textured) {
+            project.portal_render_buffer = std::move(buffer);
+            project.portal_gpu_model = upload_portal_render_model(project.portal_render_buffer, project, textured);
+            release_shadow_volume(project.portal_render_buffer);
+        }
+        PAFTA_PROFILE_END_BLOCK;
     }
     return project.portal_gpu_model;
 }
@@ -3736,30 +3677,30 @@ void draw_city_piece_voxels(
         return;
     }
     auto& model = portal_render_model(project, textured, isolate_selected ? selected_portal : std::nullopt);
-    // Native world cells sit 0.25 above their level; without the lift the piece
-    // ground cells are coplanar with their stamped terrain plots and z-fight.
+    // The game's world cells sit 0.25 above their level. Without that lift, the piece's
+    // ground cells sit in the same plane as their stamped ground and flicker against it.
     draw_gpu_building_model(model, {0.0F, 0.25F, 0.0F}, 0, draw_wires);
 
-    // Per-voxel selection/hover is outlined by the caller (draw_city_piece_mask).
+    // The caller outlines the selected or hovered voxel (draw_city_piece_mask).
 }
 
-// Glow box over a single piece voxel (one world grid cell), so pieces highlight
-// individually instead of as the whole 8x8x8 portal they are stored in.
+// A glow box over a single piece voxel (one world grid cell), so pieces highlight
+// one at a time instead of as the whole 8x8x8 portal they are stored in.
 
-// Untextured fallback colors for the road textures (asphalt2 / concrete).
+// Fallback colours without textures for the road textures (asphalt2 / concrete).
 Color city_tile_material_color(const BuildingRenderBuffer& buffer, std::uint32_t material) {
-    if (material < buffer.material_names.size() && buffer.material_names[material] == "city_curb_concrete") {
-        return {150, 154, 151, 255};
-    }
-    return {43, 47, 50, 255};
+    const auto name = material < buffer.material_names.size() ? std::string_view{buffer.material_names[material]} : "city_road_asphalt";
+    const auto rgb = procedural_material_rgb(name).value_or(*procedural_material_rgb("city_road_asphalt"));
+    return {rgb[0], rgb[1], rgb[2], 255};
 }
 
 Color terrain_material_color(const BuildingRenderBuffer&, std::uint32_t) {
-    return Color{0x40, 0x54, 0x26, 0xff};
+    const auto rgb = *procedural_material_rgb("city_terrain_grass");
+    return {rgb[0], rgb[1], rgb[2], 255};
 }
 
-// Road tiles are lit from their per-face vertex normals; terrain from smoothed
-// ones with the landscape shading. Both are world-space, drawn once.
+// Road tiles are lit by the vertex normals of each face, and the terrain by smoothed
+// normals with the landscape shading. Both are in world space and drawn once.
 void draw_uploaded_city_model(GpuBuildingRenderModel& model, bool terrain = false) {
     set_game_render_depth_output(true);
     draw_gpu_mesh_instances(model.mesh, {MatrixIdentity()}, terrain ? GpuSurface::Terrain : GpuSurface::World);
@@ -3771,8 +3712,8 @@ void unload_city_render_model(GpuBuildingRenderModel& model) {
 }
 
 GpuBuildingRenderModel upload_city_tile_model(const BuildingRenderBuffer& buffer, const EditorProject& project) {
-    // The game draws road textures untinted; the color only stands in for a
-    // texture the map folder lacks.
+    // The game draws road textures without tint. The colour only stands in for a texture
+    // the map folder doesn't have.
     auto model = upload_city_buffer_model(buffer, project, true, [&buffer](std::uint32_t material) {
         return city_tile_material_color(buffer, material);
     });
@@ -3784,10 +3725,10 @@ GpuBuildingRenderModel upload_city_tile_model(const BuildingRenderBuffer& buffer
 }
 
 // The landscape detail map (_landscape_generatetexture @d4360, tex_detail):
-// 1024x1024 grey noise, texel (x, y) from n = y*57 + x, n ^= n << 13,
-// v = ((n*n*15731 + 789221)^2 - 0x2df722f3) & 0x7fffffff (the game squares
-// where the textbook hash multiplies by n), grey = int(16 - v * 2^-26 + 192).
-// Its alpha (a cosine pattern) is unused by the landscape shader.
+// 1024x1024 grey noise. Texel (x, y) comes from n = y*57 + x, n ^= n << 13,
+// v = ((n*n*15731 + 789221)^2 - 0x2df722f3) & 0x7fffffff (the game squares where
+// the usual hash multiplies by n), grey = int(16 - v * 2^-26 + 192).
+// Its alpha (a cosine pattern) isn't used by the landscape shader.
 Texture2D landscape_detail_texture() {
     static const Texture2D texture = [] {
         constexpr int size = 1024;
@@ -3818,7 +3759,7 @@ GpuBuildingRenderModel upload_city_terrain_model(const BuildingRenderBuffer& buf
     auto model = upload_city_buffer_model(buffer, project, false, [&buffer](std::uint32_t material) {
         return terrain_material_color(buffer, material);
     });
-    // Landscape: generated detail map times the flat generated color map.
+    // Landscape: the generated detail map times the flat generated colour map.
     for (auto& part : model.mesh.parts) part.texture = landscape_detail_texture().id;
     return model;
 }
@@ -3826,7 +3767,7 @@ GpuBuildingRenderModel upload_city_terrain_model(const BuildingRenderBuffer& buf
 void draw_city_scene(
     EditorProject& project,
     const MapScene& scene,
-    const SbcStreet* selected_street,
+    std::optional<std::size_t> selected_street,
     bool render_roads,
     bool render_terrain) {
     if (g_gfx_debug_stats != nullptr) {
@@ -3851,7 +3792,8 @@ void draw_city_scene(
     }
 
     for (const auto& road : scene.roads) {
-        const auto selected = selected_street != nullptr && road.source == selected_street;
+        const auto selected = selected_street == road.source_index && project.city &&
+            road.source_index < project.city->data.streets.size() && road.source == project.city->data.streets[road.source_index];
         if (selected) {
             const auto lift = scene.unit_size * 1.1F;
             const auto pulse = 0.5F + 0.5F * static_cast<float>(std::sin(GetTime() * 4.0));
@@ -3908,7 +3850,7 @@ void draw_city_editor_overlay(const EditorProject&, const MapScene& scene) {
 
     for (const auto& intersection : scene.intersections) {
         auto position = to_raylib(intersection.position);
-        position.y = static_cast<float>(intersection.source->y) * scene.unit_size;
+        position.y = static_cast<float>(intersection.source.y) * scene.unit_size;
         const Vector3 size{marker_size, marker_size, marker_size};
         DrawCubeV(position, size, marker_fill);
         DrawCubeWiresV(position, size, marker_wire);
@@ -3925,14 +3867,14 @@ void draw_city_editor_overlay(const EditorProject&, const MapScene& scene) {
     }
 }
 
-// Street objects (World_InitResourcePoolsAndCatalogs @13dcd0): each type is a
-// set of centred boxes (BuildBlock_GenerateCubeVerticesFaces @3fb90) that
-// GeneratedModel_BuildFromStaticTableSet675f @5b840 turns straight into the
-// render model. Every face samples texel (0,0) except the -X face of the last two
-// boxes of types 1 and 4, which map the whole texture. Type 1 is the traffic
-// light (post, arm, two signal heads; arm along local -Z), type 4 the street
-// sign drawn with the light's transform. Box centres are relative to the post
-// centre, 3 above the pole's ground point.
+// Street objects (World_InitResourcePoolsAndCatalogs @13dcd0). Each type is a set
+// of boxes centred on their position (BuildBlock_GenerateCubeVerticesFaces @3fb90),
+// which GeneratedModel_BuildFromStaticTableSet675f @5b840 turns straight into the
+// render model. Every face samples texel (0,0), except the -X face of the last two
+// boxes of types 1 and 4, which use the whole texture. Type 1 is the traffic light
+// (post, arm, two signal heads; the arm points along local -Z), and type 4 is the
+// street sign, drawn with the light's transform. Box centres are relative to the
+// post's centre, 3 above where the pole meets the ground.
 struct StreetObjectBox {
     Vector3 center;
     Vector3 size;
@@ -3980,18 +3922,18 @@ BuildingRenderBuffer build_street_object_buffer(const std::array<StreetObjectBox
     return buffer;
 }
 
-// A street object's render mesh plus its shadow-volume faces pre-rotated for the
-// four pole directions (arm toward -Z, +X, +Z, -X), which placements then share
-// by translation. Models cast 64-unit volumes (RenderQueuedModelWithAdjacency
-// GeometryPass @124fe0, DAT_00278814).
+// A street object's render mesh plus its shadow-volume faces, already turned for
+// the four pole directions (arm toward -Z, +X, +Z, -X), which placements then share
+// by moving them. Models cast 64-unit volumes
+// (RenderQueuedModelWithAdjacencyGeometryPass @124fe0, DAT_00278814).
 struct StreetObjectModel {
     GpuMesh mesh;
     std::array<GpuBuildingRenderModel, 4> shadow;
 };
 
 float street_object_yaw(Vec3 arm_direction) {
-    // The arm points along -Z; raylib's +Y yaw is right-handed, so X is negated
-    // to aim it along arm_direction (the building handedness flip).
+    // The arm points along -Z. raylib's +Y turn is right-handed, so X is negated to
+    // point it along arm_direction (the same handedness flip as buildings).
     return std::atan2(-arm_direction.x, -arm_direction.z);
 }
 
@@ -4050,12 +3992,11 @@ void draw_street_object_shadow_volumes(const MapScene& scene, const Camera3D& ca
     }
 }
 
-// The red signal state (_generatetexture @9a8cc, texture DAT_43ebf074): 128x128
-// dark grey (32,32,32) with alpha 32 (a lit surface), and the lamp at columns
-// 40..87, rows 84..107 in red (255,32,32) with alpha 255 (drawn unlit). Rows run
-// bottom-up in v, so the lamp sits in the upper half of the head. The yellow and
-// green states move the lamp to rows 52..75 / 20..43; the editor shows the
-// map-load state.
+// The red signal (_generatetexture @9a8cc, texture DAT_43ebf074): 128x128 dark grey
+// (32,32,32) with alpha 32 (a lit surface), and the lamp at columns 40..87, rows
+// 84..107 in red (255,32,32) with alpha 255 (drawn without lighting). Rows go
+// bottom-up in v, so the lamp is in the top half of the head. Yellow and green move
+// the lamp to rows 52..75 and 20..43. The editor shows the state the map loads with.
 Texture2D traffic_light_signal_texture() {
     static const Texture2D texture = [] {
         Image image = GenImageColor(128, 128, Color{32, 32, 32, 32});
@@ -4073,18 +4014,18 @@ Texture2D traffic_light_signal_texture() {
 }
 
 // Street-name label (RenderStreetLabelTexture @9da10): 256x64, cleared to
-// (0, 0.25, 0, 0), the name drawn white in font 4 ("overpass", a 16x16 atlas of
-// 64px cells with CSV widths) at size 52, centred on (128, 32); alpha stays 0 so
-// the sign is lit. The font lives in the game install (<game>/font), two levels
-// above a map folder; without it the label falls back to raylib's font.
+// (0, 0.25, 0, 0), with the name in white in font 4 ("overpass", a 16x16 atlas of
+// 64px cells with widths in a CSV) at size 52, centred on (128, 32). Alpha stays 0
+// so the sign is lit. The font is in the game's install (<game>/font), two folders
+// above a map folder; without it the label uses raylib's font.
 struct GameFont {
     Image atlas{};
     std::array<float, 256> width{};  // advance per unit size: (base - 0.5) / cell height
     int cell{64};
 };
 
-// raw_widths: font flag 1 (fixedsys) keeps the CSV widths as they are; the
-// other fonts subtract half a pixel (Font_LoadAtlasMetricsAndCursorTexture).
+// raw_widths: fonts with flag 1 (fixedsys) use the CSV widths as they are; the
+// others subtract half a pixel (Font_LoadAtlasMetricsAndCursorTexture).
 std::optional<GameFont> load_game_font(const std::filesystem::path& map_root, const char* name, bool raw_widths = false) {
     for (const auto& dir : {map_root.parent_path().parent_path() / "font", map_root.parent_path() / "font"}) {
         std::ifstream csv(dir / (std::string(name) + ".csv"));
@@ -4116,7 +4057,7 @@ Texture2D render_street_label(const char* text, const GameFont* font) {
     constexpr int width = 256;
     constexpr int height = 64;
     constexpr float size = 52.0F;
-    // Glyph coverage in top-down screen space, composited over the green below.
+    // How much of each pixel the glyphs cover, top-down, laid over the green below.
     Image glyphs = GenImageColor(width, height, BLANK);
     if (font != nullptr) {
         float total = 0.0F;
@@ -4156,7 +4097,7 @@ Texture2D render_street_label(const char* text, const GameFont* font) {
         dst[i].b = static_cast<unsigned char>(255.0F * a);
     }
     UnloadImage(glyphs);
-    // The label was drawn with y down into a framebuffer, so v runs bottom-up.
+    // The label was drawn y-down into a framebuffer, so v runs bottom-up.
     ImageFlipVertical(&label);
     auto texture = LoadTextureFromImage(label);
     UnloadImage(label);
@@ -4217,11 +4158,11 @@ void draw_city_cursor(CityGridPoint point, float unit_size, CityTool tool) {
     DrawSphere(position, unit_size * 0.22F, color);
 }
 
-// Placement grid for the city tools, around the cursor. `center` is the cell
-// (piece, building) or grid point (road node) the tool will use; the plane
-// sits on world cells' floor at level*4 + 0.25, where roads, pieces, and
-// buildings rest. Lines every 8 cells mark district sectors; the lines through
-// the cursor are its X (red) and Z (blue) axes; `cell_fill` tints the cell.
+// The placement grid around the cursor for the city tools. `center` is the cell
+// (piece, building) or grid point (road node) the tool will use. The plane sits on
+// the floor of world cells at level*4 + 0.25, where roads, pieces, and buildings
+// rest. Lines every 8 cells mark district sectors, the lines through the cursor are
+// its X (red) and Z (blue) axes, and `cell_fill` tints the cell.
 void draw_city_edit_grid(CityGridPoint center, const MapScene& scene, Color accent, bool cell_fill) {
     const auto unit = scene.unit_size > 0.0F ? scene.unit_size : 4.0F;
     constexpr std::int32_t half_cells = 24;
@@ -4243,7 +4184,7 @@ void draw_city_edit_grid(CityGridPoint center, const MapScene& scene, Color acce
     };
     draw_work_grid(grid, [&](float alpha_scale) {
         if (!cell_fill) return;
-        // The target cell: a tinted tile with a crisp accent border.
+        // The target cell: a tinted tile with a sharp coloured border.
         const auto x0 = static_cast<float>(center.x) * unit;
         const auto z0 = static_cast<float>(center.z) * unit;
         const Vector3 c{x0 + unit * 0.5F, grid.y, z0 + unit * 0.5F};
@@ -4343,14 +4284,15 @@ void draw_buildblock_preview_3d(const BuildblockPreviewScene& scene) {
     }
 }
 
-// The map image (GenerateMapTextureFromVisibleSectors @124300): 512x512 of the
-// world sectors (road and curb tiles, buildings, pieces, not the landscape) drawn
-// unlit from straight above on black, orthographic half-extent 1024 around
-// (1920, 1920), so one pixel per cell over world x and z 896..2944, +x right and
-// +z down. The round map (isMapAutoGenerated) keeps its map.png instead.
-// Bumped whenever city_map_image reloads or re-renders its image.
+// Goes up whenever city_map_image reloads or redraws its image.
 std::uint64_t g_map_image_revision = 0;
 
+// The map image (GenerateMapTextureFromVisibleSectors @124300): 512x512 of the
+// world sectors (road and curb tiles, buildings, pieces, but not the landscape),
+// drawn without lighting from straight above on black. The view is orthographic,
+// half-size 1024 around (1920, 1920), so one pixel per cell over world x and z
+// 896..2944, with +x to the right and +z down. The round map
+// (isMapAutoGenerated) keeps its map.png instead.
 const Texture2D* city_map_image(EditorProject& project) {
     static RenderTexture2D target{};
     static Texture2D loaded_png{};
@@ -4405,9 +4347,9 @@ const Texture2D* city_map_image(EditorProject& project) {
     return &target.texture;
 }
 
-// Game fonts in load order (Program_InitializeAndRunClient @1330): index,
-// file, and load flags (1 = nearest filtering and raw widths, 2 = lowercase
-// drawn with the uppercase glyphs).
+// The game's fonts in load order (Program_InitializeAndRunClient @1330): index,
+// file, and load flags (1 = nearest filtering and raw widths, 2 = lowercase drawn
+// with the uppercase glyphs).
 struct GameFontInfo {
     const char* name;
     int flags;
@@ -4455,10 +4397,11 @@ std::vector<MapFontChoice> map_font_choices(const EditorProject& project) {
 
 namespace {
 
-// One loaded label font: a game atlas font or a system TrueType font rasterized
-// at the label's pixel size.
+// One loaded label font: a game atlas font, or a system TrueType font drawn at the
+// label's pixel size.
 struct MapLabelFont {
     std::string key;
+    std::filesystem::path root;
     int pixel_size{};
     std::optional<GameFont> game;
     Texture2D game_texture{};
@@ -4475,9 +4418,10 @@ struct MapLabelFont {
 
 void load_map_label_font(MapLabelFont& font, const EditorProject& project, const std::string& key, int pixel_size) {
     const bool is_game = key.starts_with("game:");
-    if (font.key == key && (is_game || font.pixel_size == pixel_size)) return;
+    if (font.root == project.root && font.key == key && (is_game || font.pixel_size == pixel_size)) return;
     font.unload();
     font.key = key;
+    font.root = project.root;
     font.pixel_size = pixel_size;
     if (is_game) {
         const auto name = key.substr(5);
@@ -4494,18 +4438,18 @@ void load_map_label_font(MapLabelFont& font, const EditorProject& project, const
     }
 }
 
-// Draws `text` centred on (x, y) at `size` map units, as renderText flags 5.
+// Draws `text` centred on (x, y) at `size` map units, like renderText flags 5.
 void draw_map_label(const MapLabelFont& font, const char* text, float x, float y, float size) {
     if (font.game) {
         const auto glyph = [&](unsigned char c) {
-            // Flag 2 fonts reuse the uppercase glyph rows for a..z.
+            // Flag 2 fonts use the uppercase glyph rows for a..z.
             return (font.game_flags & 2) != 0 && c >= 'a' && c <= 'z' ? static_cast<unsigned char>(c - 32) : c;
         };
         float advance = 0.0F;
         for (const char* c = text; *c != '\0'; ++c) advance += size * font.game->width[glyph(static_cast<unsigned char>(*c))];
         float pen = x - advance * 0.5F;
         const float top = y - size * 0.5F;
-        // _cs_drawtextstring: a size x size cell per glyph, clipped to its
+        // _cs_drawtextstring: a size x size cell per glyph, cut to its
         // advance width, sampled from the 16x16 atlas.
         rlSetTexture(font.game_texture.id);
         rlBegin(RL_QUADS);
@@ -4533,7 +4477,7 @@ void draw_map_label(const MapLabelFont& font, const char* text, float x, float y
     DrawTextEx(face, text, {x - measured.x * 0.5F, y - size * 0.5F}, size, spacing, WHITE);
 }
 
-// Draws the map screen into `target` (square, pixels wide).
+// Draws the map screen into `target` (square, `pixels` wide).
 void compose_map_menu(RenderTexture2D target, const Texture2D& image, EditorProject& project, const MapMenuOptions& options, MapLabelFont& font) {
     const auto pixels = target.texture.width;
     const bool auto_generated = project.root.filename() == "round";
@@ -4546,7 +4490,7 @@ void compose_map_menu(RenderTexture2D target, const Texture2D& image, EditorProj
     BeginTextureMode(target);
     ClearBackground(BLACK);
     BeginMode2D(Camera2D{{half, half}, {center, center}, 0.0F, half / 128.0F});
-    // Rendered images are stored bottom-up; round's map.png is a plain image.
+    // Drawn images are stored bottom-up; round's map.png is a normal image.
     const auto height = static_cast<float>(image.height);
     DrawTexturePro(image, {0.0F, 0.0F, static_cast<float>(image.width), auto_generated ? height : -height},
         {0.0F, 0.0F, 256.0F, 256.0F}, {}, 0.0F, Fade(WHITE, 0.75F));
@@ -4569,13 +4513,13 @@ MapLabelFont& map_label_font() {
 } // namespace
 
 // The map screen as DrawMapMenu @88130 draws it into its 512x512 viewport (in
-// 1024x768 virtual units, so at the screen's own pixel density), at `pixels`: an
-// orthographic view of map space, half-extent 128 around (120, 120), or
-// (128, 128) when isMapAutoGenerated, with y running down. The map image fills
-// (0, 0)-(256, 256) at alpha 0.75. On city maps each street label follows in
-// font 2 ("rockwell", set by RenderWorld before the HUD) at size 6, white, with
-// renderText flags 5: x back by half the advance width, y back by half the
-// size. Label anchors are (world - 896) * 0.125 (see build_map_scene).
+// 1024x768 virtual units, so at the screen's own pixel density), at `pixels`. It is
+// an orthographic view of map space, half-size 128 around (120, 120), or (128, 128)
+// when isMapAutoGenerated, with y going down. The map image fills (0, 0)-(256, 256)
+// at alpha 0.75. On city maps, each street label follows in font 2 ("rockwell", set
+// by RenderWorld before the HUD) at size 6, in white, with renderText flags 5: x
+// moves back by half the advance width and y by half the size. Labels sit at
+// (world - 896) * 0.125 (see build_map_scene).
 const Texture2D* map_menu_texture(EditorProject& project, int pixels, const MapMenuOptions& options) {
     const auto* image = city_map_image(project);
     if (image == nullptr) return nullptr;
@@ -4626,4 +4570,4 @@ void draw_gpu_building_model_public(GpuBuildingRenderModel& model, Vector3 origi
     draw_gpu_building_model(model, origin, rotation, false);
 }
 
-} // namespace map_editor::app_internal
+} // namespace pafta::app_internal

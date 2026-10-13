@@ -1,19 +1,17 @@
-# Sub Rosa Terrain Runtime / Render / Query Pipeline
+# How Sub Rosa draws and queries terrain at runtime
 
-**Target:** `subrosa.exe.THIS_ONE` (image base 0, x86-64 LE)  
-**Scope:** How terrain is streamed, drawn, culled, queried, and collided with at runtime.  
-**Status:** Read-only reverse engineering report. All claims cite exact Ghidra addresses and decompile snippets.
+Target: `subrosa.exe.THIS_ONE` (image base 0, x86-64 LE)
 
----
+Scope: how terrain is streamed, drawn, culled, queried, and collided with while the game runs. These are the drawing and collision paths traced in Ghidra. Addresses and snippets show where each step comes from, and anything not worked out is marked below.
 
-## 1. Streaming Model
+## 1. Streaming
 
-### 1.1 World subdivision
+### 1.1 How the world is split up
 
-The runtime terrain is subdivided into **64 super-chunks** arranged in an 8×8 grid. Each super-chunk is further split into a **16×16 grid of sub-chunks** (256 total). That gives **64 × 256 = 16 384** addressable chunks in the world.
+Runtime terrain is split into 64 super-chunks in an 8×8 grid. Each super-chunk is split again into a 16×16 grid of sub-chunks (256 in all). That makes 64 × 256 = 16 384 chunks in the world.
 
-- Chunk metadata (world origin, tile coords, etc.) lives in a per-super-chunk struct of **0xd08 (3336) bytes** indexed by the super-chunk id.
-- Inside `Terrain_SelectAndRefreshVisibleChunkSlotsAroundPoint @ 0xd26a0`, the outer loop runs `0..63` over the super-chunks. For each super-chunk it iterates a 16×16 sub-chunk grid (`0..15` inner, `0..15` outer).
+- Chunk data (world origin, tile coordinates, and so on) is in a 0xd08-byte (3336) struct per super-chunk, indexed by the super-chunk number.
+- In `Terrain_SelectAndRefreshVisibleChunkSlotsAroundPoint @ 0xd26a0`, the outer loop goes `0..63` over the super-chunks. For each, it goes over a 16×16 grid of sub-chunks (`0..15` inner, `0..15` outer).
 
 ```c
 // Terrain_SelectAndRefreshVisibleChunkSlotsAroundPoint @ 0xd26a0 (decompile excerpt)
@@ -45,21 +43,21 @@ do {
 } while (iVar16 < 0x40);               // 64 super-chunks
 ```
 
-### 1.2 LOD distance thresholds
+### 1.2 Distances for each detail level
 
-`Terrain_SelectAndRefreshVisibleChunkSlotsAroundPoint` computes the squared distance from the supplied camera point to each sub-chunk centre and selects one of **7 LOD levels** (0 = highest detail, 6 = lowest).
+`Terrain_SelectAndRefreshVisibleChunkSlotsAroundPoint` works out the squared distance from the given camera point to the centre of each sub-chunk and picks one of 7 detail levels (0 is the most detailed, 6 the least).
 
-The thresholds are read from `.rdata` as a contiguous array of IEEE-754 floats:
+The limits are read from `.rdata` as an array of IEEE-754 floats:
 
-| Address | Raw LE | Decoded float | Meaning |
+| Address | Raw LE | Value | Meaning |
 |---|---|---|---|
-| `0x278aec` | `00 00 80 48` | **262 144.0** | LOD0  cutoff  (< 512 world units) |
-| `0x278af4` | `00 00 10 49` | **589 824.0** | LOD1  cutoff  (< ~768) |
-| `0x278afc` | `00 00 80 49` | **1 048 576.0** | LOD2  cutoff  (< 1024) |
-| `0x278b00` | `00 00 10 4a` | **2 359 296.0** | LOD3  cutoff  (< ~1536) |
-| `0x278b04` | `00 00 80 4a` | **4 194 304.0** | LOD4  cutoff  (< 2048) |
-| `0x278b08` | `00 00 10 4b` | **9 437 184.0** | LOD5  cutoff  (< ~3072) |
-| `0x278b0c` | `00 00 80 4b` | **16 777 216.0** | LOD6 / max view radius (< 4096) |
+| `0x278aec` | `00 00 80 48` | 262 144.0 | LOD0 limit (< 512 world units) |
+| `0x278af4` | `00 00 10 49` | 589 824.0 | LOD1 limit (< about 768) |
+| `0x278afc` | `00 00 80 49` | 1 048 576.0 | LOD2 limit (< 1024) |
+| `0x278b00` | `00 00 10 4a` | 2 359 296.0 | LOD3 limit (< about 1536) |
+| `0x278b04` | `00 00 80 4a` | 4 194 304.0 | LOD4 limit (< 2048) |
+| `0x278b08` | `00 00 10 4b` | 9 437 184.0 | LOD5 limit (< about 3072) |
+| `0x278b0c` | `00 00 80 4b` | 16 777 216.0 | LOD6, the furthest you can see (< 4096) |
 
 ```c
 // Terrain_SelectAndRefreshVisibleChunkSlotsAroundPoint @ 0xd26a0
@@ -78,18 +76,18 @@ if (fVar3 <= fVar22) {
 }
 ```
 
-If the desired LOD’s slot pool is exhausted, the code falls back to the **next coarser LOD** until it finds a free slot (`do { ... uVar10 = uVar10 + 1; } while (...)`).
+If the chosen level has no free slots, the code tries the next less detailed level until it finds one (`do { ... uVar10 = uVar10 + 1; } while (...)`).
 
-### 1.3 Slot allocation and eviction
+### 1.3 Handing out and reusing slots
 
-Each LOD maintains its own circular slot pool.
+Each detail level has its own ring of slots.
 
-- Slot metadata base for LOD *n* is at `0x410ff780 + n * 0x18018`.
-- The pool entry size is 12 bytes (3 dwords): chunk id, sub-chunk id, age.
-- `g_terrainChunkSlotsLod0Count` (and the 6 siblings spaced `0x6006` dwords apart) stores the per-LOD slot count.
-- `DAT_410ff794 + n * 0x18018` stores the last-used slot index (LRU cursor).
+- Slot data for level *n* starts at `0x410ff780 + n * 0x18018`.
+- Each entry is 12 bytes (3 dwords): chunk id, sub-chunk id, age.
+- `g_terrainChunkSlotsLod0Count` (and its 6 siblings, `0x6006` dwords apart) holds the number of slots for each level.
+- `DAT_410ff794 + n * 0x18018` holds the last slot used (a cursor for reusing the oldest).
 
-`Terrain_RebuildChunkSlot @ 0xd0c10` chooses a slot like this:
+`Terrain_RebuildChunkSlot @ 0xd0c10` picks a slot like this:
 
 ```c
 // Terrain_RebuildChunkSlot @ 0xd0c10 (excerpt)
@@ -106,20 +104,20 @@ if (0 < iVar4) {
 }
 ```
 
-The age is set to **4** when a slot is freshly rebuilt. In `Terrain_SelectAndRefreshVisibleChunkSlotsAroundPoint`, every frame all ages are decremented by 1 if `> 0`, and slots with `age == 0` are considered recyclable.
+A slot's age is set to 4 when it is rebuilt. Every frame, `Terrain_SelectAndRefreshVisibleChunkSlotsAroundPoint` lowers every age above 0 by 1, and slots with `age == 0` can be reused.
 
-### 1.4 Vertex generation per slot
+### 1.4 Making vertices for a slot
 
-`Terrain_RebuildChunkSlot` walks a regular grid over the 128×128 cell chunk with a step of `1 << LOD`:
+`Terrain_RebuildChunkSlot` walks a regular grid over the 128×128-cell chunk in steps of `1 << LOD`:
 
 ```c
 iVar21 = 1 << ((byte)param_3 & 0x1f);   // grid step = 2^LOD
 iVar4  = iVar21 - 1;                    // step-1
 ```
 
-Loop bounds are `-1 .. 0x82` (0..129 effective), so vertex counts are:
+The loops go `-1 .. 0x82` (0..129 in practice), so the vertex counts are:
 
-| LOD | Step | Vertices / side | Total verts |
+| LOD | Step | Vertices per side | Total vertices |
 |---|---|---|---|
 | 0 | 1 | 129 | 16 641 |
 | 1 | 2 | 65 | 4 225 |
@@ -129,14 +127,14 @@ Loop bounds are `-1 .. 0x82` (0..129 effective), so vertex counts are:
 | 5 | 32 | 5 | 25 |
 | 6 | 64 | 3 | 9 |
 
-For each grid vertex it samples the **global 2049×2049 heightfield** via `g_landTileHeightChunks[superChunk * 0x684]`, computes the normal by differencing neighbouring heights, and writes an interleaved **position + normal** vertex to a CPU scratch buffer at `DAT_40e7f720`.
+For each grid vertex it reads the global 2049×2049 heightfield through `g_landTileHeightChunks[superChunk * 0x684]`, works out the normal from the difference between neighbouring heights, and writes the position and normal together into a CPU scratch buffer at `DAT_40e7f720`.
 
-Vertex format (confirmed by `glVertexAttribPointer` calls):
+Vertex format (confirmed by the `glVertexAttribPointer` calls):
 
-- **Attrib 0** (position): 3× `GL_FLOAT`, stride = 24 bytes, offset = 0
-- **Attrib 1** (normal):   3× `GL_FLOAT`, stride = 24 bytes, offset = 12
+- Attribute 0 (position): 3× `GL_FLOAT`, stride 24 bytes, offset 0
+- Attribute 1 (normal): 3× `GL_FLOAT`, stride 24 bytes, offset 12
 
-The completed vertex buffer is uploaded with `glBufferSubData`:
+The finished vertex buffer is uploaded with `glBufferSubData`:
 
 ```c
 (*glBufferSubDataProc)(GL_ARRAY_BUFFER,
@@ -145,11 +143,11 @@ The completed vertex buffer is uploaded with `glBufferSubData`:
     &DAT_40e7f720);
 ```
 
-`local_f8` is the total vertex count (e.g. 16641 for LOD0).
+`local_f8` is the total vertex count (for example 16641 at LOD0).
 
-### 1.5 GL buffer banks (streaming buffers)
+### 1.5 GL buffer banks for streaming
 
-`Render_InitTerrainStreamingBuffers @ 0xc2db0` creates **six** primary cache banks plus one shared vertex buffer:
+`Render_InitTerrainStreamingBuffers @ 0xc2db0` makes six main cache banks and one shared vertex buffer:
 
 ```asm
 ; Render_InitTerrainStreamingBuffers @ 0xc2db0 (disassembly excerpt)
@@ -167,9 +165,9 @@ The completed vertex buffer is uploaded with `glBufferSubData`:
 000c2f26: JL  0x000c2dd4                            ; loop 0..5  (6 banks)
 ```
 
-Summary:
+In short:
 
-| Bank | GL Target | Slots | Slot size | Total size | Purpose |
+| Bank | GL target | Slots | Slot size | Total | Use |
 |---|---|---|---|---|---|
 | 0 | `GL_ARRAY_BUFFER`   | 0x80 | 0x80000 | 64 MiB | Vertex data |
 | 1 | `GL_ARRAY_BUFFER`   | 0x80 | 0x80000 | 64 MiB | Vertex data |
@@ -177,23 +175,21 @@ Summary:
 | 3 | `GL_ELEMENT_ARRAY_BUFFER` | 0x40 | 0x80000 | 32 MiB | Index data |
 | 4 | `GL_ELEMENT_ARRAY_BUFFER` | 0x40 | 0x80000 | 32 MiB | Index data |
 | 5 | `GL_ELEMENT_ARRAY_BUFFER` | 0x40 | 0x80000 | 32 MiB | Index data |
-| — | `GL_ARRAY_BUFFER` (extra) | 1 | 0x80000 | 512 KiB | Shared terrain streaming buffer |
+| extra | `GL_ARRAY_BUFFER` | 1 | 0x80000 | 512 KiB | Shared terrain streaming buffer |
 
-The **index buffers are static/precomputed**; the code never calls `glBufferSubData` on them at runtime. Only vertex data is streamed per chunk. Each slot in the vertex buffer is a fixed 0x80000-byte region. The actual vertex data is smaller (e.g. 399 kB for LOD0) and the remainder is padding.
+The index buffers are made once ahead of time; the code never calls `glBufferSubData` on them while running. Only vertex data is streamed for each chunk. Each vertex slot is a fixed 0x80000-byte area. The real vertex data is smaller (for example 399 kB at LOD0), and the rest is unused.
 
-`glDrawElementsBaseVertex` is used so that every chunk slot shares the **same index pattern** but offsets the vertex indices by `baseVertexStep * slotIndex`.
+`glDrawElementsBaseVertex` lets every chunk slot share the same index pattern, shifted by `baseVertexStep * slotIndex`.
 
-**Unresolved:** the draw loop (`RenderLandscapeVisibleChunkPasses`) references **7 LOD levels** (0..6), yet only **6 primary banks** are initialised here. The exact mapping of LOD6 to one of the existing banks, or to the extra shared buffer, could not be fully determined from static analysis alone.
+Not worked out: the draw loop (`RenderLandscapeVisibleChunkPasses`) uses 7 detail levels (0..6), but only 6 main banks are set up here. Static analysis alone could not show whether LOD6 uses one of the existing banks or the extra shared buffer.
 
----
+## 2. Drawing each chunk
 
-## 2. Per-Chunk Draw Path
+`RenderLandscapeVisibleChunkPasses @ 0xd22e0`, called from `RenderWorld @ 0x11fd00`, runs the terrain drawing.
 
-The terrain draw orchestrator is **`RenderLandscapeVisibleChunkPasses @ 0xd22e0`**, called from `RenderWorld @ 0x11fd00`.
+### 2.1 Shader and texture setup (first pass only)
 
-### 2.1 Shader / texture setup (first pass only)
-
-When `param_1 == 0` (the colour / main pass):
+When `param_1 == 0` (the colour, or main, pass):
 
 ```c
 (*glUseProgramProc)(DAT_115ad740);                         // terrain shader
@@ -211,9 +207,9 @@ glActiveTexture(GL_TEXTURE2);  ... g_texLandscapeColor ...
 glActiveTexture(GL_TEXTURE4);  ... DAT_43ebe408 ...
 ```
 
-All passes bind the landscape mask texture on **texture unit 3** (`GL_TEXTURE3`).
+Every pass binds the landscape mask texture on texture unit 3 (`GL_TEXTURE3`).
 
-### 2.2 Chunk draw loop
+### 2.2 The chunk draw loop
 
 ```c
 // RenderLandscapeVisibleChunkPasses @ 0xd22e0 (decompile excerpt)
@@ -259,24 +255,22 @@ do {
 } while (local_res10 < 0x40);         // 64 super-chunks
 ```
 
-Key facts:
-- **Culling:** a super-chunk whose visibility byte (`DAT_40e6f620[superChunk]`) is `0` is skipped entirely (or drawn via a fallback prebuilt pass).
-- **GL state per chunk:** only `glBindBuffer` (index + vertex), `glVertexAttribPointer`, and `glDrawElementsBaseVertex` are issued. No matrix uploads per chunk; the shader likely reconstructs world position from the chunk origin uniform or from `baseVertex`.
-- **Index buffer:** static, bound from `(&DAT_43e98c4c)[LOD]`.
-- **Vertex buffer:** streamed slot, bound from `(&DAT_43e9908c)[LOD]`.
-- **Stride:** `6` floats (24 bytes), same for all LODs.
-- **Draw count:** `indexCount[LOD] * 3` indices = `triCount * 3`.
-- **Base vertex:** `baseVertexStep[LOD] * slotIndex`. This offsets the static index pattern to point at the uploaded slot vertices.
+What this shows:
+- Culling: a super-chunk whose visibility byte (`DAT_40e6f620[superChunk]`) is `0` is skipped completely, or drawn through a prebuilt fallback pass.
+- GL calls per chunk: only `glBindBuffer` (index and vertex), `glVertexAttribPointer`, and `glDrawElementsBaseVertex`. No matrix is uploaded per chunk, so the shader probably works out the world position from a chunk origin uniform or from `baseVertex`.
+- Index buffer: fixed, bound from `(&DAT_43e98c4c)[LOD]`.
+- Vertex buffer: a streamed slot, bound from `(&DAT_43e9908c)[LOD]`.
+- Stride: `6` floats (24 bytes), the same at every level.
+- Draw count: `indexCount[LOD] * 3` indices, which is `triCount * 3`.
+- Base vertex: `baseVertexStep[LOD] * slotIndex`. This shifts the fixed index pattern to the vertices in the uploaded slot.
 
-`Terrain_DrawChunkFromStreamingSlot @ 0xd2c90` is a standalone helper that performs the exact same GL sequence (confirmed by identical disassembly). It is likely used by secondary passes (shadow / reflection) that iterate over the same slot table.
+`Terrain_DrawChunkFromStreamingSlot @ 0xd2c90` is a separate helper that makes exactly the same GL calls (the disassembly is identical). Other passes (shadow or reflection) that walk the same slot table probably use it.
 
----
+## 3. Marking what is visible
 
-## 3. Visibility / Sector Marking Algorithm
+`Terrain_MarkVisibleSectorsAlongCameraRays @ 0x11d470` is a visibility pass on the CPU that marches rays from the camera. It runs before chunks are picked.
 
-`Terrain_MarkVisibleSectorsAlongCameraRays @ 0x11d470` is a CPU-side ray-marching visibility pass that runs **before** chunk selection.
-
-### 3.1 Ray grid
+### 3.1 The grid of rays
 
 ```c
 // Terrain_MarkVisibleSectorsAlongCameraRays @ 0x11d470 (excerpt)
@@ -294,9 +288,9 @@ do {
 } while (local_100 < 0x3b);            // 60 rows
 ```
 
-Total rays cast: **96 × 60 = 5 760**.
+That is 96 × 60 = 5 760 rays.
 
-### 3.2 Ray direction normalisation
+### 3.2 Normalising the ray directions
 
 ```c
 fVar22 = SQRT((fVar28*fVar28 + fVar31*fVar31) * fVar3 + fVar5);
@@ -311,25 +305,25 @@ fVar22 = fVar28 * fVar22 * fVar4;
 // fVar4 = DAT_00278110 = 0.0072916666977107525
 ```
 
-The resulting camera-space direction `(fVar22, fVar30, fVar29)` is then transformed into world space by the camera basis vectors (`camera.rot.forward`, `camera.rot.up`, `camera.rot.right`).
+The resulting direction relative to the camera, `(fVar22, fVar30, fVar29)`, is then turned into a world direction with the camera's axes (`camera.rot.forward`, `camera.rot.up`, `camera.rot.right`).
 
-### 3.3 Ray stepping and sector marking
+### 3.3 Stepping rays and marking sectors
 
-Each ray steps **48 times** (`iVar12 = 0..0x30`). The step length is `fVar27`:
+Each ray takes 48 steps (`iVar12 = 0..0x30`). The step length is `fVar27`:
 
 ```c
 fVar27 = (float)(local_104 & 7) + DAT_002788c8;   // 248.0 .. 255.0
 ```
 
-So each step advances the ray by roughly **248–255 world units**.
+So each step moves the ray about 248–255 world units.
 
-World coordinates at each step are kept as fixed-point integers scaled by 256 (`camera.pos * 256` plus accumulated step). The integer coordinates are right-shifted to obtain sector / sub-sector indices:
+World coordinates at each step are kept as fixed-point integers times 256 (`camera.pos * 256` plus the steps so far). Shifting the integers right gives sector and sub-sector numbers:
 
-| Shift | Resulting unit | Size |
+| Shift | Unit | Size |
 |---|---|---|
-| `>> 8` | World unit (1) | — |
-| `>> 0xe` (`>> 14`) | Sector index | **64×64×64** world units |
-| `>> 0xb` (`>> 11`) | Sub-sector index within sector | **8×8×8** world units |
+| `>> 8` | World unit (1) | none |
+| `>> 0xe` (`>> 14`) | Sector number | 64×64×64 world units |
+| `>> 0xb` (`>> 11`) | Sub-sector inside the sector | 8×8×8 world units |
 
 Sector lookup table:
 
@@ -338,7 +332,7 @@ iVar1 = *(int *)(DAT_1ada9288 +
     ((iVar17 >> 0xe) + ((iVar11 >> 0xe) * depth + (iVar15 >> 0xe)) * width) * 4);
 ```
 
-`iVar1 == -1` means empty / out of bounds.
+`iVar1 == -1` means empty or outside the map.
 
 Sub-sector visibility array:
 
@@ -349,9 +343,9 @@ lVar8 = (longlong)*(int *)(&DAT_1ada97b0 +
 (&DAT_14167e74)[lVar8 * 0x1b12] = 1;   // mark sub-sector visible
 ```
 
-### 3.4 Neighbour expansion and portal links
+### 3.4 Neighbours and portal links
 
-During the first 16 steps (`iVar12 < 0x10`), the code marks **neighbouring sectors** to combat temporal aliasing:
+During the first 16 steps (`iVar12 < 0x10`), the code also marks the sectors around the ray, so things don't flicker in and out between frames:
 
 ```c
 if (iVar12 < 0x10) {
@@ -368,7 +362,7 @@ if (iVar12 < 0x10) {
 }
 ```
 
-If the sector metadata contains portal / connectivity links (`uVar2 & 0xe0000000 == 0xc0000000`), the linked sector is also added to the raycast list with an offset encoded in the low bytes:
+If the sector data has a portal or connection link (`uVar2 & 0xe0000000 == 0xc0000000`), the linked sector is added to the raycast list too, with an offset stored in the low bytes:
 
 ```c
 if ((uVar2 & 0xe0000000) == 0xc0000000) {
@@ -378,22 +372,20 @@ if ((uVar2 & 0xe0000000) == 0xc0000000) {
 }
 ```
 
-The ray terminates early if the sub-sector’s walkability / occlusion bits indicate a solid wall (`0x40000000` pattern) and no portal link is present.
+The ray stops early when the sub-sector's walk and blocking bits say it is a solid wall (the `0x40000000` pattern) and there is no portal link.
 
----
+## 4. Asking for terrain height
 
-## 4. Terrain Height-Query Path
+### 4.1 Collecting triangles in a box
 
-### 4.1 Collecting triangles along a segment / AABB
+`Terrain_CollectHeightfieldTrianglesAlongSegment @ 0xd05b0` does the main work for every collision and capsule query. It builds a temporary list of triangles in a scratch buffer.
 
-`Terrain_CollectHeightfieldTrianglesAlongSegment @ 0xd05b0` is the workhorse for all collision and capsule queries. It builds a temporary triangle list in a scratch buffer.
+Inputs:
+- `param_1`: a scratch `uint` buffer (on the stack, about 73 kB).
+- `param_2`: the box's minimum corner (`float*`).
+- `param_3`: the box's maximum corner (`float*`).
 
-**Inputs:**
-- `param_1` — scratch `uint` buffer (stack-allocated, ~73 kB).
-- `param_2` — AABB minimum (`float*`).
-- `param_3` — AABB maximum (`float*`).
-
-**World → grid mapping**
+World to grid
 
 ```c
 fVar17 = *param_2 - _DAT_41290040;     // worldX - worldOffsetX
@@ -401,11 +393,11 @@ fVar18 = *param_3 - _DAT_41290040;     // worldX max
 uVar16 = (uint)(param_2[2] - _DAT_41290048); // worldZ min
 ```
 
-`_DAT_41290040` … `_DAT_41290048` are runtime-initialised globals (not readable in the static image). From the broader context they are known to encode the **+4096 world offset** (grid = world + 4096), but the exact sign depends on runtime initialisation.
+`_DAT_41290040` … `_DAT_41290048` are globals set at runtime, so they can't be read from the file. Other code shows they hold the +4096 world offset (grid = world + 4096), but the exact sign depends on how they are set at runtime.
 
-The function loops over integer grid cells in the AABB span and, for each active cell (checked against `g_landUseMaskBits`), emits two triangles into the scratch buffer.
+The function loops over the grid cells in the box. For each active cell (checked against `g_landUseMaskBits`) it adds two triangles to the scratch buffer.
 
-**Vertex deduplication**
+Removing duplicate vertices
 
 ```c
 // Terrain_CollectHeightfieldTrianglesAlongSegment @ 0xd05b0
@@ -431,13 +423,13 @@ if ((int)uVar11 < 0x800) {             // max 2048 unique vertices
 }
 ```
 
-The dedup tolerance is `fVar2 = DAT_0027806c = 6.103515625e-05` (~1/16384) with an integer masking trick using `DAT_00279840 = 0x7fffffff` (clear sign bit) and `DAT_00279870 = 0x80000000` (sign bit mask used to flip normals).
+Two vertices count as the same when they are within `fVar2 = DAT_0027806c = 6.103515625e-05` (about 1/16384). The check takes absolute values with an integer mask, `DAT_00279840 = 0x7fffffff` (clears the sign bit). `DAT_00279870 = 0x80000000` (the sign bit) is used to flip normals.
 
-**Triangle emission**
+Adding triangles
 
-Each cell contributes two triangles (quad split). Triangle records are stored starting at dword offset `0x2002`:
+Each cell adds two triangles (a split quad). Triangle records start at dword offset `0x2002`:
 
-| Offset (dwords) | Content |
+| Offset (dwords) | Contents |
 |---|---|
 | `0x2002 + tri*8 + 0` | vertex count (always 3) |
 | `+1` | index 0 |
@@ -447,13 +439,13 @@ Each cell contributes two triangles (quad split). Triangle records are stored st
 | `+6` | normal Y |
 | `+7` | normal Z |
 
-Maximum triangles: **0x3ff = 1023** (`param_1[0x2001]` is the triangle counter).
+At most 0x3ff = 1023 triangles (`param_1[0x2001]` counts them).
 
-### 4.2 Raycast against the heightfield
+### 4.2 Casting a ray at the heightfield
 
-`RaycastTerrainHeightfieldPatch @ 0xd1830` performs a **single-ray vs terrain** test used by gameplay raycasts (e.g. bullets, line-of-sight).
+`RaycastTerrainHeightfieldPatch @ 0xd1830` tests one ray against the terrain. Gameplay raycasts use it (bullets, line of sight, and so on).
 
-It implements a **3D DDA grid traversal** (integer step selection) over the heightfield cells:
+It walks the heightfield cells along the ray with a 3D DDA (choosing which axis to step each time):
 
 ```c
 // RaycastTerrainHeightfieldPatch @ 0xd1830 (excerpt)
@@ -490,7 +482,7 @@ do {
 } while (iVar15 <= local_168);   // max 0x4000 steps
 ```
 
-The ray result is written to `param_1` as a 7-float record:
+The result is written to `param_1` as 7 floats:
 
 | Index | Meaning |
 |---|---|
@@ -498,22 +490,20 @@ The ray result is written to `param_1` as a 7-float record:
 | 3..5 | Face normal (X, Y, Z) |
 | 6 | Hit distance `t` along the ray |
 
-The traversal limit is `0x4000` (16 384) steps, which is far larger than any practical ray, effectively unbounded.
+The walk stops after at most `0x4000` (16 384) steps, far more than any real ray needs, so in practice there is no limit.
 
----
+## 5. Terrain collision (capsule or circle against a triangle list)
 
-## 5. Terrain Collision (Capsule / Circle vs Triangle List)
+Collision goes like this:
 
-The collision pipeline is:
+1. Make a box from the capsule's ends and radius.
+2. Collect the triangles in that box into the scratch buffer with `Terrain_CollectHeightfieldTrianglesAlongSegment`.
+3. Test the shape against every triangle in the scratch buffer.
+4. Also test area geometry (buildings, objects), in case it is hit before the terrain.
 
-1. **Build AABB** from capsule endpoints + radius.
-2. **Collect triangles** into scratch buffer via `Terrain_CollectHeightfieldTrianglesAlongSegment`.
-3. **Test primitive** against every triangle in the scratch buffer.
-4. **Fallback** to area geometry (buildings, objects) if terrain hit is farther.
+### 5.1 Capsule against terrain (people)
 
-### 5.1 Capsule vs terrain (human body)
-
-`TerrainAndAreaCapsuleIntersectForHumanBody @ 0x33fe0` is the wrapper used by the human simulation (`_humansimulation @ 0xbf358` caller).
+`TerrainAndAreaCapsuleIntersectForHumanBody @ 0x33fe0` is the wrapper used by the human simulation (called from `_humansimulation @ 0xbf358`).
 
 ```c
 // TerrainAndAreaCapsuleIntersectForHumanBody @ 0x33fe0 (excerpt)
@@ -541,7 +531,7 @@ for (uVar4 = 0; uVar4 < 4; ++uVar4) {
 }
 ```
 
-`CapsuleIntersectTerrainTriangleList @ 0x337b0` iterates the scratch-buffer triangles:
+`CapsuleIntersectTerrainTriangleList @ 0x337b0` goes through the triangles in the scratch buffer:
 
 ```c
 // CapsuleIntersectTerrainTriangleList @ 0x337b0 (excerpt)
@@ -584,66 +574,58 @@ if (0 < *(int *)(param_2 + 0x8004)) {      // triangle count at dword 0x2001
 }
 ```
 
-If a hit is found within distance `DAT_00278adc = 65536.0`, the function returns `1`.
+If it finds a hit closer than `DAT_00278adc = 65536.0`, the function returns `1`.
 
-### 5.2 Circle / sphere vs terrain (wheels / rigid bodies)
+### 5.2 Circle or sphere against terrain (wheels and rigid bodies)
 
-`TerrainAndAreaCapsuleIntersectForWheelOrRigidBody @ 0x3de80` is the vehicle path. It is structurally identical to the human wrapper but calls **`CircleIntersectTerrainTriangleList @ 0x3dae0`** instead of the capsule version.
+`TerrainAndAreaCapsuleIntersectForWheelOrRigidBody @ 0x3de80` is the vehicle version. It is built the same way as the human wrapper, but calls `CircleIntersectTerrainTriangleList @ 0x3dae0` instead of the capsule version.
 
-`CircleIntersectTerrainTriangleList` iterates the same scratch-buffer triangles but calls `_circleintersecttriangle`. The only difference is the primitive test function; the triangle-fetch loop, normal computation, and closest-hit tracking are identical.
+`CircleIntersectTerrainTriangleList` goes through the same scratch-buffer triangles but calls `_circleintersecttriangle`. Only the shape test differs; fetching triangles, working out normals, and keeping the closest hit are the same.
 
-### 5.3 Area geometry fallback
+### 5.3 Also testing area geometry
 
-Both wrappers loop over **4 streamed area objects** (`uVar4 = 0..3`). The area geometry is stored at `DAT_1ada9240 + uVar4 * 0x4035c`. If an area object is active (`*piVar5 != 0`), the wrapper tests the same capsule/circle against that area’s collision geometry and updates `lineIntersectResult` if the area hit is closer than the terrain hit.
+Both wrappers loop over 4 streamed area objects (`uVar4 = 0..3`). The area geometry is at `DAT_1ada9240 + uVar4 * 0x4035c`. If an area object is active (`*piVar5 != 0`), the wrapper tests the same capsule or circle against that area's collision geometry and updates `lineIntersectResult` if the area is hit before the terrain.
 
----
+## 6. Constants
 
-## 6. Constants Table
-
-| Address | Raw (LE) | Decoded | Meaning / Usage |
+| Address | Raw (LE) | Value | Meaning or use |
 |---|---|---|---|
-| `0x278814` | `00 00 80 42` | **64.0** | Half-cell size (128 / 2) used in chunk centre offset |
-| `0x278a1c` | `00 00 80 44` | **1024.0** | Half super-chunk size (128 cells × 8 world units / 2?) |
-| `0x278aec` | `00 00 80 48` | **262 144.0** | LOD0 squared distance threshold (512²) |
-| `0x278af4` | `00 00 10 49` | **589 824.0** | LOD1 threshold (~768²) |
-| `0x278afc` | `00 00 80 49` | **1 048 576.0** | LOD2 threshold (1024²) |
-| `0x278b00` | `00 00 10 4a` | **2 359 296.0** | LOD3 threshold (~1536²) |
-| `0x278b04` | `00 00 80 4a` | **4 194 304.0** | LOD4 threshold (2048²) |
-| `0x278b08` | `00 00 10 4b` | **9 437 184.0** | LOD5 threshold (~3072²) |
-| `0x278b0c` | `00 00 80 4b` | **16 777 216.0** | LOD6 / max view radius (4096²) |
-| `0x27806c` | `00 00 80 38` | **6.1035156e-05** | Vertex dedup epsilon in `CollectHeightfieldTriangles` |
-| `0x2783f4` | `00 00 80 3f` | **1.0** | Normalisation scalar (1.0 / length) used everywhere |
-| `0x278280` | `00 00 80 3e` | **0.25** | Ray projection constant in sector marking |
-| `0x278110` | `ef ee ee 3b` | **0.0072916667** | Horizontal FOV scale in ray grid |
-| `0x278078` | `3a 8e e3 38` | **0.00010850695** | Combined FOV / aspect term in ray grid |
-| `0x278130` | `ab aa 2a 3c` | **0.010416667** | Vertical FOV scale in ray grid |
-| `0x278bc0` | `33 33 b3 be` | **-0.35** | Camera-space Z component bias in ray grid |
-| `0x278388` | `33 33 33 3f` | **0.7** | Unknown ray grid scalar |
-| `0x2787f4` | `00 00 40 42` | **48.0** | Horizontal ray grid half-width |
-| `0x2787cc` | `00 00 f0 41` | **30.0** | Vertical ray grid half-height |
-| `0x2788d8` | `00 00 80 43` | **256.0** | World-to-fixed-point scale (used in ray marching) |
-| `0x2788c8` | `00 00 78 43` | **248.0** | Base ray step length (plus 0..7 jitter) |
-| `0x278774` | `00 00 80 41` | **16.0** | Height falloff constant in `Terrain_RebuildChunkSlot` |
-| `0x278adc` | `00 00 80 47` | **65 536.0** | Collision hit distance threshold (max valid hit) |
-| `0x279840` | `ff ff ff 7f` | **0x7fffffff** | Integer sign-bit mask for absolute-value trick |
-| `0x279870` | `00 00 00 80` | **0x80000000** | Sign-bit mask used to flip normals |
+| `0x278814` | `00 00 80 42` | 64.0 | Half a cell (128 / 2), used to find the chunk centre |
+| `0x278a1c` | `00 00 80 44` | 1024.0 | Half a super-chunk (128 cells × 8 world units / 2?) |
+| `0x278aec` | `00 00 80 48` | 262 144.0 | LOD0 squared distance limit (512²) |
+| `0x278af4` | `00 00 10 49` | 589 824.0 | LOD1 limit (about 768²) |
+| `0x278afc` | `00 00 80 49` | 1 048 576.0 | LOD2 limit (1024²) |
+| `0x278b00` | `00 00 10 4a` | 2 359 296.0 | LOD3 limit (about 1536²) |
+| `0x278b04` | `00 00 80 4a` | 4 194 304.0 | LOD4 limit (2048²) |
+| `0x278b08` | `00 00 10 4b` | 9 437 184.0 | LOD5 limit (about 3072²) |
+| `0x278b0c` | `00 00 80 4b` | 16 777 216.0 | LOD6, the furthest you can see (4096²) |
+| `0x27806c` | `00 00 80 38` | 6.1035156e-05 | How close two vertices must be to count as one in `CollectHeightfieldTriangles` |
+| `0x2783f4` | `00 00 80 3f` | 1.0 | 1.0, used everywhere for 1.0 / length |
+| `0x278280` | `00 00 80 3e` | 0.25 | Ray projection constant for sector marking |
+| `0x278110` | `ef ee ee 3b` | 0.0072916667 | Horizontal field-of-view scale in the ray grid |
+| `0x278078` | `3a 8e e3 38` | 0.00010850695 | Combined field of view and aspect in the ray grid |
+| `0x278130` | `ab aa 2a 3c` | 0.010416667 | Vertical field-of-view scale in the ray grid |
+| `0x278bc0` | `33 33 b3 be` | -0.35 | Camera-space Z offset in the ray grid |
+| `0x278388` | `33 33 33 3f` | 0.7 | Unknown ray grid value |
+| `0x2787f4` | `00 00 40 42` | 48.0 | Half the ray grid's width |
+| `0x2787cc` | `00 00 f0 41` | 30.0 | Half the ray grid's height |
+| `0x2788d8` | `00 00 80 43` | 256.0 | World to fixed-point scale (used when marching rays) |
+| `0x2788c8` | `00 00 78 43` | 248.0 | Base ray step (plus 0..7 of jitter) |
+| `0x278774` | `00 00 80 41` | 16.0 | Height falloff constant in `Terrain_RebuildChunkSlot` |
+| `0x278adc` | `00 00 80 47` | 65 536.0 | Collision distance limit (furthest valid hit) |
+| `0x279840` | `ff ff ff 7f` | 0x7fffffff | Integer mask that clears the sign bit, for absolute values |
+| `0x279870` | `00 00 00 80` | 0x80000000 | Sign-bit mask used to flip normals |
 
----
+## 7. Unknowns
 
-## 7. Honest Unknowns
+1. Where LOD6's buffer lives. There are seven blocks of detail-level data (0..6), and the draw loop uses up to level 6, but `Render_InitTerrainStreamingBuffers` only sets up six main GL banks. Static analysis could not tell whether LOD6 reuses one of those banks, uses the extra 512 KiB shared vertex buffer, or is drawn some other way.
 
-1. **LOD6 buffer mapping.** Seven LOD metadata blocks exist (0..6) and the draw loop references up to index 6, but `Render_InitTerrainStreamingBuffers` only initialises six primary GL banks. Whether LOD6 re-uses one of the existing banks, uses the extra 512 KiB shared vertex buffer, or is handled by a separate render path could not be resolved statically.
+2. The world-offset globals set at runtime. `DAT_41290040` … `DAT_41290048` hold the world-to-grid offset (thought to be `+4096` from other evidence). They are in `.bss` and can't be read from the file; their values depend on how the map is set up.
 
-2. **Runtime world-offset globals.** `DAT_41290040` … `DAT_41290048` encode the world→grid offset (believed to be `+4096` based on external context). They reside in the `.bss` region and cannot be read from the static image; their exact runtime values depend on map initialisation.
+3. Sector and sub-sector layout. The visibility arrays at `DAT_14167e74`, `DAT_14161248`, `DAT_14164248` and the sector lookup tables at `DAT_1ada9288` / `DAT_1ada97b0` are large structures with no starting data. Their field sizes, bit layouts, and what the portal-link encoding means (`0xc0000000` and so on) were guessed from how they are used, not checked against a real struct definition.
 
-3. **Sector / sub-sector struct layout.** The visibility arrays at `DAT_14167e74`, `DAT_14161248`, `DAT_14164248`, and the sector lookup tables at `DAT_1ada9288` / `DAT_1ada97b0` are large, uninitialised structures. Their exact field sizes, bit layouts, and the meaning of the portal-link encoding (`0xc0000000` etc.) were inferred from usage patterns but not verified against a concrete struct definition.
+4. The real values of `g_terrainChunkSlotsLod0Count`. The slot count for each level is in globals in the `.bss` segment, which has no starting data. Their values (0x80, 0x40, or something else) can't be read from the file; only how they are used (masking with `& count-1`, so a power of two) was seen.
 
-4. **`g_terrainChunkSlotsLod0Count` actual values.** The per-LOD slot counts are stored in globals that lie in the uninitialised `.bss` segment. Their values (e.g. 0x80, 0x40, or other numbers) are not readable statically; only their usage pattern (power-of-two masking `& count-1`) was observed.
+5. How the capsule and circle tests work inside. The low-level tests `_capsuleintersecttri @ 0x35690` and `_circleintersecttriangle` were outside the functions assigned, so they were treated as black boxes. Their exact swept-sphere or Minkowski-sum methods are not described here.
 
-5. **Capsule/circle intersection internals.** The low-level primitive tests `_capsuleintersecttri @ 0x35690` and `_circleintersecttriangle` are **outside the assigned function set** and were treated as black boxes. Their exact Minkowski-sum or swept-sphere algorithms are not documented here.
-
-6. **`RenderLandscapeChunkIndexBufferPass`.** The fallback path (`local_res20[-1] == 0`) calls this function, which presumably draws prebuilt or merged index buffers for distant / invisible super-chunks. Its internals were not part of the assigned set and are not covered.
-
----
-
-*End of report.*
+6. `RenderLandscapeChunkIndexBufferPass`. The fallback path (`local_res20[-1] == 0`) calls this function, which probably draws prebuilt or merged index buffers for far or hidden super-chunks. It was outside the functions assigned and is not covered.

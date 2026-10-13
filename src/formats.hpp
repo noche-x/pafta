@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #pragma once
 
 #include <algorithm>
@@ -7,16 +8,17 @@
 #include <filesystem>
 #include <initializer_list>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
-namespace map_editor {
+namespace pafta {
 
 enum class PayloadKind {
-    // Historical port bucket for 0x40000000 solid/buildblock cells.
+    // 0x40000000: a solid or buildblock cell.
     Block,
-    // 0x80000000 standalone SblBlockMesh payload; low 10 bits select piece name/mesh.
+    // 0x80000000: a single SblBlockMesh; the low 10 bits pick the piece name and mesh.
     Piece,
     Other,
 };
@@ -24,15 +26,16 @@ enum class PayloadKind {
 struct SbbCellPayload {
     PayloadKind kind{};
     std::uint32_t word{};
-    // Block/Piece id decoded from low payload bits. Piece uses word & 0x3ff
-    // in native UI paths; legacy block payload tests keep the broader low word.
+    // Solid cells keep the low 16 bits. Pieces use the low 10 bits to pick a mesh
+    // name.
     std::uint32_t index{};
 
     bool operator==(const SbbCellPayload&) const = default;
 };
 
-// A cell's payloads, at most three (read_cell_payloads: the solid block plus
-// one per non-solid block word), stored inline instead of on the heap.
+// A cell's block references, at most three (read_cell_payloads: the solid block
+// plus one for each block word that isn't solid), stored inline instead of on the
+// heap.
 class SbbCellPayloads {
 public:
     SbbCellPayloads() = default;
@@ -72,19 +75,19 @@ struct SbbCell {
     std::uint32_t x{};
     std::uint32_t y{};
     std::uint32_t z{};
-    // Native SBB file order from SaveBuilding_SBB differs from raw BuildingCell
-    // memory order. SaveBuilding_SBB_1400548d0.decomp.txt:76-99 writes:
-    // exteriorBlock, interiorBlock, cellType, exteriorPortalFace,
-    // interiorPortalFace, placedFlag. Raw BuildingCell offsets are verified in
+    // The order the game's SaveBuilding_SBB writes fields is not the order of
+    // BuildingCell in memory. SaveBuilding_SBB_1400548d0.decomp.txt:76-99 writes:
+    // exteriorBlock, interiorBlock, cellType, exteriorPortalFace, interiorPortalFace,
+    // placedFlag. The BuildingCell memory offsets are checked in
     // BuildingTool_ReadCellValueOrZero_140067650.c:11-20: cellType +0x00,
     // exteriorBlock +0x04, interiorBlock +0x08, exteriorPortalFace +0x0c,
     // interiorPortalFace +0x10, placedFlag +0x14, texture sets +0x18/+0x28,
     // itemsetPayload +0x38.
     std::array<std::uint32_t, 6> words{};
-    // Packed item-set payload, not a plain index: 0 means none; placed sets
-    // use 0x40000000 | (rotation << 24) | name-table index. The renderer reads
-    // two rotation bits and the low 10 index bits. Keep other raw values intact.
-    // Native memory and SBB file offset are both +0x38.
+    // A packed item-set word, not a plain index. 0 means none. Placed sets use
+    // 0x40000000 | (rotation << 24) | name-list index. The renderer reads two rotation
+    // bits and the low 10 index bits. Keep any other value as it is.
+    // It is at +0x38 both in the game's memory and in the SBB file.
     std::uint32_t item_set_index{};
     bool occupied{};
     SbbCellPayloads payloads;
@@ -131,8 +134,8 @@ struct SbbBuilding {
     std::uint32_t extent_y{};
     std::uint32_t extent_z{};
     std::vector<std::string> materials;
-    std::vector<std::string> piece_names; // standalone piece meshes, indexed by Piece payload low bits.
-    std::vector<std::string> block_names; // buildblock templates, indexed by SbbCell::cell_type().
+    std::vector<std::string> piece_names; // piece meshes, picked by the low bits of a piece word.
+    std::vector<std::string> block_names; // buildblock templates, picked by SbbCell::cell_type().
     std::vector<std::string> item_set_names;
     std::vector<SbbCell> cells;
     std::uint32_t lod_marker{};
@@ -141,6 +144,13 @@ struct SbbBuilding {
 
     bool operator==(const SbbBuilding&) const = default;
 };
+
+inline constexpr std::uint32_t supported_sbb_grid_side = 64;
+
+// Header X and Y are the highest grid indices; Z is the number of floors.
+constexpr bool sbb_dimensions_supported(std::uint32_t size_x, std::uint32_t size_y, std::uint32_t size_z) {
+    return size_x < supported_sbb_grid_side && size_y < supported_sbb_grid_side && size_z <= supported_sbb_grid_side;
+}
 
 struct SbcIntersection {
     std::size_t index{};
@@ -188,6 +198,9 @@ inline std::string_view city_block_display_name(const SbcCityBlock& city_block) 
     return city_block.name.empty() ? native_default_city_block_display_name : std::string_view{city_block.name};
 }
 
+// Sector-to-cell conversion includes room for the eight cells and neighbour tests.
+std::int32_t sbc_portal_cell_base(std::int32_t sector);
+
 struct SbcPortal {
     std::size_t index{};
     std::array<std::int32_t, 4> fields{};
@@ -196,11 +209,11 @@ struct SbcPortal {
     std::vector<std::uint16_t> textures;
     std::vector<std::uint32_t> itemsets;
 
-    // The active 0x200-voxel district grid. v11+ SBC stores it in `blocks`; v10
-    // (e.g. the round map) stores the same grid, same word format
-    // (0x80000000 = piece, 0x40000000 = solid), in `legacy_blocks`. Scene/terrain
-    // building must read whichever is populated, or v10 maps lose their district
-    // pieces and the piece-driven terrain stamping.
+    // The active district grid of 0x200 voxels. v11 and later SBC files store it in
+    // `blocks`. v10 (for example the round map) stores the same grid, with the same word
+    // format (0x80000000 = piece, 0x40000000 = solid), in `legacy_blocks`. Building the
+    // scene and terrain has to read whichever one is filled in, or v10 maps lose their
+    // district pieces and the terrain stamps those pieces make.
     const std::vector<std::uint32_t>& voxel_blocks() const {
         return blocks.empty() ? legacy_blocks : blocks;
     }
@@ -243,6 +256,10 @@ struct Vec2f {
     bool operator==(const Vec2f&) const = default;
 };
 
+// The game's face orientation projects world coordinates onto the face's texture
+// plane. An unknown orientation keeps the stored UV instead of changing it.
+Vec2f native_oriented_uv(Vec3f position, Vec2f fallback, std::uint32_t orientation);
+
 struct SblBlockFace {
     std::uint32_t material{};
     std::vector<Vec3f> vertices;
@@ -254,8 +271,11 @@ struct SblBlockFace {
 };
 
 struct SblBlockLight {
+    // This old public name means a textured box, not a light.
+    // Scalars[0] is its material; the other number words are kept as they are.
     std::array<Vec3f, 8> points{};
     std::array<std::uint32_t, 6> scalars{};
+    // Bits 0..5 turn on the six faces, in the game's box-corner order.
     std::uint32_t final_value{};
 
     bool operator==(const SblBlockLight&) const = default;
@@ -318,7 +338,7 @@ struct SblPortalRect {
 struct SblLayer {
     std::size_t index{};
     std::size_t offset{};
-    // Buildblock portal layer record. Side-code sc 3..15 maps to layers[sc - 3].
+    // Buildblock portal layer record. Side code sc 3..15 maps to layers[sc - 3].
     std::uint32_t portal_type{};
     std::array<float, 4> bounds{};
     std::uint32_t door_count{};
@@ -332,9 +352,9 @@ struct SblLayer {
 };
 
 struct SblTemplate {
-    std::uint32_t version{};
-    // If present, this is a block mesh .sbl. If absent, the same container is a
-    // buildblock .sbl whose layers drive portal/edge wall geometry.
+    std::uint32_t version{1};
+    // If this is set, the .sbl is a block mesh. If not, the same file is a buildblock
+    // .sbl, whose layers shape the portal and edge walls.
     std::optional<SblBlockMesh> block;
     std::vector<SblLayer> layers;
 
@@ -350,16 +370,16 @@ enum class CsxEntryKind {
     Unknown,
 };
 
-// One item of an item set (data/itemset/*.sis, load_item_set): its item type
-// by name, its position from the cell's floor centre and its rotation rows.
+// One item in an item set (data/itemset/*.sis, load_item_set): the item's type by
+// name, its position from the centre of the cell's floor, and its rotation rows.
 struct SisItem {
     std::string type;
     Vec3f pos;
     std::array<Vec3f, 3> rot;
 };
 
-// The render mesh of an item (data/item/*.it3, load_it3_file version 3, chunk
-// 0): vertices and faces of three or four vertex indices. UVs are skipped.
+// An item's render mesh (data/item/*.it3, load_it3_file version 3, chunk 0):
+// vertices, and faces of three or four vertex indices. UVs are skipped.
 struct It3Mesh {
     std::vector<Vec3f> vertices;
     std::vector<std::vector<std::uint32_t>> faces;
@@ -383,6 +403,15 @@ struct CsxArchive {
 };
 
 std::vector<std::uint8_t> read_file_bytes(const std::filesystem::path& path);
+struct FileWrite {
+    std::filesystem::path path;
+    std::span<const std::uint8_t> bytes;
+};
+// Prepares and closes every output file before replacing anything, and puts the
+// earlier files back if a replacement fails. This can't make a multi-file save safe
+// from a power cut.
+void write_files_transaction(std::span<const FileWrite> files);
+void write_file_bytes(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes);
 SbbBuilding parse_sbb(const std::vector<std::uint8_t>& bytes);
 SbbBuilding parse_sbb_file(const std::filesystem::path& path);
 SbcMap parse_sbc(const std::vector<std::uint8_t>& bytes);
@@ -396,6 +425,8 @@ CsxArchive parse_csx_file(const std::filesystem::path& path);
 void refresh_sbl_block_faces(SblBlockMesh& block);
 std::vector<std::uint8_t> patch_sbb_cell(const std::vector<std::uint8_t>& bytes, const SbbBuilding& building, const SbbCell& cell);
 std::vector<std::uint8_t> patch_sbb_cells(const std::vector<std::uint8_t>& bytes, const SbbBuilding& building);
+// Writes the v14 layout we support, including the anchors the parser fills in for
+// v12 input. CSX packing replaces the leading version with the container's 1.
 std::vector<std::uint8_t> rebuild_sbb(const SbbBuilding& building);
 std::vector<std::uint8_t> patch_sbc_building(const std::vector<std::uint8_t>& bytes, const SbcBuilding& building, std::uint32_t version);
 std::vector<std::uint8_t> patch_sbc_buildings(const std::vector<std::uint8_t>& bytes, const SbcMap& map);
@@ -413,15 +444,16 @@ std::vector<std::uint8_t> patch_sbl_layer_portal_type(
     std::size_t layer_index,
     std::uint32_t portal_type);
 std::vector<std::uint8_t> rebuild_sbl_block(const SblBlockMesh& block);
-// Re-derives a cell's payloads and occupied flag from its words (as parsing does).
+// Works out a cell's block references and filled flag again from its words (as
+// parsing does).
 void refresh_sbb_cell_payloads(SbbCell& cell);
-// The quads one patch or one box record produces, as the game builds them.
+// The quads one patch or one box record makes, built the way the game builds them.
 std::vector<SblBlockFace> sbl_patch_faces(const SblAuthoredPatch& patch);
 std::vector<SblBlockFace> sbl_box_faces(const SblBlockLight& box);
-// Writes the block as stored (version 2): side flags, patches and boxes kept.
+// Writes the block as stored (version 2), keeping the side flags, patches, and boxes.
 std::vector<std::uint8_t> write_sbl_block(const SblBlockMesh& block);
 std::vector<std::uint8_t> rebuild_sbl_buildblock(const SblTemplate& template_file);
 std::vector<std::uint8_t> patch_sbl_layers(const std::vector<std::uint8_t>& bytes, const SblTemplate& template_file);
 std::vector<std::uint8_t> build_csx(const CsxArchive& archive);
 
-} // namespace map_editor
+} // namespace pafta

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #include "scene.hpp"
 
 #include "buildblock_catalog.hpp"
@@ -13,6 +14,7 @@
 #include <tuple>
 #include <limits>
 #include <span>
+#include <stdexcept>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -20,7 +22,16 @@
 #include <unordered_set>
 #include <utility>
 
-namespace map_editor {
+namespace pafta {
+
+std::optional<std::array<std::uint8_t, 3>> procedural_material_rgb(std::string_view name) {
+    if (name == "city_road_asphalt") return std::array<std::uint8_t, 3>{43, 47, 50};
+    if (name == "city_curb_concrete") return std::array<std::uint8_t, 3>{150, 154, 151};
+    if (name == "city_terrain_grass") return std::array<std::uint8_t, 3>{64, 84, 38};
+    if (name == "__window") return std::array<std::uint8_t, 3>{128, 128, 128};
+    return std::nullopt;
+}
+
 
 std::uint32_t terrain_noise_hash(std::int32_t x, std::int32_t y, std::uint32_t mask) {
     auto u = ((static_cast<std::uint32_t>(y + 1) & mask) * 0x39U) +
@@ -33,7 +44,7 @@ std::uint32_t terrain_noise_hash(std::int32_t x, std::int32_t y, std::uint32_t m
 namespace {
 
 // -----------------------------------------------------------------------------
-// Portal Rectangle Helpers
+// Portal rectangle helpers
 // -----------------------------------------------------------------------------
 
 float clamp01(float value) {
@@ -83,22 +94,22 @@ std::optional<PortalRect> portal_rect_for_side(
     return portal_rect(x, width, y, height);
 }
 
-// Where subrosa.exe puts a layer rectangle on a building wall, as u along the
-// wall (N/S walls: +x, E/W walls: +z) in cell fractions.
-// Outside (the far LOD) the rectangle is drawn into the wall texture unmirrored
-// (_generatematerialwindowtexture) and the face UVs follow the face tangent
-// (DAT_002b35a0: south +x, west +z, north -x, east -z), so it comes out
+// Where subrosa.exe puts a layer rectangle on a building wall, as u along the wall
+// (N/S walls: +x, E/W walls: +z) in fractions of a cell.
+// Outside (the far view), the rectangle is drawn into the wall texture without
+// mirroring (_generatematerialwindowtexture), and the face UVs follow the face's
+// tangent (DAT_002b35a0: south +x, west +z, north -x, east -z). So it ends up
 // mirrored on north and east walls only.
 std::optional<PortalRect> building_exterior_rect(PortalSide side, float x, float width, float y, float height) {
     if (side == PortalSide::North || side == PortalSide::East) return portal_rect(1.0F - (x + width), width, y, height);
     return portal_rect(x, width, y, height);
 }
-// Inside (the room, BuildBlock_AddBeams / _block_addwindows) x is mirrored as
-// 1 - (x + width) except for portal type 1 on the south/west sides, in a wall
-// frame that _block_addwindows rotates (x,z) -> (1 - z, x) per side, which runs
-// backwards on south and west walls. Net: mirrored on north and east walls,
-// and on every wall for portal type 1. Type 0 therefore lines up with the
-// exterior rectangle, as in the game.
+// Inside (the room: BuildBlock_AddBeams / _block_addwindows), x is mirrored to
+// 1 - (x + width), except for portal type 1 on the south and west sides. This
+// happens in a wall frame that _block_addwindows turns (x,z) -> (1 - z, x) for each
+// side, so it runs backwards on south and west walls. The result: mirrored on north
+// and east walls, and on every wall for portal type 1. So type 0 lines up with the
+// outside rectangle, as in the game.
 std::optional<PortalRect> building_room_rect(const SblLayer& layer, PortalSide side, float x, float width, float y, float height) {
     if (layer.portal_type == 1U) return portal_rect(1.0F - (x + width), width, y, height);
     return building_exterior_rect(side, x, width, y, height);
@@ -160,7 +171,7 @@ PayloadKind visible_payload_kind(const SbbCell& cell) {
 }
 
 // -----------------------------------------------------------------------------
-// Asset and Cell Lookup
+// Asset and cell lookup
 // -----------------------------------------------------------------------------
 
 const SblBlockMesh* find_block_mesh(const std::vector<NamedBlockMesh>& block_meshes, std::string_view name) {
@@ -172,9 +183,9 @@ const SblBlockMesh* find_block_mesh(const std::vector<NamedBlockMesh>& block_mes
 
 SblBlockMesh make_native_builtin_block_mesh_impl() {
     SblBlockMesh mesh{};
-    // VERIFY: the native decomp copies g_Block_Width/Height/Depth before disk
-    // LoadBlock_SBL; the existing TS/importer parity notes treat the built-in
-    // primitive as 1x1x1.
+    // VERIFY: the decompiled game copies g_Block_Width/Height/Depth before loading the
+    // file in LoadBlock_SBL. The older TS and importer notes treat the built-in shape
+    // as 1x1x1.
     mesh.width = 1U;
     mesh.height = 1U;
     mesh.depth = 1U;
@@ -228,9 +239,9 @@ struct CityBlockRenderResolution {
 CityBlockRenderResolution resolve_city_block_render(
     const SbcCityBlock& city_block,
     const std::vector<NamedBlockMesh>& block_meshes) {
-    // UpdatePieceVoxelData_14005fc90 initializes every city block as
-    // 0x40000000 and only switches non-empty names that match loaded block
-    // templates to 0x80000000 | blockIndex mesh instances.
+    // UpdatePieceVoxelData_14005fc90 starts every city block as 0x40000000, and only
+    // turns blocks whose name matches a loaded block template into
+    // 0x80000000 | blockIndex meshes.
     if (!city_block.name.empty()) {
         if (const auto* mesh = find_block_mesh(block_meshes, city_block.name)) {
             return {CityBlockRenderClass::Mesh, mesh};
@@ -269,34 +280,9 @@ const SblTemplate* resolve_building_buildblock_template(
     return templates.empty() ? nullptr : &templates.front().template_file;
 }
 
-// The native global buildblock catalog (g_buildblockTemplateCatalog) is what v10
-// district piece words index by `word & 0xffff`. The game builds it in
-// BuildblockCatalog_LoadAll @0x26e70: scan loose buildblock/*.sbl only (NOT CSX),
-// strip the extension, sort names bytewise, cap at 64, then index in that order.
-// Reproduce that ordering so a district word's index lands on the same template
-// the game would resolve. An out-of-range or empty-`block` template renders nothing,
-// exactly as the native instancing loop does for unfilled catalog slots.
-std::vector<const NamedBuildblockTemplate*> district_buildblock_catalog_order(
-    const std::vector<NamedBuildblockTemplate>& templates) {
-    std::vector<const NamedBuildblockTemplate*> ordered;
-    ordered.reserve(templates.size());
-    for (const auto& entry : templates) {
-        ordered.push_back(&entry);
-    }
-    std::ranges::sort(ordered, [](const NamedBuildblockTemplate* lhs, const NamedBuildblockTemplate* rhs) {
-        return lhs->name < rhs->name;
-    });
-    if (ordered.size() > 64U) {
-        ordered.resize(64U);
-    }
-    return ordered;
-}
-
-// The real v10 render catalog is g_buildblockTemplateCatalog, built procedurally
-// by Buildblock_InitTemplateMeshCatalog @0x10110 (curbs, railings, beams baked in
-// 4 Y rotations), NOT the loose buildblock/*.sbl files. Build it once and reuse.
-// A district piece word indexes this by (word & 0xffff). An empty entry (vertex/
-// face count 0) renders nothing, exactly as the native instancing loop does.
+// Buildblock_InitTemplateMeshCatalog @0x10110 provides the built-in catalog that
+// the low 16 bits of v10 district words point into. Loaded buildblock files are a
+// separate catalog. Empty built-in slots have no geometry in the game.
 const SblBlockMesh* resolve_district_procedural_mesh(std::uint32_t catalog_index) {
     static const std::vector<BuildblockCatalogEntry> catalog = build_native_builtin_catalog();
     if (catalog_index >= catalog.size()) {
@@ -350,7 +336,7 @@ const SbbCell* find_cell_at(const CellIndexMap& index, std::uint32_t x, std::uin
 }
 
 // -----------------------------------------------------------------------------
-// Building Render Buffer Helpers
+// Building render buffer helpers
 // -----------------------------------------------------------------------------
 
 constexpr auto native_preview_floor_y = 1.0F / 16.0F;
@@ -358,13 +344,13 @@ constexpr auto native_preview_ceiling_y = 7.0F / 8.0F;
 constexpr auto native_preview_inset_depth = 1.0F / 16.0F;
 
 bool is_solid_building_cell(const SbbCell& cell) {
-    // BuildBuildingBlockRenderBuffers_1400799d0.c:128: 0x40000000 class is the solid-cell tag.
+    // BuildBuildingBlockRenderBuffers_1400799d0.c:128: the 0x40000000 kind marks a solid cell.
     return (cell.exterior_block() >> 29U) == 2U;
 }
 
 std::optional<SbbCellPayload> exterior_piece_payload(const SbbCell& cell) {
     const auto word = cell.exterior_block();
-    // BuildBuildingBlockRenderBuffers_1400799d0.c:212: 0x80000000 class instantiates a block mesh.
+    // BuildBuildingBlockRenderBuffers_1400799d0.c:212: the 0x80000000 kind places a block mesh.
     if ((word >> 29U) != 4U) {
         return std::nullopt;
     }
@@ -373,7 +359,7 @@ std::optional<SbbCellPayload> exterior_piece_payload(const SbbCell& cell) {
 
 std::optional<SbbCellPayload> interior_piece_payload(const SbbCell& cell) {
     const auto word = cell.interior_block();
-    // BuildBuildingBlockRenderBuffers_1400799d0.c:212: 0x80000000 class instantiates a block mesh.
+    // BuildBuildingBlockRenderBuffers_1400799d0.c:212: the 0x80000000 kind places a block mesh.
     if ((word >> 29U) != 4U) {
         return std::nullopt;
     }
@@ -385,16 +371,16 @@ bool cell_has_exterior_surface(const SbbCell* cell) {
 }
 
 PortalSideCodes native_edge_side_codes(const SbbCell& cell, const SbbCell* east, const SbbCell* south) {
-    // BuildBuildingBlockRenderBuffers_1400799d0.c:136-141 fills edgeFlags for
-    // faces 1..4; lines 177-180 consume edgeFlags[face-1] as layer index+3.
-    // Native face -> C++ side mapping from lines 149-152:
+    // BuildBuildingBlockRenderBuffers_1400799d0.c:136-141 fills edgeFlags for faces
+    // 1..4, and lines 177-180 use edgeFlags[face-1] as layer index + 3.
+    // Game face to C++ side, from lines 149-152:
     // face 1 z+1 -> South, face 2 x-1 -> West, face 3 z-1 -> North,
     // face 4 x+1 -> East.
     return {
         cell.exterior_portal_face(), // face 3 / North: BuildingCell +0x0c.
         cell.interior_portal_face(), // face 2 / West: BuildingCell +0x10.
-        // face 1 / South: the south neighbour's +0x0c (Sbb_BuildBuildingConnectivityMetadata
-        // @29120 reads the record one z row on), not this cell's.
+        // Face 1 (South) uses the south neighbour's +0x0c, not this cell's
+        // (Sbb_BuildBuildingConnectivityMetadata @29120 reads the record one z row on).
         south == nullptr ? 0U : south->exterior_portal_face(),
         east == nullptr ? 0U : east->interior_portal_face(), // face 4 / East: east-neighbor +0x10.
     };
@@ -409,10 +395,10 @@ enum class BuildingFaceSide {
     Down,
 };
 
-// RenderBuildingCellItemsetBoundaryPreview_140079050 and FUN_1400523b0 index
-// DAT_140105000 / DAT_140105170 / DAT_140105148. VERIFY(editor.exe
-// DAT_140105000): the supplied raw corner order is non-planar with
-// DAT_140105170, so this keeps the planar fallback from the prior parity pass.
+// RenderBuildingCellItemsetBoundaryPreview_140079050 and FUN_1400523b0 use
+// DAT_140105000 / DAT_140105170 / DAT_140105148. The corner order recorded there
+// doesn't match the face table, so this preview uses a plain cube layout instead.
+// How those tables relate to each other is still unknown.
 constexpr std::array<Vec3, 8> native_preview_cube_corners{{
     {0.0F, 0.0F, 0.0F},
     {1.0F, 0.0F, 0.0F},
@@ -527,25 +513,6 @@ std::uint32_t rotate_native_orientation_once(std::uint32_t orientation) {
     }
 }
 
-Vec2f native_oriented_uv(const Vec3& position, Vec2f fallback, std::uint32_t orientation) {
-    switch (orientation & 0xf0000U) {
-        case 0x10000U:
-            return {position.z, position.y};
-        case 0x20000U:
-            return {1.0F - position.z, position.y};
-        case 0x30000U:
-            return {position.x, position.z};
-        case 0x40000U:
-            return {position.x, 1.0F - position.z};
-        case 0x50000U:
-            return {1.0F - position.x, position.y};
-        case 0x60000U:
-            return {position.x, position.y};
-        default:
-            return fallback;
-    }
-}
-
 NativeRotatedBlockFace rotate_block_face_native_impl(const SblBlockMesh& mesh, const SblBlockFace& face, std::int32_t rotation) {
     NativeRotatedBlockFace rotated;
     auto width = static_cast<float>(mesh.width);
@@ -583,17 +550,18 @@ NativeRotatedBlockFace rotate_block_face_native_impl(const SblBlockMesh& mesh, c
 
     if (orientation != 0U) {
         for (std::size_t index = 0; index < rotated.uvs.size(); ++index) {
-            rotated.uvs[index] = native_oriented_uv(rotated.vertices[index], rotated.uvs[index], orientation);
+            const auto& vertex = rotated.vertices[index];
+            rotated.uvs[index] = native_oriented_uv({vertex.x, vertex.y, vertex.z}, rotated.uvs[index], orientation);
         }
     }
 
     return rotated;
 }
 
-// Tilts a cell's TOP surface to a grade. dy_x / dy_z are the world-Y rise per +1
-// cell along each axis; only vertices on the cell top (y == max_y) are displaced,
-// so the box keeps a flat bottom and the upper edges of its side walls follow the
-// slope. Default-constructed (all zero) leaves geometry axis-aligned.
+// Tilts the TOP of a cell to a slope. dy_x and dy_z are how much world Y rises per
+// cell along each axis. Only the vertices on the cell's top (y == max_y) move, so
+// the box keeps a flat bottom and the top edges of its side walls follow the slope.
+// The default (all zero) leaves the geometry level.
 struct CellTopSlope {
     float dy_x{};
     float dy_z{};
@@ -649,8 +617,8 @@ std::array<Vec3, 4> face_rect_vertices(
 
     if (top_slope.dy_x != 0.0F || top_slope.dy_z != 0.0F) {
         for (auto& vertex : vertices) {
-            // Only the cell's top vertices ride the grade; the bottom stays flat
-            // so adjacent cells still share a watertight base.
+            // Only the cell's top vertices follow the slope. The bottom stays flat
+            // so neighbouring cells still share a closed base.
             if (vertex.y >= max_y) {
                 vertex.y += top_slope.dy_x * ((vertex.x - cx) / unit_size) +
                     top_slope.dy_z * ((vertex.z - cz) / unit_size);
@@ -743,20 +711,20 @@ std::uint32_t material_for_cell_side(const SbbCell& cell, BuildingFaceSide side)
     return material_for_cell_slot(cell, static_cast<std::uint32_t>(slot));
 }
 
-std::uint32_t material_for_piece_face(const SbbCell& cell, std::uint32_t slot, bool interior) {
-    // RenderBuildingCellFaceGroupWorld/Preview clamp logical face slots to
-    // 0..7. Interior faces use the cell's interior texture set for slots 0..7;
-    // slots 8..15 address the exterior set after subtracting eight.
+std::uint32_t piece_face_slot(std::uint32_t slot, bool interior) {
+    // RenderBuildingCellFaceGroupWorld/Preview clamp face slots to 0..7. Inside faces
+    // use the cell's inside texture set for slots 0..7, and slots 8..15 use the
+    // outside set after subtracting eight.
     if (interior) {
-        return material_for_cell_slot(cell, slot < 8U ? slot + 8U : slot < 16U ? slot - 8U : 0U);
+        if (slot < 8U) return slot + 8U;
+        if (slot < 16U) return slot - 8U;
+        return 0U;
     }
-    return material_for_cell_slot(cell, std::min(slot, 7U));
+    return std::min(slot, 7U);
 }
 
-// The cell.shorts slot material_for_piece_face reads for a piece face.
-std::uint32_t piece_face_slot(std::uint32_t slot, bool interior) {
-    if (interior) return slot < 8U ? slot + 8U : slot < 16U ? slot - 8U : 0U;
-    return std::min(slot, 7U);
+std::uint32_t material_for_piece_face(const SbbCell& cell, std::uint32_t slot, bool interior) {
+    return material_for_cell_slot(cell, piece_face_slot(slot, interior));
 }
 
 std::array<Vec3, 4> native_preview_cube_face_vertices(const SbbCell& cell, std::uint32_t face, float unit_size) {
@@ -765,17 +733,17 @@ std::array<Vec3, 4> native_preview_cube_face_vertices(const SbbCell& cell, std::
     const auto cell_x = static_cast<float>(cell.x);
     const auto cell_y = static_cast<float>(cell.y);
     const auto cell_z = static_cast<float>(cell.z);
-    // Side walls (faces 1-4) are inset 1/16 inward from the cell boundary, matching
-    // editor.exe SetupDefaultFaceVerticesAndEmit (the side template sits at z=0.0625
-    // then RotateBlockFaceVertices_90Degrees rotates it to each direction). Without
-    // this inset, adjacent solid cells' shared-boundary walls land coplanar and
-    // z-fight/squish; the inset places opposing walls 1/16 and 15/16, separated.
-    // The inset is along the face's inward normal; with native_preview_face_corners
-    // each side face is axis-planar so we push its constant axis toward the cell center.
+    // Side walls (faces 1-4) sit 1/16 in from the cell's edge, like editor.exe
+    // SetupDefaultFaceVerticesAndEmit (the side template sits at z=0.0625, and
+    // RotateBlockFaceVertices_90Degrees turns it to face each direction). Without this,
+    // the walls two solid cells share land in the same plane and flicker. With it,
+    // opposite walls sit at 1/16 and 15/16, apart from each other.
+    // The wall moves along the face's inward normal. With native_preview_face_corners
+    // each side face is flat on one axis, so we move that axis toward the cell's centre.
     for (std::size_t corner = 0; corner < vertices.size(); ++corner) {
         auto position = native_preview_cube_corners[corners[corner]];
         if (face != 0U && face != 5U) {
-            // Pull the boundary axis (the one that is constant across all 4 corners)
+            // Pull the edge axis (the one that is the same at all 4 corners)
             // inward by native_preview_floor_y.
             const auto& c0 = native_preview_cube_corners[corners[0]];
             const auto& c1 = native_preview_cube_corners[corners[1]];
@@ -844,7 +812,7 @@ std::array<std::uint32_t, 4> native_tool_preview_side_codes(
     const SbbCell& cell,
     const SbbCell* east,
     const SbbCell* south) {
-    // RenderBuildingToolCellPreview_140078060 packs these nibbles before
+    // RenderBuildingToolCellPreview_140078060 packs these nibbles before calling
     // FUN_140051070(1, key): own exterior, east interior, south exterior,
     // own interior.
     return {{
@@ -855,7 +823,7 @@ std::array<std::uint32_t, 4> native_tool_preview_side_codes(
     }};
 }
 
-// VERIFY: orientation corrected from screenshot; pending another visual confirm.
+// VERIFY: orientation was fixed from a screenshot; needs one more visual check.
 constexpr std::array<std::uint32_t, 4> native_tool_preview_side_faces{{3U, 4U, 1U, 2U}};
 
 Vec3 rotate_native_tool_side(Vec3 vertex, std::uint32_t side) {
@@ -1029,10 +997,10 @@ void add_native_tool_inset_detail(
             0x3fU,
             material_slots);
     };
-    // Windows are openings: they read as see-through cutouts like the door gap,
-    // not solid inset boxes. Draw each window as a thin frame around its rect
-    // perimeter, leaving the middle open so you can see through it. A frame is four
-    // narrow strips; frame_w is the strip thickness in cell-fraction units.
+    // Windows are openings. They should look see-through like the door gap, not like
+    // solid boxes set into the wall. Draw each window as a thin frame around its
+    // rectangle, leaving the middle open so you can see through. A frame is four narrow
+    // strips; frame_w is how thick a strip is, in fractions of a cell.
     constexpr float frame_w = 1.0F / 16.0F;
     auto add_frame_strip = [&](float fx, float fy, float fwidth, float fheight) {
         if (fwidth <= 0.0F || fheight <= 0.0F) {
@@ -1064,9 +1032,9 @@ void add_native_tool_inset_detail(
         add_frame_strip(wx, wy + fh, fw, wh - 2.0F * fh);      // left
         add_frame_strip(wx + ww - fw, wy + fh, fw, wh - 2.0F * fh); // right
     }
-    // VERIFY(editor.exe FUN_140051c60): decompilation proves the first rect
-    // array at +0x1138; beams share the same SblPortalRect shape in this port
-    // and are emitted as equivalent inset boxes for visible beam parity.
+    // VERIFY(editor.exe FUN_140051c60): the decompile proves the first rectangle array
+    // is at +0x1138. In this port, beams use the same SblPortalRect shape and are drawn
+    // as the same kind of inset boxes, so beams show up.
     for (const auto& beam : layer.beams) {
         add_rect_box(beam);
     }
@@ -1132,10 +1100,10 @@ std::optional<PortalSide> portal_side_for_building_face(BuildingFaceSide side) {
     }
 }
 
-// Sbb_BuildBuildingConnectivityMetadata @29120: face 1 (+Z) reads the cell at
-// z+1's +0x0c, face 2 (-X) this cell's +0x10, face 3 (-Z) this cell's +0x0c,
-// face 4 (+X) the cell at x+1's +0x10. Each side code sits on the wall between
-// two cells, shared by both.
+// Sbb_BuildBuildingConnectivityMetadata @29120: face 1 (+Z) reads the +0x0c of the
+// cell at z+1, face 2 (-X) this cell's +0x10, face 3 (-Z) this cell's +0x0c, and
+// face 4 (+X) the +0x10 of the cell at x+1. Each side code belongs to the wall
+// between two cells, and both cells share it.
 std::uint32_t city_buildblock_side_code_for_face(
     const SbbCell& cell,
     const SbbCell* east,
@@ -1223,27 +1191,27 @@ void add_native_solid_cell_faces(
         }
 
         std::vector<PortalRect> window_rects;
-        // The game gives every buildblock-coded face the window-array texture,
-        // and near sectors skip those faces (_render_buildsectorlist), so up
-        // close an interior piece on that side (a garage door) stands open.
+        // The game gives every face with a buildblock side code the window-array
+        // texture, and near sectors skip those faces (_render_buildsectorlist). So
+        // up close, an inside piece on that side (like a garage door) stands open.
         bool buildblock_coded = false;
         const auto portal_side = portal_side_for_building_face(side.side);
         if (portal_side.has_value()) {
             const auto side_code = city_buildblock_side_code_for_face(cell, east, south, side.side);
             const auto* layer = buildblock_layer_for_side_code(template_file, side_code);
             buildblock_coded = layer != nullptr;
-            // BuildBuildingBlockRenderBuffers only expands the exterior edge
-            // profile when the cell has no interior block (native
-            // interiorBlock == 0xffff). An interior piece owns that side's
-            // geometry and must not inherit the exterior window mask.
+            // BuildBuildingBlockRenderBuffers only builds the outside edge shape
+            // when the cell has no interior block (the game's interiorBlock ==
+            // 0xffff). An interior piece owns that side's geometry and must not
+            // pick up the outside window mask.
             if (layer != nullptr && cell.interior_block() == 0xffffU) {
-                // _generatematerialwindowtexture @9a1a1 builds one texture-array
-                // layer per (wall texture, buildblock, layer): the wall texture,
-                // then alpha 1 over the layer's BOUNDS rectangle; the window and
-                // door records are not read. array_world.frag uses that alpha as
+                // _generatematerialwindowtexture @9a1a1 makes one texture-array
+                // layer for each wall texture, buildblock, and layer: the wall
+                // texture, with alpha 1 over the layer's BOUNDS rectangle. Window
+                // and door records are not read. array_world.frag uses that alpha as
                 // shine, so from outside the whole bounds is a reflective opening,
-                // door layers (bounds, no windows) included. Keep the wall
-                // material on these quads so the shader sees the same base color.
+                // door layers (bounds with no windows) included. Keep the wall
+                // material on these quads so the shader sees the same base colour.
                 if (const auto bounds = building_exterior_rect(
                         *portal_side, layer->bounds[0], layer->bounds[1], layer->bounds[2], layer->bounds[3])) {
                     window_rects.push_back(*bounds);
@@ -1313,9 +1281,9 @@ void add_native_city_block_solid_cell(
     const auto cx = origin.x + half;
     const auto cy = origin.y + half;
     const auto cz = origin.z + half;
-    // BuildBuildingBlockRenderBuffers emits native faces 1..5 for solid cells;
-    // face 0/down stays absent here, matching the existing building solid path.
-    // A side covered by a solid neighbour is not emitted (exposed-face mask).
+    // BuildBuildingBlockRenderBuffers makes game faces 1..5 for solid cells. Face 0
+    // (down) is left out here, like in the existing solid building path. A side
+    // covered by a solid neighbour is not made (the visible-face mask).
     const auto neighbor = [&](std::size_t i) { return covered[i] ? &cell : nullptr; };
     const std::array<SolidCellFaceCheck, 5> exposed_sides{{
         {BuildingFaceSide::South, neighbor(0)},
@@ -1353,6 +1321,9 @@ BuildingRenderBuffer build_city_block_solid_preview_buffer() {
 }
 
 void sort_triangles_into_native_material_runs(BuildingRenderBuffer& buffer) {
+    // Picking grids store triangle numbers, which sorting changes.
+    buffer.mask_cache.clear();
+    buffer.pick_grid = {};
     std::stable_sort(buffer.triangles.begin(), buffer.triangles.end(), [](const RenderBufferTriangle& left, const RenderBufferTriangle& right) {
         if (left.material != right.material) {
             return left.material < right.material;
@@ -1380,8 +1351,8 @@ void sort_triangles_into_native_material_runs(BuildingRenderBuffer& buffer) {
 }
 
 std::vector<PortalRect> wall_rects_for_side_code(const SblTemplate& template_file, std::uint32_t side_code, PortalSide side) {
-    // BuildBuildingBlockRenderBuffers_1400799d0.c:177-180 consumes side-code
-    // sc 3..15 as profile index sc-3 into the buildblock/itemset geometry table.
+    // BuildBuildingBlockRenderBuffers_1400799d0.c:177-180 uses side codes 3..15 as
+    // shape index sc-3 into the buildblock/item-set geometry table.
     if (side_code < 3U || side_code > 15U) {
         return {};
     }
@@ -1393,8 +1364,8 @@ std::vector<PortalRect> wall_rects_for_side_code(const SblTemplate& template_fil
 }
 
 Vec3 building_cell_center_world(const SbbBuilding& building, const SbbCell& cell, float unit_size) {
-    // BuildBuildingBlockRenderBuffers_1400799d0.c:271-276 recenters every
-    // emitted vertex by -g_volCenter*cellSize; SBB anchors carry that center.
+    // BuildBuildingBlockRenderBuffers_1400799d0.c:271-276 moves every vertex by
+    // -g_volCenter*cellSize to centre it. SBB anchors hold that centre.
     return {
         (static_cast<float>(cell.x) - static_cast<float>(building.anchor_x) + 0.5F) * unit_size,
         (static_cast<float>(cell.y) - static_cast<float>(building.anchor_y) + 0.5F) * unit_size,
@@ -1403,7 +1374,7 @@ Vec3 building_cell_center_world(const SbbBuilding& building, const SbbCell& cell
 }
 
 // -----------------------------------------------------------------------------
-// Picking Helpers
+// Picking helpers
 // -----------------------------------------------------------------------------
 
 Vec3 add_scaled(Vec3 origin, Vec3 direction, float t) {
@@ -1490,8 +1461,8 @@ using NativeFaceArray = std::array<std::uint16_t, 8>;
 constexpr NativeFaceArray kFacesZero{};
 constexpr NativeFaceArray kFacesOne{1, 1, 1, 1, 1, 1, 1, 1};
 
-// World_SetTileBlockAndResolveNeighborLinks @f830 overwrites the cell, so the
-// last placement wins. The street owner is editor metadata for picking: an
+// World_SetTileBlockAndResolveNeighborLinks @f830 overwrites the cell, so the last
+// placement wins. The street owner is only editor data for picking: an
 // intersection fill keeps the street that paved the cell first.
 void set_city_tile(
     CityTileMap& tiles,
@@ -1507,21 +1478,21 @@ void set_city_tile(
     float top_center = std::numeric_limits<float>::quiet_NaN()) {
     auto& tile = tiles[CityTileKey{x, y, z}];
     const auto owner = street_index >= 0 ? street_index : tile.street_index;
-    // Cell y spans y*4+0.25 .. y*4+4.25; sloped tiles report the grade at the
-    // cell centre for the road outline and picking.
+    // Cell y runs from y*4+0.25 to y*4+4.25. Sloped tiles report the slope at the
+    // cell's centre, for the road outline and picking.
     const auto base_y = std::isnan(top_center) ? static_cast<float>(y) * 4.0F + 0.25F : top_center - 4.0F;
     tile = {block, faces, kind, base_y, slope_x, slope_z, owner};
 }
 
 // -----------------------------------------------------------------------------
-// Native City Street Graph
-// (subrosa.exe World_LoadMapAndInitializeTerrain @56980 intersection loader +
-//  MapConnector_AddStreetSegment @38e0)
+// The game's city street graph
+// (subrosa.exe World_LoadMapAndInitializeTerrain @56980 intersection loader and
+// MapConnector_AddStreetSegment @38e0)
 // -----------------------------------------------------------------------------
 
-// Native runtime intersection record. Axis naming follows the editor's SbcMap:
-// editor x = native unk0[1], editor z = native pos.x. The native loader stores
-// level = sbc y - 1; the drivable road surface sits at level * 4.0 + 4.25
+// The game's runtime intersection record. Axis names follow the editor's SbcMap:
+// editor x = game unk0[1], editor z = game pos.x. The game's loader stores
+// level = sbc y - 1, and the road surface you drive on is at level * 4.0 + 4.25
 // (DAT_00278688 / DAT_00278698).
 struct NativeCityIntersection {
     std::int32_t gx{};
@@ -1544,10 +1515,10 @@ struct NativeCityStreet {
     std::int32_t left_width{};   // native unk1[1] (startOffset)
     std::int32_t right_width{};  // native unk1[2] (endOffset)
     std::int32_t source_index{-1}; // index into SbcMap::streets this came from
-    // Generated name (MapConnector_AddStreetSegment @38e0): from the start
-    // intersection, (gz - 256) / 32 names First..Ninth Street along X and
-    // (gx - 256) / 56 names Abrash..Holland Ave along Z. Out-of-range positions
-    // keep the zeroed field, which reads as First Street.
+    // The made-up name (MapConnector_AddStreetSegment @38e0): from the start
+    // intersection, (gz - 256) / 32 picks First..Ninth Street along X, and
+    // (gx - 256) / 56 picks Abrash..Holland Ave along Z. Positions outside those
+    // ranges keep the zeroed field, which reads as First Street.
     std::int32_t name_index{};
 };
 
@@ -1623,9 +1594,9 @@ NativeCityGraph build_native_city_graph(const SbcMap& map) {
     return graph;
 }
 
-// Post-placement extent expansion (World_LoadMapAndInitializeTerrain @56980:
-// every positive extent grows by one tile after the perimeter tiles are placed,
-// before lane bounds and the terrain patches are computed).
+// Growing the extents after placement (World_LoadMapAndInitializeTerrain @56980:
+// every positive extent grows by one tile after the edge tiles are placed, before
+// lane bounds and terrain patches are worked out).
 void expand_native_city_extents(NativeCityGraph& graph) {
     for (auto& intersection : graph.intersections) {
         if (intersection.ext_x_pos > 0) {
@@ -1643,13 +1614,13 @@ void expand_native_city_extents(NativeCityGraph& graph) {
     }
 }
 
-// Corner-stamp height grid (UpdateMapTopHeightAndClearOccupancyBit @3fa40).
-// One float per tile-grid corner, max-updated; a tile counts as road interior
-// for the terrain patch when all four of its corners are stamped > 0.
+// The corner-stamp height grid (UpdateMapTopHeightAndClearOccupancyBit @3fa40).
+// One float per tile-grid corner, which only ever goes up. A tile counts as inside a
+// road for the terrain patch when all four of its corners are stamped above 0.
 struct CityCornerStampMap {
     std::unordered_map<std::uint64_t, float> heights;
     // Land-use mask (g_landUseMaskBits): cells whose bit a stamp cleared. The
-    // landscape shader discards terrain there (landscape.frag, land_usemask).
+    // landscape shader throws away terrain there (landscape.frag, land_usemask).
     // Only cells inside the intersections' bounding box are cleared.
     std::unordered_set<std::uint64_t> masked;
     std::int32_t mask_min_x{}, mask_max_x{-1}, mask_min_z{}, mask_max_z{-1};
@@ -1680,11 +1651,11 @@ struct CityCornerStampMap {
     }
 };
 
-// District/piece cells stamp the corner-height grid too
-// (ApplyAllCityDistrictCellsToWorld @20000): every occupied cell of an 8^3
-// district volume stamps its tile at the cell's own level * 4. The editor's
-// portals are those district volumes: fields[1..3] = position in 8-cell units,
-// voxel index decodes as y*64 + z*8 + x.
+// District and piece cells stamp the corner-height grid too
+// (ApplyAllCityDistrictCellsToWorld @20000): every filled cell of an 8^3 district
+// volume stamps its tile at the cell's own level * 4. The editor's portals are
+// those district volumes: fields[1..3] are the position in 8-cell units, and the
+// voxel index is y*64 + z*8 + x.
 void stamp_city_portal_cells(CityCornerStampMap& stamps, const SbcMap& map) {
     for (const auto& portal : map.portals) {
         const auto& voxels = portal.voxel_blocks();
@@ -1697,18 +1668,18 @@ void stamp_city_portal_cells(CityCornerStampMap& stamps, const SbcMap& map) {
             const auto local_z = static_cast<std::int32_t>((voxel_index >> 3U) & 7U);
             const auto local_y = static_cast<std::int32_t>((voxel_index >> 6U) & 7U);
             stamps.stamp(
-                portal.fields[1] * 8 + local_x,
-                portal.fields[3] * 8 + local_z,
-                static_cast<float>(portal.fields[2] * 8 + local_y) * 4.0F);
+                sbc_portal_cell_base(portal.fields[1]) + local_x,
+                sbc_portal_cell_base(portal.fields[3]) + local_z,
+                static_cast<float>(sbc_portal_cell_base(portal.fields[2]) + local_y) * 4.0F);
         }
     }
 }
 
-// Building instantiation stamps every occupied cell of the building's ANCHOR
-// layer at the placement record's y * 4 (InstantiateSbbVolumeIntoWorldAndMetadata
-// @23d00: UpdateMapTopHeight fires only when the local layer equals the anchor
-// layer). Cell tiles are resolved through the verified city placement transform
-// (rotation about the anchor), sampling each cell's rotated center.
+// Placing a building stamps every filled cell of the building's ANCHOR layer at the
+// placement record's y * 4 (InstantiateSbbVolumeIntoWorldAndMetadata @23d00 only
+// calls UpdateMapTopHeight when the local layer is the anchor layer). Each cell's
+// tile is found with the checked city placement transform (rotation around the
+// anchor), using the rotated centre of the cell.
 void stamp_city_building_footprints(
     CityCornerStampMap& stamps,
     const SbcMap& map,
@@ -1721,7 +1692,7 @@ void stamp_city_building_footprints(
         const auto& placement = map.buildings[index];
         const auto height = static_cast<float>(placement.y) * 4.0F;
         for (const auto& cell : building->cells) {
-            // The anchor layer's placed cells (those with an exterior block word).
+            // The anchor layer's placed cells (the ones with an exterior block word).
             if (cell.exterior_block() == 0U || cell.y != building->anchor_y) {
                 continue;
             }
@@ -1739,10 +1710,10 @@ void stamp_city_building_footprints(
     }
 }
 
-// Later world writes replace street cells. Streets are placed first; district
-// cells (ApplyAllCityDistrictCellsToWorld @20000) then overwrite their cell, and
-// InstantiateSbbVolumeIntoWorldAndMetadata @23ac0 deletes the block in every
-// occupied cell of the building volume before writing the building's own.
+// Later writes to the world replace street cells. Streets are placed first. Then
+// district cells (ApplyAllCityDistrictCellsToWorld @20000) overwrite their cell,
+// and InstantiateSbbVolumeIntoWorldAndMetadata @23ac0 deletes the block in every
+// filled cell of the building before writing the building's own.
 void remove_replaced_city_tiles(
     std::vector<CityTileCell>& tiles,
     const SbcMap& map,
@@ -1753,9 +1724,9 @@ void remove_replaced_city_tiles(
         const auto count = std::min<std::size_t>(voxels.size(), 0x200);
         for (std::size_t i = 0; i < count; ++i) {
             if (voxels[i] == 0U) continue;
-            replaced.insert({portal.fields[1] * 8 + static_cast<std::int32_t>(i & 7U),
-                portal.fields[2] * 8 + static_cast<std::int32_t>((i >> 6U) & 7U),
-                portal.fields[3] * 8 + static_cast<std::int32_t>((i >> 3U) & 7U)});
+            replaced.insert({sbc_portal_cell_base(portal.fields[1]) + static_cast<std::int32_t>(i & 7U),
+                sbc_portal_cell_base(portal.fields[2]) + static_cast<std::int32_t>((i >> 6U) & 7U),
+                sbc_portal_cell_base(portal.fields[3]) + static_cast<std::int32_t>((i >> 3U) & 7U)});
         }
     }
     for (std::size_t index = 0; index < map.buildings.size() && index < placement_buildings.size(); ++index) {
@@ -1780,11 +1751,11 @@ void remove_replaced_city_tiles(
     std::erase_if(tiles, [&](const CityTileCell& tile) { return replaced.contains({tile.x, tile.y, tile.z}); });
 }
 
-// Replays the game's world storage allocation (GameWorldFit) in load order and
-// drops the road tiles it cannot hold from `tiles`.
-// ponytail: tiles keep only their last writer, so a street's tiles are replayed
-// in order along the street instead of the game's exact write order; they only
-// differ in which cells of the one street that fills the storage survive.
+// Replays how the game fills its world storage (GameWorldFit), in load order, and
+// removes from `tiles` the road tiles that don't fit.
+// ponytail: a tile only keeps its last writer, so each street's tiles are replayed
+// in order along the street rather than in the game's exact write order. The only
+// difference is which cells survive on the one street that fills the storage up.
 GameWorldFit fit_to_game_world(
     std::vector<CityTileCell>& tiles,
     const NativeCityGraph& graph,
@@ -1827,9 +1798,9 @@ GameWorldFit fit_to_game_world(
         const auto& voxels = portal.voxel_blocks();
         for (std::size_t i = 0; i < std::min<std::size_t>(voxels.size(), 0x200); ++i) {
             if (voxels[i] == 0U) continue;
-            place(portal.fields[1] * 8 + static_cast<std::int32_t>(i & 7U),
-                portal.fields[2] * 8 + static_cast<std::int32_t>((i >> 6U) & 7U),
-                portal.fields[3] * 8 + static_cast<std::int32_t>((i >> 3U) & 7U));
+            place(sbc_portal_cell_base(portal.fields[1]) + static_cast<std::int32_t>(i & 7U),
+                sbc_portal_cell_base(portal.fields[2]) + static_cast<std::int32_t>((i >> 6U) & 7U),
+                sbc_portal_cell_base(portal.fields[3]) + static_cast<std::int32_t>((i >> 3U) & 7U));
         }
     }
 
@@ -1865,10 +1836,10 @@ GameWorldFit fit_to_game_world(
 
 } // namespace
 
-// Per placement, the cells a later placement overwrites. The game deletes the
-// world cell under every building cell with an exterior block word before it
-// writes its own (InstantiateSbbVolumeIntoWorldAndMetadata @23ac0), so where
-// placements overlap the later one wins.
+// For each placement, the cells a later placement overwrites. The game deletes the
+// world cell under every building cell with an exterior block word before writing
+// its own (InstantiateSbbVolumeIntoWorldAndMetadata @23ac0), so where placements
+// overlap, the later one wins.
 std::vector<std::vector<std::size_t>> overwritten_building_cells(
     const SbcMap& map,
     const std::vector<const SbbBuilding*>& placement_buildings) {
@@ -1898,16 +1869,9 @@ std::vector<std::vector<std::size_t>> overwritten_building_cells(
 
 namespace {
 
-// Street tile placement (MapConnector_PlaceStreetSegmentTilesAndSlopes @20580).
-// Lanes are solid cells at the current level with the lane marking code in face
-// slot 5 (the top). Inside the centered run-length slope region they become
-// grade blocks from the aa14 table, with the code also in slot 0 (the grade
-// quad's material). Curbs are the curb block one level up, and grade side
-// blocks from the ba14 table at the lane level inside the slope region.
-// Branch 0 (orientation 0) walks +X with lanes offset in Z and uses table edges
-// 0 (up) / 2 (down); branch 1 walks +Z with lanes in X and edges 1 / 3.
-// Length between the junction footprints, level change, and cells per level of
-// a street's slope, as MapConnector_PlaceStreetSegmentTilesAndSlopes computes them.
+// A street's length between the junction footprints, its change in level, and how
+// many cells it takes per level of slope, worked out the same way as
+// MapConnector_PlaceStreetSegmentTilesAndSlopes.
 StreetRun native_street_run(const NativeCityGraph& graph, const NativeCityStreet& street, bool auto_generated) {
     const auto& from = graph.intersections[static_cast<std::size_t>(street.a)];
     const auto& to = graph.intersections[static_cast<std::size_t>(street.b)];
@@ -1917,16 +1881,25 @@ StreetRun native_street_run(const NativeCityGraph& graph, const NativeCityStreet
     run.length = (along_x ? to.gx - to.ext_x_neg : to.gz - to.ext_z_neg) - start;
     run.climb = to.level - from.level;
     const auto abs_delta = std::abs(run.climb);
-    // ponytail: the game divides by zero when a street is shorter than its climb;
-    // clamp the run length to 1 instead of reproducing the crash.
+    // ponytail: the game divides by zero when a street is shorter than its climb.
+    // We set the run length to 1 instead of copying the crash.
     run.cells_per_level = abs_delta > 0 ? std::max(1, run.length / abs_delta) : 6;
-    // isMapAutoGenerated (the "round" map) uses a short fixed run instead: 6
-    // cells per level, 10 when the street is at least 10x longer than its climb,
-    // so the street runs flat, slopes in the middle, then runs flat again.
+    // isMapAutoGenerated (the "round" map) uses a short fixed run instead: 6 cells
+    // per level, or 10 when the street is at least 10x longer than its climb. So the
+    // street runs flat, slopes in the middle, then runs flat again.
     if (auto_generated) run.cells_per_level = abs_delta > 0 && abs_delta <= run.length / 10 ? 10 : 6;
     return run;
 }
 
+// Lays a street's tiles (MapConnector_PlaceStreetSegmentTilesAndSlopes @20580).
+// Lanes are solid cells at the current level, with the lane marking code in face
+// slot 5 (the top). Inside the sloped stretch in the middle, they become slope
+// blocks from the aa14 table, with the code also in slot 0 (the slope quad's
+// material). Curbs are the curb block one level up, and inside the slope they are
+// slope side blocks from the ba14 table at the lane level.
+// Branch 0 (orientation 0) walks along +X with lanes spread in Z and uses table
+// edges 0 (up) and 2 (down). Branch 1 walks along +Z with lanes in X and uses
+// edges 1 and 3.
 void place_native_street_tiles(
     CityTileMap& tiles,
     CityCornerStampMap& stamps,
@@ -1952,9 +1925,9 @@ void place_native_street_tiles(
     const auto slope_start = (seg_len >> 1) - half;
     const auto slope_end = (seg_len >> 1) + half;
 
-    // Uphill reads edge 0/1 at n*64+runPos; downhill reads the table 31/47 ints
-    // past its base at n*65-runPos (edge 2/3, steps reversed). Out-of-table reads
-    // resolve to id 0, like the zeroed globals the game would read.
+    // Uphill reads edge 0/1 at n*64+runPos. Downhill reads the table 31/47 ints past
+    // its start at n*65-runPos (edge 2/3, with the steps reversed). Reads past the end
+    // of the table give id 0, like the zeroed globals the game would read.
     const auto grade_block = [&](bool side, std::int32_t run_pos) {
         const auto base = (side ? 1024 : 0) + (along_x ? 0 : 16) + (delta > 0 ? 0 : 31);
         const auto index = base + (delta > 0 ? run_len * 64 + run_pos : run_len * 65 - run_pos);
@@ -1989,7 +1962,7 @@ void place_native_street_tiles(
             height += 1;
         }
         const auto coord = start + along;
-        // Grade of this cell's sloped surface, for the outline and picking.
+        // The slope of this cell's surface, for the outline and picking.
         const auto step = 4.0F / static_cast<float>(run_len);
         const auto grade = in_slope ? (delta > 0 ? step : -step) : 0.0F;
         const auto k = delta > 0 ? run_pos : run_len - 1 - run_pos;
@@ -2026,7 +1999,7 @@ void place_native_street_tiles(
         }
         last_faces = faces;
 
-        // Terrain top stamp spans curb to curb (native ~leftWidth .. rightWidth).
+        // The terrain-top stamp covers curb to curb (the game's ~leftWidth .. rightWidth).
         for (auto offset = -street.left_width - 1; offset <= street.right_width; ++offset) {
             const auto sx = along_x ? coord : center + offset;
             const auto sz = along_x ? center + offset : coord;
@@ -2041,10 +2014,9 @@ void place_native_street_tiles(
         }
     }
 
-    // Stop lines: the lane rows touching each endpoint become solid cells with
-    // the end-cap code, when that endpoint has a cross street (extents measured
-    // before the +1 expansion). The rest of the face array is left over from the
-    // last lane written.
+    // Stop lines: the lane rows touching each end become solid cells with the end-cap
+    // code, when that end has a cross street (extents measured before the +1 growth).
+    // The rest of the face array is whatever the last lane wrote.
     last_faces[5] = along_x ? 0x4801 : 0x4301;
     const auto from_cap = along_x
         ? from.ext_x_pos > 0 && (from.ext_z_pos > 0 || from.ext_z_neg > 0)
@@ -2063,9 +2035,9 @@ void place_native_street_tiles(
     }
 }
 
-// Intersection footprint + perimeter (MapConnector_PlaceIntersectionPerimeterTiles
-// @20130): solid asphalt fill over the asymmetric extents; missing-neighbor
-// sides get curb rows one level above, extended one tile past both ends.
+// An intersection's footprint and edges (MapConnector_PlaceIntersectionPerimeterTiles
+// @20130): solid asphalt over its uneven extents. Sides with no street get curb rows
+// one level up, reaching one tile past both ends.
 void place_native_intersection_tiles(CityTileMap& tiles, const NativeCityIntersection& intersection, std::int32_t index) {
     // Every tile this junction writes is tagged with it, for its outline.
     const auto tag = [&](std::int32_t x, std::int32_t y, std::int32_t z) { tiles[CityTileKey{x, y, z}].intersection_index = index; };
@@ -2090,7 +2062,7 @@ void place_native_intersection_tiles(CityTileMap& tiles, const NativeCityInterse
         }
     }
     if (intersection.street_north < 0) {
-        // Native quirk: the -x row offset uses ext_x_pos (field_0x2c), not the
+        // A quirk of the game: the -x row offset uses ext_x_pos (field_0x2c), not the
         // -x extent.
         const auto x = intersection.gx - intersection.ext_x_pos - 1;
         for (auto z = z_row_begin; z <= z_row_end; ++z) {
@@ -2117,8 +2089,8 @@ void place_native_intersection_tiles(CityTileMap& tiles, const NativeCityInterse
 
 } // namespace
 
-// Drops junctions no road uses. The game still lays a junction's tiles
-// (MapConnector_PlaceIntersectionPerimeterTiles), so a leftover shows as a slab.
+// Removes junctions that no road uses. The game still lays a junction's tiles
+// (MapConnector_PlaceIntersectionPerimeterTiles), so a leftover one shows as a slab.
 void remove_unused_city_intersections(SbcMap& map) {
     std::vector<bool> used(map.intersections.size());
     for (const auto& street : map.streets) {
@@ -2185,11 +2157,11 @@ float terrain_noise_sample(float x, float z, float frequency_x, float frequency_
 }
 
 float native_like_city_terrain_height(float world_x, float world_z, bool city_map) {
-    // Native runtime terrain samples use grid = world + 4096 at 1 sample per world
-    // unit. The 2049^2 source heightfield is upsampled 8x by the game
-    // (Terrain_RebuildLandTilesRoadPatchesAndChunkCaches @d12e0); the bilinear
-    // corners are H[col-1..col] in X but H[row..row+1] in Z, so the continuous
-    // source coordinate carries a one-sample shift on the X axis only.
+    // The game's runtime terrain samples use grid = world + 4096, one sample per world
+    // unit. The game scales the 2049^2 source heightfield up 8x
+    // (Terrain_RebuildLandTilesRoadPatchesAndChunkCaches @d12e0). The bilinear corners
+    // are H[col-1..col] in X but H[row..row+1] in Z, so the smooth source coordinate is
+    // shifted by one sample on the X axis only.
     const auto gx = (world_x + 4088.0F) * 0.125F;
     const auto gz = (world_z + 4096.0F) * 0.125F;
     const auto dx1 = gx - 640.0F;
@@ -2209,10 +2181,10 @@ float native_like_city_terrain_height(float world_x, float world_z, bool city_ma
         noise3 * 8.0F + 23.8125F + (noise1 + r1sq) * 16.0F + (noise2 * 32.0F + r1sq * 8.0F) * r1sq;
     auto height = base_blend * r2 + (1.0F - r2) * 23.875F;
 
-    // City-map shoreline carving (Terrain_GenerateIslandHeightfield @56560,
-    // isMapAutoGenerated == 0): an L-shaped water shelf at 11.75 northwest of the
-    // city, blended up with the cubic ramp (36 - 24e) * e^2 + 11.75 over four
-    // source samples at the boundary.
+    // Cutting the shoreline on city maps (Terrain_GenerateIslandHeightfield @56560,
+    // isMapAutoGenerated == 0): an L-shaped shallow water shelf at 11.75 north-west of
+    // the city, blended up with the cubic ramp (36 - 24e) * e^2 + 11.75 over four
+    // source samples at the edge.
     const auto min1 = [](float value) { return std::min(value, 1.0F); };
     const auto shore = [&](float edge) { return (36.0F - edge * 24.0F) * edge * edge + 11.75F; };
     if (!city_map) return height;
@@ -2234,25 +2206,32 @@ namespace {
 
 constexpr auto city_terrain_mesh_y_offset = 0.05F;
 
-// Runs row(0..rows-1) across the CPU cores (in order on the web build).
+// Runs row(0..rows-1) across the CPU cores (in order in the web build).
 template <typename F>
 void parallel_rows(std::int32_t rows, F&& row) {
 #ifdef __EMSCRIPTEN__
     for (std::int32_t r = 0; r < rows; ++r) row(r);
 #else
+    if (rows <= 0) return;
     std::atomic<std::int32_t> next{0};
-    std::vector<std::thread> workers(std::max(1U, std::thread::hardware_concurrency()));
-    for (auto& worker : workers) worker = std::thread([&] {
-        for (std::int32_t r; (r = next++) < rows;) row(r);
-    });
-    for (auto& worker : workers) worker.join();
+    const auto count = std::min(static_cast<unsigned>(rows), std::max(1U, std::thread::hardware_concurrency()));
+    // Futures also wait while the stack unwinds, so row's captured state stays alive if
+    // a worker fails. get() passes that failure on to the scene builder.
+    std::vector<std::future<void>> workers;
+    workers.reserve(count);
+    for (unsigned worker = 0; worker < count; ++worker) {
+        workers.push_back(std::async(std::launch::async, [&] {
+            for (auto r = next.fetch_add(1); r < rows; r = next.fetch_add(1)) row(r);
+        }));
+    }
+    for (auto& worker : workers) worker.get();
 #endif
 }
 
-// 1-world-unit terrain height grid over the city region, indexed by integer
-// world coordinates (the native land-sample grid minus its +4096 offset).
-// Only patched samples are stored; the rest is the island height, computed on
-// demand (a dense grid of a long map is tens of millions of samples).
+// A terrain height grid at one world unit per sample over the city, indexed by whole
+// world coordinates (the game's land-sample grid without its +4096 offset). Only
+// patched samples are stored. Everything else is the island height, worked out when
+// asked (a full grid for a long map would be tens of millions of samples).
 struct CityHeightfield {
     std::int32_t min_x{};
     std::int32_t min_z{};
@@ -2284,9 +2263,9 @@ struct CityHeightfield {
     }
 };
 
-// The native build patches a fixed, hardcoded list of intersection indices for
-// every non-auto-generated map (Terrain_RebuildLandTilesRoadPatchesAndChunkCaches
-// @d12e0). The same list applies regardless of map content.
+// The game patches a fixed list of intersection numbers on every map that is not
+// auto-generated (Terrain_RebuildLandTilesRoadPatchesAndChunkCaches @d12e0). The
+// list is the same whatever the map contains.
 constexpr std::array<std::int32_t, 28> native_city_terrain_patch_indices{
     2, 40, 32, 46, 45, 47, 28, 10, 33, 42, 35, 13, 59, 31,
     52, 48, 50, 19, 22, 58, 62, 61, 41, 36, 43, 44, 38, 39,
@@ -2303,13 +2282,13 @@ struct CityPatchCell {
     std::array<CityPatchCandidate, 2> entries{};
 };
 
-// Port of Terrain_ApplyStreetIntersectionHeightPatch @d3340. Expects the
-// post-placement expanded extents. Phase 1 writes a bilinear surface between
-// the four corner intersections of the city block; phase 2 re-seeds road
-// interior tiles (all four mapTopHeight corner stamps > 0) to the stamped road
-// heights; phase 3 propagates seed positions outward for 16 passes with weight
-// 1 - dist/16 (up to two direction-filtered candidates per sample); phase 4
-// smoothstep-blends every reached sample toward its seed heights.
+// Port of Terrain_ApplyStreetIntersectionHeightPatch @d3340. Expects the extents
+// after the +1 growth. Phase 1 writes a bilinear surface between the four corner
+// intersections of the block. Phase 2 resets road tiles (all four mapTopHeight
+// corner stamps > 0) to the stamped road heights. Phase 3 spreads those seed
+// positions outward for 16 passes with weight 1 - dist/16 (up to two candidates per
+// sample, filtered by direction). Phase 4 smoothstep-blends every sample reached
+// toward its seed heights.
 void apply_native_city_terrain_patch(
     CityHeightfield& field,
     const NativeCityGraph& graph,
@@ -2323,9 +2302,9 @@ void apply_native_city_terrain_patch(
     }
     const auto& a = intersections[static_cast<std::size_t>(intersection_index)];
 
-    // Neighbor walk: the south/west corner intersections may be one or two
-    // streets away (the binary skips one intermediate intersection when the
-    // direct neighbor lacks the required cross street).
+    // Walking to neighbours: the south and west corner intersections may be one or two
+    // streets away (the game skips one intersection in between when the direct
+    // neighbour doesn't have the cross street it needs).
     if (a.street_south < 0 || a.street_west < 0) {
         return;
     }
@@ -2367,8 +2346,8 @@ void apply_native_city_terrain_patch(
     const auto& corner_c = intersections[static_cast<std::size_t>(c)];
     const auto& corner_d = intersections[static_cast<std::size_t>(d)];
 
-    // Patch rect in world samples. Native quirk: the far corners subtract the
-    // same +axis extents (field_0x2c / field_0x30) used on the near corners.
+    // The patch rectangle in world samples. A quirk of the game: the far corners
+    // subtract the same +axis extents (field_0x2c / field_0x30) used on the near corners.
     const auto tile_p0 = a.gx + a.ext_x_pos;
     const auto tile_q0 = a.gz + a.ext_z_pos;
     const auto p0 = tile_p0 * 4;
@@ -2386,7 +2365,7 @@ void apply_native_city_terrain_patch(
     const auto height_c = native_road_surface_y(corner_c.level);
     const auto height_d = native_road_surface_y(corner_d.level);
 
-    // Phase 1: bilinear block surface between the four corner intersections.
+    // Phase 1: a bilinear block surface between the four corner intersections.
     for (auto qi = 0; qi <= span_q; ++qi) {
         const auto fq = static_cast<float>(qi) / static_cast<float>(span_q);
         for (auto pi = 0; pi <= span_p; ++pi) {
@@ -2397,7 +2376,7 @@ void apply_native_city_terrain_patch(
         }
     }
 
-    // Phase 2: seed road-interior tiles from the corner stamps.
+    // Phase 2: seed road tiles from the corner stamps.
     const auto cells_p = span_p >> 2;
     const auto cells_q = span_q >> 2;
     const auto grid_w = span_p + 1;
@@ -2440,10 +2419,10 @@ void apply_native_city_terrain_patch(
         }
     }
 
-    // Phase 3: 16-pass seed propagation. Each non-seed sample collects up to two
-    // candidates (original seed coordinates) from its 8-neighborhood, keeping
-    // candidates from distinct directions (dot > 0 test) and replacing weaker
-    // parallel ones.
+    // Phase 3: spread the seeds over 16 passes. Each sample that is not a seed picks up
+    // to two candidates (holding the original seed's coordinates) from its 8
+    // neighbours. It keeps candidates from different directions (dot > 0 test) and
+    // replaces weaker ones that point the same way.
     for (auto pass = 0; pass < 16; ++pass) {
         for (auto q = 1; q < span_q; ++q) {
             for (auto p = 1; p < span_p; ++p) {
@@ -2478,8 +2457,8 @@ void apply_native_city_terrain_patch(
                                 cell.count = 1;
                                 continue;
                             }
-                            // -1 = no parallel entry seen, -2 = a parallel entry
-                            // already holds an equal or better weight.
+                            // -1 = no candidate pointing the same way seen yet, -2 = one
+                            // already has an equal or better weight.
                             auto best = -1;
                             for (auto existing = 0; existing < cell.count; ++existing) {
                                 const auto& held = cell.entries[static_cast<std::size_t>(existing)];
@@ -2567,9 +2546,9 @@ std::vector<CityTileCell> build_city_tile_cells(
     return tiles;
 }
 
-// Face tables of BuildCellRenderGeometryAndAdjacency @c555, read from
-// subrosa.exe: cube corners DAT_002b34f0, face corners DAT_002b3660, and the
-// per-face tangent DAT_002b35a0 / bitangent DAT_002b35f0 that project UVs.
+// Face tables of BuildCellRenderGeometryAndAdjacency @c555, read from subrosa.exe:
+// cube corners DAT_002b34f0, face corners DAT_002b3660, and each face's tangent
+// DAT_002b35a0 and bitangent DAT_002b35f0, which project the UVs.
 // Faces: 0 -Y, 1 +Z, 2 -X, 3 -Z, 4 +X, 5 +Y.
 constexpr std::array<Vec3, 8> kNativeCubeCorner{{
     {0, 0, 0}, {1, 0, 0}, {1, 0, 1}, {0, 0, 1}, {0, 1, 0}, {1, 1, 0}, {1, 1, 1}, {0, 1, 1},
@@ -2587,9 +2566,9 @@ constexpr std::array<std::array<std::int32_t, 3>, 6> kNativeFaceNeighbor{{
     {0, -1, 0}, {0, 0, 1}, {-1, 0, 0}, {0, 0, -1}, {1, 0, 0}, {0, 1, 0},
 }};
 
-// A face code names a texture and a road-marking overlay layer: with bit 14 set
-// the low byte is the texture and bits 8..12 the overlay layer; a negative code
-// is the default texture (index 3) with overlay code & 0x3ff.
+// A face code names a texture and a road-marking overlay layer. With bit 14 set,
+// the low byte is the texture and bits 8..12 are the overlay layer. A negative code
+// means the default texture (index 3) with overlay code & 0x3ff.
 struct NativeFaceTexture {
     std::uint32_t texture{};
     std::uint32_t overlay{};
@@ -2605,7 +2584,7 @@ NativeFaceTexture decode_native_face(std::uint16_t code) {
     return {code, 0U};
 }
 
-// Road cells only use texture 0 (concrete, curbs) and 1 (asphalt2, lanes).
+// Road cells only use texture 0 (concrete, for curbs) and 1 (asphalt2, for lanes).
 std::uint32_t city_tile_material(BuildingRenderBuffer& buffer, std::uint32_t texture) {
     return material_id_for_name(buffer, texture == 0U ? "city_curb_concrete" : "city_road_asphalt");
 }
@@ -2624,8 +2603,8 @@ void add_city_tile_quad(BuildingRenderBuffer& buffer, const std::array<Vec3, 4>&
 
 } // namespace
 
-// Open-addressing hash map in flat arrays: the shadow bake inserts millions
-// of small keys, where node-based maps spend most of their time in malloc.
+// A hash map with open addressing in flat arrays. The shadow bake inserts millions
+// of small keys, and node-based maps spend most of their time in malloc.
 template <typename K, typename V, typename Hash>
 class FlatMap {
 public:
@@ -2634,7 +2613,7 @@ public:
         while (capacity < count * 2U) capacity *= 2U;
         if (capacity > slots_.size()) rehash(capacity);
     }
-    // The value for key, and whether it was added.
+    // The value for key, and whether it was just added.
     std::pair<V*, bool> emplace(const K& key, const V& value) {
         if ((size_ + 1U) * 2U > slots_.size()) rehash(std::max<std::size_t>(16, slots_.size() * 2U));
         auto i = slot_of(key);
@@ -2666,7 +2645,7 @@ public:
 
 private:
     enum : std::uint8_t { kEmpty, kFull, kErased };
-    // Mixes the hash so linear probing over a power-of-two table spreads well.
+    // Mixes the hash so linear probing over a power-of-two table spreads keys well.
     std::size_t slot_of(const K& key) const {
         auto x = static_cast<std::uint64_t>(Hash{}(key));
         x ^= x >> 33U; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33U;
@@ -2688,6 +2667,8 @@ private:
 };
 
 void keep_pick_data_only(BuildingRenderBuffer& buffer) {
+    buffer.mask_cache.clear();
+    buffer.pick_grid = {};
     struct PositionHash {
         std::size_t operator()(const Vec3& p) const {
             return std::hash<float>{}(p.x) * 73856093U ^ std::hash<float>{}(p.y) * 19349663U ^ std::hash<float>{}(p.z) * 83492791U;
@@ -2706,7 +2687,10 @@ void keep_pick_data_only(BuildingRenderBuffer& buffer) {
         remap[i] = found->second;
     }
     for (auto& triangle : buffer.triangles) {
-        for (auto& index : triangle.indices) index = index < remap.size() ? remap[index] : 0U;
+        for (auto& index : triangle.indices) {
+            if (index >= remap.size()) throw std::runtime_error("Picking buffer triangle index exceeds its vertices");
+            index = remap[index];
+        }
     }
     vertices.shrink_to_fit();
     buffer.vertices = std::move(vertices);
@@ -2717,13 +2701,13 @@ void keep_pick_data_only(BuildingRenderBuffer& buffer) {
 }
 
 void bake_shadow_volume(BuildingRenderBuffer& buffer) {
-    // Build the volume once from the face adjacency. RenderQueuedShadowVolumeAdjacencyPass @11c950
-    // extrudes every triangle of a sector, window panes included. The game's
-    // walls are whole cell quads (windows live in the texture alpha); ours are
-    // cut around window rects, which leaves T-junctions: a long edge facing
-    // several short ones never pairs, both sides emit coincident side quads,
-    // and their depth rounding leaks light as thin lines. So split every edge
-    // at the vertices lying on it, then pair each directed edge a->b with b->a.
+    // Build the volume once from the face adjacency. RenderQueuedShadowVolumeAdjacencyPass
+    // @11c950 stretches every triangle of a sector, window panes included. The game's
+    // walls are whole cell quads (windows are in the texture's alpha), but ours are cut
+    // around window rectangles, which leaves T-junctions. A long edge next to several
+    // short ones never pairs up, both sides make side quads in the same place, and depth
+    // rounding leaks light through as thin lines. So split every edge at the vertices
+    // that lie on it, then pair each edge a->b with b->a.
     using Key = std::array<std::int64_t, 3>;
     const auto point_key = [](Vec3 point) {
         return Key{std::llround(point.x * 1024.0), std::llround(point.y * 1024.0), std::llround(point.z * 1024.0)};
@@ -2736,10 +2720,10 @@ void bake_shadow_volume(BuildingRenderBuffer& buffer) {
     struct IdentityHash {
         std::size_t operator()(std::uint64_t value) const { return static_cast<std::size_t>(value); }
     };
-    // Directed edge a->b of point ids.
+    // Edge a->b between point ids, with a direction.
     const auto edge_key = [](std::uint32_t a, std::uint32_t b) { return static_cast<std::uint64_t>(a) << 32U | b; };
 
-    // Distinct points (1/1024-unit grid) get ids; edges and faces use the ids.
+    // Distinct points (on a 1/1024-unit grid) get ids, and edges and faces use the ids.
     FlatMap<Key, std::uint32_t, KeyHash> point_id;
     std::vector<Key> point_keys;
     std::vector<Vec3> point_positions;
@@ -2756,7 +2740,7 @@ void bake_shadow_volume(BuildingRenderBuffer& buffer) {
     for (std::size_t i = 0; i < buffer.vertices.size(); ++i) {
         vertex_point[i] = id_of(point_key(buffer.vertices[i].position), buffer.vertices[i].position);
     }
-    // The buffer's own points, bucketed by 1-unit grid cell.
+    // The buffer's own points, sorted into 1-unit grid cells.
     const auto cell_of = [](const Key& key) { return Key{key[0] >> 10, key[1] >> 10, key[2] >> 10}; };
     std::unordered_map<Key, std::vector<std::uint32_t>, KeyHash> grid;
     for (std::uint32_t id = 0; id < point_keys.size(); ++id) grid[cell_of(point_keys[id])].push_back(id);
@@ -2782,7 +2766,7 @@ void bake_shadow_volume(BuildingRenderBuffer& buffer) {
                 const Key v{p[0] - a[0], p[1] - a[1], p[2] - a[2]};
                 const auto t = v[0] * d[0] + v[1] * d[1] + v[2] * d[2];
                 if (t <= 0 || t >= length_sq) continue;
-                // Distance from the line, squared, within 2/1024 units.
+                // Squared distance from the line, within 2/1024 units.
                 const auto cx = static_cast<double>(v[1] * d[2] - v[2] * d[1]);
                 const auto cy = static_cast<double>(v[2] * d[0] - v[0] * d[2]);
                 const auto cz = static_cast<double>(v[0] * d[1] - v[1] * d[0]);
@@ -2793,9 +2777,9 @@ void bake_shadow_volume(BuildingRenderBuffer& buffer) {
         std::ranges::sort(on_edge);
     };
 
-    // Split faces carry the render triangle they came from: caps use that
-    // triangle as drawn, so a cap depth-matches its surface exactly, and every
-    // piece of it shares its normal, so the pieces agree on facing.
+    // Split faces remember the render triangle they came from. Caps use that triangle
+    // as drawn, so a cap's depth matches its surface exactly, and every piece shares
+    // its normal, so the pieces agree on which way they face.
     struct Face {
         std::array<std::uint32_t, 3> points{};
         std::array<std::int32_t, 3> adjacent{{-1, -1, -1}};
@@ -2812,8 +2796,8 @@ void bake_shadow_volume(BuildingRenderBuffer& buffer) {
             parents.push_back({vertex_point[triangle.indices[0]], vertex_point[triangle.indices[1]], vertex_point[triangle.indices[2]]});
         }
     }
-    // An edge whose reverse is another triangle's edge pairs as is; only the
-    // rest can meet a T-junction, so only they are searched for split points.
+    // An edge whose reverse is another triangle's edge pairs as it is. Only the rest
+    // can meet a T-junction, so only they are searched for split points.
     FlatMap<std::uint64_t, std::uint8_t, IdentityHash> directed_edges;
     directed_edges.reserve(parents.size() * 3U);
     for (const auto& ids : parents) {
@@ -2854,8 +2838,8 @@ void bake_shadow_volume(BuildingRenderBuffer& buffer) {
             add_face(ids, t);
             continue;
         }
-        // Fan the split polygon from its centroid so no fan triangle is
-        // degenerate (split points are collinear with their edge's corners).
+        // Fan the split polygon out from its centre, so no fan triangle is flat
+        // (split points are on a line with their edge's corners).
         Vec3 centroid{};
         for (const auto id : ids) {
             const auto& p = point_positions[id];
@@ -2865,25 +2849,25 @@ void bake_shadow_volume(BuildingRenderBuffer& buffer) {
         for (std::size_t i = 0; i < ring.size(); ++i) add_face({center, ring[i], ring[(i + 1U) % ring.size()]}, t);
     }
 
-    // RenderQueuedShadowVolumeAdjacencyPass decides silhouettes per frame in a
-    // geometry shader: it extrudes the faces turned away from the light and
-    // emits a side where the neighbour faces the light or the edge is open.
-    // Without a geometry shader, bake every candidate: each face carries a
-    // front and a back cap, each edge a quad whose two ends carry their own
-    // face's normal (kind in uv.x). The shadow vertex shader keeps the caps of
-    // faces turned away, and extrudes an edge end when its face is lit, so only
-    // silhouette quads get area. An open edge's far end always extrudes.
-    // Faces wind clockwise (game order), so cross(p1 - p0, p2 - p0) points
-    // inward and a face is turned away when that normal meets the light.
+    // RenderQueuedShadowVolumeAdjacencyPass picks the outline edges every frame in a
+    // geometry shader: it stretches the faces turned away from the light and adds a side
+    // where the neighbour faces the light or there is no neighbour. We have no geometry
+    // shader, so we bake every possible piece: each face gets a front and a back cap,
+    // and each edge a quad whose two ends carry their own face's normal (the kind is in
+    // uv.x). The shadow vertex shader keeps the caps of faces turned away and stretches
+    // an edge end when its face is lit, so only the outline quads end up with any area.
+    // An open edge's far end always stretches. Faces are wound clockwise (the game's
+    // order), so cross(p1 - p0, p2 - p0) points inward, and a face is turned away when
+    // that normal meets the light.
     enum : std::uint8_t { kEdge = 0, kOpenEdge = 1, kFrontCap = 2, kBackCap = 3 };
-    // Vertex layout matches the GPU mesh: position, uv (kind, 0, 0), normal.
+    // The vertex layout matches the GPU mesh: position, uv (kind, 0, 0), normal.
     auto& vertices = buffer.shadow_vertices;
     vertices.clear();
     vertices.reserve(parents.size() * 4U * 9U);
     std::uint32_t vertex_count = 0;
     std::vector<Vec3> normals(parents.size());
-    // Identical vertices (corners shared by caps of one plane) are stored once:
-    // point id, kind, and the normal's bits.
+    // Identical vertices (corners shared by caps in one plane) are stored once, keyed
+    // by point id, kind, and the bits of the normal.
     using VertexKey = std::array<std::uint32_t, 5>;
     struct VertexHash {
         std::size_t operator()(const VertexKey& key) const {
@@ -2914,8 +2898,8 @@ void bake_shadow_volume(BuildingRenderBuffer& buffer) {
         const auto& p2 = point_positions[parents[t][2]];
         const Vec3 e1{p1.x - p0.x, p1.y - p0.y, p1.z - p0.z};
         const Vec3 e2{p2.x - p0.x, p2.y - p0.y, p2.z - p0.z};
-        // Unit length, rounded: the shader reads only the sign against the light,
-        // and coplanar faces then share their cap corners.
+        // Unit length, rounded. The shader only reads the sign against the light,
+        // and rounding lets faces in the same plane share their cap corners.
         const Vec3 n{e1.y * e2.z - e1.z * e2.y, e1.z * e2.x - e1.x * e2.z, e1.x * e2.y - e1.y * e2.x};
         const auto length = std::sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
         const auto unit = [&](float v) { return length > 0.0F ? std::round(v / length * 65536.0F) / 65536.0F : 0.0F; };
@@ -2932,8 +2916,8 @@ void bake_shadow_volume(BuildingRenderBuffer& buffer) {
             const auto from = faces[f].points[edge];
             const auto to = faces[f].points[(edge + 1U) % 3U];
             const auto other_normal = other >= 0 ? normals[faces[static_cast<std::size_t>(other)].parent] : Vec3{};
-            // Two faces on one plane always face the light the same way, so
-            // their shared edge is never a silhouette: skip its quad.
+            // Two faces in the same plane always face the light the same way, so
+            // the edge between them is never part of an outline: skip its quad.
             if (other >= 0) {
                 const Vec3 cross{normal.y * other_normal.z - normal.z * other_normal.y,
                     normal.z * other_normal.x - normal.x * other_normal.z, normal.x * other_normal.y - normal.y * other_normal.x};
@@ -2955,10 +2939,10 @@ void bake_shadow_volume(BuildingRenderBuffer& buffer) {
 
 namespace {
 
-// Road tiles as BuildCellRenderGeometryAndAdjacency builds them: solid cells
-// emit each face not covered by a solid neighbour, block cells instance their
-// catalog mesh, and every face takes its texture and overlay from the cell's
-// face array. Cell y spans y*4+0.25 .. y*4+4.25.
+// Road tiles, built the way BuildCellRenderGeometryAndAdjacency builds them: solid
+// cells make each face that no solid neighbour covers, block cells place their
+// catalog mesh, and every face takes its texture and overlay from the cell's face
+// array. Cell y runs from y*4+0.25 to y*4+4.25.
 BuildingRenderBuffer build_city_tile_render_buffer(const std::vector<CityTileCell>& tiles, float unit_size) {
     static const auto catalog = build_native_builtin_catalog();
     BuildingRenderBuffer buffer;
@@ -2976,8 +2960,8 @@ BuildingRenderBuffer build_city_tile_render_buffer(const std::vector<CityTileCel
             static_cast<float>(tile.z) * unit_size,
         };
         if ((tile.block & 0xe0000000U) == kNativeSolidBlock) {
-            // UVs project the sector-local position (8-cell sectors) at 0.25 per
-            // world unit, one texture repeat per cell.
+            // UVs project the position inside the sector (8-cell sectors) at 0.25 per
+            // world unit, so the texture repeats once per cell.
             const Vec3 local{
                 static_cast<float>(tile.x & 7),
                 static_cast<float>(tile.y & 7),
@@ -3037,9 +3021,9 @@ std::optional<CityTerrain> build_city_terrain(
         return std::nullopt;
     }
 
-    // The landscape is discarded where the land-use mask bit is clear: every
-    // cell a street tile, district cell, or building anchor layer stamped
-    // (see CityCornerStampMap::stamp). Buildings and pieces stand on no terrain.
+    // The ground is thrown away where the land-use mask bit is clear: every cell that a
+    // street tile, district cell, or building's anchor layer stamped (see
+    // CityCornerStampMap::stamp). Buildings and pieces have no ground under them.
     (void)tile_cells;
     auto cell_covered = [&](std::int32_t gx, std::int32_t gz) {
         return stamps.masked.contains(CityCornerStampMap::key(gx, gz));
@@ -3055,8 +3039,8 @@ std::optional<CityTerrain> build_city_terrain(
         min_z = std::min(min_z, intersection.z);
         max_z = std::max(max_z, intersection.z);
     }
-    // Cover buildings too, not just intersections — otherwise buildings placed
-    // outside the intersection bounding box have no ground under them (holes).
+    // Cover the buildings too, not just the intersections. Otherwise buildings placed
+    // outside the intersections' bounding box have holes under them.
     for (const auto& building : map.buildings) {
         min_x = std::min(min_x, building.x);
         max_x = std::max(max_x, building.x);
@@ -3064,8 +3048,8 @@ std::optional<CityTerrain> build_city_terrain(
         max_z = std::max(max_z, building.z);
     }
 
-    // Generous padding so building footprints + road curbs near the edge stay
-    // on solid ground.
+    // Plenty of padding, so building footprints and road curbs near the edge still
+    // stand on solid ground.
     constexpr auto terrain_padding_tiles = 24;
     CityTerrain terrain{
         static_cast<float>((min_x - terrain_padding_tiles)) * unit_size,
@@ -3074,15 +3058,15 @@ std::optional<CityTerrain> build_city_terrain(
         static_cast<float>((max_z + terrain_padding_tiles)) * unit_size,
         0,
         0,
-        // Mesh/query resolution. The native heightfield below is computed at the
-        // native 1 world-unit sample spacing; the emitted mesh samples it every
-        // 2 units to keep the vertex count tractable.
+        // Mesh and query resolution. The heightfield below is worked out at the game's
+        // spacing of one sample per world unit; the mesh samples it every 2 units to
+        // keep the number of vertices manageable.
 #ifdef __EMSCRIPTEN__
-        // The desktop path keeps a dense one-unit patched field. Building that
-        // field synchronously in WebAssembly can stall the editor for minutes
-        // when a map spans thousands of units. The browser keeps the complete
-        // 0x4000 landscape but samples its editable/query surface at the same
-        // four-unit cell scale used by city tools.
+        // The desktop path keeps a full one-unit patched heightfield. Building that
+        // field on one thread in WebAssembly can freeze the editor for minutes when
+        // a map is thousands of units across. So the browser keeps the whole 0x4000
+        // landscape, but samples the surface you edit and query at the same four-unit
+        // cell size the city tools use.
         4.0F,
 #else
         2.0F,
@@ -3091,15 +3075,15 @@ std::optional<CityTerrain> build_city_terrain(
         {},
     };
 
-    // Native 1-unit heightfield: base island field, then the hardcoded
-    // intersection block patches (which only write, never read, the field).
+    // The game's one-unit heightfield: the base island, then the fixed intersection
+    // block patches (which only write to the heightfield, never read it).
     CityHeightfield field;
     field.min_x = static_cast<std::int32_t>(terrain.min_x);
     field.min_z = static_cast<std::int32_t>(terrain.min_z);
     field.count_x = static_cast<std::int32_t>(terrain.max_x - terrain.min_x) + 1;
     field.count_z = static_cast<std::int32_t>(terrain.max_z - terrain.min_z) + 1;
     field.city_map = !stamps.disabled;
-    // Terrain_RebuildLandTilesRoadPatchesAndChunkCaches patches city maps only.
+    // Terrain_RebuildLandTilesRoadPatchesAndChunkCaches only patches city maps.
     for (const auto patch_index : native_city_terrain_patch_indices) {
         if (stamps.disabled) break;
         apply_native_city_terrain_patch(field, expanded_graph, stamps, patch_index);
@@ -3123,8 +3107,8 @@ std::optional<CityTerrain> build_city_terrain(
     terrain.mesh.unit_size = unit_size;
     terrain.mesh.material_names.push_back("city_terrain_grass");
 
-    // Keep the patched local height samples for picking and object placement.
-    // The render mesh is generated below in the native 128-unit landscape chunks.
+    // Keep the patched local heights for picking and placing objects. The render mesh
+    // is made below, in the game's 128-unit landscape chunks.
     parallel_rows(terrain.sample_count_z, [&](std::int32_t z) {
         for (auto x = 0; x < terrain.sample_count_x; ++x) {
             const auto world_x = std::min(terrain.max_x, terrain.min_x + static_cast<float>(x) * terrain.sample_spacing);
@@ -3134,12 +3118,11 @@ std::optional<CityTerrain> build_city_terrain(
         }
     });
 
-    // Native landscape dimensions proven in
-    // Terrain_RebuildLandTilesRoadPatchesAndChunkCaches @ d12e0:
-    // 2049 source samples, expanded 8x to a 0x4000-square world. Rendering
-    // splits that field into 128-unit subchunks and uses steps 1..64. Use the
-    // city as the stable editor focus (the game uses the camera) so the full
-    // island is always present without rebuilding terrain on every camera move.
+    // Landscape size, proven in Terrain_RebuildLandTilesRoadPatchesAndChunkCaches @ d12e0:
+    // 2049 source samples scaled up 8x to a world 0x4000 across. Rendering splits that
+    // into 128-unit sub-chunks with steps from 1 to 64. Centre on the city, which does
+    // not move (the game centres on the camera), so the whole island is always there
+    // without rebuilding the terrain every time the camera moves.
     constexpr float landscape_min = -4096.0F;
     constexpr float landscape_max = landscape_min + 16384.0F;
     constexpr std::int32_t chunk_size = 128;
@@ -3149,10 +3132,10 @@ std::optional<CityTerrain> build_city_terrain(
         const auto dx = chunk_x + 64.0F - focus_x;
         const auto dz = chunk_z + 64.0F - focus_z;
         const auto distance = std::sqrt(dx * dx + dz * dz);
-        // The native game streams only camera-visible subchunks. This editor
-        // mesh is persistent, so native near-LOD radii would expand to about
-        // five million uploaded vertices and starve UI input. Preserve the full
-        // 0x4000 world but keep high detail local to the authored city.
+        // The game only streams the sub-chunks the camera can see. This editor mesh
+        // stays loaded, so the game's near-detail distances would add up to about five
+        // million uploaded vertices and make the UI slow to respond. Keep the whole
+        // 0x4000 world, but only use high detail near the city.
         if (distance < 256.0F) return 4;
         if (distance < 512.0F) return 8;
         if (distance < 1024.0F) return 16;
@@ -3161,7 +3144,7 @@ std::optional<CityTerrain> build_city_terrain(
     };
     auto render_height = terrain_height;
 
-    // Chunk rows build in parallel into their own buffers, joined in row order.
+    // Chunk rows build in parallel into their own buffers, then join in row order.
     const auto chunk_rows = static_cast<std::int32_t>((landscape_max - landscape_min) / static_cast<float>(chunk_size));
     std::vector<BuildingRenderBuffer> rows(static_cast<std::size_t>(chunk_rows));
     parallel_rows(chunk_rows, [&](std::int32_t row) {
@@ -3183,10 +3166,10 @@ std::optional<CityTerrain> build_city_terrain(
             }
             for (auto z = 0; z < side - 1; ++z) {
                 for (auto x = 0; x < side - 1; ++x) {
-                    // Skip terrain quads that sit under a road/curb tile — the tile's top
-                    // surface is the ground there, and the coincident terrain plane
-                    // z-fights it. Test the four corners and skip only when all are
-                    // covered so the cut follows the tile footprint without holes.
+                    // Skip terrain quads under a road or curb tile. The tile's top is the
+                    // ground there, and a terrain plane at the same height flickers against
+                    // it. Check the four corners and only skip when all of them are covered,
+                    // so the cut follows the tile's outline without leaving holes.
                     const auto quad_min_x = chunk_x + static_cast<float>(x * step);
                     const auto quad_min_z = chunk_z + static_cast<float>(z * step);
                     const auto quad_max_x = quad_min_x + static_cast<float>(step);
@@ -3196,8 +3179,8 @@ std::optional<CityTerrain> build_city_terrain(
                             static_cast<std::int32_t>(std::floor(wx / unit_size)),
                             static_cast<std::int32_t>(std::floor(wz / unit_size)));
                     };
-                    // Sample just inside each corner so a quad flush against a tile edge
-                    // resolves to the cell it actually overlaps.
+                    // Sample just inside each corner, so a quad that touches a tile's edge
+                    // finds the cell it really overlaps.
                     constexpr auto eps = 0.01F;
                     if (cell_of(quad_min_x + eps, quad_min_z + eps) &&
                         cell_of(quad_max_x - eps, quad_min_z + eps) &&
@@ -3229,20 +3212,20 @@ std::optional<CityTerrain> build_city_terrain(
         row = {};
     }
 
-    // One material run so the terrain mesh can be uploaded as a GPU chunk (it is
-    // a single grass material) instead of drawn triangle-by-triangle.
+    // One material run, so the terrain mesh can be uploaded as one GPU chunk (it is
+    // all one grass material) instead of drawn a triangle at a time.
     sort_triangles_into_native_material_runs(terrain.mesh);
     return terrain;
 }
 
 // Traffic light corner objects. Placement: MapConnector_PlaceIntersectionPerimeterTiles
-// @20130 stores corner codes only when more than two streets connect, one per
-// present neighbor, in the diagonal corner tile outside the footprint, one level
-// above the road. Rendering: _area_interior_buildsectormodel @14820 places the
-// type-1 street object at the corner cell center plus the per-type local offset
-// (0, 3.25, -1) rotated by the code's bits 10-11 (N=0, E=1, S=2, W=3 quarter
-// turns) — i.e. the post stands on the curb plate, shifted one unit toward the
-// street its arm crosses; the model's arm extends along local -z.
+// @20130 only stores corner codes when more than two streets meet. It stores one
+// for each neighbour that exists, in the diagonal corner tile just outside the
+// footprint, one level above the road. Drawing: _area_interior_buildsectormodel
+// @14820 places the type-1 street object at the centre of the corner cell plus the
+// type's own offset (0, 3.25, -1), turned by bits 10-11 of the code (N=0, E=1, S=2,
+// W=3 quarter turns). So the post stands on the curb plate, moved one unit toward
+// the street its arm reaches over. The model's arm points along local -z.
 std::vector<CityTrafficLightPole> build_city_traffic_light_poles(
     const NativeCityGraph& graph,
     float unit_size) {
@@ -3257,13 +3240,13 @@ std::vector<CityTrafficLightPole> build_city_traffic_light_poles(
             continue;
         }
 
-        // Pole ground point: corner cell base (+0.25) plus the model offset
-        // (origin y 3.25, pole half-height 3) = 0.5 above the cell level — the
-        // top of the curb plate.
+        // Where the pole meets the ground: the bottom of the corner cell (+0.25)
+        // plus the model offset (origin y 3.25, pole half-height 3), which is 0.5
+        // above the cell level, the top of the curb plate.
         const auto base_y = native_road_surface_y(intersection.level) + 0.25F;
-        // The sign names the street crossing the arm (RenderModels @212e0): the
-        // neighbour one step clockwise in (south, west, north, east) from the
-        // pole's direction, else the one counter-clockwise, else street 0.
+        // The sign names the street the arm reaches over (RenderModels @212e0): the
+        // neighbour one step clockwise in (south, west, north, east) from the pole's
+        // direction, or else the one counter-clockwise, or else street 0.
         const std::array<std::int32_t, 4> neighbours{
             intersection.street_south, intersection.street_west, intersection.street_north, intersection.street_east};
         auto add_pole = [&](std::int32_t tile_x, std::int32_t tile_z, Vec3 arm, std::size_t direction) {
@@ -3304,7 +3287,7 @@ std::vector<CityTrafficLightPole> build_city_traffic_light_poles(
 } // namespace
 
 // -----------------------------------------------------------------------------
-// Building Scene and Render Buffers
+// Building scene and render buffers
 // -----------------------------------------------------------------------------
 
 float terrain_height_at(const CityTerrain& terrain, float world_x, float world_z) {
@@ -3413,20 +3396,20 @@ SbbScene build_sbb_scene(
     return scene;
 }
 
-// The room inside a cell whose interior block is 0xffff. The game builds it
-// with _block_createbuildblock(0, key) @1a990 from the key
-// InstantiateSbbVolumeIntoWorldAndMetadata @23ac0 packs per cell: side codes
-// north (the cell's +0x0c word), east (the +x cell's +0x10), south (the +z
-// cell's +0x0c), west (the cell's +0x10); bit 16 floor and bit 17 ceiling from
-// the placed flag; the cell type picks the buildblock. Side code 1 is a plain
-// wall (_block_addbasicsurface @19140), 3..15 a wall with that buildblock
-// layer's windows. Walls stand 1/16 inside the cell edge; the floor
-// (_block_addbasicsurface2 @194b0) lies at 1/16, pulled in 1/16 from each side
-// that has a wall; the ceiling at 7/8. Surfaces use the interior texture set
-// (slots 8..15). Floors are two-sided: shipped rooms set only the floor bit, so
-// a room's ceiling is the floor above seen from below. Walls face inward only.
-// ponytail: code 2 (the curved corner patches) and the door-flag bits are not
-// generated yet; add them when a building needs them.
+// The room inside a cell whose interior block is 0xffff. The game builds it with
+// _block_createbuildblock(0, key) @1a990, from the key that
+// InstantiateSbbVolumeIntoWorldAndMetadata @23ac0 packs for each cell: side codes
+// for north (the cell's +0x0c word), east (the +x cell's +0x10), south (the +z
+// cell's +0x0c), and west (the cell's +0x10); bit 16 for the floor and bit 17 for
+// the ceiling, from the placed flag; and the cell type, which picks the buildblock.
+// Side code 1 is a plain wall (_block_addbasicsurface @19140), and 3..15 is a wall
+// with that buildblock layer's windows. Walls stand 1/16 inside the cell's edge.
+// The floor (_block_addbasicsurface2 @194b0) lies at 1/16, pulled in 1/16 from each
+// side that has a wall, and the ceiling is at 7/8. Surfaces use the inside texture
+// set (slots 8..15). Floors are two-sided: the game's rooms only set the floor bit,
+// so a room's ceiling is the floor above, seen from below. Walls only face inward.
+// ponytail: code 2 (the curved corner pieces) and the door-flag bits are not made
+// yet; add them when a building needs them.
 void add_native_interior_room(
     BuildingRenderBuffer& buffer,
     VertexIndexMap& vertex_indices,
@@ -3440,15 +3423,15 @@ void add_native_interior_room(
     const auto unit = buffer.unit_size;
     const Vec3 base{cx - unit * 0.5F, cy - unit * 0.5F, cz - unit * 0.5F};
     const auto at = [&](float x, float y, float z) { return Vec3{base.x + x * unit, base.y + y * unit, base.z + z * unit}; };
-    // Floors are two-sided (the floor above is this room's ceiling). Walls face
-    // only into the room: seen from outside they sit 1/16 behind the exterior
-    // wall and would depth-fight with it at a distance. A visible face's
-    // geometric normal points away from the viewer, so an inward wall's normal
-    // points away from the cell centre.
-    // Material slots as the room builder numbers them (_block_addbeam @19940):
-    // 0..7 index the cell's interior set, 8..15 its exterior set. Wall faces
-    // rotate with the side, so a room's N/E/S/W walls use interior 1/2/3/4 and
-    // their outer faces exterior 3/4/1/2 (the shell's N/E/S/W slots).
+    // Floors are two-sided (the floor above is this room's ceiling). Walls only face
+    // into the room: from outside they sit 1/16 behind the outside wall and would
+    // flicker against it from far away. A face you can see has its normal pointing away
+    // from you, so an inward wall's normal points away from the cell's centre.
+    // Material slots are numbered the way the room builder numbers them
+    // (_block_addbeam @19940): 0..7 point into the cell's inside set, and 8..15 into
+    // its outside set. Wall faces turn with the side, so a room's N/E/S/W walls use
+    // inside slots 1/2/3/4, and their outer faces use outside slots 3/4/1/2 (the
+    // shell's N/E/S/W slots).
     const auto shorts_index = [](std::uint32_t game_slot) { return game_slot < 8U ? game_slot + 8U : game_slot - 8U; };
     const auto wall_slot = [](BuildingFaceSide side) -> std::uint32_t {
         switch (side) {
@@ -3497,22 +3480,24 @@ void add_native_interior_room(
     if ((cell.placed_flag() & 1U) != 0U) flat(inset, BuildingFaceSide::Down);
     if (ceiling) flat(7.0F / 8.0F, BuildingFaceSide::Up);
 
-    // Side walls, as _block_createbuildblock @1a990 builds them. Code 1 is a
-    // plain wall (_block_addbasicsurface). Codes 3..15 go through
-    // BuildBlock_AddBeams @1a1c0: the layer's BOUNDS is the opening, framed by
-    // up to four 1/16-deep boxes (left/right/bottom/top) whose opening-facing
-    // faces (jambs, sill, lintel) take interior slot 6; then every beam record
-    // is a box: type 0 flush with the wall (depth 1/16), types 1 and 2 stand
-    // out 1/16 each way (depth 3/16, 5/16), other types are thin mullions
-    // (1/64 deep at 1/128, slot 7). _block_addwindows @1a590 then adds a glass
-    // pane per window record, 1/64 in (1/256 for portal type 1), but only when
-    // the layer's portal type is 0 or the side is north/east. Door layers
-    // (portal type 1, bounds, no windows) are therefore open doorways.
-    // A pane is one quad, wound to face out of the cell: the game draws it
-    // unculled and shades its two sides differently (see the glass pass).
-    // Rooms belong to the near LOD only, where the shell's buildblock faces
-    // are not drawn, so the frame's outer face never meets the shell.
-    // u runs along the wall and v up it; d is the depth in from the cell edge.
+    // Side walls, built the way _block_createbuildblock @1a990 builds them. Code 1 is a
+    // plain wall (_block_addbasicsurface). Codes 3..15 go through BuildBlock_AddBeams
+    // @1a1c0:
+    // - The layer's BOUNDS rectangle is the opening. Up to four boxes 1/16 deep frame
+    //   it (left, right, bottom, top). Their faces toward the opening (the jambs, sill,
+    //   and lintel) use inside slot 6.
+    // - Then every beam record is a box. Type 0 is flush with the wall (1/16 deep).
+    //   Types 1 and 2 stick out 1/16 each way (3/16 and 5/16 deep). Other types are
+    //   thin dividers (1/64 deep at 1/128, slot 7).
+    // - _block_addwindows @1a590 then adds a glass pane for each window record, 1/64 in
+    //   (1/256 for portal type 1), but only when the layer's portal type is 0 or the
+    //   side is north or east.
+    // So door layers (portal type 1, with bounds and no windows) are open doorways.
+    // A pane is one quad, facing out of the cell. The game draws it without culling and
+    // shades its two sides differently (see the glass pass).
+    // Rooms only exist in the near view, where the shell's buildblock faces are not
+    // drawn, so the frame's outer face never meets the shell.
+    // u runs along the wall and v up it; d is how far in from the cell's edge.
     const std::array<BuildingFaceSide, 4> faces{
         BuildingFaceSide::North, BuildingFaceSide::East, BuildingFaceSide::South, BuildingFaceSide::West};
     for (std::size_t side = 0; side < 4; ++side) {
@@ -3524,12 +3509,12 @@ void add_native_interior_room(
                 default: return at(d, v, u);
             }
         };
-        // A wall-parallel quad at depth d over [u0,u1] x [v0,v1].
+        // A quad flat against the wall at depth d, over [u0,u1] x [v0,v1].
         const auto facing = [&](float u0, float u1, float v0, float v1, float d) {
             return std::array<Vec3, 4>{wall(u0, v1, d), wall(u1, v1, d), wall(u1, v0, d), wall(u0, v0, d)};
         };
-        // Box over [u0,u1] x [v0,v1] x [d0,d1]; faces toward the room / edge use
-        // the wall slot, the four sides `edge_slot`.
+        // A box over [u0,u1] x [v0,v1] x [d0,d1]. Faces toward the room or the edge use
+        // the wall slot, and the four sides use `edge_slot`.
         const auto box = [&](float u0, float u1, float v0, float v1, float d0, float d1, std::uint32_t edge_slot) {
             add_surface(facing(u0, u1, v0, v1, d1), quad_uvs(u0, u1 - u0, v0, v1 - v0), faces[side], true);
             add_surface(facing(u0, u1, v0, v1, d0), quad_uvs(u0, u1 - u0, v0, v1 - v0), faces[side], true);
@@ -3545,10 +3530,10 @@ void add_native_interior_room(
             continue;
         }
         if (codes[side] == 2U) {
-            // Corner fill: two full-height 1/16 strips at the side's starting
+            // Corner fill: two full-height strips, 1/16 wide, at the side's starting
             // corner (NW, NE, SE, SW for N, E, S, W; the game's wall frame runs
-            // backwards on S/W), closing the notch where a neighbour's inset
-            // wall ends. The second strip takes the previous side's wall slot.
+            // backwards on S and W). They close the gap where a neighbour's inset
+            // wall ends. The second strip uses the previous side's wall slot.
             const bool reversed = side >= 2U;
             const auto u0 = reversed ? 1.0F - inset : 0.0F;
             const auto u1 = reversed ? 1.0F : inset;
@@ -3565,13 +3550,13 @@ void add_native_interior_room(
             return building_room_rect(*layer, *portal_side, x, width, y, height);
         };
         const auto opening = rect_of(layer->bounds[0], layer->bounds[1], layer->bounds[2], layer->bounds[3]);
-        // Frame: the wall minus the opening, facing the room at depth `inset`.
+        // Frame: the wall without the opening, facing the room at depth `inset`.
         const auto frame = opening ? subtract_city_window_rects({*opening}) : std::vector<PortalRect>{unit_portal_rect()};
         for (const auto& rect : frame) {
             add_surface(facing(rect.x, rect.max_x, rect.y, rect.max_y, inset),
                 quad_uvs(rect.x, rect.width, rect.y, rect.height), faces[side], false);
-            // The outer face on the cell edge, for portal type 0 only. It shows
-            // in the near LOD, where the shell's window face is not drawn.
+            // The outer face on the cell's edge, for portal type 0 only. It shows in
+            // the near view, where the shell's window face is not drawn.
             if (layer->portal_type == 0U) {
                 add_surface(facing(rect.x, rect.max_x, rect.y, rect.max_y, 0.0F),
                     quad_uvs(rect.x, rect.width, rect.y, rect.height), faces[side], true,
@@ -3616,7 +3601,7 @@ BuildingRenderBuffer build_native_building_render_buffer(
     const std::vector<NamedBuildblockTemplate>& buildblock_templates,
     std::optional<std::uint32_t> floor,
     bool roofs) {
-    MAPED_PROFILE_FUNCTION();
+    PAFTA_PROFILE_FUNCTION();
     BuildingRenderBuffer buffer;
     const auto unit_size = buffer.unit_size;
     VertexIndexMap vertex_indices;
@@ -3649,9 +3634,9 @@ BuildingRenderBuffer build_native_building_render_buffer(
             : &native_builtin_block_mesh_singleton();
     };
 
-    // InstantiateSbbVolumeIntoWorldAndMetadata places rooms only in cells no
-    // interior piece's footprint already covers (a 2-wide garage door owns
-    // its second cell); pieces reach +x/+z/+y from their own cell.
+    // InstantiateSbbVolumeIntoWorldAndMetadata only places rooms in cells that no
+    // interior piece's footprint already covers (a 2-wide garage door owns its second
+    // cell). Pieces reach +x, +z, and +y from their own cell.
     std::unordered_set<std::uint64_t> piece_footprint;
     const auto footprint_key = [](std::uint64_t x, std::uint64_t y, std::uint64_t z) { return x << 42U | y << 21U | z; };
     for (const auto& cell : building.cells) {
@@ -3676,13 +3661,13 @@ BuildingRenderBuffer build_native_building_render_buffer(
     };
 
     for (const auto& cell : building.cells) {
-        // A single-floor view drops the other floors, so the floor above no
-        // longer covers this floor's top faces.
+        // Showing one floor hides the others, so the floor above no longer
+        // covers this floor's top faces.
         if (!cell.occupied || (floor.has_value() && cell.y != *floor)) {
             continue;
         }
-        // Tag every face this cell emits with the cell and its texture slot:
-        // a selector call names the slot of the triangles emitted after it.
+        // Tag every face this cell makes with the cell and its texture slot. A
+        // selector call names the slot of the triangles made after it.
         const auto cell_index = static_cast<std::uint32_t>(&cell - building.cells.data());
         std::size_t tagged = buffer.triangles.size();
         std::uint8_t pending_slot = 0xffU;
@@ -3745,13 +3730,13 @@ BuildingRenderBuffer build_native_building_render_buffer(
 
         if (cell.interior_block() == 0xffffU && !piece_footprint.contains(footprint_key(cell.x, cell.y, cell.z))) {
             tag(0xffU);
-            // InstantiateSbbVolumeIntoWorldAndMetadata @23ac0 packs the room
-            // key: side codes N (own +0x0c), E ((x+1) +0x10), S ((z+1) +0x0c),
-            // W (own +0x10), and turns an open side into code 2 (a corner fill)
+            // InstantiateSbbVolumeIntoWorldAndMetadata @23ac0 packs the room key:
+            // side codes N (own +0x0c), E ((x+1) +0x10), S ((z+1) +0x0c), and
+            // W (own +0x10). It turns an open side into code 2 (a corner fill)
             // where a neighbour's wall ends at that side's starting corner.
-            // Sbb_BuildBuildingConnectivityMetadata @29120 derives the ceiling:
-            // top layer, or the cell above has no exterior or interior block,
-            // or has its own floor.
+            // Sbb_BuildBuildingConnectivityMetadata @29120 works out the ceiling:
+            // the top layer, or when the cell above has no exterior or interior
+            // block, or has its own floor.
             const auto code_at = [&](std::int64_t dx, std::int64_t dz, bool north_word) -> std::uint32_t {
                 if (static_cast<std::int64_t>(cell.x) + dx < 0 || static_cast<std::int64_t>(cell.z) + dz < 0) return 0U;
                 const auto* other = find_cell_at(cell_lookup, static_cast<std::uint32_t>(cell.x + dx), cell.y,
@@ -3779,7 +3764,7 @@ BuildingRenderBuffer build_native_building_render_buffer(
             const bool ceiling = above == nullptr || !above->occupied || above->exterior_block() == 0U ||
                 above->interior_block() == 0U || above->placed_flag() != 0U;
             add_native_interior_room(buffer, vertex_indices, cell, codes, ceiling, template_file, cx, cy, cz);
-            // The room tags its own slots; the cell is its position here.
+            // The room tags its own slots; here the cell is its position.
             for (; tagged < buffer.triangles.size(); ++tagged) buffer.triangles[tagged].cell = cell_index;
         }
 
@@ -3787,13 +3772,13 @@ BuildingRenderBuffer build_native_building_render_buffer(
             tag(0xffU);
             continue;
         }
-        // Without roofs every upward face counts as covered.
+        // Without roofs, every upward face counts as covered.
         static const auto roof_cover = native_city_block_solid_cell();
         if (!roofs) up = &roof_cover;
 
-        // World_SetTileBlockAndResolveNeighborLinks @f830 gives a solid cell all
-        // six faces and clears only those against a solid neighbour (the bottom
-        // also at world y 0), so overhangs show their underside.
+        // World_SetTileBlockAndResolveNeighborLinks @f830 gives a solid cell all six
+        // faces and only removes those against a solid neighbour (and the bottom at world
+        // y 0), so you can see the underside of overhangs.
         const auto* down = floor.has_value() || cell.y == 0U ? nullptr : find_cell_at(cell_lookup, cell.x, cell.y - 1U, cell.z);
         const std::array<SolidCellFaceCheck, 6> native_sides{{
             {BuildingFaceSide::South, south},
@@ -3953,10 +3938,10 @@ BuildingRenderBuffer build_city_building_full_render_buffer(
     const std::vector<NamedBlockMesh>& block_meshes,
     const std::vector<NamedBuildblockTemplate>& buildblock_templates,
     BuildingLod lod) {
-    // City placement uses the runtime building buffer, not the editor's
-    // floor-tool preview. The preview interprets placed_flag bits as optional
-    // floor/ceiling guides; using it in the city dropped exposed face 5 on
-    // otherwise solid top cells and made roofs or top floors disappear.
+    // City placement uses the game's building buffer, not the editor's floor-tool
+    // preview. The preview treats placed_flag bits as optional floor and ceiling
+    // guides; using it in the city dropped the visible top face (face 5) on solid top
+    // cells, which made roofs or top floors disappear.
     return select_building_lod(build_native_building_render_buffer(building, block_meshes, buildblock_templates), lod);
 }
 
@@ -3988,9 +3973,9 @@ BuildingRenderBuffer build_native_portal_render_buffer(
     const std::vector<NamedBlockMesh>& block_meshes,
     std::optional<std::size_t> selected_portal,
     [[maybe_unused]] const std::vector<NamedBuildblockTemplate>& buildblock_templates,
-    const std::vector<std::string>& texture_names,
+    [[maybe_unused]] const std::vector<std::string>& texture_names,
     const std::vector<const SbbBuilding*>& placement_buildings) {
-    MAPED_PROFILE_FUNCTION();
+    PAFTA_PROFILE_FUNCTION();
     BuildingRenderBuffer buffer;
     VertexIndexMap vertex_indices;
 
@@ -4007,9 +3992,9 @@ BuildingRenderBuffer build_native_portal_render_buffer(
     };
     // World_LoadMapAndInitializeTerrain places v10 district cells before the
     // buildings, and InstantiateSbbVolumeIntoWorldAndMetadata then writes every
-    // building cell with an exterior block word over the world cell. Those
-    // district cells are gone; the building's solids are neighbours for the
-    // face test. (Later-format city blocks are placed after the buildings.)
+    // building cell that has an exterior block word over the world cell. Those
+    // district cells are gone, and the building's solid cells count as neighbours in
+    // the face test. (Newer city blocks are placed after the buildings.)
     std::unordered_set<CityTileKey, CityTileKeyHash> building_cells;
     for (std::size_t index = 0; map.city_blocks.empty() && index < map.buildings.size() && index < placement_buildings.size(); ++index) {
         const auto* building = placement_buildings[index];
@@ -4041,9 +4026,9 @@ BuildingRenderBuffer build_native_portal_render_buffer(
             if (cell_word == 0U) {
                 continue;
             }
-            const auto sx = portal.fields[1] * 8 + static_cast<std::int32_t>(vi & 7U);
-            const auto sz = portal.fields[3] * 8 + static_cast<std::int32_t>((vi >> 3U) & 7U);
-            const auto sy = portal.fields[2] * 8 + static_cast<std::int32_t>((vi >> 6U) & 7U);
+            const auto sx = sbc_portal_cell_base(portal.fields[1]) + static_cast<std::int32_t>(vi & 7U);
+            const auto sz = sbc_portal_cell_base(portal.fields[3]) + static_cast<std::int32_t>((vi >> 3U) & 7U);
+            const auto sy = sbc_portal_cell_base(portal.fields[2]) + static_cast<std::int32_t>((vi >> 6U) & 7U);
             if ((cell_word & 0xe0000000U) == 0x40000000U && !replaced_by_building(sx, sy, sz)) {
                 solid_cell_coords.insert(solid_key(sx, sy, sz));
             }
@@ -4071,25 +4056,19 @@ BuildingRenderBuffer build_native_portal_render_buffer(
             const auto local_z = static_cast<std::int32_t>((voxel_index >> 3U) & 7U);
             const auto local_y = static_cast<std::int32_t>((voxel_index >> 6U) & 7U);
             const auto origin = Vec3{
-                static_cast<float>(portal.fields[1] * 8 + local_x) * buffer.unit_size,
-                static_cast<float>(portal.fields[2] * 8 + local_y) * buffer.unit_size,
-                static_cast<float>(portal.fields[3] * 8 + local_z) * buffer.unit_size,
+                static_cast<float>(sbc_portal_cell_base(portal.fields[1]) + local_x) * buffer.unit_size,
+                static_cast<float>(sbc_portal_cell_base(portal.fields[2]) + local_y) * buffer.unit_size,
+                static_cast<float>(sbc_portal_cell_base(portal.fields[3]) + local_z) * buffer.unit_size,
             };
 
-            // v10 maps (e.g. round) have no city_blocks. The native loader applies
-            // these legacy district cells in World_LoadMapAndInitializeTerrain's
-            // legacy loop, feeding the raw word into World_SetTileBlockAndResolveNeighborLinks:
-            //   - class 0x40000000 = a solid world cell (the flat asphalt road-end
-            //     slabs); per-face material comes from the cell's 8-short texture grid
-            //     (portal.textures, 8 per voxel), short 0 = first loaded texture.
-            //   - class 0x80000000 = a buildblock-template instance indexed by
-            //     (word & 0xffff) into the global buildblock catalog (loose
-            //     buildblock/*.sbl, sorted, capped 64). Index 0 = _null and any
-            //     out-of-range index render nothing, exactly as the native instancing
-            //     loop does for empty catalog slots.
+            // World_LoadMapAndInitializeTerrain's old loop passes these words to
+            // World_SetTileBlockAndResolveNeighborLinks: the 0x40000000 kind is a
+            // solid cell, and 0x80000000 picks from the built-in catalog by its low
+            // 16 bits. The per-face texture grid is only read as zero or not zero,
+            // picking concrete or asphalt, not a loaded texture by number.
             if (map.city_blocks.empty()) {
-                if (replaced_by_building(portal.fields[1] * 8 + local_x, portal.fields[2] * 8 + local_y,
-                        portal.fields[3] * 8 + local_z)) {
+                if (replaced_by_building(sbc_portal_cell_base(portal.fields[1]) + local_x, sbc_portal_cell_base(portal.fields[2]) + local_y,
+                        sbc_portal_cell_base(portal.fields[3]) + local_z)) {
                     continue;
                 }
                 const auto cell_class = word & 0xe0000000U;
@@ -4098,21 +4077,21 @@ BuildingRenderBuffer build_native_portal_render_buffer(
                     const auto tex_idx = grid_base < portal.textures.size()
                         ? static_cast<std::size_t>(portal.textures[grid_base])
                         : 0U;
-                    // World_LoadMapAndInitializeTerrain's legacy district loop hands
-                    // World_SetTileBlockAndResolveNeighborLinks each face as
-                    // (grid != 0), so these cells only ever use texture 0 ("concrete")
-                    // or texture 1, whose slot asphalt2.png loads into. The stored
-                    // index itself is never used.
+                    // World_LoadMapAndInitializeTerrain's old district loop gives
+                    // World_SetTileBlockAndResolveNeighborLinks each face as (grid != 0),
+                    // so these cells only ever use texture 0 ("concrete") or texture 1,
+                    // the slot asphalt2.png loads into. The stored number itself is never
+                    // used.
                     return material_id_for_name(buffer, tex_idx == 0U ? "city_curb_concrete" : "city_road_asphalt");
                 };
 
                 if (cell_class == 0x40000000U) {
-                    // World_SetTileBlockAndResolveNeighborLinks places every
-                    // district solid; BuildCellRenderGeometryAndAdjacency then
-                    // skips only the faces shared with a solid neighbour.
-                    const auto cell_x = portal.fields[1] * 8 + local_x;
-                    const auto cell_y = portal.fields[2] * 8 + local_y;
-                    const auto cell_z = portal.fields[3] * 8 + local_z;
+                    // World_SetTileBlockAndResolveNeighborLinks places every district cell
+                    // as solid, and BuildCellRenderGeometryAndAdjacency then only skips
+                    // the faces shared with a solid neighbour.
+                    const auto cell_x = sbc_portal_cell_base(portal.fields[1]) + local_x;
+                    const auto cell_y = sbc_portal_cell_base(portal.fields[2]) + local_y;
+                    const auto cell_z = sbc_portal_cell_base(portal.fields[3]) + local_z;
                     const auto solid = [&](std::int32_t dx, std::int32_t dy, std::int32_t dz) {
                         return solid_cell_coords.contains(solid_key(cell_x + dx, cell_y + dy, cell_z + dz));
                     };
@@ -4133,13 +4112,13 @@ BuildingRenderBuffer build_native_portal_render_buffer(
                     if (mesh == nullptr) {
                         continue;
                     }
-                    // BuildCellRenderGeometryAndAdjacency @0xc4c0 copies the catalog
-                    // mesh's vertices with translation only — it does NOT rotate the
-                    // piece geometry by the cell's (word>>24)&3 rotation (that field
-                    // only rotates the per-quad UV/material slot at render time, plus
-                    // the four pre-rotated catalog ids the map may reference directly).
-                    // So render the catalog mesh as authored (rotation 0); the
-                    // material slot still comes from the cell's 8-short texture grid.
+                    // BuildCellRenderGeometryAndAdjacency @0xc4c0 copies the catalog mesh's
+                    // vertices and only moves them. It does NOT rotate the piece by the
+                    // cell's (word>>24)&3 rotation. That field only turns the UV and
+                    // material slot of each quad when drawing, plus the four pre-rotated
+                    // catalog ids the map can point to directly. So draw the catalog mesh as
+                    // it is (rotation 0); the material slot still comes from the cell's
+                    // 8-short texture grid.
                     add_rotated_block_mesh_to_buffer(
                         buffer,
                         vertex_indices,
@@ -4186,16 +4165,6 @@ BuildingRenderBuffer build_native_portal_render_buffer(
 
     sort_triangles_into_native_material_runs(buffer);
     return buffer;
-}
-
-std::string district_buildblock_name_for_index(
-    const std::vector<NamedBuildblockTemplate>& buildblock_templates,
-    std::uint32_t catalog_index) {
-    const auto ordered = district_buildblock_catalog_order(buildblock_templates);
-    if (catalog_index >= ordered.size()) {
-        return {};
-    }
-    return ordered[catalog_index]->name;
 }
 
 std::optional<CellPick> pick_building_cell(
@@ -4254,12 +4223,12 @@ std::optional<Vec3> ray_terrain_hit(const CityTerrain& terrain, const Vec3& ray_
         return ray_ground_hit(ray_origin, ray_dir);
     }
 
-    // March the ray in fixed steps and detect the span where it crosses from above
-    // the heightfield to below it, then bisect that span. signed_gap(t) > 0 means
-    // the ray point is above the terrain surface at that x/z. The terrain is a
-    // height grid, so a downward-looking ray crosses it at most once over the
-    // relevant span; a coarse march plus a short bisection lands within a few
-    // millimetres without needing per-triangle intersection.
+    // Move along the ray in fixed steps to find the stretch where it goes from above
+    // the heightfield to below it, then halve that stretch until it is small.
+    // signed_gap(t) > 0 means the ray is above the ground at that x/z. The terrain is a
+    // height grid, so a ray looking down crosses it at most once in the stretch that
+    // matters. A rough march plus a short bisection lands within a few millimetres
+    // without testing every triangle.
     const auto signed_gap = [&](float t) {
         const auto p = add_scaled(ray_origin, ray_dir, t);
         return p.y - terrain_height_at(terrain, p.x, p.z);
@@ -4271,7 +4240,7 @@ std::optional<Vec3> ray_terrain_hit(const CityTerrain& terrain, const Vec3& ray_
 
     float prev_t = 0.0F;
     float prev_gap = signed_gap(prev_t);
-    // Ray starting under the surface: nothing meaningful to snap to.
+    // The ray starts under the ground, so there is nothing sensible to snap to.
     if (prev_gap < 0.0F) {
         return ray_ground_hit(ray_origin, ray_dir);
     }
@@ -4373,9 +4342,9 @@ std::optional<CityPiecePick> pick_city_piece(
             const auto local_z = static_cast<std::int32_t>((block_index / 8U) & 7U);
             const auto local_y = static_cast<std::int32_t>((block_index / 0x40U) & 7U);
             const Vec3 center{
-                (static_cast<float>(portal.fields[1] * 8 + local_x) + 0.5F) * unit_size,
-                (static_cast<float>(portal.fields[2] * 8 + local_y) + 0.5F) * unit_size,
-                (static_cast<float>(portal.fields[3] * 8 + local_z) + 0.5F) * unit_size,
+                (static_cast<float>(sbc_portal_cell_base(portal.fields[1]) + local_x) + 0.5F) * unit_size,
+                (static_cast<float>(sbc_portal_cell_base(portal.fields[2]) + local_y) + 0.5F) * unit_size,
+                (static_cast<float>(sbc_portal_cell_base(portal.fields[3]) + local_z) + 0.5F) * unit_size,
             };
             const auto box_min = Vec3{center.x - half, center.y - half, center.z - half};
             const auto box_max = Vec3{center.x + half, center.y + half, center.z + half};
@@ -4391,93 +4360,30 @@ std::optional<CityPiecePick> pick_city_piece(
     return nearest;
 }
 
-std::optional<std::size_t> pick_city_road(
-    const SbcMap& map,
-    const MapScene& scene,
-    const Vec3& ray_origin,
-    const Vec3& ray_dir) {
-    // Roads sit on the terrain surface, often well above y=0. Hit-testing against
-    // the y=0 plane lands the ground point at the wrong X/Z (the click misses the
-    // visible road), so raycast the actual terrain surface like the cursor does.
-    const auto hit = scene.terrain.has_value()
-        ? ray_terrain_hit(*scene.terrain, ray_origin, ray_dir)
-        : ray_ground_hit(ray_origin, ray_dir);
-    if (!hit.has_value()) {
-        return std::nullopt;
-    }
-
-    // Distance from the surface hit to each road segment; the nearest segment
-    // within its drawn half-width wins. scene.roads[i].source back-references the
-    // SBC street, resolved to an index into map.streets.
-    std::optional<std::size_t> nearest;
-    float nearest_dist = std::numeric_limits<float>::max();
-    for (const auto& road : scene.roads) {
-        const auto ax = road.from.x;
-        const auto az = road.from.z;
-        const auto bx = road.to.x;
-        const auto bz = road.to.z;
-        const auto dx = bx - ax;
-        const auto dz = bz - az;
-        const auto seg_len_sq = dx * dx + dz * dz;
-        auto u = seg_len_sq > 0.000001F
-            ? ((hit->x - ax) * dx + (hit->z - az) * dz) / seg_len_sq
-            : 0.0F;
-        u = std::clamp(u, 0.0F, 1.0F);
-        const auto cx = ax + dx * u;
-        const auto cz = az + dz * u;
-        const auto dist = std::sqrt((hit->x - cx) * (hit->x - cx) + (hit->z - cz) * (hit->z - cz));
-        const auto half_width = std::max(road.width, scene.unit_size) * 0.5F;
-        if (dist > half_width || dist >= nearest_dist) {
-            continue;
-        }
-
-        std::optional<std::size_t> street_index;
-        for (std::size_t i = 0; i < map.streets.size(); ++i) {
-            if (&map.streets[i] == road.source) {
-                street_index = i;
-                break;
-            }
-        }
-        if (!street_index.has_value()) {
-            continue;
-        }
-        nearest = *street_index;
-        nearest_dist = dist;
-    }
-
-    return nearest;
-}
-
 std::optional<std::size_t> pick_city_intersection(
     const SbcMap& map,
     const MapScene& scene,
     const Vec3& ray_origin,
     const Vec3& ray_dir) {
     constexpr float marker_size = 2.0F;
-    // Pad the pick target a little beyond the drawn marker so the small node cube
-    // is easy to grab, but not so much that it swallows the road running through
-    // it (a full-cell box made roads unselectable near their endpoints). The
-    // unified picker (pick_city_road_or_node) breaks node/road ties by camera
-    // distance, so this only needs to be comfortably clickable, not greedy.
+    // Make the pick target a bit bigger than the drawn marker, so the small node cube is
+    // easy to grab, but not so big that it covers the road running through it (a
+    // full-cell box made roads impossible to select near their ends). The combined
+    // picker (pick_city_road_or_node) breaks ties between nodes and roads by distance
+    // from the camera, so this only needs to be easy to click, not greedy.
     const auto half = marker_size * 0.85F;
 
     std::optional<std::size_t> nearest;
     auto nearest_t = std::numeric_limits<float>::max();
     for (const auto& intersection : scene.intersections) {
-        std::optional<std::size_t> index;
-        for (std::size_t i = 0; i < map.intersections.size(); ++i) {
-            if (&map.intersections[i] == intersection.source) {
-                index = i;
-                break;
-            }
-        }
-        if (!index.has_value()) {
+        const auto index = intersection.source_index;
+        if (index >= map.intersections.size() || intersection.source != map.intersections[index]) {
             continue;
         }
 
         const Vec3 center{
             intersection.position.x,
-            static_cast<float>(intersection.source->y) * scene.unit_size,
+            static_cast<float>(intersection.source.y) * scene.unit_size,
             intersection.position.z,
         };
         const auto t = ray_aabb_intersection_t(
@@ -4489,7 +4395,7 @@ std::optional<std::size_t> pick_city_intersection(
             continue;
         }
 
-        nearest = *index;
+        nearest = index;
         nearest_t = *t;
     }
 
@@ -4501,25 +4407,19 @@ std::optional<CityRoadPick> pick_city_road_or_node(
     const MapScene& scene,
     const Vec3& ray_origin,
     const Vec3& ray_dir) {
-    // Node candidate: distance along the ray to the nearest node marker box.
+    // Node candidate: the distance along the ray to the closest node marker box.
     constexpr float marker_size = 2.0F;
     const auto node_half = marker_size * 0.85F;
     std::optional<std::size_t> node_index;
     float node_t = std::numeric_limits<float>::max();
     for (const auto& intersection : scene.intersections) {
-        std::optional<std::size_t> index;
-        for (std::size_t i = 0; i < map.intersections.size(); ++i) {
-            if (&map.intersections[i] == intersection.source) {
-                index = i;
-                break;
-            }
-        }
-        if (!index.has_value()) {
+        const auto index = intersection.source_index;
+        if (index >= map.intersections.size() || intersection.source != map.intersections[index]) {
             continue;
         }
         const Vec3 center{
             intersection.position.x,
-            static_cast<float>(intersection.source->y) * scene.unit_size,
+            static_cast<float>(intersection.source.y) * scene.unit_size,
             intersection.position.z,
         };
         const auto t = ray_aabb_intersection_t(
@@ -4528,24 +4428,27 @@ std::optional<CityRoadPick> pick_city_road_or_node(
             {center.x + node_half, center.y + node_half, center.z + node_half});
         if (t.has_value() && *t < node_t) {
             node_t = *t;
-            node_index = *index;
+            node_index = index;
         }
     }
 
-    // Road candidate: where the ray meets the terrain surface, which road's drawn
-    // footprint (segment within its half-width) that point lands in. The road t is
-    // the distance from the ray origin to that surface hit, so it is directly
-    // comparable to the node t above.
-    // Pick against the actual rendered road tiles (the asphalt you see), not the
-    // abstract centerline. Each road tile is a unit cube; the nearest one the ray
-    // enters resolves to its owning street via tile.street_index. Intersection
-    // tiles (street_index < 0) are ignored so they fall through to node picking.
+    // Check each street once before going through its tiles. A cached scene can keep
+    // drawing after an edit, but must not select a record that moved or changed.
+    std::vector<bool> current_roads(map.streets.size(), false);
+    for (const auto& road : scene.roads) {
+        if (road.source_index < map.streets.size() && road.source == map.streets[road.source_index]) {
+            current_roads[road.source_index] = true;
+        }
+    }
+    // The closest drawn road tile gives the street it belongs to. Intersection tiles
+    // belong to no street and fall through to node picking.
     std::optional<std::size_t> road_index;
     float road_t = std::numeric_limits<float>::max();
     const auto unit = scene.unit_size;
     for (const auto& tile : scene.city_tiles) {
         if (tile.kind != CityTileKind::Road || tile.street_index < 0 ||
-            static_cast<std::size_t>(tile.street_index) >= map.streets.size()) {
+            static_cast<std::size_t>(tile.street_index) >= current_roads.size() ||
+            !current_roads[static_cast<std::size_t>(tile.street_index)]) {
             continue;
         }
         const Vec3 box_min{static_cast<float>(tile.x) * unit, tile.base_y, static_cast<float>(tile.z) * unit};
@@ -4557,8 +4460,8 @@ std::optional<CityRoadPick> pick_city_road_or_node(
         }
     }
 
-    // Whichever the ray reaches first wins. A small bias keeps a direct node click
-    // winning when the node box and the road overlap (the node sits on the road).
+    // Whichever the ray reaches first wins. A small bias lets a direct click on a node
+    // win when the node box and the road overlap (the node sits on the road).
     if (node_index.has_value() && (!road_index.has_value() || node_t <= road_t + scene.unit_size * 0.25F)) {
         return CityRoadPick{CityRoadPick::Kind::Node, *node_index};
     }
@@ -4569,7 +4472,7 @@ std::optional<CityRoadPick> pick_city_road_or_node(
 }
 
 // -----------------------------------------------------------------------------
-// City Scene Builders
+// City scene builders
 // -----------------------------------------------------------------------------
 
 CityBuildingBasis native_city_building_rotation_basis(std::int32_t rotation) {
@@ -4612,10 +4515,10 @@ namespace {
 Vec3 native_city_editor_offset_cell(std::int32_t rotation) {
     auto x = 0;
     auto z = 0;
-    // StreetPieceTool_CanvasRender_14006c400 applies only this rotation grid
-    // correction before RenderBuildingTemplatePreview. LoadCity_SBC stores an
-    // extent-center triplet for bounds/placement bookkeeping, but the rendered
-    // template mesh is already recentered by BuildBuildingBlockRenderBuffers.
+    // StreetPieceTool_CanvasRender_14006c400 only applies this rotation fix before
+    // RenderBuildingTemplatePreview. LoadCity_SBC stores a centre point of the extents
+    // for bounds and placement, but the drawn template mesh is already centred by
+    // BuildBuildingBlockRenderBuffers.
     switch (rotation & 3) {
         case 1:
             x = 1;
@@ -4639,9 +4542,9 @@ Vec3 native_city_building_render_origin(const SbcBuilding& placement, float unit
     const auto offset = native_city_editor_offset_cell(placement.rotation);
     return {
         (static_cast<float>(placement.x) + offset.x) * unit_size,
-        // All native world cells sit 0.25 above their level (cell at level L
-        // spans L*4+0.25 .. L*4+4.25); without the lift, building bottoms are
-        // coplanar with their stamped terrain plots and z-fight.
+        // Every world cell in the game sits 0.25 above its level (a cell at level L
+        // runs from L*4+0.25 to L*4+4.25). Without that lift, building bottoms sit in
+        // the same plane as their stamped ground and flicker against it.
         static_cast<float>(placement.y) * unit_size + 0.25F,
         (static_cast<float>(placement.z) + offset.z) * unit_size,
     };
@@ -4684,18 +4587,19 @@ std::optional<BuildingFacePick> pick_building_face(const BuildingRenderBuffer& b
     return best;
 }
 
-std::uint64_t city_scene_fingerprint(const SbcMap& map) {
-    // Hash over the fields the city scene is built from: intersections (terrain
-    // + tile grid + poles), streets (road tiles), and building placements. Anything
-    // that changes the rendered city changes one of these, so a mismatch is the
-    // signal to rebuild the cached MapScene.
+std::uint64_t city_scene_fingerprint(const SbcMap& map, std::uint64_t building_revision) {
+    // A hash of everything the city scene is built from: intersections (terrain, tile
+    // grid, poles), streets (road tiles), and building placements. The revision covers
+    // edited SBB assets that terrain stamps and world storage use.
     std::uint64_t hash = 1469598103934665603ULL;
-    // Word-at-a-time FNV variant: this runs every frame over every piece voxel,
-    // and only needs to detect change, not be a stable byte-wise FNV-1a.
+    // An FNV variant that works a word at a time. This runs every frame over every
+    // piece voxel and only needs to notice changes, so it doesn't have to be byte-wise
+    // FNV-1a.
     const auto mix = [&hash](std::int64_t value) {
         hash ^= static_cast<std::uint64_t>(value);
         hash *= 1099511628211ULL;
     };
+    mix(static_cast<std::int64_t>(building_revision));
     mix(static_cast<std::int64_t>(map.intersections.size()));
     for (const auto& it : map.intersections) {
         mix(it.x);
@@ -4711,20 +4615,22 @@ std::uint64_t city_scene_fingerprint(const SbcMap& map) {
     }
     mix(static_cast<std::int64_t>(map.buildings.size()));
     for (const auto& building : map.buildings) {
+        mix(static_cast<std::int64_t>(building.name.size()));
+        for (const unsigned char c : building.name) mix(c);
         mix(building.x);
         mix(building.y);
         mix(building.z);
         mix(building.rotation);
     }
-    // Piece (portal/district) cells stamp the terrain corner-height grid, so
-    // piece edits must rebuild the scene too.
+    // Piece (portal or district) cells stamp the terrain's corner-height grid, so
+    // piece edits have to rebuild the scene too.
     mix(static_cast<std::int64_t>(map.portals.size()));
     for (const auto& portal : map.portals) {
         mix(portal.fields[1]);
         mix(portal.fields[2]);
         mix(portal.fields[3]);
-        // Four independent lanes, so the multiplies don't wait on each other;
-        // every word still feeds one lane.
+        // Four separate lanes, so the multiplies don't wait on each other;
+        // every word still goes into one lane.
         const auto& words = portal.voxel_blocks();
         std::array<std::uint64_t, 4> lanes{hash, hash + 1U, hash + 2U, hash + 3U};
         std::size_t i = 0;
@@ -4739,18 +4645,20 @@ std::uint64_t city_scene_fingerprint(const SbcMap& map) {
     return hash;
 }
 
-std::uint64_t city_terrain_fingerprint(const SbcMap& map) {
-    // Subset of city_scene_fingerprint covering only the inputs that change the
-    // terrain heightfield mesh: intersection positions (corner heights), building
-    // footprints, and piece/portal cells (footprint stamping). Streets/road widths
-    // are excluded, so road and street edits skip the expensive terrain re-upload.
+std::uint64_t city_terrain_fingerprint(const SbcMap& map, std::uint64_t building_revision) {
+    // Part of city_scene_fingerprint, covering only what changes the terrain mesh:
+    // intersection positions (corner heights), building footprints, and piece or
+    // portal cells (footprint stamps). Streets and road widths are left out, so road and
+    // street edits skip the slow terrain upload.
     std::uint64_t hash = 1469598103934665603ULL;
-    // Word-at-a-time FNV variant: this runs every frame over every piece voxel,
-    // and only needs to detect change, not be a stable byte-wise FNV-1a.
+    // An FNV variant that works a word at a time. This runs every frame over every
+    // piece voxel and only needs to notice changes, so it doesn't have to be byte-wise
+    // FNV-1a.
     const auto mix = [&hash](std::int64_t value) {
         hash ^= static_cast<std::uint64_t>(value);
         hash *= 1099511628211ULL;
     };
+    mix(static_cast<std::int64_t>(building_revision));
     mix(static_cast<std::int64_t>(map.intersections.size()));
     for (const auto& it : map.intersections) {
         mix(it.x);
@@ -4759,6 +4667,8 @@ std::uint64_t city_terrain_fingerprint(const SbcMap& map) {
     }
     mix(static_cast<std::int64_t>(map.buildings.size()));
     for (const auto& building : map.buildings) {
+        mix(static_cast<std::int64_t>(building.name.size()));
+        for (const unsigned char c : building.name) mix(c);
         mix(building.x);
         mix(building.y);
         mix(building.z);
@@ -4802,17 +4712,17 @@ StreetPreview preview_city_street(const SbcMap& map, std::size_t street_index, b
 
 MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*>& placement_buildings, bool auto_generated,
     bool fit_game_world) {
-    MAPED_PROFILE_FUNCTION();
+    PAFTA_PROFILE_FUNCTION();
     MapScene scene;
-    // Native build order (World_LoadMapAndInitializeTerrain @56980): street
-    // graph, then street/intersection tiles, district/piece cells, and building
-    // footprints (all of which stamp the corner-height grid), then extent
-    // expansion, then the terrain rebuild with its patches.
+    // The game's build order (World_LoadMapAndInitializeTerrain @56980): the street
+    // graph, then street and intersection tiles, district and piece cells, and building
+    // footprints (all of which stamp the corner-height grid), then growing the extents,
+    // then rebuilding the terrain with its patches.
     auto graph = build_native_city_graph(map);
     CityCornerStampMap corner_stamps;
     corner_stamps.disabled = auto_generated;
-    // The mask bounds are the raw intersection extents (0x35fd1444..0x35fd1458),
-    // gathered before any tile is placed.
+    // The mask bounds use the raw intersection extents (0x35fd1444..0x35fd1458),
+    // collected before any tile is placed.
     if (!map.intersections.empty()) {
         corner_stamps.mask_min_x = corner_stamps.mask_min_z = std::numeric_limits<std::int32_t>::max();
         corner_stamps.mask_max_x = corner_stamps.mask_max_z = std::numeric_limits<std::int32_t>::lowest();
@@ -4826,8 +4736,8 @@ MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*
     scene.city_tiles = build_city_tile_cells(graph, corner_stamps, auto_generated);
     if (fit_game_world) scene.world_fit = fit_to_game_world(scene.city_tiles, graph, map, placement_buildings);
     remove_replaced_city_tiles(scene.city_tiles, map, placement_buildings);
-    // The road mesh and its shadow volume need only the tiles: build them while
-    // the terrain builds.
+    // The road mesh and its shadow volume only need the tiles, so build them while the
+    // terrain builds.
     auto tile_buffer = std::async(
 #ifdef __EMSCRIPTEN__
         std::launch::deferred,
@@ -4842,10 +4752,10 @@ MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*
     stamp_city_portal_cells(corner_stamps, map);
     stamp_city_building_footprints(corner_stamps, map, placement_buildings);
     scene.traffic_light_poles = build_city_traffic_light_poles(graph, scene.unit_size);
-    // Map labels (DrawMapMenu @88040): a street along X is named on its first
-    // segment (no street arriving at its start from -X); one along Z on the
-    // segment starting at gz 320..323, shifted 16 map units down on odd avenue
-    // columns. Placed at the segment midpoint, (world - 896) / 8.
+    // Map labels (DrawMapMenu @88040): a street along X is named on its first segment
+    // (the one with no street arriving at its start from -X). A street along Z is named
+    // on the segment starting at gz 320..323, moved 16 map units down on odd avenue
+    // columns. Labels sit at the middle of the segment, at (world - 896) / 8.
     for (const auto& street : graph.streets) {
         const auto& a = graph.intersections[static_cast<std::size_t>(street.a)];
         const auto& b = graph.intersections[static_cast<std::size_t>(street.b)];
@@ -4911,7 +4821,8 @@ MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*
         }
 
         scene.roads.push_back({
-            &source,
+            source,
+            source_index,
             {
                 static_cast<float>(source_from.x) * scene.unit_size,
                 native_road_surface_y(source_from.y - 1),
@@ -4946,14 +4857,15 @@ MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*
         const auto& native = graph.intersections[intersection_index];
         auto width = 2.0F * scene.unit_size;
         for (const auto& road : scene.roads) {
-            if (road.source->from_intersection == static_cast<std::int32_t>(intersection.index) ||
-                road.source->to_intersection == static_cast<std::int32_t>(intersection.index)) {
+            if (road.source.from_intersection == static_cast<std::int32_t>(intersection_index) ||
+                road.source.to_intersection == static_cast<std::int32_t>(intersection_index)) {
                 width = std::max(width, road.width);
             }
         }
 
         scene.intersections.push_back({
-            &intersection,
+            intersection,
+            intersection_index,
             {
                 static_cast<float>(intersection.x) * scene.unit_size,
                 native_road_surface_y(intersection.y - 1),
@@ -4985,10 +4897,12 @@ MapScene build_map_scene(const SbcMap& map, const std::vector<const SbbBuilding*
         });
     }
 
-    for (const auto& building : map.buildings) {
+    for (std::size_t building_index = 0; building_index < map.buildings.size(); ++building_index) {
+        const auto& building = map.buildings[building_index];
         const auto origin = native_city_building_render_origin(building, scene.unit_size);
         scene.buildings.push_back({
-            &building,
+            building,
+            building_index,
             origin,
             static_cast<float>(building.rotation),
         });
@@ -5102,7 +5016,7 @@ NativeRotatedBlockFace rotate_block_face_native(const SblBlockMesh& mesh, const 
 }
 
 // -----------------------------------------------------------------------------
-// Buildblock Portal Overlay Builders
+// Buildblock portal overlay builders
 // -----------------------------------------------------------------------------
 
 std::vector<PortalRect> build_portal_overlay_rects(const SblLayer& layer, PortalSide side) {
@@ -5137,30 +5051,4 @@ std::vector<PortalRect> build_portal_wall_rects(const SblLayer& layer, PortalSid
     return walls;
 }
 
-std::vector<PortalRect> build_portal_window_rects(const SblLayer& layer, PortalSide side) {
-    const auto bounds = portal_rect_for_side(layer, side, layer.bounds[0], layer.bounds[1], layer.bounds[2], layer.bounds[3]);
-    if (!bounds.has_value()) {
-        return {};
-    }
-    std::vector<PortalRect> window_rects;
-    for (const auto& window : layer.windows) {
-        const auto cutout = portal_rect_for_side(layer, side, window.x, window.width, window.y, window.height);
-        if (cutout.has_value() && rects_intersect(*bounds, *cutout)) {
-            window_rects.push_back(*cutout);
-        }
-    }
-    return window_rects;
-}
-
-std::vector<PortalRect> build_portal_beam_rects(const SblLayer& layer, PortalSide side) {
-    std::vector<PortalRect> beam_rects;
-    for (const auto& beam : layer.beams) {
-        const auto rect = portal_rect_for_side(layer, side, beam.x, beam.width, beam.y, beam.height);
-        if (rect.has_value()) {
-            beam_rects.push_back(*rect);
-        }
-    }
-    return beam_rects;
-}
-
-} // namespace map_editor
+} // namespace pafta

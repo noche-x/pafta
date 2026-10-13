@@ -1,6 +1,7 @@
-// Context-aware workspace windows: Tools, Library, and Properties. Each is a
-// normal floating/dockable ImGui window whose contents follow the current mode,
-// tool, and selection.
+// SPDX-License-Identifier: GPL-2.0-only
+// Workspace windows that follow the context: Tools, Library, and Properties. Each
+// is a normal ImGui window you can float or dock, and its contents follow the
+// current mode, tool, and selection.
 #include "app_internal.hpp"
 
 #include <imgui.h>
@@ -9,7 +10,7 @@
 #include <algorithm>
 #include <string>
 
-namespace map_editor::app_internal {
+namespace pafta::app_internal {
 namespace {
 
 const char* mode_name(EditorTab tab) {
@@ -23,7 +24,7 @@ const char* mode_name(EditorTab tab) {
     return "";
 }
 
-// Tooltip with the action's current shortcut appended.
+// A tooltip with the action's current shortcut added to the end.
 void help_tooltip(const EditorUi& ui, const char* text, std::optional<EditorAction> action = std::nullopt) {
     if (!ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) return;
     if (action.has_value()) {
@@ -38,13 +39,16 @@ void draw_placed_list(EditorProject& project, EditorUi& ui, bool roads) {
     ImGui::SetNextItemWidth(-FLT_MIN);
     ImGui::InputTextWithHint("##placed_search", "Filter by name", search.data(), search.size());
     const auto names = roads ? city_street_names(project.city->data) : city_building_names(project.city->data);
+    const auto query = lower_name(search.data());
     std::vector<std::size_t> visible;
     for (std::size_t i = 0; i < names.size(); ++i) {
-        if (asset_search_matches(ui, names[i])) visible.push_back(i);
+        if (query.empty() || lower_name(names[i]).find(query) != std::string::npos) visible.push_back(i);
     }
-    ImGui::TextDisabled("%zu of %zu. Click selects, double-click edits.", visible.size(), names.size());
-    // When the selection changes (e.g. picked in the viewport), scroll the list
-    // to it; duplicate names made the selected row easy to miss off-screen.
+    ImGui::TextDisabled("%zu of %zu", visible.size(), names.size());
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped("%s", roads ? "Click selects; double-click frames." : "Click selects; double-click edits.");
+    ImGui::PopStyleColor();
+    // Scroll by record index when the viewport selection changes. Names can repeat.
     const bool list_selected = roads ? ui.city_selection == CitySelectionKind::Road : ui.city_selection == CitySelectionKind::Building;
     const auto selected_index = roads ? ui.selected_city_street : ui.selected_city_building;
     static std::optional<std::size_t> last_scrolled[2];
@@ -76,6 +80,20 @@ void draw_placed_list(EditorProject& project, EditorUi& ui, bool roads) {
                     if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                         ui.focus_selection_requested = true;
                     }
+                    if (ImGui::BeginPopupContextItem("##road_menu")) {
+                        ui.selected_city_street = i;
+                        ui.city_selection = CitySelectionKind::Road;
+                        if (ImGui::MenuItem(ICON_FA_CROSSHAIRS " Frame")) ui.focus_selection_requested = true;
+                        if (ImGui::MenuItem(ICON_FA_COPY " Duplicate")) {
+                            begin_city_action(project, ui, "duplicate road");
+                            duplicate_city_street(project, ui);
+                        }
+                        if (ImGui::MenuItem(ICON_FA_TRASH " Delete")) {
+                            begin_city_action(project, ui, "delete road");
+                            delete_city_street(project, ui);
+                        }
+                        ImGui::EndPopup();
+                    }
                 } else {
                     const bool in_group = std::find(ui.selected_city_buildings.begin(), ui.selected_city_buildings.end(), i) != ui.selected_city_buildings.end();
                     const bool active = ui.city_selection == CitySelectionKind::Building && (ui.selected_city_building == i || in_group);
@@ -92,6 +110,24 @@ void draw_placed_list(EditorProject& project, EditorUi& ui, bool roads) {
                     if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                         edit_city_building(project, ui, i);
                     }
+                    if (ImGui::BeginPopupContextItem("##building_menu")) {
+                        if (!active) {
+                            ui.selected_city_building = i;
+                            ui.selected_city_buildings = {i};
+                            ui.city_selection = CitySelectionKind::Building;
+                        }
+                        if (ImGui::MenuItem(ICON_FA_PEN " Edit building")) edit_city_building(project, ui, i);
+                        if (ImGui::MenuItem(ICON_FA_CROSSHAIRS " Frame")) ui.focus_selection_requested = true;
+                        if (ImGui::MenuItem(ICON_FA_COPY " Duplicate")) {
+                            begin_city_action(project, ui, "duplicate building");
+                            duplicate_city_building(project, ui);
+                        }
+                        if (ImGui::MenuItem(ICON_FA_TRASH " Delete")) {
+                            begin_city_action(project, ui, "delete building");
+                            delete_city_building(project, ui);
+                        }
+                        ImGui::EndPopup();
+                    }
                 }
                 ImGui::PopID();
             }
@@ -105,9 +141,8 @@ void draw_placed_list(EditorProject& project, EditorUi& ui, bool roads) {
 namespace {
 
 constexpr float kToolButton = 34.0F;  // every toolbar button is this square, so icons line up
-const ImVec4 kPanelBg{0.08F, 0.08F, 0.09F, 0.94F};
 
-// Square icon button with an "on" state and a tooltip naming its key.
+// A square icon button with an "on" state and a tooltip naming its key.
 bool tool_button(const char* icon, bool active, const EditorUi& ui, const char* tip, std::optional<EditorAction> action = std::nullopt) {
     if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
     const bool pressed = ImGui::Button(icon, ImVec2(kToolButton, kToolButton));
@@ -122,20 +157,22 @@ void toolbar_divider() {
     ImGui::SameLine();
 }
 
-// Horizontal strip of thumbnails. `thumb(i)` may return null while a thumbnail
-// is still rendering. Returns the clicked index, if any.
+// A grid of thumbnails that wraps to the window width. `thumb(i)` may return null
+// while a thumbnail is still being drawn. Returns the index clicked, if any.
 template <typename Name, typename Thumb, typename Extra>
 std::optional<std::size_t> thumbnail_strip(const char* id, std::size_t count, std::size_t selected, const std::array<char, 128>& search,
                                            Name name, Thumb thumb, Extra extra) {
     constexpr float cell = 88.0F;
     std::optional<std::size_t> clicked;
-    if (ImGui::BeginChild(id, ImVec2(0.0F, 0.0F), ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar)) {
-        bool first = true;
+    if (ImGui::BeginChild(id, ImVec2(0.0F, 0.0F), ImGuiChildFlags_None)) {
+        const float step = cell + ImGui::GetStyle().FramePadding.x * 2.0F + ImGui::GetStyle().ItemSpacing.x;
+        const int per_row = std::max(1, static_cast<int>((ImGui::GetContentRegionAvail().x + ImGui::GetStyle().ItemSpacing.x) / step));
+        const auto needle = lower_name(search.data());
+        int column = 0;
         for (std::size_t i = 0; i < count; ++i) {
             const std::string& label = name(i);
-            if (search[0] != '\0' && lower_name(label).find(lower_name(search.data())) == std::string::npos) continue;
-            if (!first) ImGui::SameLine();
-            first = false;
+            if (!needle.empty() && lower_name(label).find(needle) == std::string::npos) continue;
+            if (column++ % per_row != 0) ImGui::SameLine();
             ImGui::PushID(static_cast<int>(i));
             ImGui::BeginGroup();
             const RenderTexture2D* texture = thumb(i);
@@ -152,15 +189,16 @@ std::optional<std::size_t> thumbnail_strip(const char* id, std::size_t count, st
             ImGui::EndGroup();
             ImGui::PopID();
         }
+        if (column == 0) ImGui::TextDisabled("Nothing matches.");
     }
     ImGui::EndChild();
     return clicked;
 }
 
-// One-line hint for the active tool, drawn under the toolbar.
+// A one-line hint for the active tool, drawn under the toolbar.
 const char* tool_hint(const EditorUi& ui) {
     if (ui.tab == EditorTab::Blocks) {
-        return "Click a patch or box to select it. Arrows / PgUp PgDn move it; Ctrl+D copies; Delete removes.";
+        return "Click to select. Drag the arrows and handles, or G move, S scale, R rotate (X/Y/Z lock). Right-click for more.";
     }
     if (ui.tab == EditorTab::Buildings) {
         switch (ui.building_tool) {
@@ -173,7 +211,7 @@ const char* tool_hint(const EditorUi& ui) {
         return "";
     }
     switch (ui.city_tool) {
-        case CityTool::Select: return "Click to select, drag a box for many. Alt+drag orbits, middle-drag pans, wheel zooms.";
+        case CityTool::Select: return "Click to select, drag a box for many. Right-click for actions. Middle-drag orbits, Shift+middle pans.";
         case CityTool::Building: return "Pick a building below; the outline shows where it lands. R turns it, click to place.";
         case CityTool::Road: return ui.pending_road_start ? "Click to lay the next straight segment. Esc or clicking the end finishes."
                                                           : "Click to start a road.";
@@ -185,239 +223,275 @@ const char* tool_hint(const EditorUi& ui) {
 
 } // namespace
 
-// Floating toolbar across the top of the viewport and the asset drawer along
-// its bottom. They are child windows of the scene canvas, so the mouse over
-// them never reaches the scene.
-void draw_viewport_overlays(EditorProject* project, EditorUi& ui, Camera3D& camera, std::string& status, bool& open_folder_requested) {
-    const ImVec2 origin = ImGui::GetWindowPos();
-    const ImVec2 extent = ImGui::GetWindowSize();
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, kPanelBg);
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0F);
+// The toolbar is a normal window. It starts floating over the top of the 3D view;
+// drag it by its edge to move it, or onto a dock edge to dock it.
+void draw_toolbar_window(EditorProject* project, EditorUi& ui, Camera3D& camera, std::string& status, bool& open_folder_requested) {
+    if (!ui.show_toolbar_window) return;
+    const auto* viewport = ImGui::GetMainViewport();
+    const ImGuiCond cond = ui.reset_layout ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.38F, viewport->WorkPos.y + 12.0F), cond, ImVec2(0.5F, 0.0F));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0F, 6.0F));
-
-    // Toolbar, centred using last frame's width.
-    static float toolbar_width = 600.0F;
-    ImGui::SetCursorScreenPos(ImVec2(origin.x + std::max(8.0F, (extent.x - toolbar_width) * 0.5F), origin.y + 8.0F));
-    constexpr ImGuiChildFlags kFit = ImGuiChildFlags_AutoResizeX | ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding;
-    if (ImGui::BeginChild("##toolbar", ImVec2(0.0F, 0.0F), kFit, ImGuiWindowFlags_NoScrollbar)) {
-        if (project == nullptr) {
-            if (ImGui::Button(ICON_FA_FOLDER_OPEN "  Open a map folder", ImVec2(0.0F, kToolButton))) open_folder_requested = true;
-        } else {
-            // Mode.
-            if (tool_button(ICON_FA_CITY, ui.tab == EditorTab::City, ui, "City mode", EditorAction::TabCity) && ui.tab != EditorTab::City) {
-                ui.requested_tab = EditorTab::City;
-            }
-            ImGui::SameLine();
-            ImGui::BeginDisabled(project->buildings.empty());
-            if (tool_button(ICON_FA_BUILDING, ui.tab == EditorTab::Buildings, ui, "Building mode: edit a building template", EditorAction::TabBuildings) &&
-                ui.tab != EditorTab::Buildings) {
-                ui.requested_tab = EditorTab::Buildings;
-            }
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            if (tool_button(ICON_FA_CUBES, ui.tab == EditorTab::Blocks, ui, "Block mode: make and edit block meshes") &&
-                ui.tab != EditorTab::Blocks) {
-                ui.requested_tab = EditorTab::Blocks;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0F);
+    const bool open = ImGui::Begin(ICON_FA_TOOLBOX " Toolbar###Toolbar", &ui.show_toolbar_window,
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoScrollbar);
+    ImGui::PopStyleVar(2);
+    if (open) {
+        // A grip to drag the toolbar by; right-click it to hide the toolbar.
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::Button(ICON_FA_GRIP_VERTICAL, ImVec2(16.0F, kToolButton));
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+            ImGui::StartMouseMovingWindowOrNode(ImGui::GetCurrentWindow(), ImGui::GetCurrentWindow()->DockNode, true);
+        }
+        help_tooltip(ui, "Drag to move the toolbar. Right-click for options.");
+        if (ImGui::BeginPopupContextItem("##toolbar_menu")) {
+            if (ImGui::MenuItem("Hide toolbar")) ui.show_toolbar_window = false;
+            if (ImGui::MenuItem("Put back over the view")) ui.reset_layout = true;
+            ImGui::EndPopup();
+        }
+        ImGui::SameLine();
+    if (project == nullptr) {
+        if (ImGui::Button(ICON_FA_FOLDER_OPEN "  Open a map folder", ImVec2(0.0F, kToolButton))) open_folder_requested = true;
+    } else {
+        // Mode.
+        if (tool_button(ICON_FA_CITY, ui.tab == EditorTab::City, ui, "City mode", EditorAction::TabCity) && ui.tab != EditorTab::City) {
+            ui.requested_tab = EditorTab::City;
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(project->buildings.empty());
+        if (tool_button(ICON_FA_BUILDING, ui.tab == EditorTab::Buildings, ui, "Building mode: edit a building template", EditorAction::TabBuildings) &&
+            ui.tab != EditorTab::Buildings) {
+            ui.requested_tab = EditorTab::Buildings;
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (tool_button(ICON_FA_CUBES, ui.tab == EditorTab::Blocks, ui, "Block mode: make and edit block meshes") &&
+            ui.tab != EditorTab::Blocks) {
+            ui.requested_tab = EditorTab::Blocks;
+        }
+        toolbar_divider();
+        if (ui.tab == EditorTab::City && project->city) {
+            struct Tool { const char* icon; CityTool tool; const char* tip; EditorAction action; };
+            constexpr Tool tools[] = {
+                {ICON_FA_ARROW_POINTER, CityTool::Select, "Select", EditorAction::ToolSelect},
+                {ICON_FA_HOUSE, CityTool::Building, "Place building", EditorAction::ToolBuilding},
+                {ICON_FA_ROAD, CityTool::Road, "Lay road", EditorAction::ToolRoad},
+                {ICON_FA_CUBE, CityTool::Piece, "Stamp piece", EditorAction::ToolPiece},
+                {ICON_FA_ERASER, CityTool::Erase, "Erase", EditorAction::ToolErase},
+            };
+            for (std::size_t t = 0; t < std::size(tools); ++t) {
+                if (t != 0) ImGui::SameLine();
+                if (tool_button(tools[t].icon, ui.city_tool == tools[t].tool, ui, tools[t].tip, tools[t].action)) {
+                    ui.city_tool = tools[t].tool;
+                    if (ui.city_tool != CityTool::Road) ui.pending_road_start.reset();
+                }
             }
             toolbar_divider();
-            if (ui.tab == EditorTab::City && project->city) {
-                struct Tool { const char* icon; CityTool tool; const char* tip; EditorAction action; };
-                constexpr Tool tools[] = {
-                    {ICON_FA_ARROW_POINTER, CityTool::Select, "Select", EditorAction::ToolSelect},
-                    {ICON_FA_HOUSE, CityTool::Building, "Place building", EditorAction::ToolBuilding},
-                    {ICON_FA_ROAD, CityTool::Road, "Lay road", EditorAction::ToolRoad},
-                    {ICON_FA_CUBE, CityTool::Piece, "Stamp piece", EditorAction::ToolPiece},
-                    {ICON_FA_ERASER, CityTool::Erase, "Erase", EditorAction::ToolErase},
-                };
-                for (std::size_t t = 0; t < std::size(tools); ++t) {
-                    if (t != 0) ImGui::SameLine();
-                    if (tool_button(tools[t].icon, ui.city_tool == tools[t].tool, ui, tools[t].tip, tools[t].action)) {
-                        ui.city_tool = tools[t].tool;
-                        if (ui.city_tool != CityTool::Road) ui.pending_road_start.reset();
-                    }
-                }
-                toolbar_divider();
-                if (tool_button(ICON_FA_EYE, ui.render_roads, ui, "Game preview: terrain and finished roads")) ui.render_roads = true;
+            if (tool_button(ICON_FA_EYE, ui.render_roads, ui, "Game preview: terrain and finished roads")) ui.render_roads = true;
+            ImGui::SameLine();
+            if (tool_button(ICON_FA_PEN_RULER, !ui.render_roads, ui, "Editor guide: road network only")) ui.render_roads = false;
+            ImGui::SameLine();
+            if (tool_button(ICON_FA_CROSSHAIRS, false, ui, "Frame the selection", EditorAction::FocusSelection)) focus_current_selection(*project, ui, camera);
+            ImGui::SameLine();
+            if (tool_button(ICON_FA_EXPAND, false, ui, "Show the whole city", EditorAction::FrameCity)) focus_camera_on_city(camera, *project);
+        } else if (ui.tab == EditorTab::City) {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("No city layout. Use Assets > New city.");
+        } else if (ui.tab == EditorTab::Buildings && !project->buildings.empty()) {
+            struct Tool { const char* icon; BuildingTool tool; const char* tip; };
+            constexpr Tool tools[] = {
+                {ICON_FA_ARROW_POINTER, BuildingTool::Select, "Select block"},
+                {ICON_FA_SQUARE_PLUS, BuildingTool::PlaceBlock, "Add block"},
+                {ICON_FA_PAINTBRUSH, BuildingTool::PaintTexture, "Paint faces"},
+                {ICON_FA_ANCHOR, BuildingTool::Anchor, "Move anchor"},
+                {ICON_FA_OBJECT_GROUP, BuildingTool::ItemSet, "Place item set"},
+            };
+            const EditorAction keys[] = {EditorAction::ToolSelect, EditorAction::ToolBuilding, EditorAction::ToolRoad,
+                EditorAction::ToolPiece, EditorAction::ToolErase};
+            for (std::size_t t = 0; t < std::size(tools); ++t) {
+                if (t != 0) ImGui::SameLine();
+                if (tool_button(tools[t].icon, ui.building_tool == tools[t].tool, ui, tools[t].tip, keys[t])) ui.building_tool = tools[t].tool;
+            }
+            toolbar_divider();
+            // The whole building, or one floor, changed with - and +.
+            ui.selected_building = std::min(ui.selected_building, project->buildings.size() - 1U);
+            const int max_floor = std::max(0, static_cast<int>(project->buildings[ui.selected_building].data.size_z) - 1);
+            if (tool_button(ICON_FA_LAYER_GROUP, ui.building_view_floor_only, ui, "Show one floor at a time")) {
+                ui.building_view_floor_only = !ui.building_view_floor_only;
+                project->building_floor_preview_dirty = true;
+            }
+            if (ui.building_view_floor_only) {
+                ui.building_view_floor = std::clamp(ui.building_view_floor, 0, max_floor);
                 ImGui::SameLine();
-                if (tool_button(ICON_FA_PEN_RULER, !ui.render_roads, ui, "Editor guide: road network only")) ui.render_roads = false;
-                ImGui::SameLine();
-                if (tool_button(ICON_FA_CROSSHAIRS, false, ui, "Frame the selection", EditorAction::FocusSelection)) focus_current_selection(*project, ui, camera);
-                ImGui::SameLine();
-                if (tool_button(ICON_FA_EXPAND, false, ui, "Show the whole city", EditorAction::FrameCity)) focus_camera_on_city(camera, *project);
-            } else if (ui.tab == EditorTab::City) {
-                ImGui::AlignTextToFramePadding();
-                ImGui::TextDisabled("No city layout. Use Assets > New city.");
-            } else if (ui.tab == EditorTab::Buildings && !project->buildings.empty()) {
-                struct Tool { const char* icon; BuildingTool tool; const char* tip; };
-                constexpr Tool tools[] = {
-                    {ICON_FA_ARROW_POINTER, BuildingTool::Select, "Select block"},
-                    {ICON_FA_SQUARE_PLUS, BuildingTool::PlaceBlock, "Add block"},
-                    {ICON_FA_PAINTBRUSH, BuildingTool::PaintTexture, "Paint faces"},
-                    {ICON_FA_ANCHOR, BuildingTool::Anchor, "Move anchor"},
-                    {ICON_FA_OBJECT_GROUP, BuildingTool::ItemSet, "Place item set"},
-                };
-                const EditorAction keys[] = {EditorAction::ToolSelect, EditorAction::ToolBuilding, EditorAction::ToolRoad,
-                    EditorAction::ToolPiece, EditorAction::ToolErase};
-                for (std::size_t t = 0; t < std::size(tools); ++t) {
-                    if (t != 0) ImGui::SameLine();
-                    if (tool_button(tools[t].icon, ui.building_tool == tools[t].tool, ui, tools[t].tip, keys[t])) ui.building_tool = tools[t].tool;
-                }
-                toolbar_divider();
-                // Whole building, or one floor stepped with -/+.
-                ui.selected_building = std::min(ui.selected_building, project->buildings.size() - 1U);
-                const int max_floor = std::max(0, static_cast<int>(project->buildings[ui.selected_building].data.size_z) - 1);
-                if (tool_button(ICON_FA_LAYER_GROUP, ui.building_view_floor_only, ui, "Show one floor at a time")) {
-                    ui.building_view_floor_only = !ui.building_view_floor_only;
+                if (ImGui::Button(ICON_FA_MINUS, ImVec2(kToolButton, kToolButton)) && ui.building_view_floor > 0) {
+                    --ui.building_view_floor;
                     project->building_floor_preview_dirty = true;
                 }
-                if (ui.building_view_floor_only) {
-                    ui.building_view_floor = std::clamp(ui.building_view_floor, 0, max_floor);
-                    ImGui::SameLine();
-                    if (ImGui::Button(ICON_FA_MINUS, ImVec2(kToolButton, kToolButton)) && ui.building_view_floor > 0) {
-                        --ui.building_view_floor;
-                        project->building_floor_preview_dirty = true;
-                    }
-                    ImGui::SameLine();
-                    ImGui::AlignTextToFramePadding();
-                    ImGui::Text("Floor %d/%d", ui.building_view_floor, max_floor);
-                    ImGui::SameLine();
-                    if (ImGui::Button(ICON_FA_PLUS, ImVec2(kToolButton, kToolButton)) && ui.building_view_floor < max_floor) {
-                        ++ui.building_view_floor;
-                        project->building_floor_preview_dirty = true;
-                    }
-                }
                 ImGui::SameLine();
-                if (tool_button(ICON_FA_HOUSE, ui.building_hide_roofs, ui, "Hide roofs (see inside)")) {
-                    ui.building_hide_roofs = !ui.building_hide_roofs;
-                }
+                ImGui::AlignTextToFramePadding();
+                ImGui::Text("Floor %d/%d", ui.building_view_floor, max_floor);
                 ImGui::SameLine();
-                if (tool_button(ICON_FA_TABLE_CELLS, ui.show_buildblock_window, ui, "Buildblock editor", EditorAction::WindowBuildblock)) {
-                    ui.show_buildblock_window = !ui.show_buildblock_window;
+                if (ImGui::Button(ICON_FA_PLUS, ImVec2(kToolButton, kToolButton)) && ui.building_view_floor < max_floor) {
+                    ++ui.building_view_floor;
+                    project->building_floor_preview_dirty = true;
                 }
             }
-            toolbar_divider();
-            if (tool_button(ICON_FA_ROTATE_LEFT, false, ui, "Undo", EditorAction::Undo)) undo_edit(*project, ui, status, false);
             ImGui::SameLine();
-            if (tool_button(ICON_FA_ROTATE_RIGHT, false, ui, "Redo", EditorAction::Redo)) undo_edit(*project, ui, status, true);
-        }
-        toolbar_width = ImGui::GetWindowWidth();
-        const ImVec2 bar_min = ImGui::GetWindowPos();
-        const float bar_bottom = bar_min.y + ImGui::GetWindowHeight();
-        ImGui::EndChild();
-        if (project != nullptr) {
-            const char* hint = tool_hint(ui);
-            const ImVec2 size = ImGui::CalcTextSize(hint);
-            const ImVec2 at{origin.x + (extent.x - size.x) * 0.5F, bar_bottom + 6.0F};
-            auto* draw = ImGui::GetWindowDrawList();
-            draw->AddRectFilled(ImVec2(at.x - 8.0F, at.y - 3.0F), ImVec2(at.x + size.x + 8.0F, at.y + size.y + 3.0F), IM_COL32(0, 0, 0, 150), 4.0F);
-            draw->AddText(at, IM_COL32(225, 225, 225, 255), hint);
-            if (ui.tab == EditorTab::City) {
-                std::string warning;
-                for (const auto& problem : game_world_fit_problems(*project)) warning += (warning.empty() ? "" : "\n") + problem;
-                if (!warning.empty()) {
-                    const ImVec2 warning_size = ImGui::CalcTextSize(warning.c_str(), nullptr, false, toolbar_width);
-                    const ImVec2 warning_at{origin.x + (extent.x - warning_size.x) * 0.5F, at.y + size.y + 10.0F};
-                    draw->AddRectFilled(ImVec2(warning_at.x - 8.0F, warning_at.y - 3.0F),
-                        ImVec2(warning_at.x + warning_size.x + 8.0F, warning_at.y + warning_size.y + 3.0F), IM_COL32(90, 10, 10, 200), 4.0F);
-                    draw->AddText(nullptr, 0.0F, warning_at, IM_COL32(255, 150, 140, 255), warning.c_str(), nullptr, toolbar_width);
-                }
+            if (tool_button(ICON_FA_HOUSE, ui.building_hide_roofs, ui, "Hide roofs (see inside)")) {
+                ui.building_hide_roofs = !ui.building_hide_roofs;
+            }
+            ImGui::SameLine();
+            if (tool_button(ICON_FA_TABLE_CELLS, ui.show_buildblock_window, ui, "Buildblock editor", EditorAction::WindowBuildblock)) {
+                ui.show_buildblock_window = !ui.show_buildblock_window;
             }
         }
-    } else {
-        ImGui::EndChild();
+        toolbar_divider();
+        if (tool_button(ICON_FA_ROTATE_LEFT, false, ui, "Undo", EditorAction::Undo)) undo_edit(*project, ui, status, false);
+        ImGui::SameLine();
+        if (tool_button(ICON_FA_ROTATE_RIGHT, false, ui, "Redo", EditorAction::Redo)) undo_edit(*project, ui, status, true);
     }
+    }
+    ImGui::End();
+}
 
-    // Asset drawer: only where a tool picks from assets.
-    const bool drawer_buildings = project && ((ui.tab == EditorTab::City && project->city && ui.city_tool == CityTool::Building) ||
-                                              ui.tab == EditorTab::Buildings) && !project->buildings.empty();
-    const bool drawer_pieces = project && ui.tab == EditorTab::City && project->city && ui.city_tool == CityTool::Piece && !project->blocks.empty();
-    if (ui.show_asset_drawer && (drawer_buildings || drawer_pieces)) {
-        const float height = ui.asset_drawer_open ? 176.0F : 42.0F;
-        ImGui::SetCursorScreenPos(ImVec2(origin.x + 8.0F, origin.y + extent.y - height - 8.0F));
-        if (ImGui::BeginChild("##asset_drawer", ImVec2(extent.x - 16.0F, height), ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar)) {
-            static std::array<char, 128> building_search{};
-            static std::array<char, 128> piece_search{};
-            auto& search = drawer_pieces ? piece_search : building_search;
-            if (ImGui::Button(ui.asset_drawer_open ? ICON_FA_CHEVRON_DOWN : ICON_FA_CHEVRON_UP, ImVec2(28.0F, 0.0F))) {
-                ui.asset_drawer_open = !ui.asset_drawer_open;
-            }
-            ImGui::SameLine();
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted(drawer_pieces ? "Pieces" : ui.tab == EditorTab::Buildings ? "Edit which building" : "Buildings");
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(200.0F);
-            ImGui::InputTextWithHint("##drawer_search", ICON_FA_MAGNIFYING_GLASS " Search", search.data(), search.size());
-            if (drawer_pieces) {
-                ImGui::SameLine();
-                if (!project->textures.empty()) {
-                    ui.place_piece_texture = std::min(ui.place_piece_texture, project->textures.size() - 1U);
-                    ImGui::SetNextItemWidth(160.0F);
-                    if (ImGui::BeginCombo("##piece_texture", project->textures[ui.place_piece_texture].name.c_str())) {
-                        for (std::size_t i = 0; i < project->textures.size(); ++i) {
-                            if (ImGui::Selectable(project->textures[i].name.c_str(), ui.place_piece_texture == i)) ui.place_piece_texture = i;
-                        }
-                        ImGui::EndCombo();
-                    }
-                    help_tooltip(ui, "Texture the stamped piece uses");
-                    ImGui::SameLine();
+// The asset drawer: buildings in City and Building mode, pieces with the Piece tool.
+// It is a normal window, docked under the 3D view at first.
+void draw_asset_drawer_window(EditorProject* project, EditorUi& ui, std::string& status) {
+    if (!ui.show_asset_drawer) return;
+    if (!ImGui::Begin(ICON_FA_IMAGES " Assets###Assets", &ui.show_asset_drawer)) {
+        ImGui::End();
+        return;
+    }
+    const bool has_city = project != nullptr && project->city.has_value();
+    const bool drawer_pieces = has_city && ui.tab == EditorTab::City && ui.city_tool == CityTool::Piece && !project->blocks.empty();
+    const bool drawer_buildings = project != nullptr && !drawer_pieces && (has_city || ui.tab == EditorTab::Buildings) &&
+        (ui.tab == EditorTab::City || ui.tab == EditorTab::Buildings) && !project->buildings.empty();
+    if (!drawer_buildings && !drawer_pieces) {
+        ImGui::TextDisabled(project == nullptr ? "Open a map to see its buildings and pieces here." : "Nothing to pick in this mode.");
+        ImGui::End();
+        return;
+    }
+    static std::array<char, 128> building_search{};
+    static std::array<char, 128> piece_search{};
+    auto& search = drawer_pieces ? piece_search : building_search;
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(drawer_pieces ? "Pieces" : ui.tab == EditorTab::Buildings ? "Edit which building" : "Buildings");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(200.0F);
+    ImGui::InputTextWithHint("##drawer_search", ICON_FA_MAGNIFYING_GLASS " Search", search.data(), search.size());
+    if (drawer_pieces) {
+        ImGui::SameLine();
+        if (!project->textures.empty()) {
+            ui.place_piece_texture = std::min(ui.place_piece_texture, project->textures.size() - 1U);
+            ImGui::SetNextItemWidth(160.0F);
+            if (ImGui::BeginCombo("##piece_texture", project->textures[ui.place_piece_texture].name.c_str())) {
+                for (std::size_t i = 0; i < project->textures.size(); ++i) {
+                    if (ImGui::Selectable(project->textures[i].name.c_str(), ui.place_piece_texture == i)) ui.place_piece_texture = i;
                 }
-                if (ImGui::Button(ICON_FA_ROTATE)) ui.selected_piece_rotation = (ui.selected_piece_rotation + 1) & 3;
-                help_tooltip(ui, "Turn the piece", EditorAction::RotateSelection);
-                ImGui::SameLine();
-                ImGui::AlignTextToFramePadding();
-                ImGui::TextDisabled("%zu deg", ui.selected_piece_rotation * 90);
-            } else if (ui.tab == EditorTab::City) {
-                ImGui::SameLine();
-                if (ImGui::Button(ICON_FA_ROTATE)) ui.place_building_rotation = (ui.place_building_rotation + 1) & 3;
-                help_tooltip(ui, "Turn the building", EditorAction::RotateSelection);
-                ImGui::SameLine();
-                ImGui::AlignTextToFramePadding();
-                ImGui::TextDisabled("%d deg", ui.place_building_rotation * 90);
+                ImGui::EndCombo();
             }
-            if (ui.asset_drawer_open) {
-                if (drawer_pieces) {
-                    ui.place_piece_mesh = std::min(ui.place_piece_mesh, project->blocks.size() - 1U);
-                    // The game's solid cube: a city block with no mesh name.
-                    if (ImGui::Button("Solid\nblock\n(nblock)", ImVec2(94.0F, 94.0F))) ui.place_piece_solid = true;
-                    if (ui.place_piece_solid) {
-                        ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), IM_COL32(235, 190, 78, 255), 3.0F, 0, 3.0F);
+            help_tooltip(ui, "Texture the stamped piece uses");
+            ImGui::SameLine();
+        }
+        if (ImGui::Button(ICON_FA_ROTATE)) ui.selected_piece_rotation = (ui.selected_piece_rotation + 1) & 3;
+        help_tooltip(ui, "Turn the piece", EditorAction::RotateSelection);
+        ImGui::SameLine();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("%zu deg", ui.selected_piece_rotation * 90);
+    } else if (ui.tab == EditorTab::City) {
+        ImGui::SameLine();
+        if (ImGui::Button(ICON_FA_ROTATE)) ui.place_building_rotation = (ui.place_building_rotation + 1) & 3;
+        help_tooltip(ui, "Turn the building", EditorAction::RotateSelection);
+        ImGui::SameLine();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("%d deg", ui.place_building_rotation * 90);
+    }
+    {
+        if (drawer_pieces) {
+            ui.place_piece_mesh = std::min(ui.place_piece_mesh, project->blocks.size() - 1U);
+            // The game's solid cube: a city block with no mesh name.
+            if (ImGui::Button("Solid\nblock\n(nblock)", ImVec2(94.0F, 94.0F))) ui.place_piece_solid = true;
+            if (ui.place_piece_solid) {
+                ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), IM_COL32(235, 190, 78, 255), 3.0F, 0, 3.0F);
+            }
+            help_tooltip(ui, "A plain solid cube with the chosen texture on every side");
+            ImGui::SameLine();
+            const auto picked = thumbnail_strip("##piece_strip", project->blocks.size(), ui.place_piece_solid ? project->blocks.size() : ui.place_piece_mesh, search,
+                [&](std::size_t i) -> const std::string& { return project->blocks[i].name; },
+                [&](std::size_t i) { return block_thumbnail(*project, i); },
+                [](std::size_t) {});
+            if (picked) {
+                ui.place_piece_mesh = *picked;
+                ui.place_piece_solid = false;
+            }
+        } else {
+            const bool editing = ui.tab == EditorTab::Buildings;
+            const auto current = editing ? ui.selected_building : ui.place_building_template;
+            const auto picked = thumbnail_strip("##building_strip", project->buildings.size(), current, search,
+                [&](std::size_t i) -> const std::string& { return project->buildings[i].name; },
+                [&](std::size_t i) { return building_thumbnail(*project, i); },
+                [&](std::size_t i) {
+                    if (ImGui::BeginPopupContextItem("##building_menu")) {
+                        ImGui::TextDisabled("%s", project->buildings[i].name.c_str());
+                        if (has_city && ImGui::MenuItem(ICON_FA_HOUSE " Place in the city")) {
+                            ui.place_building_template = i;
+                            ui.city_tool = CityTool::Building;
+                            ui.requested_tab = EditorTab::City;
+                        }
+                        if (ImGui::MenuItem(ICON_FA_PEN " Edit building")) edit_building(*project, ui, i);
+                        if (ImGui::MenuItem(ICON_FA_FILE_EXPORT " Export .sbb...")) export_building_sbb(*project, i, status);
+                        ImGui::EndPopup();
                     }
-                    help_tooltip(ui, "A plain solid cube with the chosen texture on every side");
-                    ImGui::SameLine();
-                    const auto picked = thumbnail_strip("##piece_strip", project->blocks.size(), ui.place_piece_solid ? project->blocks.size() : ui.place_piece_mesh, search,
-                        [&](std::size_t i) -> const std::string& { return project->blocks[i].name; },
-                        [&](std::size_t i) { return block_thumbnail(*project, i); },
-                        [](std::size_t) {});
-                    if (picked) {
-                        ui.place_piece_mesh = *picked;
-                        ui.place_piece_solid = false;
+                    if (editing) return;
+                    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) edit_building(*project, ui, i);
+                    if (ImGui::BeginDragDropSource()) {
+                        ImGui::SetDragDropPayload("MAP_BUILDING", &i, sizeof(i));
+                        ImGui::TextUnformatted(project->buildings[i].name.c_str());
+                        ImGui::EndDragDropSource();
                     }
+                });
+            if (picked) {
+                if (editing) {
+                    edit_building(*project, ui, *picked);
                 } else {
-                    const bool editing = ui.tab == EditorTab::Buildings;
-                    const auto current = editing ? ui.selected_building : ui.place_building_template;
-                    const auto picked = thumbnail_strip("##building_strip", project->buildings.size(), current, search,
-                        [&](std::size_t i) -> const std::string& { return project->buildings[i].name; },
-                        [&](std::size_t i) { return building_thumbnail(*project, i); },
-                        [&](std::size_t i) {
-                            if (editing) return;
-                            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) edit_building(*project, ui, i);
-                            if (ImGui::BeginDragDropSource()) {
-                                ImGui::SetDragDropPayload("MAP_BUILDING", &i, sizeof(i));
-                                ImGui::TextUnformatted(project->buildings[i].name.c_str());
-                                ImGui::EndDragDropSource();
-                            }
-                        });
-                    if (picked) {
-                        if (editing) edit_building(*project, ui, *picked);
-                        else ui.place_building_template = *picked;
-                    }
+                    // Picking a building gets the Building tool ready to place it.
+                    ui.place_building_template = *picked;
+                    ui.city_tool = CityTool::Building;
+                    ui.pending_road_start.reset();
                 }
             }
         }
-        ImGui::EndChild();
     }
-    ImGui::PopStyleVar(2);
-    ImGui::PopStyleColor();
+    ImGui::End();
+}
+
+// Drawn over the 3D view: the hint for the active tool and map warnings, under
+// `top` (screen y). Returns the bottom of what it drew.
+float draw_viewport_overlays(EditorProject* project, EditorUi& ui) {
+    const ImVec2 origin = ImGui::GetWindowPos();
+    const ImVec2 extent = ImGui::GetWindowSize();
+    float top_overlay_bottom = origin.y;
+    if (project == nullptr) return top_overlay_bottom;
+    const char* hint = tool_hint(ui);
+    const ImVec2 size = ImGui::CalcTextSize(hint);
+    const ImVec2 at{origin.x + (extent.x - size.x) * 0.5F, extent.y + origin.y - size.y - 12.0F};
+    auto* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(ImVec2(at.x - 8.0F, at.y - 3.0F), ImVec2(at.x + size.x + 8.0F, at.y + size.y + 3.0F), IM_COL32(0, 0, 0, 150), 4.0F);
+    draw->AddText(at, IM_COL32(225, 225, 225, 255), hint);
+    if (ui.tab == EditorTab::City) {
+        std::string warning;
+        for (const auto& problem : game_world_fit_problems(*project)) warning += (warning.empty() ? "" : "\n") + problem;
+        if (!warning.empty()) {
+            const float wrap = std::min(600.0F, extent.x - 32.0F);
+            const ImVec2 warning_size = ImGui::CalcTextSize(warning.c_str(), nullptr, false, wrap);
+            const ImVec2 warning_at{origin.x + (extent.x - warning_size.x) * 0.5F, origin.y + 10.0F};
+            draw->AddRectFilled(ImVec2(warning_at.x - 8.0F, warning_at.y - 3.0F),
+                ImVec2(warning_at.x + warning_size.x + 8.0F, warning_at.y + warning_size.y + 3.0F), IM_COL32(90, 10, 10, 200), 4.0F);
+            draw->AddText(nullptr, 0.0F, warning_at, IM_COL32(255, 150, 140, 255), warning.c_str(), nullptr, wrap);
+            top_overlay_bottom = warning_at.y + warning_size.y + 3.0F;
+        }
+    }
+    return top_overlay_bottom;
 }
 
 // Outliner: what is in the map (placed buildings and roads), docked above
@@ -461,8 +535,8 @@ void draw_outliner_window(EditorProject* project, EditorUi& ui) {
     ImGui::End();
 }
 
-// The placement height of the Road, Piece, and Building tools, relative to the
-// surface under the cursor.
+// How high the Road, Piece, and Building tools place things, relative to the surface
+// under the cursor.
 void draw_place_height(EditorUi& ui) {
     field_label("Height");
     ImGui::SetNextItemWidth(-FLT_MIN);
@@ -502,8 +576,8 @@ void draw_properties_window(EditorProject* project, EditorUi& ui, std::string& s
         return;
     }
     if (ui.tab == EditorTab::City) {
-        // The placement height belongs to the tool, so it shows even while
-        // something is selected (the tool section below only shows without one).
+        // The placement height belongs to the tool, so it shows even while something
+        // is selected (the tool section below only shows when nothing is).
         if (project->city && ui.city_selection != CitySelectionKind::None &&
             (ui.city_tool == CityTool::Road || ui.city_tool == CityTool::Piece || ui.city_tool == CityTool::Building)) {
             ImGui::SeparatorText("Placing");
@@ -562,7 +636,7 @@ void draw_properties_window(EditorProject* project, EditorUi& ui, std::string& s
             ImGui::SetNextItemWidth(-FLT_MIN);
             if (ImGui::InputInt("##junction_level", &level) && level != node.y) {
                 begin_city_action(*project, ui, "move junction");
-                nudge_city_junction_level(*project, ui, level - node.y);
+                nudge_city_junction_level(*project, ui, static_cast<std::int64_t>(level) - node.y);
             }
             help_tooltip(ui, "Junction height in cells; its roads slope to meet it", EditorAction::NudgeUp);
             if (ImGui::Button("Start road here")) {
@@ -646,7 +720,7 @@ void draw_properties_window(EditorProject* project, EditorUi& ui, std::string& s
             help_tooltip(ui, "Remove the selection from the map", EditorAction::DeleteSelection);
         } else if (ui.city_selection == CitySelectionKind::Piece) {
             ImGui::SeparatorText("Piece");
-            // The voxel word carries the city-block record (low 12 bits) and the
+            // The voxel word holds the city-block record (low 12 bits) and the
             // quarter-turn rotation (bits 24-25).
             const auto& city_blocks = project->city->data.city_blocks;
             const auto block_index = static_cast<std::size_t>(ui.selected_piece_word & 0xfffU);
@@ -713,4 +787,4 @@ void draw_properties_window(EditorProject* project, EditorUi& ui, std::string& s
     ImGui::End();
 }
 
-} // namespace map_editor::app_internal
+} // namespace pafta::app_internal

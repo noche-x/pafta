@@ -1,11 +1,8 @@
 # SBC city-map format
 
-SBC stores the road graph, placed buildings, district block definitions,
-portal voxel regions, and portal connections. The editor accepts versions 7
-through 12. Section presence changes with the version, so readers must advance
-through the file in order.
+An SBC file holds the road network, the placed buildings, the city-block definitions, portal voxel regions, and portal connections. Pafta reads versions 7 to 12. Which sections exist depends on the version, so a reader has to go through the file in order.
 
-## File order
+## Section order
 
 ```text
 version
@@ -18,21 +15,19 @@ version 8+: portals
 version 9+: portal connections
 ```
 
-All counts are `u32`. All numeric record members are little-endian.
+Every count is a `u32`. Every number in a record is little-endian.
 
-## Header and unknown name table
+## Header and unknown name list
 
 | Offset | Type | Field |
 |---:|---|---|
 | `0x00` | `u32` | version |
 
-Versions 10 through 12 then store a counted sequence of `ascii[64]` values.
-The editor preserves this section during layout edits but does not expose its
-contents. Its native purpose remains unknown.
+Versions 10 to 12 follow this with a count and that many `ascii[64]` values. Pafta keeps this section when editing the layout but does not show it. What the game uses it for is unknown.
 
 ## Intersections
 
-The intersection section starts with a count. Each record occupies `0x0c`.
+This section starts with a count. Each record is `0x0c` bytes.
 
 | Relative offset | Type | Field |
 |---:|---|---|
@@ -40,28 +35,26 @@ The intersection section starts with a count. Each record occupies `0x0c`.
 | `0x04` | `i32` | Y cell coordinate |
 | `0x08` | `i32` | Z cell coordinate |
 
-The renderer multiplies these cell coordinates by the city unit size.
+The renderer multiplies these by the city unit size.
 
 ## Streets
 
-The street section starts with a count. Each record occupies `0x34`.
+This section starts with a count. Each record is `0x34` bytes.
 
 | Relative offset | Type | Field |
 |---:|---|---|
 | `0x00` | `i32` | first intersection index |
 | `0x04` | `i32` | second intersection index |
-| `0x08` | `i32` | district or metadata value |
-| `0x0c` | `i32` | first-side width |
-| `0x10` | `i32` | second-side width |
+| `0x08` | `i32` | district or other data |
+| `0x0c` | `i32` | width on the first side |
+| `0x10` | `i32` | width on the second side |
 | `0x14` | `ascii[32]` | street name |
 
-Native editor overlay evidence calls the two endpoint indices directly and
-uses the width values to expand endpoint extents. The exact semantic name of
-the `0x08` value remains unproven.
+The original editor's overlay uses the two intersection indices directly and uses the widths to widen the ends. What the `0x08` value means is still not proven.
 
 ## Placed buildings
 
-The building section starts with a count. Each record occupies `0x50`.
+This section starts with a count. Each record is `0x50` bytes.
 
 | Relative offset | Type | Field |
 |---:|---|---|
@@ -69,66 +62,56 @@ The building section starts with a count. Each record occupies `0x50`.
 | `0x40` | `i32` | X cell coordinate |
 | `0x44` | `i32` | Y cell coordinate |
 | `0x48` | `i32` | Z cell coordinate |
-| `0x4c` | `i32` | quarter-turn rotation |
+| `0x4c` | `i32` | rotation in quarter turns |
 
-The current renderer treats the rotation as a value modulo four.
+The renderer uses the rotation modulo four.
 
 ## City-block definitions
 
-Versions 11 and 12 store this section. It starts with a count. Each definition
-contains:
+Only versions 11 and 12 have this section. It starts with a count, and each definition holds:
 
 | Order | Type | Field |
 |---:|---|---|
-| 1 | `ascii[64]` | block mesh name; empty selects the native `nblock` display name |
-| 2 | `u32` | layer count; version 12 only |
+| 1 | `ascii[64]` | block mesh name; empty means the game's `nblock` display name |
+| 2 | `u32` | layer count (version 12 only) |
 | 3 | `ascii[64][8]` per layer | eight material or texture names |
 
-Version 11 has one implicit layer. The editor limits a parsed layer count to 64
-as a corrupt-file guard; this is not a proven native limit.
+Version 11 always has one layer. Pafta rejects more than 64 layers and needs every name to fit in the file. The limit of 64 is Pafta's own; nobody has shown the game has the same limit.
 
 ## Portals
 
-Versions 8 through 12 store portals. Each portal begins with four `i32` fields.
-The editor currently exposes them without final semantic names. Current scene
-code treats fields 1, 2, and 3 as the portal-region X, Y, and Z coordinates;
-field 0 still needs a clean native trace.
+Versions 8 to 12 have portals. Each portal starts with four `i32` fields, which Pafta shows without proper names yet. The scene code treats fields 1, 2, and 3 as the X, Y, and Z of the portal region. Field 0 still needs a clean trace through the game's code.
 
-The payload after those fields depends on the version:
+What comes after those fields depends on the version:
 
-| Version | `u32[512]` blocks | `u32[512]` legacy blocks | `u16[4096]` textures | `u32[512]` item sets |
+| Version | `u32[512]` blocks | `u32[512]` old-style blocks | `u16[4096]` textures | `u32[512]` item sets |
 |---:|:---:|:---:|:---:|:---:|
 | 8-9 | no | yes | yes | no |
 | 10 | no | yes | yes | yes |
 | 11-12 | yes | no | no | yes |
 
-Both block arrays describe an `8 x 8 x 8` voxel region. The linear index is:
+Both block arrays cover an `8 x 8 x 8` grid of voxels. The index of a voxel is:
 
 ```text
 index = local_x + local_z * 8 + local_y * 64
 ```
 
-The block word uses the same high-bit classes seen in building cells:
-`0x40000000` marks a solid cell and `0x80000000` marks a mesh instance. The
-meaning of the remaining bits depends on the district block catalog and still
-needs a complete native description.
+Block words use the same top-bit kinds as building cells: `0x40000000` is a solid cell and `0x80000000` is a mesh. What the other bits mean depends on the city-block catalog, and still needs a full description from the game's code.
 
-The legacy texture array has eight `u16` values per voxel. Exact slot names are
-not yet proven.
+The old texture array has eight `u16` values per voxel. The exact meaning of each slot is not proven yet.
 
 ## Portal connections
 
-Versions 9 through 12 end with a counted array of `0x0c` records. Each record
-contains three `i32` values. The parser preserves them as raw fields because
-their native roles remain unresolved.
+Versions 9 to 12 end with a count and that many `0x0c`-byte records, each holding three `i32` values. The parser keeps them as raw fields because nobody knows yet what the game does with them.
 
-## Writer behavior
+## How Pafta writes it
 
-`rebuild_sbc` always emits version 12. It writes an empty unknown header table,
-then every modeled section. `rebuild_sbc_layout` keeps the source version and
-preserves the unmodeled tail after intersections, streets, and buildings.
+The parser needs every section the version calls for, and every counted record has to fit in the file. A cut-off section is never treated as empty or partly filled.
 
-In-place patch functions preserve unrelated bytes. Portal rebuilding rewrites
-the whole portal section because portal count changes alter every following
-offset; it then appends the original connection tail.
+`rebuild_sbc` always writes version 12. It writes an empty unknown name list, then every section Pafta understands. `rebuild_sbc_layout` keeps the original version and keeps everything after the intersections, streets, and buildings as it was.
 
+Patches that edit in place leave unrelated bytes alone. Rebuilding portals rewrites the whole portal section, because a different portal count moves every later offset, and then adds the original connection section back on the end.
+
+## Coordinate safety
+
+Pafta converts portal sector coordinates to cell coordinates with checked 64-bit arithmetic. It rejects coordinates whose eight-cell sector and immediate neighbours would overflow a signed 32-bit cell coordinate. Scene construction and picking use the same checked conversion for in-memory edits. This is an arithmetic safety check; it does not prove a coordinate fits the game's world storage.

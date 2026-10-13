@@ -1,26 +1,24 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #include "app_internal.hpp"
 
 #include <imgui.h>
-#include <imgui_internal.h>
 #include <rlImGui.h>
 
 #include <algorithm>
 #include <array>
 #include <cfloat>
 #include <cstdint>
-#include <cmath>
 #include <iomanip>
-#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
 
-namespace map_editor::app_internal {
+namespace pafta::app_internal {
 
-// Left-hand label for the next widget at a shared column, so fields line up
-// down a panel; the widget takes the rest of the row (give it a "##" id).
+// A label on the left, in a shared column, for the next widget, so fields line up
+// down a panel. The widget takes the rest of the row (give it a "##" id).
 void field_label(const char* label) {
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted(label);
@@ -43,6 +41,7 @@ void invalidate_buildblock_preview_scene(EditorProject& project) {
 }
 
 const BuildblockPreviewScene& buildblock_preview_scene(EditorProject& project, std::size_t index) {
+    // Changing the selection rebuilds here; edits go through mark_buildblock_changed.
     if (!project.cached_buildblock_preview_index.has_value() ||
         *project.cached_buildblock_preview_index != index) {
         project.cached_buildblock_preview_scene =
@@ -58,9 +57,7 @@ std::string hex_u32(std::uint32_t value) {
     return stream.str();
 }
 
-// Compact catalog combo: shows entries[selected], lets you pick another. Empty
-// names render as their index so unnamed blocks/materials stay selectable. Used by
-// both the viewport toolbar and the block tool panel.
+// Empty names keep their numbered slots and can still be selected.
 bool catalog_combo(const char* label, const std::vector<std::string>& entries, std::size_t& selected) {
     if (entries.empty()) {
         ImGui::TextDisabled("%s: (none)", label);
@@ -88,52 +85,6 @@ bool catalog_combo(const char* label, const std::vector<std::string>& entries, s
     return changed;
 }
 
-const char* building_cell_field_label(std::size_t field_index) {
-    static constexpr std::array labels{
-        "Exterior Block",
-        "Interior Block",
-        "Cell Type",
-        "Exterior Portal Face",
-        "Interior Portal Face",
-        "Placed Flag",
-        "Itemset",
-    };
-    return labels[std::min(field_index, labels.size() - 1U)];
-}
-
-const char* payload_kind_label(std::uint32_t word) {
-    switch ((word >> 29U) & 7U) {
-        case 0:
-            return word == 0U ? "empty" : "raw";
-        case 2:
-            return "buildblock";
-        case 4:
-            return "piece";
-        default:
-            return "other";
-    }
-}
-
-std::uint32_t payload_id(std::uint32_t word) {
-    return ((word >> 29U) & 7U) == 4U ? (word & 0x3ffU) : (word & 0xffffU);
-}
-
-std::uint32_t payload_rotation(std::uint32_t word) {
-    return (word >> 24U) & 3U;
-}
-
-std::string payload_name(const SbbBuilding& building, const SbbCell& cell, std::uint32_t word) {
-    const auto payload_class = (word >> 29U) & 7U;
-    const auto id = payload_id(word);
-    if (payload_class == 4U && id < building.piece_names.size()) {
-        return building.piece_names[id];
-    }
-    if (payload_class == 2U && cell.cell_type() < building.block_names.size()) {
-        return building.block_names[cell.cell_type()];
-    }
-    return "(unresolved)";
-}
-
 const LoadedAsset<SblTemplate>* find_buildblock_asset(const EditorProject& project, std::string_view name) {
     const auto match = std::ranges::find_if(project.buildblocks, [name](const LoadedAsset<SblTemplate>& asset) {
         return asset.name == name;
@@ -148,351 +99,42 @@ const LoadedAsset<SblTemplate>* buildblock_for_cell(const EditorProject& project
     return find_buildblock_asset(project, building.block_names[cell.cell_type()]);
 }
 
-const SbbCell* cell_at_or_null(const SbbBuilding& building, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
-    const auto match = std::ranges::find_if(building.cells, [x, y, z](const SbbCell& cell) {
-        return cell.x == x && cell.y == y && cell.z == z;
-    });
-    return match == building.cells.end() ? nullptr : &*match;
-}
-
-struct PortalSideInspectorRow {
-    const char* side{};
-    std::uint32_t code{};
-    const char* source{};
-};
-
-struct PreviewExtents {
-    float min_x{std::numeric_limits<float>::max()};
-    float min_y{std::numeric_limits<float>::max()};
-    float max_x{std::numeric_limits<float>::lowest()};
-    float max_y{std::numeric_limits<float>::lowest()};
-    bool has_content{};
-};
-
-std::array<PortalSideInspectorRow, 4> portal_side_rows(const SbbBuilding& building, const SbbCell& cell) {
-    const auto* east = cell_at_or_null(building, cell.x + 1U, cell.y, cell.z);
-    return {
-        PortalSideInspectorRow{"North", cell.exterior_portal_face(), "cell.exterior"},
-        PortalSideInspectorRow{"West", cell.interior_portal_face(), "cell.interior"},
-        PortalSideInspectorRow{"South", cell.exterior_portal_face(), "cell.exterior"},
-        PortalSideInspectorRow{"East", east == nullptr ? 0U : east->interior_portal_face(), "east.interior"},
-    };
-}
-
-std::string portal_layer_label(std::uint32_t side_code, const LoadedAsset<SblTemplate>* buildblock) {
-    if (side_code < 3U) {
-        return "closed";
+// The building's buildblocks, each shown as previews of its first faces. Changes
+// `selected` (an index into building.block_names); true when it changed.
+bool buildblock_picker(const EditorProject& project, const SbbBuilding& building, std::size_t& selected) {
+    if (building.block_names.empty()) {
+        ImGui::TextDisabled("(no buildblocks; add one under Buildblocks)");
+        return false;
     }
-    const auto layer_index = static_cast<std::size_t>(side_code - 3U);
-    if (buildblock == nullptr) {
-        return "layer " + std::to_string(layer_index) + " (template unresolved)";
-    }
-    if (layer_index >= buildblock->data.layers.size()) {
-        return "layer " + std::to_string(layer_index) + " (missing)";
-    }
-    const auto& layer = buildblock->data.layers[layer_index];
-    return "layer " + std::to_string(layer.index) + " type " + std::to_string(layer.portal_type);
-}
-
-bool input_u32(const char* label, std::uint32_t& value) {
-    constexpr std::uint32_t step = 1U;
-    constexpr std::uint32_t step_fast = 16U;
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    return ImGui::InputScalar(label, ImGuiDataType_U32, &value, &step, &step_fast);
-}
-
-bool drag_unit_float(const char* label, float& value) {
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    return ImGui::DragFloat(label, &value, 0.0625F, 0.0F, 1.0F, "%.4f", ImGuiSliderFlags_AlwaysClamp);
-}
-
-void property_row(std::string_view label, std::string_view value) {
-    ImGui::TableNextRow();
-    ImGui::TableNextColumn();
-    ImGui::TextUnformatted(label.data(), label.data() + label.size());
-    ImGui::TableNextColumn();
-    ImGui::TextUnformatted(value.data(), value.data() + value.size());
-}
-
-void include_preview_point(PreviewExtents& extents, float x, float y) {
-    extents.min_x = std::min(extents.min_x, x);
-    extents.min_y = std::min(extents.min_y, y);
-    extents.max_x = std::max(extents.max_x, x);
-    extents.max_y = std::max(extents.max_y, y);
-    extents.has_content = true;
-}
-
-bool preview_layer_matches(std::optional<std::size_t> layer_index, std::size_t candidate) {
-    return !layer_index.has_value() || *layer_index == candidate;
-}
-
-ImU32 buildblock_rect_fill_color(BuildblockPreviewRectKind kind) {
-    switch (kind) {
-        case BuildblockPreviewRectKind::Bounds:
-            return IM_COL32(63, 183, 184, 95);
-        case BuildblockPreviewRectKind::Window:
-            return IM_COL32(92, 154, 222, 145);
-        case BuildblockPreviewRectKind::Beam:
-            return IM_COL32(216, 136, 68, 150);
-    }
-    return IM_COL32(160, 160, 160, 130);
-}
-
-ImU32 buildblock_rect_border_color(BuildblockPreviewRectKind kind) {
-    switch (kind) {
-        case BuildblockPreviewRectKind::Bounds:
-            return IM_COL32(63, 183, 184, 255);
-        case BuildblockPreviewRectKind::Window:
-            return IM_COL32(92, 154, 222, 255);
-        case BuildblockPreviewRectKind::Beam:
-            return IM_COL32(216, 136, 68, 255);
-    }
-    return IM_COL32(160, 160, 160, 255);
-}
-
-void draw_buildblock_preview_contents(
-    ImDrawList* draw_list,
-    const BuildblockPreviewScene& scene,
-    std::optional<std::size_t> layer_index,
-    ImVec2 canvas_min,
-    ImVec2 canvas_max) {
-    draw_list->AddRectFilled(canvas_min, canvas_max, IM_COL32(13, 15, 17, 255), 3.0F);
-
-    PreviewExtents extents;
-    for (const auto& rect : scene.rects) {
-        if (!preview_layer_matches(layer_index, rect.layer_index)) {
-            continue;
+    selected = std::min(selected, building.block_names.size() - 1U);
+    bool changed = false;
+    const float size = ImGui::GetFrameHeight();
+    ImGui::PushID("buildblock_picker");
+    for (std::size_t i = 0; i < building.block_names.size(); ++i) {
+        ImGui::PushID(static_cast<int>(i));
+        const auto* asset = find_buildblock_asset(project, building.block_names[i]);
+        const auto start = ImGui::GetCursorScreenPos();
+        if (ImGui::Selectable("##bb", selected == i, ImGuiSelectableFlags_AllowOverlap, ImVec2(0.0F, size))) {
+            selected = i;
+            changed = true;
         }
-        include_preview_point(extents, rect.center.x - rect.size.x * 0.5F, rect.center.y - rect.size.y * 0.5F);
-        include_preview_point(extents, rect.center.x + rect.size.x * 0.5F, rect.center.y + rect.size.y * 0.5F);
-    }
-    for (const auto& door : scene.doors) {
-        if (!preview_layer_matches(layer_index, door.layer_index)) {
-            continue;
+        ImGui::SetCursorScreenPos(start);
+        const std::size_t shown = asset == nullptr ? 0U : std::min<std::size_t>(asset->data.layers.size(), 4U);
+        for (std::size_t l = 0; l < shown; ++l) {
+            draw_buildblock_layer(ImGui::GetWindowDrawList(), ImGui::GetCursorScreenPos(), size, asset->data.layers[l]);
+            ImGui::Dummy(ImVec2(size, size));
+            ImGui::SameLine(0.0F, 2.0F);
         }
-        include_preview_point(extents, door.position.x - 0.25F, door.position.y - 0.25F);
-        include_preview_point(extents, door.position.x + 0.25F, door.position.y + 0.25F);
+        ImGui::SetCursorScreenPos(ImVec2(start.x + 4.0F * (size + 2.0F) + 6.0F, start.y));
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(asset == nullptr ? (building.block_names[i] + " (not loaded)").c_str() : building.block_names[i].c_str());
+        ImGui::PopID();
     }
-    if (!extents.has_content) {
-        include_preview_point(extents, 0.0F, 0.0F);
-        include_preview_point(extents, 4.0F, 4.0F);
-    }
-
-    const auto range_x = std::max(0.001F, extents.max_x - extents.min_x);
-    const auto range_y = std::max(0.001F, extents.max_y - extents.min_y);
-    const auto pad = 8.0F;
-    const auto canvas_w = std::max(1.0F, canvas_max.x - canvas_min.x - pad * 2.0F);
-    const auto canvas_h = std::max(1.0F, canvas_max.y - canvas_min.y - pad * 2.0F);
-    const auto scale = std::min(canvas_w / range_x, canvas_h / range_y);
-    const auto origin = ImVec2{
-        canvas_min.x + pad + (canvas_w - range_x * scale) * 0.5F,
-        canvas_min.y + pad + (canvas_h - range_y * scale) * 0.5F,
-    };
-    auto map_point = [&](float x, float y) {
-        return ImVec2{
-            origin.x + (x - extents.min_x) * scale,
-            origin.y + (extents.max_y - y) * scale,
-        };
-    };
-
-    for (const auto& rect : scene.rects) {
-        if (!preview_layer_matches(layer_index, rect.layer_index)) {
-            continue;
-        }
-        const auto a = map_point(rect.center.x - rect.size.x * 0.5F, rect.center.y + rect.size.y * 0.5F);
-        const auto b = map_point(rect.center.x + rect.size.x * 0.5F, rect.center.y - rect.size.y * 0.5F);
-        draw_list->AddRectFilled(a, b, buildblock_rect_fill_color(rect.kind), 1.0F);
-        draw_list->AddRect(a, b, buildblock_rect_border_color(rect.kind), 1.0F);
-    }
-    for (const auto& door : scene.doors) {
-        if (!preview_layer_matches(layer_index, door.layer_index)) {
-            continue;
-        }
-        const auto center = map_point(door.position.x, door.position.y);
-        draw_list->AddCircleFilled(center, 3.5F, IM_COL32(180, 108, 225, 230));
-        draw_list->AddCircle(center, 3.5F, IM_COL32(245, 245, 245, 230));
-    }
+    ImGui::PopID();
+    return changed;
 }
 
-void draw_payload_table(const SbbBuilding& building, const SbbCell& cell) {
-    if (!ImGui::BeginTable("##cell_payloads", 5, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
-        return;
-    }
-    ImGui::TableSetupColumn("Slot");
-    ImGui::TableSetupColumn("Raw");
-    ImGui::TableSetupColumn("Kind");
-    ImGui::TableSetupColumn("Id / Rot");
-    ImGui::TableSetupColumn("Resolved");
-    ImGui::TableHeadersRow();
-
-    auto draw_row = [&](const char* slot, std::uint32_t word) {
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        ImGui::TextUnformatted(slot);
-        ImGui::TableNextColumn();
-        const auto raw = hex_u32(word);
-        ImGui::TextUnformatted(raw.c_str());
-        ImGui::TableNextColumn();
-        ImGui::TextUnformatted(payload_kind_label(word));
-        ImGui::TableNextColumn();
-        ImGui::Text("%u / %u", payload_id(word), payload_rotation(word));
-        ImGui::TableNextColumn();
-        const auto name = payload_name(building, cell, word);
-        ImGui::TextUnformatted(name.c_str());
-    };
-
-    draw_row("Exterior", cell.exterior_block());
-    draw_row("Interior", cell.interior_block());
-    ImGui::EndTable();
-}
-
-void draw_texture_slot_table(const SbbBuilding& building, const SbbCell& cell) {
-    if (!ImGui::BeginTable("##cell_textures", 4, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
-        return;
-    }
-    ImGui::TableSetupColumn("Set");
-    ImGui::TableSetupColumn("Slot");
-    ImGui::TableSetupColumn("Value");
-    ImGui::TableSetupColumn("Material");
-    ImGui::TableHeadersRow();
-    for (std::size_t slot = 0; slot < cell.shorts.size(); ++slot) {
-        const auto material = static_cast<std::size_t>(cell.shorts[slot]);
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        ImGui::TextUnformatted(slot < 8U ? "Exterior" : "Interior");
-        ImGui::TableNextColumn();
-        ImGui::Text("%zu", slot % 8U);
-        ImGui::TableNextColumn();
-        ImGui::Text("%u", cell.shorts[slot]);
-        ImGui::TableNextColumn();
-        ImGui::TextUnformatted(material < building.materials.size() ? building.materials[material].c_str() : "(unresolved)");
-    }
-    ImGui::EndTable();
-}
-
-void draw_portal_side_table(const EditorProject& project, const SbbBuilding& building, const SbbCell& cell) {
-    const auto* buildblock = buildblock_for_cell(project, building, cell);
-    if (buildblock != nullptr) {
-        ImGui::Text("Buildblock: %s", buildblock->name.c_str());
-    } else {
-        ImGui::TextUnformatted("Buildblock: (unresolved)");
-    }
-
-    if (!ImGui::BeginTable("##portal_side_codes", 4, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
-        return;
-    }
-    ImGui::TableSetupColumn("Side");
-    ImGui::TableSetupColumn("Code");
-    ImGui::TableSetupColumn("Source");
-    ImGui::TableSetupColumn("Layer");
-    ImGui::TableHeadersRow();
-    for (const auto& row : portal_side_rows(building, cell)) {
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        ImGui::TextUnformatted(row.side);
-        ImGui::TableNextColumn();
-        ImGui::Text("%u", row.code);
-        ImGui::TableNextColumn();
-        ImGui::TextUnformatted(row.source);
-        ImGui::TableNextColumn();
-        const auto layer = portal_layer_label(row.code, buildblock);
-        ImGui::TextUnformatted(layer.c_str());
-    }
-    ImGui::EndTable();
-}
-
-void reset_buildblock_template_selection(EditorUi& ui, std::size_t buildblock_index) {
-    ui.selected_buildblock = buildblock_index;
-    ui.selected_buildblock_layer = 0;
-    ui.selected_buildblock_door = 0;
-    ui.selected_buildblock_window = 0;
-    ui.selected_buildblock_beam = 0;
-    ui.selected_buildblock_field = 0;
-}
-
-void select_buildblock_face(EditorUi& ui, std::size_t face_index) {
-    ui.selected_buildblock_layer = face_index;
-    ui.selected_buildblock_door = 0;
-    ui.selected_buildblock_window = 0;
-    ui.selected_buildblock_beam = 0;
-}
-
-void draw_buildblock_face_preview(
-    ImDrawList* draw_list,
-    const BuildblockPreviewScene& scene,
-    const SblLayer& layer,
-    std::size_t face_index,
-    ImVec2 min,
-    ImVec2 max,
-    bool selected,
-    bool hovered) {
-    const auto bg = ImGui::GetColorU32(selected ? ImGuiCol_HeaderActive : hovered ? ImGuiCol_HeaderHovered : ImGuiCol_FrameBg);
-    const auto border = ImGui::GetColorU32(selected ? ImGuiCol_Text : ImGuiCol_Border);
-    draw_list->AddRectFilled(min, max, bg);
-    draw_list->AddRect(min, max, border);
-
-    const auto title = "Face " + std::to_string(face_index);
-    const auto title_width = ImGui::CalcTextSize(title.c_str()).x;
-    draw_list->AddText(
-        ImVec2{min.x + 8.0F, min.y + 6.0F},
-        ImGui::GetColorU32(ImGuiCol_Text),
-        title.c_str(),
-        title.c_str() + title.size());
-    const auto type = "type " + std::to_string(layer.portal_type);
-    const auto type_width = ImGui::CalcTextSize(type.c_str()).x;
-    if (title_width + type_width + 28.0F <= max.x - min.x) {
-        draw_list->AddText(
-            ImVec2{max.x - type_width - 8.0F, min.y + 6.0F},
-            ImGui::GetColorU32(ImGuiCol_TextDisabled),
-            type.c_str(),
-            type.c_str() + type.size());
-    }
-
-    const auto canvas_min = ImVec2{min.x + 8.0F, min.y + 28.0F};
-    const auto canvas_max = ImVec2{max.x - 8.0F, max.y - 8.0F};
-    draw_buildblock_preview_contents(draw_list, scene, std::optional<std::size_t>{layer.index}, canvas_min, canvas_max);
-}
-
-
-void draw_buildblock_preview_panel(EditorProject& project, EditorUi& ui) {
-    if (project.buildblocks.empty()) {
-        ImGui::TextUnformatted("No buildblocks loaded.");
-        return;
-    }
-
-    ui.selected_buildblock = std::min(ui.selected_buildblock, project.buildblocks.size() - 1U);
-    const auto& asset = project.buildblocks[ui.selected_buildblock];
-    const auto& buildblock = asset.data;
-    if (buildblock.layers.empty()) {
-        ImGui::Text("Buildblock: %s", asset.name.c_str());
-        ImGui::TextUnformatted("No portal faces.");
-        return;
-    }
-
-    ui.selected_buildblock_layer = std::min(ui.selected_buildblock_layer, buildblock.layers.size() - 1U);
-    const auto layer_id = buildblock.layers[ui.selected_buildblock_layer].index;
-    ImGui::Text("Buildblock: %s", asset.name.c_str());
-    ImGui::SameLine();
-    ImGui::TextDisabled("Face %zu", layer_id);
-
-    const auto& scene = buildblock_preview_scene(project, ui.selected_buildblock);
-    const auto canvas_min = ImGui::GetCursorScreenPos();
-    const auto avail = ImGui::GetContentRegionAvail();
-    const auto canvas_size = ImVec2{
-        std::max(160.0F, avail.x),
-        std::max(180.0F, avail.y),
-    };
-    ImGui::InvisibleButton("##buildblock_2d_preview_canvas", canvas_size);
-    draw_buildblock_preview_contents(
-        ImGui::GetWindowDrawList(),
-        scene,
-        std::optional<std::size_t>{layer_id},
-        canvas_min,
-        ImVec2{canvas_min.x + canvas_size.x, canvas_min.y + canvas_size.y});
-}
-
-// A stable pseudo-color for a material with no loaded texture, so the swatch is
-// still distinguishable instead of a flat grey.
+// Materials with no loaded texture can still be selected by their short name.
 bool material_swatch_picker(const EditorProject& project, const char* id, const std::vector<std::string>& materials, std::size_t& selected) {
     if (materials.empty()) {
         ImGui::TextDisabled("(no materials)");
@@ -516,11 +158,8 @@ bool material_swatch_picker(const EditorProject& project, const char* id, const 
         if (tex != nullptr && tex->id != 0U) {
             clicked = rlImGuiImageButtonSize(("##sw" + std::to_string(i)).c_str(), tex, Vector2{swatch, swatch});
         } else {
-            // No texture: a colored button stands in, labelled with the short name.
-
             const std::string label = name.substr(0, 3) + "##sw" + std::to_string(i);
             clicked = ImGui::Button(label.c_str(), ImVec2(swatch, swatch));
-
         }
         if (clicked) {
             selected = i;
@@ -574,18 +213,16 @@ std::optional<std::size_t> search_grid(const char* id, std::array<char, 128>& se
     return clicked;
 }
 
-// Place Block panel: Exterior and Interior, each switched on separately and
-// each either normal (solid shell / generated room) or a piece. A click writes
-// only the enabled layers (BuildingTool_WriteCellFromCurrentSelection
-// @1400672a0).
+// Each layer that is turned on replaces its own block word and textures. A layer
+// that is off leaves the cell's data alone (BuildingTool_WriteCellFromCurrentSelection).
 void draw_block_tool_panel(EditorProject& project, EditorUi& ui) {
     ui.selected_building = std::min(ui.selected_building, project.buildings.size() - 1U);
     auto& building = project.buildings[ui.selected_building].data;
     auto& cfg = ui.block_config;
 
-    // What each texture slot paints. The shell's sides use slots 1..4 as
-    // S/W/N/E; the room's walls use 1..4 as N/E/S/W and slot 6 for opening
-    // frames (add_native_interior_room). Pieces use the slots their faces name.
+    // What each texture slot paints. The shell's sides use slots 1..4 as S/W/N/E. The
+    // room's walls use 1..4 as N/E/S/W, and slot 6 for the frames around openings
+    // (add_native_interior_room). Pieces use whatever slots their faces name.
     static constexpr std::array<const char*, 8> exterior_slots{"Bottom", "South", "West", "North", "East", "Top", "Slot 6", "Slot 7"};
     static constexpr std::array<const char*, 8> interior_slots{"Floor", "North wall", "East wall", "South wall", "West wall", "Ceiling", "Opening frame", "Slot 7"};
 
@@ -604,7 +241,7 @@ void draw_block_tool_panel(EditorProject& project, EditorUi& ui) {
             });
         if (picked) block = *picked;
     };
-    // Each slot shows its material as a thumbnail; clicking opens a swatch grid.
+    // Each slot shows its material as a thumbnail; clicking opens a grid of swatches.
     const auto texture_grid = [&](const char* label, std::array<std::size_t, 8>& materials, const std::array<const char*, 8>& names) {
         if (!ImGui::TreeNodeEx(label, ImGuiTreeNodeFlags_DefaultOpen)) return;
         if (building.materials.empty()) {
@@ -657,9 +294,15 @@ void draw_block_tool_panel(EditorProject& project, EditorUi& ui) {
         if (cfg.interior_piece) {
             piece_picker("interior_piece", interior_search, cfg.interior_piece_block);
         } else if (!building.block_names.empty()) {
-            field_label("Room windows and doors from");
-            catalog_combo("##block_buildblock", building.block_names, cfg.buildblock_index);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("The buildblock (.sbl in buildblock/) whose layers give the room's walls their windows and doors.");
+            ImGui::TextUnformatted("Room walls from buildblock");
+            buildblock_picker(project, building, cfg.buildblock_index);
+        }
+        if (!cfg.interior_piece) {
+            ImGui::Checkbox("Floor", &cfg.room_floor);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Off: the room has no floor and the room below has no ceiling,\n"
+                                  "so stacked rooms join into one tall room.");
+            }
         }
         texture_grid("Interior textures", cfg.interior_textures, interior_slots);
     }
@@ -691,8 +334,8 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
         ui.selected_materials.clear();
         ui.material_selection_building = ui.selected_building;
     }
-    // Placements and the map archive use the asset name; the name stored inside
-    // the .sbb is separate, usually blank, and unused by the game.
+    // Placements and archive entries use the asset name. The name in the SBB header is
+    // stored separately, and changing it doesn't rename those references.
     std::array<char, 52> asset_name{};
     std::copy_n(asset.name.data(), std::min(asset.name.size(), asset_name.size() - 1), asset_name.data());
     field_label("Name");
@@ -702,7 +345,7 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
     if (ImGui::IsItemActive()) ImGui::TextDisabled("Press Enter to rename. Every placement of it is renamed too.");
     std::array<char, 64> name{};
     std::copy_n(building.name.data(), std::min(building.name.size(), name.size() - 1), name.data());
-    field_label("Name in file (unused by the game)");
+    field_label("Name in file");
     if (ImGui::InputTextWithHint("##name_in_file", "(blank)", name.data(), name.size())) {
         building.name = name.data();
         mark_building_changed(project, ui);
@@ -738,7 +381,7 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
             }
             ImGui::EndListBox();
         }
-        // Add: click a texture, or type a name that is not loaded and press Enter.
+        // Add: click a texture, or type a name that isn't loaded and press Enter.
         const auto add_material = [&](const std::string& material) {
             if (material.empty() || building.materials.size() >= 1024) return;
             const auto key = lower_name(material);
@@ -762,6 +405,8 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
         ImGui::SameLine();
         ImGui::BeginDisabled(ui.selected_materials.empty());
         if (ImGui::Button("Remove selected")) {
+            // Material indices are in both texture sets, so renumber them together.
+            // A removed material becomes the format's 0xffff missing-texture slot.
             std::vector<std::uint16_t> remap(building.materials.size(), 0xffffU);
             std::vector<std::string> kept;
             for (std::size_t i = 0; i < building.materials.size(); ++i) {
@@ -785,9 +430,9 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
         }
         ImGui::EndDisabled();
     }
-    // The buildblocks (cell_type) and piece meshes (piece payloads) this building
-    // may use. Entries are referenced by index, so only an unused buildblock can
-    // be removed; pieces are append-only.
+    // The buildblocks (cell_type) and piece meshes (piece words) this building can use.
+    // Entries are used by index, so only a buildblock nothing uses can be removed, and
+    // pieces can only be added.
     const auto name_list = [&](const char* header, std::vector<std::string>& names, const std::vector<std::string>& library,
                                bool removable) {
         if (!ImGui::CollapsingHeader(header)) return;
@@ -894,7 +539,21 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
 
     const auto occupied = occupied_cell_indices(building);
     if (!occupied.empty()) {
-        const auto& cell = building.cells[occupied[std::min(ui.selected_building_cell, occupied.size() - 1U)]];
+        auto& cell = building.cells[occupied[std::min(ui.selected_building_cell, occupied.size() - 1U)]];
+        ImGui::SeparatorText("Selected block");
+        ImGui::Text("Cell %u, %u, %u", cell.x, cell.y, cell.z);
+        if (cell.interior_block() == 0xffffU) {
+            bool floor = (cell.placed_flag() & 1U) != 0U;
+            if (ImGui::Checkbox("Room floor", &floor)) {
+                cell.placed_flag() = floor ? (cell.placed_flag() | 1U) : (cell.placed_flag() & ~1U);
+                refresh_sbb_cell_payloads(cell);
+                mark_building_changed(project, ui);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Off: no floor here and no ceiling on the room below,\n"
+                                  "so the two rooms join into one tall room.");
+            }
+        }
         if (cell.item_set_index != 0U) {
             if (is_sbb_item_set_payload(cell.item_set_index) &&
                 sbb_item_set_name_index(cell.item_set_index) < building.item_set_names.size()) {
@@ -923,22 +582,34 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
         if (!ui.paint_side_code) {
             material_swatch_picker(project, "paint_material", building.materials, ui.paint_material_index);
         } else {
-            // Side code 0 leaves the side open, 1 is a plain wall, 3.. picks a
-            // layer (windows, doors) of the block's buildblock.
+            // Side code 0 leaves the side open, 1 is a plain wall, and 3 and up pick a
+            // face of the block's buildblock, shown as previews.
             ImGui::TextUnformatted("Buildblock");
-            catalog_combo("##paint_buildblock", building.block_names, ui.block_config.buildblock_index);
+            buildblock_picker(project, building, ui.block_config.buildblock_index);
             const auto* asset = building.block_names.empty()
                 ? nullptr
                 : find_buildblock_asset(project, building.block_names[std::min(ui.block_config.buildblock_index, building.block_names.size() - 1U)]);
-            if (ImGui::Selectable("Open (no wall)", ui.paint_code == 0U)) ui.paint_code = 0U;
-            if (ImGui::Selectable("Plain wall", ui.paint_code == 1U)) ui.paint_code = 1U;
+            ImGui::TextUnformatted("Wall type");
+            const float size = ImGui::GetFrameHeight() * 2.2F;
+            const int per_row = std::max(1, static_cast<int>(ImGui::GetContentRegionAvail().x / (size + ImGui::GetStyle().ItemSpacing.x)));
+            int column = 0;
+            const auto next = [&] { if (column++ % per_row != 0) ImGui::SameLine(); };
+            SblLayer open_face{};
+            open_face.bounds = {0.0F, 1.0F, 0.0F, 1.0F};
+            next();
+            if (buildblock_layer_button("##open", open_face, size, ui.paint_code == 0U)) ui.paint_code = 0U;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open: no wall on this side");
+            next();
+            if (buildblock_layer_button("##wall", SblLayer{}, size, ui.paint_code == 1U)) ui.paint_code = 1U;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Plain wall");
             if (asset != nullptr) {
                 for (std::size_t layer = 0; layer < asset->data.layers.size() && layer < 13U; ++layer) {
-                    const auto& l = asset->data.layers[layer];
-                    const auto label = "Layer " + std::to_string(layer) + ": " + std::to_string(l.windows.size()) + " windows, " +
-                        std::to_string(l.doors.size()) + " doors";
+                    ImGui::PushID(static_cast<int>(layer));
                     const auto code = static_cast<std::uint32_t>(layer + 3U);
-                    if (ImGui::Selectable(label.c_str(), ui.paint_code == code)) ui.paint_code = code;
+                    next();
+                    if (buildblock_layer_button("##layer", asset->data.layers[layer], size, ui.paint_code == code)) ui.paint_code = code;
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Face %zu of %s", layer + 1U, asset->name.c_str());
+                    ImGui::PopID();
                 }
             } else if (!building.block_names.empty()) {
                 ImGui::TextDisabled("Buildblock not loaded.");
@@ -948,146 +619,7 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
     }
 }
 
-const char* block_field_label(std::size_t field) {
-    static constexpr std::array labels{
-        "Width",
-        "Height",
-        "Depth",
-        "Flag 0",
-        "Flag 1",
-        "Flag 2",
-        "Flag 3",
-        "Flag 4",
-        "Flag 5",
-        "Patch Point X",
-        "Patch Point Y",
-        "Patch Point Z",
-        "Patch Point U",
-        "Patch Point V",
-    };
-    return labels[std::min(field, labels.size() - 1U)];
-}
-
-void draw_portal_details(const SbcPortal& portal) {
-    if (ImGui::BeginTable("##portal_summary", 2, ImGuiTableFlags_SizingStretchProp)) {
-        property_row("Index", std::to_string(portal.index));
-        property_row("Fields", std::to_string(portal.fields[0]) + ", " + std::to_string(portal.fields[1]) + ", " + std::to_string(portal.fields[2]) + ", " + std::to_string(portal.fields[3]));
-        property_row("Blocks", std::to_string(portal.blocks.size()));
-        property_row("Textures", std::to_string(portal.textures.size()));
-        property_row("Itemsets", std::to_string(portal.itemsets.size()));
-        ImGui::EndTable();
-    }
-
-    const auto rows = std::max(portal.blocks.size(), std::max(portal.textures.size(), portal.itemsets.size()));
-    if (rows == 0U) {
-        return;
-    }
-    if (!ImGui::BeginTable("##portal_slots", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp)) {
-        return;
-    }
-    ImGui::TableSetupColumn("Slot");
-    ImGui::TableSetupColumn("Block Word");
-    ImGui::TableSetupColumn("Texture");
-    ImGui::TableSetupColumn("Itemset");
-    ImGui::TableHeadersRow();
-    for (std::size_t i = 0; i < rows; ++i) {
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        ImGui::Text("%zu", i);
-        ImGui::TableNextColumn();
-        if (i < portal.blocks.size()) {
-            const auto value = hex_u32(portal.blocks[i]);
-            ImGui::TextUnformatted(value.c_str());
-        } else {
-            ImGui::TextUnformatted("-");
-        }
-        ImGui::TableNextColumn();
-        if (i < portal.textures.size()) {
-            ImGui::Text("%u", portal.textures[i]);
-        } else {
-            ImGui::TextUnformatted("-");
-        }
-        ImGui::TableNextColumn();
-        if (i < portal.itemsets.size()) {
-            ImGui::Text("%u", portal.itemsets[i]);
-        } else {
-            ImGui::TextUnformatted("-");
-        }
-    }
-    ImGui::EndTable();
-}
-
-const char* buildblock_field_label(std::size_t field) {
-    static constexpr std::array labels{
-        "Bounds X",
-        "Bounds Width",
-        "Bounds Y",
-        "Bounds Height",
-        "Door X",
-        "Door Y",
-        "Door Type",
-        "Window X",
-        "Window Width",
-        "Window Y",
-        "Window Height",
-        "Window Type",
-        "Beam X",
-        "Beam Width",
-        "Beam Y",
-        "Beam Height",
-        "Beam Type",
-    };
-    return labels[std::min(field, labels.size() - 1U)];
-}
-
-const char* buildblock_field_label_getter(void*, int field) {
-    return buildblock_field_label(static_cast<std::size_t>(std::max(field, 0)));
-}
-
-void draw_rect_collection_table(
-    const char* table_id,
-    const std::vector<SblPortalRect>& rects,
-    std::size_t& selected_index,
-    const char* label) {
-    if (rects.empty()) {
-        ImGui::Text("%s: none", label);
-        return;
-    }
-    selected_index = std::min(selected_index, rects.size() - 1U);
-    if (!ImGui::BeginTable(table_id, 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingFixedFit)) {
-        return;
-    }
-    ImGui::TableSetupColumn("#");
-    ImGui::TableSetupColumn("X");
-    ImGui::TableSetupColumn("W");
-    ImGui::TableSetupColumn("Y");
-    ImGui::TableSetupColumn("H");
-    ImGui::TableSetupColumn("Type");
-    ImGui::TableHeadersRow();
-    for (std::size_t i = 0; i < rects.size(); ++i) {
-        const auto& rect = rects[i];
-        ImGui::PushID(static_cast<int>(i));
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        if (ImGui::Selectable(std::to_string(i).c_str(), selected_index == i, ImGuiSelectableFlags_SpanAllColumns)) {
-            selected_index = i;
-        }
-        ImGui::TableNextColumn();
-        ImGui::Text("%.3f", rect.x);
-        ImGui::TableNextColumn();
-        ImGui::Text("%.3f", rect.width);
-        ImGui::TableNextColumn();
-        ImGui::Text("%.3f", rect.y);
-        ImGui::TableNextColumn();
-        ImGui::Text("%.3f", rect.height);
-        ImGui::TableNextColumn();
-        ImGui::Text("%u", rect.type);
-        ImGui::PopID();
-    }
-    ImGui::EndTable();
-}
-
-void draw_buildblock_inspector(EditorProject& project, EditorUi& ui, std::string& status) {
+void draw_buildblock_inspector(EditorProject& project, EditorUi& ui, std::string&) {
     if (project.buildblocks.empty()) return;
     ui.selected_buildblock = std::min(ui.selected_buildblock, project.buildblocks.size() - 1U);
     auto& asset = project.buildblocks[ui.selected_buildblock];
@@ -1132,8 +664,8 @@ void draw_buildblock_inspector(EditorProject& project, EditorUi& ui, std::string
         mark_buildblock_changed(project, ui);
     }
     ImGui::EndDisabled();
-    // Face numbers are referenced by buildings. Clear in place instead of
-    // shifting every following face and silently changing those references.
+    // Buildings refer to faces by number. Clear in place instead of moving every
+    // later face down, which would quietly change those references.
     ImGui::SameLine();
     if (ImGui::Button("Clear face")) {
         model.layers[ui.selected_buildblock_layer] = SblLayer{};
@@ -1155,7 +687,7 @@ void draw_buildblock_inspector(EditorProject& project, EditorUi& ui, std::string
         return edit;
     };
     changed |= rectangle("face", layer.bounds[0], layer.bounds[2], layer.bounds[1], layer.bounds[3]);
-    // Only portal type 1's mirror behavior is understood; preserve other values.
+    // Only how portal type 1 mirrors is understood; keep any other value as it is.
     if (layer.portal_type <= 1) {
         bool mirrored = layer.portal_type == 1;
         if (ImGui::Checkbox("Mirror on opposite sides", &mirrored)) { layer.portal_type = mirrored ? 1 : 0; changed = true; }
@@ -1196,4 +728,4 @@ void draw_buildblock_inspector(EditorProject& project, EditorUi& ui, std::string
     if (changed) mark_buildblock_changed(project, ui);
 }
 
-} // namespace map_editor::app_internal
+} // namespace pafta::app_internal

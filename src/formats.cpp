@@ -1,27 +1,27 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #include "formats.hpp"
 
 #include <bit>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
-#include <cstring>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
+#include <utility>
 
-namespace map_editor {
+namespace pafta {
 namespace {
 
 // -----------------------------------------------------------------------------
-// Binary Reader/Writer Primitives
+// Basic binary reading and writing
 // -----------------------------------------------------------------------------
 
-constexpr std::size_t sbb_exterior_block_word = SbbCell::exterior_block_word;
-constexpr std::size_t sbb_interior_block_word = SbbCell::interior_block_word;
 constexpr std::uint32_t sbb_payload_class_mask = 0xe0000000U;
-// BuildBuildingBlockRenderBuffers_1400799d0.c:128: solid/buildblock cell tag.
+// BuildBuildingBlockRenderBuffers_1400799d0.c:128: marks a solid or buildblock cell.
 constexpr std::uint32_t sbb_solid_payload_class = 0x40000000U;
-// BuildBuildingBlockRenderBuffers_1400799d0.c:212: standalone mesh-instance tag;
-// this port exposes those parallel cell payloads as PayloadKind::Piece.
+// BuildBuildingBlockRenderBuffers_1400799d0.c:212: marks a single mesh.
 constexpr std::uint32_t sbb_piece_payload_class = 0x80000000U;
 constexpr std::uint32_t sbb_empty_interior = 0xffffU;
 
@@ -48,10 +48,7 @@ public:
     }
 
     [[nodiscard]] float f32(std::size_t offset) const {
-        const auto word = u32(offset);
-        float value{};
-        std::memcpy(&value, &word, sizeof(value));
-        return value;
+        return std::bit_cast<float>(u32(offset));
     }
 
     [[nodiscard]] std::string ascii(std::size_t offset, std::size_t length) const {
@@ -70,10 +67,16 @@ public:
         return bytes_.size();
     }
 
+    void records(std::size_t offset, std::size_t count, std::size_t stride, std::string_view section) const {
+        if (offset > bytes_.size() || count > (bytes_.size() - offset) / stride) {
+            throw std::runtime_error("Truncated " + std::string{section});
+        }
+    }
+
 private:
     void require(std::size_t offset, std::size_t length) const {
         if (offset > bytes_.size() || length > bytes_.size() - offset) {
-            throw std::runtime_error("Unexpected end of file while reading SBB");
+            throw std::runtime_error("Unexpected end of binary file at byte " + std::to_string(offset));
         }
     }
 
@@ -104,9 +107,7 @@ public:
     }
 
     void f32(std::size_t offset, float value) {
-        std::uint32_t word{};
-        std::memcpy(&word, &value, sizeof(value));
-        u32(offset, word);
+        u32(offset, std::bit_cast<std::uint32_t>(value));
     }
 
     void ascii(std::size_t offset, std::size_t length, const std::string& value) {
@@ -135,7 +136,7 @@ private:
 };
 
 // -----------------------------------------------------------------------------
-// SBB/SBC/SBL Parse Helpers
+// SBB, SBC, and SBL parsing helpers
 // -----------------------------------------------------------------------------
 
 std::vector<std::string> read_fixed_ascii_chunks(
@@ -145,14 +146,11 @@ std::vector<std::string> read_fixed_ascii_chunks(
     std::uint32_t count
 ) {
     std::vector<std::string> strings;
+    reader.records(offset, count, chunk_size, "SBB name table");
     strings.reserve(count);
 
-    for (std::uint32_t index = 0; index < count && offset + chunk_size <= reader.size(); ++index) {
-        auto value = reader.ascii(offset, chunk_size);
-        if (value.empty()) {
-            break;
-        }
-        strings.push_back(std::move(value));
+    for (std::uint32_t index = 0; index < count; ++index) {
+        strings.push_back(reader.ascii(offset, chunk_size));
         offset += chunk_size;
     }
 
@@ -160,17 +158,18 @@ std::vector<std::string> read_fixed_ascii_chunks(
 }
 
 std::vector<std::string> read_counted_names(const BinaryReader& reader, std::size_t offset) {
-    const auto count = std::min<std::uint32_t>(reader.u32(offset), 1024U);
+    const auto count = reader.u32(offset);
+    if (count > 1024U) throw std::runtime_error("SBB name table exceeds 1024 entries");
     return read_fixed_ascii_chunks(reader, offset + 4, 0x40, count);
 }
 
 SbbCellPayloads read_cell_payloads(const std::array<std::uint32_t, 6>& words) {
     SbbCellPayloads payloads;
-    const auto exterior = words[sbb_exterior_block_word];
-    const auto interior = words[sbb_interior_block_word];
+    const auto exterior = words[SbbCell::exterior_block_word];
+    const auto interior = words[SbbCell::interior_block_word];
 
-    // SaveBuilding_SBB_1400548d0.decomp.txt:76-99 serializes exterior/interior
-    // block payloads first, even though BuildingCell memory keeps cellType at +0x00.
+    // SaveBuilding_SBB_1400548d0.decomp.txt:76-99 writes the exterior and interior
+    // block words first, even though BuildingCell keeps cellType at +0x00 in memory.
     if ((exterior & sbb_payload_class_mask) == sbb_solid_payload_class) {
         payloads.push_back({PayloadKind::Block, exterior, exterior & 0xffffU});
     }
@@ -201,18 +200,16 @@ std::vector<SbbCell> read_sbb_cells(
     std::uint32_t size_z
 ) {
     std::vector<SbbCell> cells;
-    const auto width = std::min<std::uint32_t>(0x40, size_x + 1);
-    const auto depth = std::min<std::uint32_t>(0x40, size_y + 1);
-    const auto height = std::min<std::uint32_t>(0x40, size_z);
-    cells.reserve(static_cast<std::size_t>(width) * depth * height);
+    const auto width = size_x + 1;
+    const auto depth = size_y + 1;
+    const auto height = size_z;
+    const auto count = static_cast<std::size_t>(width) * depth * height;
+    reader.records(offset, count, 0x3c, "SBB cell volume");
+    cells.reserve(count);
 
     for (std::uint32_t y = 0; y < height; ++y) {
         for (std::uint32_t z = 0; z < depth; ++z) {
             for (std::uint32_t x = 0; x < width; ++x) {
-                if (offset + 0x3c > reader.size()) {
-                    return cells;
-                }
-
                 std::array<std::uint32_t, 6> words{};
                 for (std::size_t index = 0; index < words.size(); ++index) {
                     words[index] = reader.u32(offset + index * 4);
@@ -245,10 +242,6 @@ std::vector<SbbCell> read_sbb_cells(
     return cells;
 }
 
-std::uint32_t safe_record_count(std::uint32_t count, std::uint32_t limit) {
-    return std::min(count, limit);
-}
-
 bool sbc_has_city_blocks(std::uint32_t version) {
     return version >= 0x0b;
 }
@@ -270,17 +263,21 @@ std::size_t sbb_table_offset(std::uint32_t version) {
 }
 
 std::size_t sbb_cell_count(const SbbBuilding& building) {
-    const auto width = std::min<std::uint32_t>(0x40, building.size_x + 1);
-    const auto depth = std::min<std::uint32_t>(0x40, building.size_y + 1);
-    const auto height = std::min<std::uint32_t>(0x40, building.size_z);
+    if (!sbb_dimensions_supported(building.size_x, building.size_y, building.size_z)) {
+        throw std::runtime_error("SBB dimensions exceed the supported 64-cell grid");
+    }
+    const auto width = building.size_x + 1;
+    const auto depth = building.size_y + 1;
+    const auto height = building.size_z;
     return static_cast<std::size_t>(width) * depth * height;
 }
 
+constexpr std::size_t max_csx_payload_bytes = 512U * 1024U * 1024U;
 constexpr std::uint32_t max_sbl_buildblock_doors = 2;
 constexpr std::uint32_t max_sbl_buildblock_rects = 16;
 
 // -----------------------------------------------------------------------------
-// SBL Block Mesh Reconstruction
+// Rebuilding SBL block meshes
 // -----------------------------------------------------------------------------
 
 std::uint32_t exterior_face_count(std::uint32_t width, std::uint32_t height, std::uint32_t depth, const std::array<std::uint32_t, 6>& flags) {
@@ -315,6 +312,10 @@ void append_u32(std::vector<std::uint8_t>& bytes, std::uint32_t value) {
 
 void append_i32(std::vector<std::uint8_t>& bytes, std::int32_t value) {
     append_u32(bytes, static_cast<std::uint32_t>(value));
+}
+
+void append_f32(std::vector<std::uint8_t>& bytes, float value) {
+    append_u32(bytes, std::bit_cast<std::uint32_t>(value));
 }
 
 void append_u16(std::vector<std::uint8_t>& bytes, std::uint16_t value) {
@@ -352,8 +353,6 @@ std::vector<Vec3f> default_block_face_quad(std::uint32_t face_index) {
     }
     return quad;
 }
-
-Vec2f native_oriented_uv(const Vec3f& position, const Vec2f& fallback, std::uint32_t orientation);
 
 std::uint32_t native_default_face_orientation(std::uint32_t face_dir) {
     switch (face_dir) {
@@ -443,16 +442,13 @@ std::vector<SblBlockFace> build_exterior_block_faces(std::uint32_t width, std::u
     return faces;
 }
 
-std::uint32_t clamp_bezier_order(std::uint32_t order) {
-    return std::clamp(order, 1U, 3U);
-}
-
 std::uint32_t clamp_bezier_tess(std::uint32_t tess) {
     return std::clamp(tess, 1U, 128U);
 }
 
 float bezier1d(std::uint32_t order, float t, const std::array<float, 4>& values) {
-    const auto clamped_order = clamp_bezier_order(order);
+    // Only four control points are stored, so preview curves are at most cubic.
+    const auto clamped_order = std::clamp(order, 1U, 3U);
     const auto inverse = 1.0F - t;
     if (clamped_order == 1U) {
         return values[0] * inverse + values[3] * t;
@@ -519,24 +515,6 @@ Vec2f bezier_patch_uv_sample(
     };
 }
 
-Vec2f native_oriented_uv(const Vec3f& position, const Vec2f& fallback, std::uint32_t orientation) {
-    switch (orientation & 0xf0000U) {
-        case 0x10000U:
-            return {position.z, position.y};
-        case 0x20000U:
-            return {1.0F - position.z, position.y};
-        case 0x30000U:
-            return {position.x, position.z};
-        case 0x40000U:
-            return {position.x, 1.0F - position.z};
-        case 0x50000U:
-            return {1.0F - position.x, position.y};
-        case 0x60000U:
-            return {position.x, position.y};
-        default:
-            return fallback;
-    }
-}
 
 Vec3f subtract(Vec3f left, Vec3f right) {
     return {left.x - right.x, left.y - right.y, left.z - right.z};
@@ -602,32 +580,21 @@ void emit_bezier_patch_faces(
         for (std::uint32_t column = 0; column < columns; ++column) {
             const auto a0 = static_cast<float>(column) / static_cast<float>(columns);
             const auto a1 = static_cast<float>(column + 1U) / static_cast<float>(columns);
+            const std::array<Vec2f, 4> samples{{{a0, b0}, {a1, b0}, {a1, b1}, {a0, b1}}};
+            std::vector<Vec3f> vertices;
+            std::vector<Vec2f> uvs;
+            vertices.reserve(samples.size());
+            uvs.reserve(samples.size());
+            for (const auto& sample : samples) {
+                const auto position = bezier_patch_sample(control_points, column_order, row_order, sample.u, sample.v);
+                const auto uv = bezier_patch_uv_sample(control_uvs, column_order, row_order, sample.u, sample.v);
+                vertices.push_back(position);
+                uvs.push_back(native_oriented_uv(position, uv, material));
+            }
             faces.push_back({
                 material & 0xffffU,
-                {
-                    bezier_patch_sample(control_points, column_order, row_order, a0, b0),
-                    bezier_patch_sample(control_points, column_order, row_order, a1, b0),
-                    bezier_patch_sample(control_points, column_order, row_order, a1, b1),
-                    bezier_patch_sample(control_points, column_order, row_order, a0, b1),
-                },
-                {
-                    native_oriented_uv(
-                        bezier_patch_sample(control_points, column_order, row_order, a0, b0),
-                        bezier_patch_uv_sample(control_uvs, column_order, row_order, a0, b0),
-                        material),
-                    native_oriented_uv(
-                        bezier_patch_sample(control_points, column_order, row_order, a1, b0),
-                        bezier_patch_uv_sample(control_uvs, column_order, row_order, a1, b0),
-                        material),
-                    native_oriented_uv(
-                        bezier_patch_sample(control_points, column_order, row_order, a1, b1),
-                        bezier_patch_uv_sample(control_uvs, column_order, row_order, a1, b1),
-                        material),
-                    native_oriented_uv(
-                        bezier_patch_sample(control_points, column_order, row_order, a0, b1),
-                        bezier_patch_uv_sample(control_uvs, column_order, row_order, a0, b1),
-                        material),
-                },
+                std::move(vertices),
+                std::move(uvs),
                 true,
                 material & 0xf0000U,
             });
@@ -635,12 +602,12 @@ void emit_bezier_patch_faces(
     }
 }
 
-void emit_sbl_light_faces(
+void emit_sbl_box_faces(
     std::vector<SblBlockFace>& faces,
     const std::array<Vec3f, 8>& points,
     const std::array<std::uint32_t, 6>& scalars,
     std::uint32_t final_value) {
-    constexpr std::array<std::array<std::size_t, 4>, 6> light_face_corners{{
+    constexpr std::array<std::array<std::size_t, 4>, 6> box_face_corners{{
         {{3, 2, 1, 0}},
         {{7, 6, 2, 3}},
         {{4, 7, 3, 0}},
@@ -649,15 +616,13 @@ void emit_sbl_light_faces(
         {{4, 5, 6, 7}},
     }};
 
-    for (std::size_t face = 0; face < light_face_corners.size(); ++face) {
+    for (std::size_t face = 0; face < box_face_corners.size(); ++face) {
         if ((final_value & (1U << face)) == 0U) {
             continue;
         }
-        const auto& corners = light_face_corners[face];
-        // LoadAndInitBlockTemplates_SBL calculates the orientation from the
-        // emitted light-face triangle normal. It does not use the face index:
-        // light points can describe a rotated or non-cubic surface. A fixed
-        // cube orientation flips UVs on authored light faces.
+        const auto& corners = box_face_corners[face];
+        // Boxes can be turned or stretched, so UV projection follows the normal
+        // of each face made, not a fixed side of a cube.
         const auto edge_a = subtract(points[corners[1]], points[corners[0]]);
         const auto edge_b = subtract(points[corners[2]], points[corners[0]]);
         const auto orientation = native_orientation_from_normal(normalize(cross(edge_a, edge_b)));
@@ -733,11 +698,13 @@ std::optional<SblBlockMesh> read_sbl_block_mesh(const BinaryReader& reader) {
     };
 
     auto faces = build_exterior_block_faces(width, height, depth, flags);
-    const auto authored_face_count = safe_record_count(reader.u32(40), 0x400);
+    const auto authored_face_count = reader.u32(40);
+    if (authored_face_count > 0x400U) throw std::runtime_error("SBL exceeds 1024 authored patches");
+    reader.records(44, authored_face_count, 344, "SBL authored patches");
     std::vector<SblAuthoredPatch> authored_patches;
     authored_patches.reserve(authored_face_count);
     auto offset = std::size_t{44};
-    for (std::uint32_t face = 0; face < authored_face_count && offset + 344 <= reader.size(); ++face) {
+    for (std::uint32_t face = 0; face < authored_face_count; ++face) {
         const auto face_offset = offset;
         const auto column_order = reader.u32(offset);
         const auto column_tess = reader.u32(offset + 4);
@@ -793,11 +760,13 @@ std::optional<SblBlockMesh> read_sbl_block_mesh(const BinaryReader& reader) {
 
     auto light_count = 0U;
     std::vector<SblBlockLight> lights;
-    if (reader.u32(0) > 1 && offset + 4 <= reader.size()) {
-        light_count = safe_record_count(reader.u32(offset), 0x100);
+    if (reader.u32(0) > 1) {
+        light_count = reader.u32(offset);
+        if (light_count > 0x100U) throw std::runtime_error("SBL exceeds 256 boxes");
         offset += 4;
+        reader.records(offset, light_count, 0x7c, "SBL boxes");
         lights.reserve(light_count);
-        for (std::uint32_t light = 0; light < light_count && offset + 0x7c <= reader.size(); ++light) {
+        for (std::uint32_t light = 0; light < light_count; ++light) {
             std::array<Vec3f, 8> points{};
             for (auto& point : points) {
                 point = {
@@ -815,7 +784,7 @@ std::optional<SblBlockMesh> read_sbl_block_mesh(const BinaryReader& reader) {
             const auto final_value = reader.u32(offset);
             offset += 4;
             lights.push_back({points, scalars, final_value});
-            emit_sbl_light_faces(faces, points, scalars, final_value);
+            emit_sbl_box_faces(faces, points, scalars, final_value);
         }
     }
 
@@ -834,8 +803,9 @@ std::optional<SblBlockMesh> read_sbl_block_mesh(const BinaryReader& reader) {
 
 std::vector<SblDoor> read_sbl_doors(const BinaryReader& reader, std::size_t offset, std::uint32_t count) {
     std::vector<SblDoor> doors;
+    reader.records(offset, count, 12, "SBL doors");
     doors.reserve(count);
-    for (std::uint32_t index = 0; index < count && offset + 12 <= reader.size(); ++index) {
+    for (std::uint32_t index = 0; index < count; ++index) {
         doors.push_back({
             reader.u32(offset),
             reader.f32(offset + 4),
@@ -848,8 +818,9 @@ std::vector<SblDoor> read_sbl_doors(const BinaryReader& reader, std::size_t offs
 
 std::vector<SblPortalRect> read_sbl_rects(const BinaryReader& reader, std::size_t offset, std::uint32_t count) {
     std::vector<SblPortalRect> rects;
+    reader.records(offset, count, 20, "SBL rectangles");
     rects.reserve(count);
-    for (std::uint32_t index = 0; index < count && offset + 20 <= reader.size(); ++index) {
+    for (std::uint32_t index = 0; index < count; ++index) {
         rects.push_back({
             reader.u32(offset),
             reader.f32(offset + 4),
@@ -866,7 +837,9 @@ std::vector<SblLayer> read_sbl_layers(const BinaryReader& reader) {
     std::vector<SblLayer> layers;
     auto offset = std::size_t{4};
 
-    for (std::size_t index = 0; index < 16 && offset + 0x18 <= reader.size(); ++index) {
+    for (std::size_t index = 0; offset < reader.size(); ++index) {
+        if (index >= 16) throw std::runtime_error("SBL buildblock exceeds 16 layers");
+        reader.records(offset, 1, 0x18, "SBL buildblock layer");
         const auto layer_offset = offset;
         const auto portal_type = reader.u32(offset);
         const std::array<float, 4> bounds{
@@ -875,18 +848,21 @@ std::vector<SblLayer> read_sbl_layers(const BinaryReader& reader) {
             reader.f32(offset + 12),
             reader.f32(offset + 16),
         };
-        const auto door_count = safe_record_count(reader.u32(offset + 20), max_sbl_buildblock_doors);
+        const auto door_count = reader.u32(offset + 20);
+        if (door_count > max_sbl_buildblock_doors) throw std::runtime_error("SBL layer exceeds 2 doors");
         offset += 0x18;
 
         auto doors = read_sbl_doors(reader, offset, door_count);
         offset += doors.size() * 12;
 
-        const auto window_count = offset + 4 <= reader.size() ? safe_record_count(reader.u32(offset), max_sbl_buildblock_rects) : 0U;
+        const auto window_count = reader.u32(offset);
+        if (window_count > max_sbl_buildblock_rects) throw std::runtime_error("SBL layer exceeds 16 windows");
         offset += 4;
         auto windows = read_sbl_rects(reader, offset, window_count);
         offset += windows.size() * 20;
 
-        const auto beam_count = offset + 4 <= reader.size() ? safe_record_count(reader.u32(offset), max_sbl_buildblock_rects) : 0U;
+        const auto beam_count = reader.u32(offset);
+        if (beam_count > max_sbl_buildblock_rects) throw std::runtime_error("SBL layer exceeds 16 beams");
         offset += 4;
         auto beams = read_sbl_rects(reader, offset, beam_count);
         offset += beams.size() * 20;
@@ -911,14 +887,12 @@ std::vector<SblLayer> read_sbl_layers(const BinaryReader& reader) {
 CsxEntryKind classify_csx_entry(std::uint32_t type) {
     switch (type) {
         case 0x585a0001:
-            // Block/buildblock .sbl (parse_sbl). CSX packs these with container
-            // version sentinel 1; load_project_csx_geometry normalizes 1 -> 2.
+            // Block or buildblock .sbl (parse_sbl). CSX stores these with container
+            // version 1; load_project_csx_geometry changes 1 to 2.
             return CsxEntryKind::Sbl;
         case 0x585a0002:
-            // Building .sbb. CSX packs it with container version sentinel 1;
-            // load_project_csx_geometry normalizes 1 -> 14 before parse_sbb.
-            // (parse_sbl is lenient enough to misread these bytes as layers, but
-            // parse_sbb confirms they are real buildings, e.g. station2 12x12x4.)
+            // Building .sbb. CSX stores it with container version 1;
+            // load_project_csx_geometry changes 1 to 14 before parse_sbb.
             return CsxEntryKind::Sbb;
         case 0x585a0004:
             return CsxEntryKind::Texture;
@@ -930,8 +904,27 @@ CsxEntryKind classify_csx_entry(std::uint32_t type) {
 } // namespace
 
 // -----------------------------------------------------------------------------
-// Public Parse Entry Points
+// Public parse functions
 // -----------------------------------------------------------------------------
+
+Vec2f native_oriented_uv(Vec3f position, Vec2f fallback, std::uint32_t orientation) {
+    switch (orientation & 0xf0000U) {
+        case 0x10000U:
+            return {position.z, position.y};
+        case 0x20000U:
+            return {1.0F - position.z, position.y};
+        case 0x30000U:
+            return {position.x, position.z};
+        case 0x40000U:
+            return {position.x, 1.0F - position.z};
+        case 0x50000U:
+            return {1.0F - position.x, position.y};
+        case 0x60000U:
+            return {position.x, position.y};
+        default:
+            return fallback;
+    }
+}
 
 std::vector<std::uint8_t> read_file_bytes(const std::filesystem::path& path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -939,10 +932,7 @@ std::vector<std::uint8_t> read_file_bytes(const std::filesystem::path& path) {
         throw std::runtime_error("Could not open " + path.string());
     }
 
-    // Bulk read: size the buffer from the end-seek and pull the whole file in one
-    // read() call. The previous istreambuf_iterator construction copied the file a
-    // byte at a time through the stream's locale/sentry machinery, which dominated
-    // load-time profiles (CSX/SBC/SBB/SBL all funnel through here).
+    // One big read avoids slow byte-by-byte stream work on large map archives.
     const auto end = file.tellg();
     if (end < 0) {
         throw std::runtime_error("Could not size " + path.string());
@@ -952,11 +942,111 @@ std::vector<std::uint8_t> read_file_bytes(const std::filesystem::path& path) {
     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(end));
     if (!bytes.empty()) {
         file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-        if (file.gcount() != static_cast<std::streamsize>(bytes.size())) {
-            bytes.resize(static_cast<std::size_t>(file.gcount()));
-        }
+        if (!file || file.gcount() != static_cast<std::streamsize>(bytes.size()))
+            throw std::runtime_error("Could not read complete file: " + path.string());
     }
     return bytes;
+}
+
+void write_files_transaction(std::span<const FileWrite> files) {
+    struct StagedFile {
+        std::filesystem::path target;
+        std::filesystem::path directory;
+        bool backed_up{};
+        bool installed{};
+    };
+    std::vector<StagedFile> staged;
+    staged.reserve(files.size());
+    try {
+        for (const auto& output : files) {
+            const auto target = std::filesystem::absolute(output.path).lexically_normal();
+            const auto duplicate = std::ranges::any_of(staged, [&](const auto& entry) { return entry.target == target; });
+            if (duplicate) {
+                throw std::runtime_error("Duplicate output file: " + target.string());
+            }
+            const auto status = std::filesystem::symlink_status(target);
+            if (std::filesystem::exists(status) && !std::filesystem::is_regular_file(status)) {
+                throw std::runtime_error("Output is not a regular file: " + target.string());
+            }
+            std::filesystem::create_directories(target.parent_path());
+            // A folder next to the target that only this save creates keeps temporary
+            // names from clashing with another save and keeps each rename on one volume.
+            std::filesystem::path directory;
+            for (int attempt = 0; attempt < 100; ++attempt) {
+                const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+                directory = target.parent_path() / ("." + target.filename().string() + ".pafta-save-" + std::to_string(stamp));
+                if (std::filesystem::create_directory(directory)) {
+                    break;
+                }
+                directory.clear();
+            }
+            if (directory.empty()) {
+                throw std::runtime_error("Could not create staging directory for " + target.string());
+            }
+            staged.push_back({target, directory});
+            std::ofstream file{directory / "new", std::ios::binary | std::ios::trunc};
+            if (!file) {
+                throw std::runtime_error("Could not open staged output: " + target.string());
+            }
+            file.write(reinterpret_cast<const char*>(output.bytes.data()), static_cast<std::streamsize>(output.bytes.size()));
+            if (!file) {
+                throw std::runtime_error("Could not write staged output: " + target.string());
+            }
+            file.flush();
+            if (!file) {
+                throw std::runtime_error("Could not flush staged output: " + target.string());
+            }
+            file.close();
+            if (!file) {
+                throw std::runtime_error("Could not close staged output: " + target.string());
+            }
+        }
+        for (auto& entry : staged) {
+            if (std::filesystem::exists(entry.target)) {
+                std::filesystem::rename(entry.target, entry.directory / "old");
+                entry.backed_up = true;
+            }
+            std::filesystem::rename(entry.directory / "new", entry.target);
+            entry.installed = true;
+        }
+    } catch (const std::exception& error) {
+        std::string recovery_error;
+        for (auto entry = staged.rbegin(); entry != staged.rend(); ++entry) {
+            std::error_code failure;
+            if (entry->installed) {
+                std::filesystem::remove(entry->target, failure);
+                if (failure) {
+                    recovery_error += "; could not remove " + entry->target.string() + ": " + failure.message();
+                }
+            }
+            if (entry->backed_up) {
+                std::filesystem::rename(entry->directory / "old", entry->target, failure);
+                if (failure) {
+                    recovery_error += "; restore " + (entry->directory / "old").string() + " to " + entry->target.string() + ": " + failure.message();
+                    continue; // Preserve the recovery copy.
+                }
+            }
+            std::filesystem::remove_all(entry->directory, failure);
+            if (failure) {
+                recovery_error += "; could not remove staging directory " + entry->directory.string() + ": " + failure.message();
+            }
+        }
+        throw std::runtime_error(std::string{error.what()} + recovery_error);
+    }
+    // Every replacement worked. Cleanup errors must not start a rollback after another
+    // file's recovery copy has already been removed.
+    for (const auto& entry : staged) {
+        std::error_code failure;
+        std::filesystem::remove_all(entry.directory, failure);
+        if (failure) {
+            throw std::runtime_error("Files were saved, but could not remove recovery directory " + entry.directory.string() + ": " + failure.message());
+        }
+    }
+}
+
+void write_file_bytes(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes) {
+    const FileWrite output{path, bytes};
+    write_files_transaction(std::span{&output, 1});
 }
 
 SbbBuilding parse_sbb(const std::vector<std::uint8_t>& bytes) {
@@ -975,6 +1065,9 @@ SbbBuilding parse_sbb(const std::vector<std::uint8_t>& bytes) {
     building.size_x = reader.u32(0x44);
     building.size_y = reader.u32(0x48);
     building.size_z = reader.u32(0x4c);
+    if (!sbb_dimensions_supported(building.size_x, building.size_y, building.size_z)) {
+        throw std::runtime_error("SBB dimensions exceed the supported 64-cell grid");
+    }
     building.anchor_x = building.version > 0x0c ? reader.u32(0x50) : 4;
     building.anchor_y = building.version > 0x0c ? reader.u32(0x54) : 4;
     building.anchor_z = building.version > 0x0c ? reader.u32(0x58) : 4;
@@ -996,10 +1089,10 @@ SbbBuilding parse_sbb(const std::vector<std::uint8_t>& bytes) {
     building.cells = read_sbb_cells(reader, offset, building.size_x, building.size_y, building.size_z);
     offset += sbb_cell_count(building) * 0x3c;
 
-    if (building.version >= 0x0e && offset + 8 <= reader.size()) {
+    if (building.version >= 0x0e && offset < reader.size()) {
         building.lod_tail.assign(bytes.begin() + static_cast<std::ptrdiff_t>(offset), bytes.end());
-        building.lod_marker = reader.u32(offset);
-        if (building.lod_marker == 1) {
+        if (offset + 4 <= reader.size()) building.lod_marker = reader.u32(offset);
+        if (building.lod_marker == 1 && offset + 8 <= reader.size()) {
             building.lod_group_count = reader.u32(offset + 4);
         }
     }
@@ -1009,6 +1102,15 @@ SbbBuilding parse_sbb(const std::vector<std::uint8_t>& bytes) {
 
 SbbBuilding parse_sbb_file(const std::filesystem::path& path) {
     return parse_sbb(read_file_bytes(path));
+}
+
+std::int32_t sbc_portal_cell_base(std::int32_t sector) {
+    const auto base = static_cast<std::int64_t>(sector) * 8;
+    if (base < static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::min()) + 1 ||
+        base > static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max()) - 8) {
+        throw std::runtime_error("SBC portal coordinate exceeds the safe cell range: " + std::to_string(sector));
+    }
+    return static_cast<std::int32_t>(base);
 }
 
 SbcMap parse_sbc(const std::vector<std::uint8_t>& bytes) {
@@ -1029,12 +1131,14 @@ SbcMap parse_sbc(const std::vector<std::uint8_t>& bytes) {
         for (std::uint32_t i = 0; i < count; ++i) {
             std::array<std::uint8_t, 64> record{};
             std::copy_n(bytes.begin() + offset, 64, record.begin());
-            map.header_records.push_back(record); offset += 64;
+            map.header_records.push_back(record);
+            offset += 64;
         }
     }
 
     const auto intersection_count = reader.u32(offset);
     offset += 4;
+    reader.records(offset, intersection_count, 12, "SBC intersections");
     map.intersections.reserve(intersection_count);
     for (std::uint32_t index = 0; index < intersection_count; ++index) {
         map.intersections.push_back({
@@ -1048,6 +1152,7 @@ SbcMap parse_sbc(const std::vector<std::uint8_t>& bytes) {
 
     const auto street_count = reader.u32(offset);
     offset += 4;
+    reader.records(offset, street_count, 0x34, "SBC streets");
     map.streets.reserve(street_count);
     for (std::uint32_t index = 0; index < street_count; ++index) {
         map.streets.push_back({
@@ -1064,6 +1169,7 @@ SbcMap parse_sbc(const std::vector<std::uint8_t>& bytes) {
 
     const auto building_count = reader.u32(offset);
     offset += 4;
+    reader.records(offset, building_count, 0x50, "SBC buildings");
     map.buildings.reserve(building_count);
     for (std::uint32_t index = 0; index < building_count; ++index) {
         map.buildings.push_back({
@@ -1077,32 +1183,27 @@ SbcMap parse_sbc(const std::vector<std::uint8_t>& bytes) {
         offset += 0x50;
     }
 
-    if (sbc_has_city_blocks(map.version) && offset + 4 <= reader.size()) {
+    if (sbc_has_city_blocks(map.version)) {
         const auto city_block_count = reader.u32(offset);
         offset += 4;
+        reader.records(offset, city_block_count, map.version >= 0x0c ? 0x44 : 0x240, "SBC city blocks");
         map.city_blocks.reserve(city_block_count);
-        for (std::uint32_t index = 0; index < city_block_count && offset + 0x40 <= reader.size(); ++index) {
+        for (std::uint32_t index = 0; index < city_block_count; ++index) {
             const auto name = reader.ascii(offset, 0x40);
             offset += 0x40;
 
             std::uint32_t layer_count = 1;
             if (map.version >= 0x0c) {
-                if (offset + 4 > reader.size()) {
-                    break;
-                }
                 layer_count = reader.u32(offset);
                 offset += 4;
             }
 
-            const auto safe_layer_count = std::min<std::uint32_t>(layer_count, 64);
-            const auto layer_bytes = static_cast<std::size_t>(safe_layer_count) * 8 * 0x40;
-            if (offset + layer_bytes > reader.size()) {
-                offset = reader.size();
-                break;
-            }
+            if (layer_count > 64) throw std::runtime_error("SBC city block exceeds 64 layers");
+            reader.records(offset, layer_count, 8 * 0x40, "SBC city block layers");
+            const auto layer_bytes = static_cast<std::size_t>(layer_count) * 8 * 0x40;
             std::vector<std::array<std::string, 8>> layers;
-            layers.reserve(safe_layer_count);
-            for (std::uint32_t layer = 0; layer < safe_layer_count; ++layer) {
+            layers.reserve(layer_count);
+            for (std::uint32_t layer = 0; layer < layer_count; ++layer) {
                 std::array<std::string, 8> slots{};
                 for (std::size_t slot = 0; slot < slots.size(); ++slot) {
                     slots[slot] = reader.ascii(offset + static_cast<std::size_t>(layer) * 8 * 0x40 + slot * 0x40, 0x40);
@@ -1114,17 +1215,20 @@ SbcMap parse_sbc(const std::vector<std::uint8_t>& bytes) {
         }
     }
 
-    if (map.version > 7 && offset + 4 <= reader.size()) {
+    if (map.version > 7) {
         const auto portal_count = reader.u32(offset);
         offset += 4;
+        const auto portal_stride = map.version > 0x0a ? 0x1010U : map.version > 9 ? 0x3010U : 0x2810U;
+        reader.records(offset, portal_count, portal_stride, "SBC portals");
         map.portals.reserve(portal_count);
-        for (std::uint32_t index = 0; index < portal_count && offset + 16 <= reader.size(); ++index) {
+        for (std::uint32_t index = 0; index < portal_count; ++index) {
             const auto fields = std::array<std::int32_t, 4>{
                 reader.i32(offset),
                 reader.i32(offset + 4),
                 reader.i32(offset + 8),
                 reader.i32(offset + 12),
             };
+            for (std::size_t axis = 1; axis < fields.size(); ++axis) sbc_portal_cell_base(fields[axis]);
             offset += 16;
 
             map.portals.push_back({
@@ -1138,10 +1242,6 @@ SbcMap parse_sbc(const std::vector<std::uint8_t>& bytes) {
 
             auto& portal = map.portals.back();
             if (map.version > 0x0a) {
-                if (offset + 0x800 > reader.size()) {
-                    offset = reader.size();
-                    break;
-                }
                 portal.blocks.reserve(0x200);
                 for (std::size_t block_index = 0; block_index < 0x200; ++block_index) {
                     portal.blocks.push_back(reader.u32(offset + block_index * 4U));
@@ -1150,20 +1250,12 @@ SbcMap parse_sbc(const std::vector<std::uint8_t>& bytes) {
             }
 
             if (map.version < 0x0b) {
-                if (offset + 0x800 > reader.size()) {
-                    offset = reader.size();
-                    break;
-                }
                 portal.legacy_blocks.reserve(0x200);
                 for (std::size_t block_index = 0; block_index < 0x200; ++block_index) {
                     portal.legacy_blocks.push_back(reader.u32(offset + block_index * 4U));
                 }
                 offset += 0x800;
 
-                if (offset + 0x2000 > reader.size()) {
-                    offset = reader.size();
-                    break;
-                }
                 portal.textures.reserve(0x1000);
                 for (std::size_t texture_index = 0; texture_index < 0x1000; ++texture_index) {
                     portal.textures.push_back(reader.u16(offset + texture_index * 2U));
@@ -1172,10 +1264,6 @@ SbcMap parse_sbc(const std::vector<std::uint8_t>& bytes) {
             }
 
             if (map.version > 9) {
-                if (offset + 0x800 > reader.size()) {
-                    offset = reader.size();
-                    break;
-                }
                 portal.itemsets.reserve(0x200);
                 for (std::size_t itemset_index = 0; itemset_index < 0x200; ++itemset_index) {
                     portal.itemsets.push_back(reader.u32(offset + itemset_index * 4U));
@@ -1185,11 +1273,12 @@ SbcMap parse_sbc(const std::vector<std::uint8_t>& bytes) {
         }
     }
 
-    if (map.version > 8 && offset + 4 <= reader.size()) {
+    if (map.version > 8) {
         const auto connection_count = reader.u32(offset);
         offset += 4;
+        reader.records(offset, connection_count, 12, "SBC portal connections");
         map.portal_connections.reserve(connection_count);
-        for (std::uint32_t index = 0; index < connection_count && offset + 12 <= reader.size(); ++index) {
+        for (std::uint32_t index = 0; index < connection_count; ++index) {
             map.portal_connections.push_back({
                 index,
                 {reader.i32(offset), reader.i32(offset + 4), reader.i32(offset + 8)},
@@ -1222,18 +1311,20 @@ SblTemplate parse_sbl_file(const std::filesystem::path& path) {
 void refresh_sbl_block_faces(SblBlockMesh& block) {
     const auto exterior_count = exterior_face_count(block.width, block.height, block.depth, block.exterior_flags);
     const auto authored_count = authored_render_face_count(block.authored_patches);
-    std::vector<SblBlockFace> preserved_light_faces;
-    const auto light_begin = static_cast<std::size_t>(exterior_count) + static_cast<std::size_t>(authored_count);
-    // Box faces come from the box records; a block without records (the
-    // native procedural catalog) keeps the box faces it was built with.
-    if (block.lights.empty() && light_begin < block.faces.size()) {
-        preserved_light_faces.assign(block.faces.begin() + static_cast<std::ptrdiff_t>(light_begin), block.faces.end());
+    std::vector<SblBlockFace> preserved_box_faces;
+    const auto box_begin = static_cast<std::size_t>(exterior_count) + static_cast<std::size_t>(authored_count);
+    // Box faces come from the box records. A block with no records (from the game's
+    // built-in catalog) keeps the box faces it was built with.
+    if (block.lights.empty() && box_begin < block.faces.size()) {
+        preserved_box_faces.assign(block.faces.begin() + static_cast<std::ptrdiff_t>(box_begin), block.faces.end());
     }
 
     auto faces = build_exterior_block_faces(block.width, block.height, block.depth, block.exterior_flags);
     append_authored_patch_faces(faces, block.authored_patches);
-    for (const auto& box : block.lights) emit_sbl_light_faces(faces, box.points, box.scalars, box.final_value);
-    faces.insert(faces.end(), preserved_light_faces.begin(), preserved_light_faces.end());
+    for (const auto& box : block.lights) {
+        emit_sbl_box_faces(faces, box.points, box.scalars, box.final_value);
+    }
+    faces.insert(faces.end(), preserved_box_faces.begin(), preserved_box_faces.end());
     block.face_count = static_cast<std::uint32_t>(faces.size());
     block.faces = std::move(faces);
 }
@@ -1246,25 +1337,35 @@ CsxArchive parse_csx(const std::vector<std::uint8_t>& bytes) {
         reader.u32(8),
         {},
     };
+    if (archive.directory_offset < 12) throw std::runtime_error("CSX directory overlaps its header");
+    reader.records(archive.directory_offset, archive.entry_count, 0x40, "CSX directory");
+    // Bound all copies before allocating any payload. Repeated references must not
+    // multiply a small input into a much larger in-memory archive.
+    const auto budget = std::min(bytes.size(), max_csx_payload_bytes);
+    std::size_t payload_total = 0;
+    for (std::uint32_t index = 0; index < archive.entry_count; ++index) {
+        const auto entry = static_cast<std::size_t>(archive.directory_offset) + static_cast<std::size_t>(index) * 0x40;
+        const auto offset = reader.u32(entry + 4);
+        const auto size = reader.u32(entry + 8);
+        reader.records(offset, size, 1, "CSX entry payload");
+        if (size > budget - payload_total) {
+            throw std::runtime_error("CSX payload copies exceed the file size or the 512 MiB allocation limit");
+        }
+        payload_total += size;
+    }
     archive.entries.reserve(archive.entry_count);
 
     for (std::uint32_t index = 0; index < archive.entry_count; ++index) {
         const auto directory_entry = static_cast<std::size_t>(archive.directory_offset) + static_cast<std::size_t>(index) * 0x40;
-        if (directory_entry + 0x40 > reader.size()) {
-            break;
-        }
-
         const auto type = reader.u32(directory_entry);
         const auto payload_offset = reader.u32(directory_entry + 4);
         const auto payload_size = reader.u32(directory_entry + 8);
         std::vector<std::uint8_t> payload;
-        if (static_cast<std::size_t>(payload_offset) <= bytes.size() &&
-            static_cast<std::size_t>(payload_size) <= bytes.size() - static_cast<std::size_t>(payload_offset)) {
-            payload.assign(
-                bytes.begin() + static_cast<std::ptrdiff_t>(payload_offset),
-                bytes.begin() + static_cast<std::ptrdiff_t>(payload_offset + payload_size)
-            );
-        }
+        reader.records(payload_offset, payload_size, 1, "CSX entry payload");
+        payload.assign(
+            bytes.begin() + static_cast<std::ptrdiff_t>(payload_offset),
+            bytes.begin() + static_cast<std::ptrdiff_t>(static_cast<std::size_t>(payload_offset) + payload_size)
+        );
 
         archive.entries.push_back({
             index,
@@ -1282,11 +1383,21 @@ CsxArchive parse_csx(const std::vector<std::uint8_t>& bytes) {
 
 std::vector<SisItem> parse_sis(const std::vector<std::uint8_t>& bytes) {
     const BinaryReader reader{bytes};
-    const auto vec = [&](std::size_t o) { return Vec3f{reader.f32(o), reader.f32(o + 4), reader.f32(o + 8)}; };
-    // version (1), count, then 64-byte type name, position and 3 rotation rows.
-    std::vector<SisItem> items(safe_record_count(reader.u32(4), 4096U));
-    for (std::size_t i = 0, o = 8; i < items.size(); ++i, o += 112) {
-        items[i] = {reader.ascii(o, 64), vec(o + 64), {vec(o + 76), vec(o + 88), vec(o + 100)}};
+    const auto read_vector = [&](std::size_t offset) {
+        return Vec3f{reader.f32(offset), reader.f32(offset + 4), reader.f32(offset + 8)};
+    };
+    // Version (1), count, then for each item a 64-byte type name, position, and 3
+    // rotation rows.
+    const auto count = reader.u32(4);
+    if (count > 4096U) throw std::runtime_error("SIS exceeds 4096 items");
+    reader.records(8, count, 112, "SIS items");
+    std::vector<SisItem> items(count);
+    auto offset = std::size_t{8};
+    for (auto& item : items) {
+        item.type = reader.ascii(offset, 64);
+        item.pos = read_vector(offset + 64);
+        item.rot = {read_vector(offset + 76), read_vector(offset + 88), read_vector(offset + 100)};
+        offset += 112;
     }
     return items;
 }
@@ -1294,18 +1405,36 @@ std::vector<SisItem> parse_sis(const std::vector<std::uint8_t>& bytes) {
 It3Mesh parse_it3(const std::vector<std::uint8_t>& bytes) {
     const BinaryReader reader{bytes};
     It3Mesh mesh;
-    // version 3, chunk id 0, render sub-version, then vertices and faces.
-    if (reader.i32(0) != 3 || reader.i32(4) != 0) return mesh;
-    std::size_t o = 16;
-    mesh.vertices.resize(safe_record_count(reader.u32(12), 65536U));
-    for (auto& v : mesh.vertices) { v = {reader.f32(o), reader.f32(o + 4), reader.f32(o + 8)}; o += 12; }
-    mesh.faces.resize(safe_record_count(reader.u32(o), 65536U));
-    o += 4;
+    // Version 3, chunk id 0, render sub-version, then vertices and faces.
+    if (reader.i32(0) != 3 || reader.i32(4) != 0) {
+        return mesh;
+    }
+    auto offset = std::size_t{16};
+    const auto vertex_count = reader.u32(12);
+    if (vertex_count > 65536U) throw std::runtime_error("IT3 exceeds 65536 vertices");
+    reader.records(offset, vertex_count, 12, "IT3 vertices");
+    mesh.vertices.resize(vertex_count);
+    for (auto& vertex : mesh.vertices) {
+        vertex = {reader.f32(offset), reader.f32(offset + 4), reader.f32(offset + 8)};
+        offset += 12;
+    }
+    const auto face_count = reader.u32(offset);
+    if (face_count > 65536U) throw std::runtime_error("IT3 exceeds 65536 faces");
+    offset += 4;
+    reader.records(offset, face_count, 4, "IT3 face headers");
+    mesh.faces.resize(face_count);
     for (auto& face : mesh.faces) {
-        face.resize(safe_record_count(reader.u32(o), 64U));
-        o += 4;
-        // Each corner: vertex index then its UV.
-        for (auto& index : face) { index = reader.u32(o); o += 12; }
+        const auto corner_count = reader.u32(offset);
+        if (corner_count > 64U) throw std::runtime_error("IT3 face exceeds 64 corners");
+        offset += 4;
+        reader.records(offset, corner_count, 12, "IT3 face corners");
+        face.resize(corner_count);
+        // Each corner: the vertex index, then its UV.
+        for (auto& index : face) {
+            index = reader.u32(offset);
+            if (index >= mesh.vertices.size()) throw std::runtime_error("IT3 face references a missing vertex");
+            offset += 12;
+        }
     }
     return mesh;
 }
@@ -1315,7 +1444,7 @@ CsxArchive parse_csx_file(const std::filesystem::path& path) {
 }
 
 // -----------------------------------------------------------------------------
-// Patch and Rebuild Writers
+// Patch and rebuild writers
 // -----------------------------------------------------------------------------
 
 static void write_sbb_cell(BinaryWriter& writer, const SbbBuilding& building, const SbbCell& cell) {
@@ -1346,11 +1475,16 @@ std::vector<std::uint8_t> patch_sbb_cell(const std::vector<std::uint8_t>& bytes,
 
 std::vector<std::uint8_t> patch_sbb_cells(const std::vector<std::uint8_t>& bytes, const SbbBuilding& building) {
     BinaryWriter writer{bytes};
-    for (const auto& cell : building.cells) write_sbb_cell(writer, building, cell);
+    for (const auto& cell : building.cells) {
+        write_sbb_cell(writer, building, cell);
+    }
     return std::move(writer).bytes();
 }
 
 std::vector<std::uint8_t> rebuild_sbb(const SbbBuilding& building) {
+    if (!sbb_dimensions_supported(building.size_x, building.size_y, building.size_z)) {
+        throw std::runtime_error("SBB dimensions exceed the supported 64-cell grid");
+    }
     auto size_x = building.size_x;
     auto size_y = building.size_y;
     auto size_z = building.size_z;
@@ -1358,8 +1492,11 @@ std::vector<std::uint8_t> rebuild_sbb(const SbbBuilding& building) {
         if (cell.exterior_block() == 0 && cell.interior_block() == 0) {
             continue;
         }
-        // X/Z sizes are the highest index (the grid below spans 0..size
-        // inclusive); Y is the floor count.
+        if (cell.x >= supported_sbb_grid_side || cell.y >= supported_sbb_grid_side || cell.z >= supported_sbb_grid_side) {
+            throw std::runtime_error("SBB occupied cell lies outside the supported 64-cell grid");
+        }
+        // X and Z sizes are the highest index (the grid below runs from 0 to size,
+        // both included); Y is the number of floors.
         size_x = std::max(size_x, cell.x);
         size_y = std::max(size_y, cell.z);
         size_z = std::max(size_z, cell.y + 1U);
@@ -1393,8 +1530,8 @@ std::vector<std::uint8_t> rebuild_sbb(const SbbBuilding& building) {
     append_name_table(building.block_names);
     append_name_table(building.item_set_names);
 
-    // Index the cells once; a per-slot search made large buildings take seconds.
-    // The first cell at a position wins, as the search did.
+    // Each position in the file has one cell. When a position repeats, the first model
+    // cell wins. Keep that order when building the lookup grid.
     const auto stride_x = static_cast<std::size_t>(size_x) + 1U;
     const auto stride_z = static_cast<std::size_t>(size_y) + 1U;
     std::vector<const SbbCell*> grid(stride_x * stride_z * size_z, nullptr);
@@ -1658,8 +1795,7 @@ std::vector<std::uint8_t> patch_sbc_portals(const std::vector<std::uint8_t>& byt
             }
             for (std::size_t texture_index = 0; texture_index < 0x1000; ++texture_index) {
                 const auto value = texture_index < portal.textures.size() ? portal.textures[texture_index] : 0U;
-                rebuilt.push_back(static_cast<std::uint8_t>(value & 0xffU));
-                rebuilt.push_back(static_cast<std::uint8_t>((value >> 8U) & 0xffU));
+                append_u16(rebuilt, static_cast<std::uint16_t>(value));
             }
         }
         if (map.version > 9) {
@@ -1738,14 +1874,19 @@ std::vector<std::uint8_t> rebuild_sbc_layout(const std::vector<std::uint8_t>& by
 }
 
 std::vector<std::uint8_t> rebuild_sbc(const SbcMap& map) {
-    for (const auto& portal : map.portals)
-        if (std::any_of(portal.legacy_blocks.begin(), portal.legacy_blocks.end(), [](auto word) { return word != 0; }))
+    for (const auto& portal : map.portals) {
+        const auto has_legacy_cells = std::ranges::any_of(portal.legacy_blocks, [](auto word) { return word != 0; });
+        if (has_legacy_cells) {
             throw std::runtime_error("Promote legacy district geometry before writing SBC v12");
+        }
+    }
     std::vector<std::uint8_t> rebuilt;
     append_u32(rebuilt, 0x0c);
 
     append_u32(rebuilt, static_cast<std::uint32_t>(map.header_records.size()));
-    for (const auto& record : map.header_records) rebuilt.insert(rebuilt.end(), record.begin(), record.end());
+    for (const auto& record : map.header_records) {
+        rebuilt.insert(rebuilt.end(), record.begin(), record.end());
+    }
 
     append_u32(rebuilt, static_cast<std::uint32_t>(map.intersections.size()));
     for (const auto& intersection : map.intersections) {
@@ -1811,11 +1952,11 @@ std::vector<std::uint8_t> rebuild_sbc(const SbcMap& map) {
 }
 
 std::vector<std::uint8_t> patch_sbl_word(const std::vector<std::uint8_t>& bytes, std::size_t word_index, std::uint32_t value) {
-    BinaryWriter writer{bytes};
-    const auto offset = word_index * 4;
-    if (offset + 4 > bytes.size()) {
-        return std::move(writer).bytes();
+    if (word_index >= bytes.size() / 4U) {
+        throw std::runtime_error("SBL word index out of range");
     }
+    BinaryWriter writer{bytes};
+    const auto offset = word_index * 4U;
     writer.u32(offset, value);
     return std::move(writer).bytes();
 }
@@ -1880,35 +2021,42 @@ std::vector<std::uint8_t> patch_sbl_layer_portal_type(
 }
 
 std::vector<std::uint8_t> rebuild_sbl_block(const SblBlockMesh& block) {
-    // Materialize evaluated quads as linear patches. Used for converting native
-    // procedural catalog entries, never to rewrite an imported curved mesh.
+    // Turn the worked-out quads into flat patches. Only used to convert entries from the
+    // game's built-in catalog, never to rewrite an imported curved mesh.
     std::vector<std::uint8_t> bytes;
-    const auto number = [&](float value) {
-        std::uint32_t bits; std::memcpy(&bits, &value, 4); append_u32(bytes, bits);
-    };
     append_u32(bytes, 2);
     append_u32(bytes, std::max(1U, block.width));
     append_u32(bytes, std::max(1U, block.height));
     append_u32(bytes, std::max(1U, block.depth));
-    for (int i = 0; i < 6; ++i) append_u32(bytes, 0);
+    for (int i = 0; i < 6; ++i) {
+        append_u32(bytes, 0);
+    }
     append_u32(bytes, static_cast<std::uint32_t>(block.faces.size()));
     for (const auto& face : block.faces) {
-        if (face.vertices.size() != 4 || face.uvs.size() != 4)
+        if (face.vertices.size() != 4 || face.uvs.size() != 4) {
             throw std::runtime_error("Legacy conversion requires quad faces with UVs");
-        append_u32(bytes, 1); append_u32(bytes, 1);
-        append_u32(bytes, 1); append_u32(bytes, 1);
-        append_u32(bytes, face.material & 0xffffU); append_u32(bytes, 0);
-        for (int row = 0; row < 4; ++row) for (int column = 0; column < 4; ++column) {
-            const float u = column / 3.0F, v = row / 3.0F;
-            const auto interpolate = [&](auto value) {
-                return (value(0) * (1-u) + value(1) * u) * (1-v) +
-                    (value(3) * (1-u) + value(2) * u) * v;
-            };
-            number(interpolate([&](int i) { return face.vertices[i].x; }));
-            number(interpolate([&](int i) { return face.vertices[i].y; }));
-            number(interpolate([&](int i) { return face.vertices[i].z; }));
-            number(interpolate([&](int i) { return face.uvs[i].u; }));
-            number(interpolate([&](int i) { return face.uvs[i].v; }));
+        }
+        append_u32(bytes, 1); // Column order and tessellation.
+        append_u32(bytes, 1);
+        append_u32(bytes, 1); // Row order and tessellation.
+        append_u32(bytes, 1);
+        append_u32(bytes, face.material & 0xffffU);
+        append_u32(bytes, 0);
+        for (int row = 0; row < 4; ++row) {
+            for (int column = 0; column < 4; ++column) {
+                const auto u = column / 3.0F;
+                const auto v = row / 3.0F;
+                const auto interpolate = [&](auto value) {
+                    const auto first = value(0) * (1 - u) + value(1) * u;
+                    const auto second = value(3) * (1 - u) + value(2) * u;
+                    return first * (1 - v) + second * v;
+                };
+                append_f32(bytes, interpolate([&](int i) { return face.vertices[i].x; }));
+                append_f32(bytes, interpolate([&](int i) { return face.vertices[i].y; }));
+                append_f32(bytes, interpolate([&](int i) { return face.vertices[i].z; }));
+                append_f32(bytes, interpolate([&](int i) { return face.uvs[i].u; }));
+                append_f32(bytes, interpolate([&](int i) { return face.uvs[i].v; }));
+            }
         }
     }
     append_u32(bytes, 0); // No supplemental v2 records.
@@ -1928,15 +2076,14 @@ std::vector<SblBlockFace> sbl_patch_faces(const SblAuthoredPatch& patch) {
 
 std::vector<SblBlockFace> sbl_box_faces(const SblBlockLight& box) {
     std::vector<SblBlockFace> faces;
-    emit_sbl_light_faces(faces, box.points, box.scalars, box.final_value);
+    emit_sbl_box_faces(faces, box.points, box.scalars, box.final_value);
     return faces;
 }
 
 std::vector<std::uint8_t> write_sbl_block(const SblBlockMesh& block) {
-    // BlockSbl_LoadFromFile @e6e50: version, size, six side flags, patches,
-    // then (version 2) the box records.
+    // BlockSbl_LoadFromFile @e6e50: version, size, six side flags, patches, and then
+    // (in version 2) the box records.
     std::vector<std::uint8_t> bytes;
-    const auto number = [&](float value) { append_u32(bytes, std::bit_cast<std::uint32_t>(value)); };
     append_u32(bytes, 2);
     append_u32(bytes, block.width);
     append_u32(bytes, block.height);
@@ -1952,19 +2099,19 @@ std::vector<std::uint8_t> write_sbl_block(const SblBlockMesh& block) {
         append_u32(bytes, patch.normal_flag_a);
         append_u32(bytes, patch.normal_flag_b);
         for (const auto& point : patch.control_points) {
-            number(point.position.x);
-            number(point.position.y);
-            number(point.position.z);
-            number(point.u);
-            number(point.v);
+            append_f32(bytes, point.position.x);
+            append_f32(bytes, point.position.y);
+            append_f32(bytes, point.position.z);
+            append_f32(bytes, point.u);
+            append_f32(bytes, point.v);
         }
     }
     append_u32(bytes, static_cast<std::uint32_t>(block.lights.size()));
     for (const auto& box : block.lights) {
         for (const auto& corner : box.points) {
-            number(corner.x);
-            number(corner.y);
-            number(corner.z);
+            append_f32(bytes, corner.x);
+            append_f32(bytes, corner.y);
+            append_f32(bytes, corner.z);
         }
         for (const auto scalar : box.scalars) append_u32(bytes, scalar);
         append_u32(bytes, box.final_value);
@@ -1973,35 +2120,38 @@ std::vector<std::uint8_t> write_sbl_block(const SblBlockMesh& block) {
 }
 
 std::vector<std::uint8_t> rebuild_sbl_buildblock(const SblTemplate& template_file) {
-    if (template_file.block || template_file.layers.size() > 16)
+    if (template_file.block || template_file.layers.size() > 16) {
         throw std::runtime_error("Expected a buildblock with at most 16 faces");
+    }
     std::vector<std::uint8_t> bytes;
-    // All shipped buildblock templates use header 1. Block-mesh SBL v2 is a
-    // different layout; setting this to 2 is not a buildblock upgrade.
-    append_u32(bytes, 1);
-    const auto number = [&](float value) {
-        const auto offset = bytes.size();
-        bytes.resize(offset + 4);
-        std::uint32_t bits;
-        std::memcpy(&bits, &value, sizeof(bits));
-        for (unsigned i = 0; i < 4; ++i) bytes[offset + i] = static_cast<std::uint8_t>(bits >> (i * 8));
-    };
+    // Unknown buildblock headers are preserved; changing one is not a format upgrade.
+    append_u32(bytes, template_file.version);
     for (const auto& layer : template_file.layers) {
-        if (layer.doors.size() > 2 || layer.windows.size() > 16 || layer.beams.size() > 16)
+        if (layer.doors.size() > 2 || layer.windows.size() > 16 || layer.beams.size() > 16) {
             throw std::runtime_error("Buildblock face exceeds its opening limits");
+        }
         append_u32(bytes, layer.portal_type);
-        for (const auto value : layer.bounds) number(value);
+        for (const auto value : layer.bounds) {
+            append_f32(bytes, value);
+        }
         append_u32(bytes, static_cast<std::uint32_t>(layer.doors.size()));
         for (const auto& door : layer.doors) {
-            append_u32(bytes, door.type); number(door.x); number(door.y);
+            append_u32(bytes, door.type);
+            append_f32(bytes, door.x);
+            append_f32(bytes, door.y);
         }
-        const auto rectangles = [&](const auto& rects) {
+        const auto append_rectangles = [&](const auto& rects) {
             append_u32(bytes, static_cast<std::uint32_t>(rects.size()));
             for (const auto& rect : rects) {
-                append_u32(bytes, rect.type); number(rect.x); number(rect.width); number(rect.y); number(rect.height);
+                append_u32(bytes, rect.type);
+                append_f32(bytes, rect.x);
+                append_f32(bytes, rect.width);
+                append_f32(bytes, rect.y);
+                append_f32(bytes, rect.height);
             }
         };
-        rectangles(layer.windows); rectangles(layer.beams);
+        append_rectangles(layer.windows);
+        append_rectangles(layer.beams);
     }
     return bytes;
 }
@@ -2076,13 +2226,20 @@ std::vector<std::uint8_t> patch_sbl_layers(const std::vector<std::uint8_t>& byte
 }
 
 // -----------------------------------------------------------------------------
-// CSX Archive Writer
+// CSX archive writer
 // -----------------------------------------------------------------------------
 
 std::vector<std::uint8_t> build_csx(const CsxArchive& archive) {
-    const auto payload_size = std::ranges::fold_left(archive.entries, std::size_t{0}, [](std::size_t total, const CsxEntry& entry) {
-        return total + entry.payload.size();
-    });
+    auto payload_size = std::size_t{0};
+    for (const auto& entry : archive.entries) {
+        if (entry.payload.size() > max_csx_payload_bytes - payload_size) {
+            throw std::runtime_error("CSX output exceeds the 512 MiB payload allocation limit");
+        }
+        payload_size += entry.payload.size();
+    }
+    if (archive.entries.size() > (std::numeric_limits<std::uint32_t>::max() - 12U - payload_size) / 0x40U) {
+        throw std::runtime_error("CSX output exceeds its 32-bit directory offsets");
+    }
     const auto directory_offset = std::size_t{12} + payload_size;
     BinaryWriter writer{directory_offset + archive.entries.size() * 0x40};
     writer.u32(0, archive.magic);
@@ -2105,4 +2262,4 @@ std::vector<std::uint8_t> build_csx(const CsxArchive& archive) {
     return std::move(writer).bytes();
 }
 
-} // namespace map_editor
+} // namespace pafta

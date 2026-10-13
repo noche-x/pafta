@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Pafta</title>
+    <link rel="icon" href="data:,">
     <style>
       html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #12161d; }
       canvas { display: block; width: 100%; height: 100%; outline: 0; }
@@ -41,7 +42,7 @@
 
       window.addEventListener('error', function(event) {
         if (started) return;
-        if (event.target instanceof HTMLScriptElement && event.target.src.includes('map_editor_web.') && event.target.src.endsWith('.js')) {
+        if (event.target instanceof HTMLScriptElement && event.target.src.includes('pafta_web.') && event.target.src.endsWith('.js')) {
           fail('The editor script was blocked or could not be downloaded. Allow this site in your blocker, then refresh.');
         } else if (event.error) {
           fail('The editor failed to start: ' + event.message);
@@ -58,7 +59,7 @@
         onAbort: function(reason) { fail('The editor stopped: ' + reason); },
         instantiateWasm: function(imports, successCallback) {
           (async function() {
-            const response = await fetch('map_editor_web.wasm', { credentials: 'same-origin' });
+            const response = await fetch('pafta_web.wasm', { credentials: 'same-origin' });
             if (!response.ok) throw new Error('WebAssembly download failed (HTTP ' + response.status + ')');
 
             const total = Number(response.headers.get('Content-Length'));
@@ -91,9 +92,7 @@
           started = true;
           clearTimeout(timeout);
           requestAnimationFrame(function() { requestAnimationFrame(function() { if (!failed) loading.hidden = true; }); });
-          if (typeof window.mapEditorBrowserInstallDropTarget === 'function') {
-            window.mapEditorBrowserInstallDropTarget(document.getElementById('canvas'));
-          }
+          window.paftaBrowserInstallDropTarget(document.getElementById('canvas'));
         }
       };
       })();

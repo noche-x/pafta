@@ -1,49 +1,33 @@
 # Mesh export (glTF)
 
-Exports the active view (Building / Block / City) to glTF via `File > Export Mesh...`.
-Writes `<name>.gltf` + `.bin` + loose `.png` textures into the chosen folder.
+On desktop, choose `File > Export Mesh...` to export the Building, Block, or City view you have open. Pafta writes `<name>.gltf`, a `.bin` file, and loose `.png` textures into the folder you pick. Texture file names start with the image number, so two textures whose names clean up to the same text still get separate files. If reading a texture back or writing a file fails, the export reports an error.
 
-## Coordinate convention (verified against the Blender addon)
+## Axes (checked against the Blender add-on)
 
-The user's own fork of the Blender addon (`github.com/noche-x/io_scene_subrosa`,
-checked out at `/Users/noche/repos/blender_subrosa/io_scene_subrosa`) establishes
-the canonical Sub-Rosa <-> Blender axis mapping. The fork covers the model formats
-(.cmc/.cmo/.it3/.itm/.sbv/.sit/.srv/.tst) only, NOT .sbb/.sbl/.sbc, so it is an axis
-convention reference, not a format to match:
+Noche's fork of the Blender add-on (`github.com/noche-x/io_scene_subrosa`, checked out at `/Users/noche/repos/blender_subrosa/io_scene_subrosa`) shows how Sub Rosa axes map to Blender axes. The fork handles the model formats (.cmc/.cmo/.it3/.itm/.sbv/.sit/.srv/.tst) but not .sbb/.sbl/.sbc. We only use it as a reference for the axes, not as a format to copy:
 
 - Import (`shared.py:40`): file `(x, y, z)` -> Blender `(x, z, y)`.
 - Export (`export_sbv.py:244,260,279`): Blender `(x, y, z)` -> file `(x, z, y)`.
 
-So Sub Rosa is **Y-up**; Blender is **Z-up**; the addon swaps Y and Z.
+Sub Rosa has Y pointing up, Blender has Z pointing up, and the add-on swaps Y and Z.
 
-glTF is **Y-up** by spec, and Blender's glTF importer auto-rotates Y-up -> Z-up on
-import. Therefore exporting in **raw engine space (Y-up, no transform)** lands in the
-same final Blender orientation the addon produces. That is what this exporter does:
-positions verbatim, original (CCW) winding, no axis mirror.
+glTF always has Y up, and Blender's glTF importer turns Y-up into Z-up on its own. So if we export the game's coordinates unchanged, the model ends up facing the same way in Blender as it does with the add-on. That is what the exporter does: positions stay the same, triangles keep their original counter-clockwise order, and no axis is mirrored.
 
-Open risk to confirm visually: the Y-up->Z-up importer rotation must not leave the
-mesh mirrored/inside-out. If it does, apply an axis mirror + winding reversal in
-`mesh_export.cpp` (transform_vertex + reverse triangle index order together).
+Check the imported model for mirroring or faces turned inside out. If the Y-up to Z-up turn causes either one, change the axis transform and the triangle order together in `mesh_export.cpp` (`transform_vertex` and the reversed index order).
 
-The addon handles a different format family (.cmo/.cmc/.sbv/.itm/.it3/.srv/.tst
-model formats), not .sbb/.sbl/.sbc, so it is a convention reference only, not a
-format to match byte-for-byte.
+## What gets exported
 
-## Contents
-- Flat per-face normals (mesh de-indexed so faces never share normals).
-- UVs preserved from the render buffer.
-- One glTF primitive + material per material name; split from `material_runs`.
-- Textures read back off the GPU and re-flipped to upright (undoing the editor's
-  load-time vertical flip) so they read correctly in DCC tools.
+- Flat normals per face. Vertices are not shared, so faces never share normals.
+- The UVs from the render buffer, unchanged.
+- One glTF primitive and one material for each material name, split using `material_runs`.
+- Textures read back from the GPU and flipped upright again (the editor flips them when loading), so they look right in modeling tools.
 
-## Scope builders
+## Where each view's mesh comes from
+
 - Building: `build_native_building_render_buffer`.
-- Block: `build_block_mesh_render_buffer` (materials named `material_<slot>`; textures
-  bind only if a project material of that name exists).
-- City: terrain mesh + road/curb tile buffer + each placement transformed into world
-  space via `native_city_building_rotation_basis` + `native_city_building_render_origin`.
-  Warns before exporting > 2M triangles.
+- Block: `build_block_mesh_render_buffer`. Materials are named `material_<slot>`, and textures only attach when the project has a material with that name.
+- City: the terrain mesh, the road and curb tiles, and each placed building moved into world space with `native_city_building_rotation_basis` and `native_city_building_render_origin`.
 
-## Dependency
-tinygltf (header-only) via CMake FetchContent. Uses raylib's already-linked stb and
-raylib `ExportImage` for PNG writes to avoid duplicate stb symbols.
+## Library
+
+tinygltf (header-only) comes in through CMake FetchContent. PNG files are written with raylib's `ExportImage`, using the stb that raylib already links, so stb symbols are not duplicated.

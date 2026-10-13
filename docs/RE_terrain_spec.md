@@ -1,45 +1,47 @@
-# Sub Rosa City Terrain RE Spec
+# Early city terrain analysis and porting proposal
 
-## Executive summary
+This proposal was written before the terrain patches were implemented. For the later findings and how Pafta does it now, see [terrain_generation.md](terrain_generation.md). The notes and steps below are the earlier analysis, not a list of things wrong with Pafta today.
 
-The current `map_editor_cpp` city terrain model is strategically wrong. It builds the city terrain mesh by sampling `native_like_city_terrain_height()`, which is a port of the base island heightfield generator (`Terrain_GenerateIslandHeightfield @56560`). That function is not the source of the city's authored ups and downs.
+## How terrain worked when this was written
 
-The game starts from a base land field, but the actual city shape is produced later by `Terrain_ApplyStreetIntersectionHeightPatch @d3340`. That function overwrites city heightfield samples with authored intersection heights, bilinearly fills each four-intersection rectangle, then feathers the stamped patch into the surrounding land. The city is an authored street/intersection heightfield, not procedural noisy hills.
+Back then, Pafta built city terrain by sampling `native_like_city_terrain_height()`, a port of the base island generator (`Terrain_GenerateIslandHeightfield @56560`). That left out the later city patches that use the heights stored on intersections.
 
-Port direction: `build_city_terrain()` should stop treating noise as the city shape. It should build a cached terrain field from the SBC intersection graph and the same authored height contract already used by road tiles.
+The game starts with a base land heightfield, but the city's real shape comes later, from `Terrain_ApplyStreetIntersectionHeightPatch @d3340`. That function overwrites city heightfield samples with the stored intersection heights, fills each rectangle between four intersections with a bilinear blend, and then softens the edge of the patch into the land around it. The city ground follows its streets and intersections; it is not noisy procedural hills.
+
+The proposal was to build a cached terrain heightfield from the SBC intersection graph, using the same heights the road tiles use.
 
 ## Evidence checked in this pass
 
-- `/tmp/re_terrain_patch.c` is a 54-line reconstructed decompile summary, not a full raw Ghidra dump in this workspace. It contains the key constants, rectangle math, bilinear fill loop, and high-level smoothing pass notes for `Terrain_ApplyStreetIntersectionHeightPatch @d3340`.
-- `src/scene.cpp` currently samples `native_like_city_terrain_height(world_x, world_z)` inside `build_city_terrain()`.
-- `src/scene.cpp` already computes road tile `authored_y` from intersection levels and street endpoint interpolation. This is the right ownership model: roads carry authored height; terrain should conform.
-- `tests/parser_tests.cpp` currently has a test named `city_terrain_is_non_flat_noise_mesh_padded_to_city_bounds()`. That test encodes the old, wrong product assumption and will need replacement during Terrain v2.
+- `/tmp/re_terrain_patch.c` is a 54-line summary rebuilt from the decompile, not a full Ghidra dump. It has the key constants, the rectangle math, the bilinear fill loop, and rough notes on the smoothing pass of `Terrain_ApplyStreetIntersectionHeightPatch @d3340`.
+- `src/scene.cpp` samples `native_like_city_terrain_height(world_x, world_z)` inside `build_city_terrain()`.
+- `src/scene.cpp` already works out road tile `authored_y` from intersection levels by blending between the two ends of each street. That is the right way round: roads carry the stored height, and the terrain should follow them.
+- `tests/parser_tests.cpp` has a test called `city_terrain_is_non_flat_noise_mesh_padded_to_city_bounds()`. It is built on the old, wrong idea of what the terrain should be, and has to be replaced as part of Terrain v2.
 
-## Plain-language model
+## The idea in plain words
 
-The city terrain pipeline is:
+The game builds city terrain like this:
 
-1. Generate or load a base island land heightfield.
-2. In the city region, that base is effectively water-level/flat for the relevant native coordinate band. The base field is not where road grades, plateaus, and neighborhood slopes come from.
-3. For each valid four-corner street-intersection block, stamp an authored terrain patch:
-   - determine the rectangle between the four intersection footprints;
-   - convert each corner's authored grid-Y level to world height with `level * 4.0 + 4.25`;
-   - bilinearly fill every native heightfield sample in that rectangle;
-   - write samples through `Terrain_SetLandSampleWithTileBorderMirroring()`.
-4. Run a feather/smooth stage so the road plateau and block interior ease into nearby land instead of forming a vertical step.
-5. Final terrain is the base field plus these authored intersection patches.
+1. Make or load a base island heightfield.
+2. In the city, that base is basically flat, near water level. Road slopes, raised areas, and hilly neighbourhoods do not come from it.
+3. For each block closed in by four street intersections, stamp a terrain patch:
+   - find the rectangle between the four intersection footprints;
+   - turn each corner's grid-Y level into a world height with `level * 4.0 + 4.25`;
+   - fill every heightfield sample in the rectangle with a bilinear blend of the corners;
+   - write each sample with `Terrain_SetLandSampleWithTileBorderMirroring()`.
+4. Run a softening pass so the road surface and the inside of the block ease into the nearby land instead of ending in a cliff.
+5. The final terrain is the base heightfield plus these patches.
 
-Operationally: the terrain is a heightfield built from city topology. The island noise can remain as a base/fallback outside the stamped region, but it must not be the primary city terrain signal.
+In practice, the terrain is a heightfield built from the city's layout. The island noise can stay as a background outside the patched area, but it must not be what shapes the city.
 
-## Coordinate and height contracts
+## Coordinates and heights
 
-Known decoded constants:
+Decoded constants:
 
 ```text
 native heightfield sample index = grid_coord * 4 + 0x1000
                                = grid_coord * 4 + 4096
 
-map_editor grid cell size       = 4.0 world units
+pafta grid cell size       = 4.0 world units
 native samples per grid cell    = 4
 native sample spacing           = 1.0 world unit
 
@@ -48,17 +50,17 @@ DAT_00278688                    = 4.0
 DAT_00278698                    = 4.25
 ```
 
-Implications for the port:
+What this means for the port:
 
-- `SbcIntersection.y` is the authored level. Terrain patch corner height is not just `intersection.y * unit_size`; it is `intersection.y * 4.0 + 4.25`.
-- Existing `CityTileCell::base_y` is a solid-cell base convention. The rendered top of a flat road tile is `base_y + unit_size` in the current mesh path. When validating terrain/road alignment, compare against the rendered road surface convention, not blindly against `base_y`.
-- The native patch operates at 4x finer resolution than the map tile grid. `map_editor_cpp` does not need to upload a 1-world-unit terrain mesh everywhere, but its cached CPU heightfield or evaluator must be able to reproduce the authored plateaus and ramps at road/contact points.
+- `SbcIntersection.y` is the stored level. A patch corner's height is not just `intersection.y * unit_size`; it is `intersection.y * 4.0 + 4.25`.
+- `CityTileCell::base_y` is where a solid cell starts. In the current mesh code, the top of a flat road tile is drawn at `base_y + unit_size`. When checking that terrain and roads line up, compare against where the road top is drawn, not against `base_y`.
+- The game's patch works at 4x finer resolution than the map tile grid. `pafta` does not need a 1-unit terrain mesh everywhere, but its cached heightfield (or whatever works out heights) must reproduce the flat areas and ramps where roads touch the ground.
 
 ## `Terrain_ApplyStreetIntersectionHeightPatch @d3340`
 
-### Inputs and topology guard
+### Input and the block check
 
-The function takes one street-intersection index, `param_1`. It only applies when a closed four-intersection block can be reached through street chains:
+The function takes one intersection index, `param_1`. It only does anything when it can follow streets around a closed block of four intersections:
 
 ```text
 A = streetIntersections[param_1]
@@ -67,7 +69,7 @@ C = A.streetWest.intersectionB
 D = C.streetSouth.intersectionB
 ```
 
-The decompile summary names those locals as:
+The decompile summary calls these locals:
 
 ```text
 A = param_1
@@ -76,11 +78,11 @@ C = lVar14
 D = lVar15
 ```
 
-If that south/west/south chain is missing, the patch is skipped. This is important: this function stamps four-corner city blocks, not isolated single intersections.
+If the south, west, south chain is broken, the patch is skipped. So this function stamps whole four-cornered blocks, never a single intersection on its own.
 
-### Rectangle bounds
+### The rectangle
 
-The patch rectangle is computed in native heightfield sample index space:
+The patch rectangle is worked out in heightfield sample coordinates:
 
 ```c
 gx0 = (A.unk0[1] + A.field_0x2c) * 4 + 0x1000;
@@ -92,15 +94,15 @@ width_samples = gx1 - gx0;
 depth_samples = gz1 - gz0;
 ```
 
-The field names are still decompiler names. Do not over-normalize them until the next Ghidra pass confirms native struct layout. The actionable behavior is clear:
+These are still the decompiler's field names. Don't rename them until the next Ghidra pass confirms the struct layout. What they do is clear enough:
 
-- `field_0x2c` and `field_0x30` are footprint/half-width offsets used to inset the patch rectangle away from each intersection center.
-- Bounds are inclusive in the fill loops: `gx0..gx1` and `gz0..gz1`.
-- Bounds are in the native terrain sample grid, not directly in `map_editor_cpp` terrain mesh vertex indices.
+- `field_0x2c` and `field_0x30` are footprint offsets that pull the patch rectangle in from each intersection's centre.
+- The fill loops include both ends: `gx0..gx1` and `gz0..gz1`.
+- The bounds are in the game's terrain sample grid, not in `pafta` terrain mesh vertex indices.
 
 ### Corner heights
 
-The four authored corner heights are:
+The four corner heights are:
 
 ```c
 hA = A.unk0[2] * 4.0f + 4.25f;
@@ -109,11 +111,11 @@ hC = C.unk0[2] * 4.0f + 4.25f;
 hD = D.unk0[2] * 4.0f + 4.25f;
 ```
 
-For the current SBC parser, this maps to the intersection Y level concept already exposed as `SbcIntersection.y`, subject to field-layout confirmation.
+In the current SBC parser this is the intersection's Y level, `SbcIntersection.y`, once the field layout is confirmed.
 
 ### Bilinear fill
 
-Native loop shape:
+The game's loop:
 
 ```c
 tx_step = 1.0f / (float)(gx1 - gx0);
@@ -134,30 +136,30 @@ for (gz = gz0; gz <= gz1; ++gz) {
 }
 ```
 
-Equivalent to the decompile expression:
+This is the same as the decompiled expression:
 
 ```c
 h = (1.0f - tx) * (hC * tz + hA * (1.0f - tz))
   + (hD * tz + hB * (1.0f - tz)) * tx;
 ```
 
-This is the core shape generator. If the four intersection levels differ, the terrain inside the block becomes a planar/bilinear grade matching those corners. If all four levels match, the block becomes a flat plateau at `level * 4.0 + 4.25`.
+This is what gives the city its shape. If the four intersection levels differ, the ground inside the block becomes a bilinear slope that meets each corner. If all four are the same, the block is a flat area at `level * 4.0 + 4.25`.
 
-### Feather and smooth stage
+### Softening the edges
 
-The handed decompile summary proves these facts:
+The decompile summary we were given shows:
 
 - Scratch buffer: `DAT_04afa9a0`.
-- Scratch record stride: `0x0c`, described as `{count, x, z, weight}` in the summary.
-- Stamp footprint: 5 by 5 cells.
-- Cell/row layout notes: `0x1c` bytes per cell and `0x1c00` per row, implying a `0x100`-wide scratch lattice.
-- The rectangle is walked in 4-sample steps (`>> 2` relationship), matching one map grid cell per coarse smoothing step.
-- Corner-validity / gate tables around `DAT_3ce6f5f8` decide whether a contribution is legal.
-- Multiple outer iterations: `local_120 = 0x10`, so 16 smoothing/feather passes.
-- Falloff form: `weight = 1.0 - distance * FLOAT_002781bc`, with non-positive weights rejected/clamped out.
-- Writes go back through `Terrain_SetLandSampleWithTileBorderMirroring()`.
+- Scratch records are `0x0c` bytes apart, described as `{count, x, z, weight}` in the summary.
+- The stamp covers 5 by 5 cells.
+- Layout notes: `0x1c` bytes per cell and `0x1c00` per row, which suggests a scratch grid `0x100` wide.
+- The rectangle is walked 4 samples at a time (a `>> 2` relationship), one map grid cell per coarse smoothing step.
+- Corner validity tables around `DAT_3ce6f5f8` decide whether a contribution is allowed.
+- There are several outer passes: `local_120 = 0x10`, so 16 passes.
+- Falloff: `weight = 1.0 - distance * FLOAT_002781bc`, and weights of zero or below are thrown out.
+- Results are written back with `Terrain_SetLandSampleWithTileBorderMirroring()`.
 
-Port-level pseudocode that stays inside the known evidence:
+Pseudocode for the port that sticks to what is known:
 
 ```c
 for (pass = 0; pass < 16; ++pass) {
@@ -190,82 +192,82 @@ for (pass = 0; pass < 16; ++pass) {
 }
 ```
 
-Spread/radius, with confidence labels:
+How far it spreads, and how sure we are:
 
-- Direct kernel radius is proven as 5 by 5 coarse cells, i.e. radius 2 on the 4-sample lattice.
-- The function runs 16 outer iterations.
-- If each pass feeds the next pass's updated heightfield, the maximum effective outward propagation is up to `16 * 2 = 32` coarse grid cells, or `32` map cells, or `128` native samples.
-- That 32-cell propagation is an implementation inference from the summarized decompile, not a verified exact edge radius. The raw Ghidra pass needs to confirm whether each pass expands from newly written values or repeatedly restamps from the same source set.
+- The kernel is proven to be 5 by 5 coarse cells, so radius 2 on the 4-sample grid.
+- The function runs 16 outer passes.
+- If each pass builds on the heights written by the pass before, the furthest it could spread is `16 * 2 = 32` coarse cells, which is 32 map cells or 128 samples.
+- That 32-cell figure is a guess from the summary, not a proven radius. A direct Ghidra pass needs to show whether each pass spreads from the new values or keeps stamping from the same starting set.
 
-### Final land merge
+### Final blend with the land
 
-The final pass reads existing land tile heights:
+The last pass reads the existing land heights:
 
 ```c
 chunk = g_landTileHeightChunks[chunkX + chunkY * 8];
 land_height = chunk[(z & 0x7ff) * 0x801 + (x & 0x7ff)];
 ```
 
-The blend form is smoothstep-like:
+It blends with a smoothstep-like curve:
 
 ```c
 f = (DAT_00278644 - 2.0f * t) * t * t;  // DAT_00278644 = 3.0
 out = (1.0f - f) * land_height + f * patch_height;
 ```
 
-So with the decoded constant:
+With the decoded constant, that is:
 
 ```c
 f = (3.0f - 2.0f * t) * t * t;
 ```
 
-This is the standard `t*t*(3 - 2*t)` easing curve. The unresolved part is how native computes `t` for each edge sample and what exact distance band it uses.
+This is the usual `t*t*(3 - 2*t)` easing curve. What is still unknown is how the game works out `t` for each edge sample, and over what distance.
 
-## Why the current port is wrong
+## What the earlier port got wrong
 
-Current `build_city_terrain()` does this:
+The earlier `build_city_terrain()` did this:
 
 ```c++
 height = native_like_city_terrain_height(world_x, world_z);
 ```
 
-That makes the mesh depend on the island base generator. The island base generator may be useful as a background land field, but it does not know:
+So the mesh only followed the island generator. That generator may be fine for background land, but it knows nothing about:
 
 - intersection heights;
 - street widths;
-- intersection footprint insets;
-- four-corner city blocks;
-- road grades;
-- authored city ramps;
-- feathered transition from roads to surrounding land.
+- how far footprints pull the patch in;
+- blocks with four corners;
+- road slopes;
+- ramps in the city;
+- the soft edge between roads and the land around them.
 
-The current road tile path is already closer to the game than the terrain path. Road tiles use intersection Y levels and interpolate between street endpoints. Terrain v2 should make the terrain agree with that authored city surface, instead of asking the road network to visually coexist with unrelated island noise.
+The road tile code was already closer to the game than the terrain code. Road tiles use intersection Y levels and blend between the ends of each street. Terrain v2 should make the ground match that city surface, instead of asking the roads to sit on top of unrelated island noise.
 
-## Port plan for `map_editor_cpp`
+## The original porting proposal
 
-This is a report-only task; do not apply these steps in this pass.
+The task produced this proposal; nothing was implemented.
 
-### 1. Keep the base field, but demote it
+### 1. Keep the base heightfield, but only in the background
 
 In `src/scene.cpp`, keep `native_like_city_terrain_height()` only as:
 
-- optional base island field outside city patches; or
-- flat fallback initialized to `23.875f` inside the city working area.
+- an optional base island outside the city patches; or
+- a flat value of `23.875f` across the city area.
 
-For Terrain v2, the base is the substrate. It is not the city shape. A practical first implementation should initialize the terrain grid to `23.875f` across the cached city bounds, then stamp the authored patches. After that works, re-enable the island base as an outer fallback if screenshots prove it matters near city edges.
+In Terrain v2 the base is what the patches sit on, not the city's shape. A practical first version would fill the terrain grid with `23.875f` across the cached city bounds and then stamp the patches. Once that works, bring the island back as an outer background if screenshots show it matters near the city's edges.
 
-### 2. Build an authored terrain working grid
+### 2. Build a working height grid
 
-Modify `build_city_terrain(const SbcMap& map, float unit_size)` so it creates a CPU working height grid before creating mesh vertices.
+Change `build_city_terrain(const SbcMap& map, float unit_size)` so it makes a height grid on the CPU before making mesh vertices.
 
-Recommended first-pass grid:
+Suggested first version:
 
-- Coordinate domain: map grid/world coordinates aligned with existing `CityTerrain` bounds.
-- Height value: world Y.
-- Mesh spacing: use `unit_size` (`4.0`) for initial correctness at road/grid contact points, not the current `unit_size * 4.0` (`16.0`). The terrain mesh is cached per `city_scene_fingerprint()`, so the cost is acceptable.
-- Optional exact mode later: native sample spacing (`1.0`) if visual comparisons show 4.0 spacing misses curb/feather detail.
+- Coordinates: map grid or world coordinates, lined up with the existing `CityTerrain` bounds.
+- Values: world Y.
+- Mesh spacing: `unit_size` (`4.0`) at first, so it is right where roads meet the grid, instead of the current `unit_size * 4.0` (`16.0`). The terrain mesh is cached by `city_scene_fingerprint()`, so the extra cost is fine.
+- Later, optionally: the game's sample spacing (`1.0`), if comparisons show that 4.0 spacing loses curb or edge detail.
 
-The working grid can store terrain heights at mesh vertices. For exact native semantics, add conversion helpers:
+The working grid can store heights at mesh vertices. For the game's exact behaviour, add conversion helpers:
 
 ```c++
 native_sample_x = grid_x * 4 + 4096;
@@ -274,166 +276,163 @@ world_x = grid_x * unit_size;
 world_z = grid_z * unit_size;
 ```
 
-If the mesh grid is coarser than native samples, evaluate the patch formula analytically at each mesh vertex instead of trying to literally replay every native sample write.
+If the mesh grid is coarser than the game's samples, work out the patch formula directly at each mesh vertex instead of replaying every sample write the game does.
 
-### 3. Derive four-corner patch rectangles from city topology
+### 3. Find the four-cornered blocks from the city layout
 
-Add a helper near the existing city tile helpers, not in a new architecture layer:
+Add a helper next to the existing city tile helpers, without a new layer of architecture:
 
 ```text
 build_city_intersection_patches(map)
 ```
 
-Responsibilities:
+It should:
 
-- find closed four-intersection blocks equivalent to `A -> south B`, `A -> west C`, `C -> south D`;
-- compute footprint insets matching native `field_0x2c` and `field_0x30`;
-- emit patch records with four corner intersections, inclusive rectangle bounds, and four world heights.
+- find closed blocks of four intersections, the same as `A -> south B`, `A -> west C`, `C -> south D`;
+- work out how far footprints pull the patch in, matching `field_0x2c` and `field_0x30`;
+- output patch records with the four corner intersections, the rectangle bounds (both ends included), and four world heights.
 
-Use existing `SbcStreet` endpoint data to build directional adjacency. Direction naming must be verified against native:
+Use the existing `SbcStreet` end data to work out which way each neighbour lies. The direction names must be checked against the game:
 
-- current code has `side_from_intersection_delta()` and `CityIntersectionSide`;
-- native decompile uses `streetSouth` and `streetWest`;
-- do not assume current side naming exactly matches native memory names until the lead Ghidra pass confirms struct layout.
+- the current code has `side_from_intersection_delta()` and `CityIntersectionSide`;
+- the decompile uses `streetSouth` and `streetWest`;
+- don't assume the current side names match the game's names until the lead's Ghidra pass confirms the struct layout.
 
-### 4. Stamp bilinear plateaus
+### 4. Stamp the bilinear patches
 
-For each patch record:
+For each patch:
 
-1. Convert each corner level to world terrain Y:
+1. Turn each corner level into a world terrain Y:
 
 ```c++
 height = static_cast<float>(intersection.y) * 4.0f + 4.25f;
 ```
 
-2. For each terrain grid sample inside the patch rectangle, compute normalized `tx/tz`.
-3. Write the bilinear height into the working terrain grid.
+2. For each terrain sample inside the rectangle, work out `tx/tz` from 0 to 1.
+3. Write the bilinear height into the working grid.
 
-This must overwrite the base field for interior samples. Do not average with noise in the plateau. The native function calls `Terrain_SetLandSampleWithTileBorderMirroring()` during fill, so the patch owns those samples.
+Inside the patch, this must replace the base height, not average with the noise. The game calls `Terrain_SetLandSampleWithTileBorderMirroring()` while filling, so the patch fully owns those samples.
 
-### 5. Feather edges
+### 5. Soften the edges
 
-Implement a conservative v2 feather that mirrors the proven native shape but keeps unresolved constants isolated:
+Write a careful first version that follows the known shape, and keep the unknown constants in one place:
 
 - Use a radius-2, 5-by-5 kernel on the coarse grid.
 - Run 16 passes.
 - Use `weight = max(0, 1 - distance * feather_falloff)`.
-- Use smoothstep edge blend `t*t*(3 - 2*t)` for final merge where distance-to-patch edge is known.
+- Use the smoothstep blend `t*t*(3 - 2*t)` for the final merge where the distance to the patch edge is known.
 
-Important: put the falloff/radius constants in one small helper or local config struct. Do not bake guesses across the codebase. The next Ghidra pass should be able to replace those values without a refactor.
+Put the falloff and radius constants in one small helper or local settings struct. Don't scatter guesses across the code. The next Ghidra pass should be able to swap the values without a refactor.
 
-If exact native feathering is still unknown at implementation time, ship the first implementation as:
+If the game's exact softening is still unknown when this is built, ship the first version with:
 
 - exact rectangle bounds and bilinear fill;
-- approximate feather with explicit comments and tests for broad properties only.
+- a rough softening, with clear comments, and tests that only check the general behaviour.
 
-Do not claim exact native smoothing until `FLOAT_002781bc`, the gate table behavior, and the edge distance `t` calculation are confirmed.
+Don't claim it matches the game's smoothing until `FLOAT_002781bc`, the validity tables, and how the edge distance `t` is worked out are all confirmed.
 
-### 6. Align road and terrain height queries
+### 6. Make road and terrain heights agree
 
-Current dependent paths:
+Code that depends on this:
 
-- `build_city_tile_cells()` already produces `CityTileCell::base_y` and slopes from authored intersection heights.
-- `build_city_tile_render_buffer()` renders road/curb solid-cell tops from `base_y + unit_size` plus slope displacement.
+- `build_city_tile_cells()` already works out `CityTileCell::base_y` and slopes from intersection heights.
+- `build_city_tile_render_buffer()` draws road and curb tops at `base_y + unit_size`, plus the slope.
 - `build_city_traffic_light_poles()`, `scene.roads`, and `scene.intersections` call `terrain_height_at()`.
 
 After Terrain v2:
 
-- `terrain_height_at()` at an intersection center should return the patch terrain height for that authored level, using the terrain convention `level * 4.0 + 4.25`.
-- Road visual placement tests must compare against the actual rendered road top convention. If road tiles need a `+0.25` correction to match the native terrain surface, make that a separate vertical-alignment fix with screenshot/native evidence.
-- Roads should not float above unrelated noise or sink below the authored terrain. The road tile grade and terrain patch grade should come from the same intersection levels.
+- `terrain_height_at()` at an intersection's centre should return the patch height for its level, using `level * 4.0 + 4.25`.
+- Tests of road placement must compare against where the road top is actually drawn. If road tiles need a `+0.25` shift to sit on the game's terrain, make that a separate height fix backed by screenshots or game evidence.
+- Roads should not float above unrelated noise or sink below the ground. Road slopes and terrain slopes should both come from the same intersection levels.
 
-### 7. Update tests when implementing
+### 7. Update the tests
 
 Expected test changes:
 
-- Replace `city_terrain_is_non_flat_noise_mesh_padded_to_city_bounds()` with a Terrain v2 test suite.
-- Keep `terrain_noise_hash_matches_native_all_ones_mask()` if the island base helper remains.
-- Add a synthetic four-corner block test:
+- Replace `city_terrain_is_non_flat_noise_mesh_padded_to_city_bounds()` with Terrain v2 tests.
+- Keep `terrain_noise_hash_matches_native_all_ones_mask()` if the island helper stays.
+- Add a made-up four-corner block test:
   - four intersections forming a rectangle;
-  - corner Y levels differ;
+  - different Y levels at the corners;
   - terrain at the four patch corners equals `level * 4.0 + 4.25`;
-  - terrain at the rectangle center equals the bilinear average;
-  - patch interior is not sampled from `native_like_city_terrain_height()`.
-- Add a flat city-base test:
-  - no valid four-corner patch means city terrain initializes to `23.875` or optional base field;
-  - no procedural hill claim in the middle of the city.
-- Add a road-alignment test:
-  - compare `terrain_height_at()` to the rendered top-surface convention for a road/intersection, not just `CityTileCell::base_y`.
-- Add a feather property test:
-  - heights outside the patch approach base land;
-  - adjacent terrain deltas are bounded;
-  - do not assert exact weights until the lead Ghidra pass closes the unknowns.
+  - terrain at the centre equals the bilinear average;
+  - the inside of the patch does not come from `native_like_city_terrain_height()`.
+- Add a flat city test:
+  - with no valid four-corner block, city terrain is `23.875` (or the optional base);
+  - no procedural hills in the middle of the city.
+- Add a road alignment test:
+  - compare `terrain_height_at()` with where the road or intersection top is drawn, not just `CityTileCell::base_y`.
+- Add a softening test:
+  - heights outside the patch move towards the base land;
+  - the difference between neighbouring heights stays small;
+  - don't check exact weights until the lead's Ghidra pass settles the unknowns.
 
-### 8. Cache and performance
+### 8. Caching and speed
 
-The scene is already cached by `city_scene_fingerprint()`, which hashes intersections, streets, widths, and buildings. Terrain v2 should stay inside that lifecycle:
+The scene is already cached by `city_scene_fingerprint()`, which hashes intersections, streets, widths, and buildings. Terrain v2 should fit into that:
 
-- Build the CPU height grid once per fingerprint.
-- Generate mesh vertices/triangles from that grid.
-- Upload the terrain GPU model through the existing path.
+- Build the height grid once per fingerprint.
+- Make the mesh vertices and triangles from that grid.
+- Upload the terrain to the GPU the existing way.
 
-Even a `4.0` world-unit mesh grid is cheap compared with building/render-buffer work. A native `1.0` world-unit grid may still be viable for normal city bounds, but treat that as a fidelity toggle after the first correct implementation.
+Even a mesh grid at `4.0` world units is cheap next to the building and render-buffer work. A grid at the game's `1.0` units may still be fine for normal city sizes, but treat that as a quality option after the first correct version.
 
-## Lead Ghidra pass still needed
+## What still needs a Ghidra pass from the lead
 
-These are the remaining blockers for exact-native parity:
+These block matching the game exactly:
 
-1. Exact meanings of `streetIntersection.field_0x2c` and `field_0x30`.
-   - Are they half-widths, footprint margins, side-specific road widths, or already-normalized inset distances?
-   - How do they map to current `SbcStreet.left_width` / `right_width` and `city_intersection_footprint()`?
+1. What `streetIntersection.field_0x2c` and `field_0x30` really mean.
+   - Are they half-widths, footprint margins, road widths per side, or already-scaled inset distances?
+   - How do they relate to `SbcStreet.left_width` / `right_width` and `city_intersection_footprint()`?
 
-2. Exact native direction mapping.
-   - Confirm which current axis (`SbcIntersection.x` or `.z`) corresponds to decompile `unk0[1]` and `pos.x`.
-   - Confirm what native names `streetSouth` and `streetWest` mean relative to current `CityIntersectionSide`.
+2. Which direction is which in the game.
+   - Confirm which axis (`SbcIntersection.x` or `.z`) is the decompile's `unk0[1]` and which is `pos.x`.
+   - Confirm what the game's `streetSouth` and `streetWest` mean compared with `CityIntersectionSide`.
 
-3. Raw feather normalization.
+3. How softening is averaged.
    - Confirm the scratch record layout at `DAT_04afa9a0`.
-   - Confirm whether `{count, x, z, weight}` in the summary is literal or a semantic shorthand.
-   - Confirm whether the blended result divides by total weight, count, or another accumulator.
+   - Confirm whether `{count, x, z, weight}` in the summary is the real layout or just a description.
+   - Confirm whether the result is divided by the total weight, the count, or something else.
 
 4. `FLOAT_002781bc`.
-   - This is the distance falloff multiplier in `weight = 1 - distance * falloff`.
-   - Without it, exact feather radius/shape is not locked.
+   - This is the falloff multiplier in `weight = 1 - distance * falloff`.
+   - Without it, the softening's reach and shape are not fixed.
 
-5. Gate table semantics around `DAT_3ce6f5f8`.
-   - Need to know how corner validity masks prevent smoothing across invalid patch corners, missing roads, or block boundaries.
+5. What the tables around `DAT_3ce6f5f8` do.
+   - We need to know how the corner validity masks stop smoothing across bad corners, missing roads, or block edges.
 
-6. Final edge blend `t`.
-   - `DAT_00278644 = 3.0` gives the smoothstep curve, but the source/range of `t` still needs confirmation.
-   - Confirm the distance band and whether `t=0` is land edge or patch edge in every branch.
+6. The final edge blend `t`.
+   - `DAT_00278644 = 3.0` gives the smoothstep curve, but where `t` comes from and its range still need confirming.
+   - Confirm the distance range, and whether `t=0` is the land edge or the patch edge in every case.
 
-7. Call ordering.
-   - Confirm when `Terrain_ApplyStreetIntersectionHeightPatch()` runs relative to `Terrain_GenerateIslandHeightfield()`, land-tile chunk initialization, roads, buildings, and object placement.
+7. Call order.
+   - Confirm when `Terrain_ApplyStreetIntersectionHeightPatch()` runs compared with `Terrain_GenerateIslandHeightfield()`, setting up land-tile chunks, roads, buildings, and placing objects.
 
-## Honest unknowns
+## Unknowns
 
-- I cannot justify exact feather weights from the available `/tmp/re_terrain_patch.c`; it only gives the kernel shape, pass count, scratch-buffer hints, and falloff form.
-- I cannot prove the effective feather spread is exactly 32 map cells. That is the maximum implied by a radius-2 kernel over 16 cumulative passes, not a confirmed native distance.
-- I cannot prove the current `city_intersection_footprint()` odd/even anchoring matches native `field_0x2c` / `field_0x30`. The source already has a `VERIFY` comment on that footprint logic, and Terrain v2 depends on closing it.
-- I cannot prove whether the terrain mesh should keep the current `height - 0.05f` render offset. The native terrain sample height is `level * 4.0 + 4.25`; visual road/ground z-fighting policy should be validated separately.
-- I cannot claim the base island noise is useless everywhere. The correct statement is narrower: it is not the source of the authored city grades/plateaus. Keep it as a base/fallback until native call ordering and screenshots say otherwise.
+- The available `/tmp/re_terrain_patch.c` is not enough to work out exact softening weights. It only gives the kernel shape, the number of passes, hints about the scratch buffer, and the form of the falloff.
+- I cannot prove the softening reaches exactly 32 map cells. That is the most a radius-2 kernel could reach over 16 passes that build on each other, not a confirmed distance.
+- I cannot prove that the odd/even anchoring in `city_intersection_footprint()` matches the game's `field_0x2c` / `field_0x30`. The code already has a `VERIFY` comment on that footprint logic, and Terrain v2 depends on settling it.
+- I cannot prove whether the terrain mesh should keep its `height - 0.05f` render offset. The game's sample height is `level * 4.0 + 4.25`. How to stop roads and ground flickering against each other should be checked on its own.
+- I cannot say the island noise is useless everywhere. All I can say is that the city's slopes and flat areas do not come from it. Keep it as a background until the call order and screenshots say otherwise.
 
-## Implementation decision record
+## Decision record
 
-Recommended Terrain v2 sequencing:
+Suggested order for Terrain v2:
 
-1. Replace the noise-owned city mesh with an authored patch-owned mesh.
-2. First ship exact rectangle/bilinear behavior from the RE.
-3. Add conservative approximate feathering behind isolated constants.
-4. Run a follow-up Ghidra pass to lock the feather constants and footprint fields.
-5. Update tests away from "non-flat noise" and toward authored intersection terrain.
+1. Replace the noise-driven city mesh with one driven by the patches.
+2. First ship the exact rectangle and bilinear behaviour from the research.
+3. Add a careful, rough softening, with its constants kept in one place.
+4. Do a follow-up Ghidra pass to fix the softening constants and footprint fields.
+5. Change the tests from "the ground is noisy" to "the ground follows the intersections".
 
-This is the practical route. It removes the wrong strategic dependency now, preserves the island generator as a supporting asset, and contains the remaining unknowns behind a small surface area.
+This removes the wrong dependency now, keeps the island generator as a helper, and keeps the remaining unknowns in a small part of the code.
 
----
+## Lead's Ghidra follow-up (2026-06-05)
 
-## LEAD GHIDRA GAP-FILL ADDENDUM (2026-06-05)
+The lead answered several of the "still needs a Ghidra pass" items by reading subrosa.exe directly. This later pass corrected the placeholders above as follows.
 
-Resolved several "lead Ghidra pass still needed" items by reading subrosa.exe directly.
-These are VERIFIED facts — use them in the implementation instead of the placeholders above.
-
-### StreetIntersection struct (confirmed layout, size 136)
+### StreetIntersection struct (layout confirmed, size 136)
 ```
 off 0:  int unk0[3]   -> unk0[1] = grid X base, unk0[2] = height LEVEL (int)
 off 12: Vector pos    -> pos.x (float-as-int) = grid Z base
@@ -446,36 +445,36 @@ off 48: int field_0x30 -> +Z (south) footprint half-extent
 off 52: int field_0x34 -> -X (west)  footprint half-extent
 off 56: int field_0x38 -> -Z (north) footprint half-extent
 ```
-RESOLVES gap #1 (footprint fields) + gap #2 (axis mapping): unk0[1]=X, pos.x=Z, CONFIRMED by
-StreetIntersection_Process @3760 which computes footprint edges as:
-  east  edge = unk0[1] + field_0x2c
-  west  edge = unk0[1] - field_0x34
-  south edge = pos.x   + field_0x30
-  north edge = pos.x   - field_0x38
-i.e. the four fields are per-side half-extents (E/W/S/N), NOT a single half-width.
 
-### Feather constants (RESOLVES gap #4 and #6)
-- FLOAT_002781bc = 0.0625 (= 1/16)  -> feather weight = 1 - dist*0.0625; reaches 0 at 16 samples.
-- DAT_00278644   = 3.0              -> final smoothstep edge blend f = (3 - 2t)*t*t.
-- FLOAT_00278280 = 0.25             -> 5x5 feather stamp sub-step (quarter native sample).
-Combined with the proven 16 outer passes + radius-2 5x5 kernel: feather propagates up to ~16
-native samples per the falloff (not the 32-cell upper bound guessed above; the 1/16 falloff caps
-single-stamp reach at 16 samples = 4 map cells, multi-pass widens it but each stamp is bounded).
+This answers item 1 (footprint fields) and item 2 (axes): unk0[1] is X and pos.x is Z. `StreetIntersection_Process @3760` confirms it, because it works out the footprint edges as:
 
-### Height/coord (already confirmed)
-world Y = level*4.0 + 4.25; heightfield index = grid*4 + 4096; map cell = 4.0 units.
+```text
+east  edge = unk0[1] + field_0x2c
+west  edge = unk0[1] - field_0x34
+south edge = pos.x   + field_0x30
+north edge = pos.x   - field_0x38
+```
 
-### STILL genuinely open (lower priority, not blocking a first correct impl)
-- gate table DAT_3ce6f5f8 semantics (corner-validity masks) — affects only edge cases between
-  blocks; a first impl can feather uniformly and refine later.
-- exact scratch-buffer weight normalization (divide by total weight vs count) — affects feather
-  smoothness, not plateau correctness.
-- call ordering vs island gen — for map_editor it doesn't matter; we build terrain fresh.
+So the four fields are separate reaches for each side (E/W/S/N), not one half-width.
 
-### IMPLEMENTATION GUIDANCE for Terrain v2 (lead)
-The bilinear plateau core + per-side footprint rectangles are now FULLY SPECIFIED and should be
-implemented faithfully. The feather is conservative-but-grounded (constants known). map_editor's
-SbcIntersection.x/.y/.z map to grid X / height-level / grid Z; the four per-side extents are not
-currently parsed from SBC — use the existing city_intersection_footprint() extents as the stand-in
-(it already derives a footprint from street widths) until/unless SBC carries them. Terrain must
-agree with road authored_y (level*4+4.25) so roads sit in the ground.
+### Softening constants (answers items 4 and 6)
+
+- FLOAT_002781bc = 0.0625 (= 1/16), so the softening weight is 1 - dist*0.0625 and reaches 0 at 16 samples.
+- DAT_00278644 = 3.0, so the final smoothstep edge blend is f = (3 - 2t)*t*t.
+- FLOAT_00278280 = 0.25, the sub-step of the 5x5 softening stamp (a quarter of a sample).
+
+Together with the 16 outer passes and the radius-2 5x5 kernel, the softening reaches about 16 samples, as set by the falloff. That replaces the 32-cell upper limit guessed above: the 1/16 falloff stops a single stamp at 16 samples (4 map cells). Several passes widen it, but each stamp has that limit.
+
+### Heights and coordinates (already confirmed)
+
+world Y = level*4.0 + 4.25; heightfield index = grid*4 + 4096; a map cell is 4.0 units.
+
+### Still open (lower priority, does not block a first correct version)
+
+- What the table at DAT_3ce6f5f8 does (corner validity masks). It only affects edge cases between blocks; a first version can soften evenly and improve later.
+- Exactly how the scratch buffer averages weights (by total weight or by count). It affects how smooth the softening is, not whether the flat areas are right.
+- Call order against the island generator. For pafta it doesn't matter, since we build the terrain from scratch.
+
+### Lead's guidance for Terrain v2
+
+The bilinear patch and the per-side footprint rectangles are now FULLY KNOWN and should be implemented exactly. The softening is careful but backed by evidence (the constants are known). pafta's SbcIntersection.x/.y/.z are grid X, height level, and grid Z. The four per-side reaches are not read from the SBC yet, so use the existing city_intersection_footprint() reaches in their place (it already works out a footprint from street widths) until the SBC provides them, if ever. The terrain must agree with the road's authored_y (level*4+4.25) so roads sit in the ground.
