@@ -1439,6 +1439,46 @@ It3Mesh parse_it3(const std::vector<std::uint8_t>& bytes) {
     return mesh;
 }
 
+std::optional<FileRepair> repair_sbb(const std::vector<std::uint8_t>& bytes) {
+    try {
+        const BinaryReader reader{bytes};
+        if (reader.size() < 0x50) return std::nullopt;
+        const auto version = reader.u32(0);
+        if (!sbb_version_supported(version)) return std::nullopt;
+        SbbBuilding sizes;
+        sizes.size_x = reader.u32(0x44);
+        sizes.size_y = reader.u32(0x48);
+        sizes.size_z = reader.u32(0x4c);
+        if (!sbb_dimensions_supported(sizes.size_x, sizes.size_y, sizes.size_z)) return std::nullopt;
+        // Walk the tables the way parse_sbb does; they must be complete.
+        const auto table_offset = sbb_table_offset(version);
+        const auto material_count = reader.u32(table_offset - 4U);
+        if (material_count > 1024U) return std::nullopt;
+        auto offset = table_offset + static_cast<std::size_t>(material_count) * 0x40;
+        for (int table = 0; table < 3; ++table) {
+            const auto count = reader.u32(offset);
+            if (count > 1024U) return std::nullopt;
+            offset += 4 + static_cast<std::size_t>(count) * 0x40;
+        }
+        if (offset > reader.size()) return std::nullopt;
+        const auto cells_end = offset + sbb_cell_count(sizes) * 0x3c;
+        if (reader.size() >= cells_end) return std::nullopt;
+        const auto missing_bytes = cells_end - reader.size();
+        // Read it the way editor.exe does (the missing cells come out empty), then
+        // save it the way editor.exe does: version 14, every cell, and the end marker
+        // (1, then a group count of 0).
+        auto padded = bytes;
+        padded.resize(cells_end, 0);
+        const auto missing_cells = (missing_bytes + 0x3b) / 0x3c;
+        FileRepair repair{rebuild_sbb(parse_sbb(padded)), {}};
+        repair.description = "resaved like editor.exe does: " + std::to_string(missing_cells) +
+            (missing_cells == 1 ? " empty cell" : " empty cells") + " added where the file stopped early, version 14, and the end marker";
+        return repair;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
 CsxArchive parse_csx_file(const std::filesystem::path& path) {
     return parse_csx(read_file_bytes(path));
 }

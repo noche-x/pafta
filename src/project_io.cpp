@@ -366,6 +366,165 @@ void record_source_load_error(EditorProject& project, std::string message) {
     project.load_warnings.push_back(std::move(message));
 }
 
+// A load error for a file whose bytes are kept, so "Try auto-fixing" can repair it.
+// An entry with no name gets "unnamed_<n>" as part of its fix.
+void record_failed_asset(EditorProject& project, std::string message, FailedAsset::Kind kind, std::string name,
+                         std::filesystem::path source, std::vector<std::uint8_t> bytes, bool imported = false) {
+    if (imported) project.load_warnings.push_back(message);
+    else record_source_load_error(project, message);
+    FailedAsset failed{kind, std::move(name), std::move(source), std::move(bytes), std::move(message), std::nullopt, imported};
+    std::string renamed;
+    if (failed.name.empty()) {
+        failed.name = "unnamed_" + std::to_string(project.failed_assets.size() + 1U);
+        renamed = "named it " + failed.name;
+    }
+    const auto loads = [&](const std::vector<std::uint8_t>& bytes) {
+        try {
+            if (failed.kind == FailedAsset::Kind::Building) (void)parse_sbb(bytes);
+            else if (failed.kind == FailedAsset::Kind::Sbl) {
+                const auto sbl = parse_sbl(bytes);
+                if (!sbl.block && sbl.layers.empty()) return false;
+            } else return false;
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
+    };
+    if (failed.kind == FailedAsset::Kind::Building) failed.repair = repair_sbb(failed.bytes);
+    if (!renamed.empty()) {
+        if (failed.repair) failed.repair->description = renamed + ", " + failed.repair->description;
+        else if (loads(failed.bytes)) failed.repair = FileRepair{failed.bytes, renamed};
+    }
+    project.failed_assets.push_back(std::move(failed));
+}
+
+bool apply_asset_repair(EditorProject& project, EditorUi& ui, std::size_t index, std::string& status) {
+    if (index >= project.failed_assets.size() || !project.failed_assets[index].repair) return false;
+    auto failed = std::move(project.failed_assets[index]);
+    project.failed_assets.erase(project.failed_assets.begin() + static_cast<std::ptrdiff_t>(index));
+    const auto drop_message = [&](std::vector<std::string>& messages) {
+        if (const auto it = std::ranges::find(messages, failed.message); it != messages.end()) messages.erase(it);
+    };
+    drop_message(project.save_blocking_load_errors);
+    drop_message(project.load_warnings);
+    auto bytes = std::move(failed.repair->bytes);
+    const auto key = lower_name(failed.name);
+    const auto add = [&](auto& assets, auto& bytes_list, auto data) {
+        // A copy that loaded from somewhere else (the archive or a loose file) keeps
+        // its place; the fix then only clears the error.
+        const auto existing = std::ranges::find_if(assets, [&](const auto& asset) { return lower_name(asset.name) == key; });
+        if (existing != assets.end() && failed.imported) {
+            // An imported file replaces the map's asset with the same name.
+            existing->data = std::move(data);
+            existing->dirty = true;
+            bytes_list[static_cast<std::size_t>(existing - assets.begin())] = bytes;
+            return true;
+        }
+        if (existing != assets.end()) {
+            status = failed.name + ": already loaded from another copy, so the broken one was dropped";
+            return false;
+        }
+        assets.push_back({failed.source, failed.name, std::move(data), true, false});
+        bytes_list.push_back(bytes);
+        return true;
+    };
+    try {
+        bool added = false;
+        if (failed.kind == FailedAsset::Kind::Building) {
+            added = add(project.buildings, project.building_bytes, parse_sbb(bytes));
+            if (added) {
+                ui.building_dirty = true;
+                ++project.city_building_revision;
+            }
+        } else {
+            auto sbl = parse_sbl(bytes);
+            if (sbl.block) {
+                added = add(project.blocks, project.block_bytes, *sbl.block);
+                if (added) ui.block_dirty = true;
+            } else {
+                added = add(project.buildblocks, project.buildblock_bytes, std::move(sbl));
+                if (added) ui.buildblock_dirty = true;
+            }
+        }
+        if (added) status = failed.name + ": " + failed.repair->description + ". Save to keep the fix.";
+    } catch (const std::exception& error) {
+        report_failure(status, failed.name + ": the fix did not load: " + error.what());
+        return false;
+    }
+    project.render_buffers_dirty = true;
+    project.placement_assets_dirty = true;
+    project.building_thumbnail_ready.assign(project.building_thumbnail_ready.size(), false);
+    project.block_thumbnail_ready.assign(project.block_thumbnail_ready.size(), false);
+    invalidate_render_input_cache(project);
+    invalidate_portal_render_models(project);
+    return true;
+}
+
+std::size_t import_files_into_project(EditorProject& project, EditorUi& ui, const std::vector<std::filesystem::path>& paths,
+                                      std::string& status) {
+    std::size_t added = 0;
+    std::size_t failed_count = 0;
+    std::string last;
+    for (const auto& path : paths) {
+        const auto extension = lower_extension(path);
+        const auto name = stem_name(path);
+        std::vector<std::uint8_t> bytes;
+        try {
+            bytes = read_file_bytes(path);
+            if (extension == ".png") {
+                // A texture: shown now, and kept as an archive entry so Save writes it.
+                Image image = decode_flipped_png_from_file(path);
+                if (!IsImageValid(image)) throw std::runtime_error("not a readable PNG image");
+                Texture2D texture = upload_decoded_image(image);
+                configure_texture(texture);
+                const auto key = lower_name(name);
+                const auto loaded = std::ranges::find_if(project.textures, [&](const LoadedTexture& t) { return lower_name(t.name) == key; });
+                if (loaded != project.textures.end()) *loaded = LoadedTexture{name, texture};
+                else project.textures.emplace_back(name, texture);
+                CsxEntry entry{};
+                entry.name = name;
+                entry.kind = CsxEntryKind::Texture;
+                entry.type = 0x585a0004U;
+                entry.payload.resize(0x4c, 0);
+                entry.payload[0] = 1;
+                for (unsigned i = 0; i < 4; ++i) entry.payload[0x44 + i] = static_cast<std::uint8_t>(bytes.size() >> (8 * i));
+                entry.payload.insert(entry.payload.end(), bytes.begin(), bytes.end());
+                const auto archived = std::ranges::find_if(project.archive_entries, [&](const CsxEntry& e) {
+                    return e.type == entry.type && lower_name(e.name) == key;
+                });
+                if (archived != project.archive_entries.end()) *archived = std::move(entry);
+                else project.archive_entries.push_back(std::move(entry));
+                ui.city_dirty = true;
+                ++added;
+                continue;
+            }
+            if (extension != ".sbb" && extension != ".sbl") throw std::runtime_error("choose an .sbb, .sbl, or .png file");
+            // Buildings and blocks go through the same path as a repaired file.
+            const auto kind = extension == ".sbb" ? FailedAsset::Kind::Building : FailedAsset::Kind::Sbl;
+            if (kind == FailedAsset::Kind::Building) (void)parse_sbb(bytes);
+            else {
+                const auto sbl = parse_sbl(bytes);
+                if (!sbl.block && sbl.layers.empty()) throw std::runtime_error("no supported block or buildblock data");
+            }
+            project.failed_assets.push_back({kind, name, path, {}, {}, FileRepair{bytes, "imported"}, true});
+            std::string ignored;
+            if (apply_asset_repair(project, ui, project.failed_assets.size() - 1U, ignored)) ++added;
+        } catch (const std::exception& error) {
+            ++failed_count;
+            last = path.filename().string() + ": " + error.what();
+            const auto kind = extension == ".sbb" ? FailedAsset::Kind::Building
+                : extension == ".sbl" ? FailedAsset::Kind::Sbl : FailedAsset::Kind::Other;
+            record_failed_asset(project, last, kind, name, path, std::move(bytes), true);
+        }
+    }
+    status = "Imported " + std::to_string(added) + " of " + std::to_string(paths.size()) + " files into the map.";
+    if (failed_count > 0U) {
+        status += " " + std::to_string(failed_count) + " could not be imported; see Load problems.";
+        ui.show_load_problems_window = true;
+    }
+    return added;
+}
+
 void require_complete_project_source(const EditorProject& project) {
     if (!project.save_blocking_load_errors.empty()) {
         throw std::runtime_error("Source map or geometry was not loaded: " + project.save_blocking_load_errors.front() +
@@ -412,8 +571,15 @@ void load_project_csx_geometry(EditorProject& project) {
             for (const auto& entry : archive.entries) {
                 const auto name = std::filesystem::path{entry.name}.stem().string();
                 if (name.empty()) {
-                    if (entry.kind == CsxEntryKind::Sbb || entry.kind == CsxEntryKind::Sbl)
-                        record_source_load_error(project, path.filename().string() + ": geometry entry has no usable name");
+                    if (entry.kind == CsxEntryKind::Sbb || entry.kind == CsxEntryKind::Sbl) {
+                        std::vector<std::uint8_t> bytes = entry.payload;
+                        try {
+                            bytes = entry.kind == CsxEntryKind::Sbb ? normalize_packed_sbb_bytes(entry.payload) : normalize_packed_sbl_bytes(entry.payload);
+                        } catch (const std::exception&) {
+                        }
+                        record_failed_asset(project, path.filename().string() + ": geometry entry has no usable name",
+                            entry.kind == CsxEntryKind::Sbb ? FailedAsset::Kind::Building : FailedAsset::Kind::Sbl, {}, path, std::move(bytes));
+                    }
                     continue;
                 }
                 try {
@@ -486,6 +652,7 @@ void load_project_csx_geometry(EditorProject& project) {
         std::optional<SbbBuilding> building;
         std::optional<SblTemplate> sbl;
         std::string warning;  // if set, add it to load_warnings and skip the merge
+        FailedAsset::Kind failed_kind{FailedAsset::Kind::Other};
     };
 
     // Put every CSX entry from every archive into one work list, in archive and entry
@@ -524,14 +691,23 @@ void load_project_csx_geometry(EditorProject& project) {
         const auto& entry = archives[ref.archive_index].entries[ref.entry_index];
         const auto& path = csx_paths[ref.archive_index];
         const auto name = std::filesystem::path{entry.name}.stem().string();
-        if (name.empty()) {
-            if (entry.kind == CsxEntryKind::Sbb || entry.kind == CsxEntryKind::Sbl)
-                parsed[i].warning = path.filename().string() + ": geometry entry has no usable name";
-            return;
-        }
         ParsedGeometry out;
         out.name = name;
         out.source = path;
+        out.failed_kind = entry.kind == CsxEntryKind::Sbb ? FailedAsset::Kind::Building
+            : entry.kind == CsxEntryKind::Sbl ? FailedAsset::Kind::Sbl : FailedAsset::Kind::Other;
+        if (name.empty()) {
+            if (entry.kind == CsxEntryKind::Sbb || entry.kind == CsxEntryKind::Sbl) {
+                out.warning = path.filename().string() + ": geometry entry has no usable name";
+                out.bytes = entry.payload;
+                try {
+                    out.bytes = entry.kind == CsxEntryKind::Sbb ? normalize_packed_sbb_bytes(entry.payload) : normalize_packed_sbl_bytes(entry.payload);
+                } catch (const std::exception&) {
+                }
+                parsed[i] = std::move(out);
+            }
+            return;
+        }
         try {
             if (entry.kind == CsxEntryKind::Sbb) {
                 out.bytes = normalize_packed_sbb_bytes(entry.payload);
@@ -554,7 +730,7 @@ void load_project_csx_geometry(EditorProject& project) {
     // Merge one at a time in the original order (the CSX-wins merge depends on order).
     for (auto& item : parsed) {
         if (!item.warning.empty()) {
-            record_source_load_error(project, std::move(item.warning));
+            record_failed_asset(project, std::move(item.warning), item.failed_kind, std::move(item.name), item.source, std::move(item.bytes));
             continue;
         }
         if (item.kind == GeometryKind::Sbb) {
@@ -694,7 +870,7 @@ std::optional<EditorProject> load_project_folder(const std::filesystem::path& fo
         });
         for (auto& r : results) {
             if (!r.warning.empty()) {
-                record_source_load_error(project, std::move(r.warning));
+                record_failed_asset(project, std::move(r.warning), FailedAsset::Kind::Building, stem_name(r.path), r.path, std::move(r.bytes));
                 continue;
             }
             project.buildings.push_back({r.path, stem_name(r.path), std::move(*r.building)});
@@ -729,7 +905,7 @@ std::optional<EditorProject> load_project_folder(const std::filesystem::path& fo
         });
         for (auto& r : results) {
             if (!r.warning.empty()) {
-                record_source_load_error(project, std::move(r.warning));
+                record_failed_asset(project, std::move(r.warning), FailedAsset::Kind::Sbl, stem_name(r.path), r.path, std::move(r.bytes));
                 continue;
             }
             if (r.parsed->block.has_value()) {
@@ -768,7 +944,7 @@ std::optional<EditorProject> load_project_folder(const std::filesystem::path& fo
         });
         for (auto& r : results) {
             if (!r.warning.empty()) {
-                record_source_load_error(project, std::move(r.warning));
+                record_failed_asset(project, std::move(r.warning), FailedAsset::Kind::Sbl, stem_name(r.path), r.path, std::move(r.bytes));
                 continue;
             }
             if (!r.parsed->layers.empty()) {

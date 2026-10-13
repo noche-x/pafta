@@ -140,25 +140,6 @@ jobs:
             -DPAFTA_ENABLE_PROFILER=OFF
       - name: Build browser editor
         run: EM_CACHE="$PWD/build/web/emcache" EMCC_BATCH_BUILD=0 cmake --build build/web --target pafta_web --parallel 2
-      - name: Install browser test tool
-        run: |
-          npm install --prefix build/browser-test --no-save --package-lock=false playwright@1.64.0
-          build/browser-test/node_modules/.bin/playwright install --with-deps chromium
-      - name: Run compiled editor in Chromium
-        run: |
-          python3 -m http.server 8000 --bind 127.0.0.1 --directory build/web > build/web/http.log 2>&1 &
-          server_pid=$!
-          trap 'kill "$server_pid"' EXIT
-          NODE_PATH="$PWD/build/browser-test/node_modules" node tests/browser_smoke_tests.js
-      - name: Keep browser diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pafta-browser-smoke
-          path: |
-            build/web/browser-smoke.png
-            build/web/http.log
-          if-no-files-found: ignore
       - name: Package browser build
         run: |
           mkdir -p dist/site

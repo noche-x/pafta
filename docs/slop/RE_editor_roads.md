@@ -215,7 +215,7 @@ Based on how `editor.exe` really behaves:
 1. Storing streets: keep them as plain node and segment records, the same as the SBC layout. Do not put them in a voxel grid in the editor.
 2. Drawing streets: draw nodes as marker gizmos plus the grown node and street guide quads, exactly as `RenderStreetToolNodeAndSegmentOverlays` sets them up.
 3. Placing pieces: use `SetPortalVoxelData` → `SetVoxelCellData` for custom city pieces, with the same default of a solid voxel (`0x40000000`) and the block-mesh fallback (`0x80000000|idx`) from `UpdatePieceVoxelData`.
-4. Keeping the game separate: when the port later loads the same SBC in a game-like view, that part should make road tiles the way subrosa.exe does (`MapConnector_PlaceStreetSegmentTilesAndSlopes` and the rest), as described in `docs/RE_roads_spec.md` and `docs/RE_terrain_spec.md`.
+4. Keeping the game separate: when the port later loads the same SBC in a game-like view, that part should make road tiles the way subrosa.exe does (`MapConnector_PlaceStreetSegmentTilesAndSlopes` and the rest), as described in `docs/slop/RE_roads_spec.md` and `docs/slop/RE_terrain_spec.md`.
 5. Do not place editor roads as `0x40000000` solid cells in the editor preview. The real editor does not, so doing it in the port would be wrong.
 
 ## 9. Open questions

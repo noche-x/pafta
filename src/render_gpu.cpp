@@ -16,6 +16,7 @@ void ImGui_ImplRaylib_UpdateTexture(ImTextureData* tex);
 #endif
 
 #include <algorithm>
+#include <cfloat>
 #if defined(__APPLE__)
 #include <malloc/malloc.h>
 #elif defined(__GLIBC__)
@@ -2972,6 +2973,51 @@ void draw_sbb_scene_for_app(
 // Item sets placed the way the game places them (setup_item_sets / entry_pose):
 // each item stands on the centre of the cell's floor, turned with the set in quarter
 // turns around Y. Sets whose items have no data/item mesh keep a gold diamond marker.
+// Draws the items of one set, untextured and shaded by facing, around `origin` (the
+// centre of a cell's floor) turned by `quarter_turns`. False when none of its item
+// meshes are loaded.
+bool draw_item_set_items(const EditorProject& project, const std::vector<SisItem>& items, Vector3 origin, std::uint32_t quarter_turns) {
+    const float angle = static_cast<float>(quarter_turns & 3U) * PI * 0.5F;
+    const float c = std::cos(angle), s = std::sin(angle);
+    const auto turn = [&](Vec3f v) { return Vec3f{v.x * c - v.z * s, v.y, v.x * s + v.z * c}; };
+    bool drawn = false;
+    rlDrawRenderBatchActive();
+    rlDisableBackfaceCulling();
+    rlBegin(RL_TRIANGLES);
+    for (const auto& item : items) {
+        const auto mesh = project.item_meshes.find(lower_name(item.type));
+        if (mesh == project.item_meshes.end()) continue;
+        drawn = true;
+        const auto p = turn(item.pos);
+        const std::array<Vec3f, 3> r{turn(item.rot[0]), turn(item.rot[1]), turn(item.rot[2])};
+        const auto world = [&](std::uint32_t i) {
+            const auto l = i < mesh->second.vertices.size() ? mesh->second.vertices[i] : Vec3f{};
+            return Vector3{origin.x + p.x + r[0].x * l.x + r[1].x * l.y + r[2].x * l.z,
+                origin.y + p.y + r[0].y * l.x + r[1].y * l.y + r[2].y * l.z,
+                origin.z + p.z + r[0].z * l.x + r[1].z * l.y + r[2].z * l.z};
+        };
+        for (const auto& face : mesh->second.faces) {
+            if (face.size() < 3) continue;
+            const auto a = world(face[0]), b = world(face[1]), d = world(face[2]);
+            // No texture: shade by how much the face points up.
+            const auto n = Vector3Normalize(Vector3CrossProduct(Vector3Subtract(b, a), Vector3Subtract(d, a)));
+            const auto light = static_cast<unsigned char>(120.0F + 100.0F * std::fabs(n.y) + 30.0F * std::fabs(n.x));
+            rlColor4ub(light, light, static_cast<unsigned char>(light * 0.9F), 255);
+            for (std::size_t k = 1; k + 1 < face.size(); ++k) {
+                const auto v1 = world(face[k]), v2 = world(face[k + 1]);
+                rlVertex3f(a.x, a.y, a.z); rlVertex3f(v1.x, v1.y, v1.z); rlVertex3f(v2.x, v2.y, v2.z);
+            }
+        }
+    }
+    rlEnd();
+    // rlgl draws its batch later, so flush it while culling is still off. Otherwise
+    // the items draw with culling on, and .it3 faces wind the other way, so only
+    // their back faces showed (they looked inside out).
+    rlDrawRenderBatchActive();
+    rlEnableBackfaceCulling();
+    return drawn;
+}
+
 void draw_building_item_set_guides(const EditorProject& project, const SbbBuilding& building, std::optional<std::uint32_t> floor) {
     constexpr float unit = 4.0F;
     constexpr Color color{250, 196, 75, 255};
@@ -2983,42 +3029,8 @@ void draw_building_item_set_guides(const EditorProject& project, const SbbBuildi
         const auto name_index = sbb_item_set_name_index(cell.item_set_index);
         const auto set = name_index < building.item_set_names.size()
             ? project.item_sets.find(lower_name(building.item_set_names[name_index])) : project.item_sets.end();
-        const float angle = static_cast<float>(sbb_item_set_rotation(cell.item_set_index)) * PI * 0.5F;
-        const float c = std::cos(angle), s = std::sin(angle);
-        const auto turn = [&](Vec3f v) { return Vec3f{v.x * c - v.z * s, v.y, v.x * s + v.z * c}; };
-        bool drawn = false;
-        if (set != project.item_sets.end()) {
-            rlDisableBackfaceCulling();
-            rlBegin(RL_TRIANGLES);
-            for (const auto& item : set->second) {
-                const auto mesh = project.item_meshes.find(lower_name(item.type));
-                if (mesh == project.item_meshes.end()) continue;
-                drawn = true;
-                const auto p = turn(item.pos);
-                const std::array<Vec3f, 3> r{turn(item.rot[0]), turn(item.rot[1]), turn(item.rot[2])};
-                const auto world = [&](std::uint32_t i) {
-                    const auto l = i < mesh->second.vertices.size() ? mesh->second.vertices[i] : Vec3f{};
-                    return Vector3{x + p.x + r[0].x * l.x + r[1].x * l.y + r[2].x * l.z,
-                        y + p.y + r[0].y * l.x + r[1].y * l.y + r[2].y * l.z,
-                        z + p.z + r[0].z * l.x + r[1].z * l.y + r[2].z * l.z};
-                };
-                for (const auto& face : mesh->second.faces) {
-                    if (face.size() < 3) continue;
-                    const auto a = world(face[0]), b = world(face[1]), d = world(face[2]);
-                    // No texture: shade by how much the face points up.
-                    const auto n = Vector3Normalize(Vector3CrossProduct(Vector3Subtract(b, a), Vector3Subtract(d, a)));
-                    const auto light = static_cast<unsigned char>(120.0F + 100.0F * std::fabs(n.y) + 30.0F * std::fabs(n.x));
-                    rlColor4ub(light, light, static_cast<unsigned char>(light * 0.9F), 255);
-                    for (std::size_t k = 1; k + 1 < face.size(); ++k) {
-                        const auto v1 = world(face[k]), v2 = world(face[k + 1]);
-                        rlVertex3f(a.x, a.y, a.z); rlVertex3f(v1.x, v1.y, v1.z); rlVertex3f(v2.x, v2.y, v2.z);
-                    }
-                }
-            }
-            rlEnd();
-            rlEnableBackfaceCulling();
-        }
-        if (drawn) continue;
+        if (set != project.item_sets.end() &&
+            draw_item_set_items(project, set->second, {x, y, z}, sbb_item_set_rotation(cell.item_set_index))) continue;
         const float top = y + unit + 0.08F;
         const Vector3 north{x, top, z - 1.3F};
         const Vector3 east{x + 1.3F, top, z};
@@ -3029,6 +3041,51 @@ void draw_building_item_set_guides(const EditorProject& project, const SbbBuildi
         DrawLine3D(south, west, color);
         DrawLine3D(west, north, color);
     }
+}
+
+const RenderTexture2D* item_set_thumbnail(EditorProject& project, const std::string& name) {
+    const auto key = lower_name(name);
+    const auto set = project.item_sets.find(key);
+    if (set == project.item_sets.end()) return nullptr;
+    if (const auto found = project.item_set_thumbnails.find(key); found != project.item_set_thumbnails.end()) return &found->second;
+    if (project.thumbnail_budget <= 0) return nullptr;
+    --project.thumbnail_budget;
+    // Frame the items themselves, over a patch of floor under them.
+    Vector3 lo{FLT_MAX, FLT_MAX, FLT_MAX}, hi{-FLT_MAX, -FLT_MAX, -FLT_MAX};
+    for (const auto& item : set->second) {
+        const auto mesh = project.item_meshes.find(lower_name(item.type));
+        if (mesh == project.item_meshes.end()) continue;
+        for (const auto& l : mesh->second.vertices) {
+            const Vector3 v{item.pos.x + item.rot[0].x * l.x + item.rot[1].x * l.y + item.rot[2].x * l.z,
+                item.pos.y + item.rot[0].y * l.x + item.rot[1].y * l.y + item.rot[2].y * l.z,
+                item.pos.z + item.rot[0].z * l.x + item.rot[1].z * l.y + item.rot[2].z * l.z};
+            lo = Vector3Min(lo, v);
+            hi = Vector3Max(hi, v);
+        }
+    }
+    if (lo.x > hi.x) lo = hi = {};
+    const auto center = Vector3Scale(Vector3Add(lo, hi), 0.5F);
+    const float radius = std::max(0.5F, Vector3Distance(lo, hi) * 0.5F);
+    const float dist = radius * 1.9F;
+    Camera3D cam{};
+    cam.position = {center.x + dist * 0.7F, center.y + dist * 0.6F, center.z + dist * 0.7F};
+    cam.target = center;
+    cam.up = {0.0F, 1.0F, 0.0F};
+    cam.fovy = 45.0F;
+    cam.projection = CAMERA_PERSPECTIVE;
+    auto& target = project.item_set_thumbnails[key];
+    target = LoadRenderTexture(128, 128);
+    begin_game_texture_mode(target);
+    ClearBackground(Color{32, 36, 41, 255});
+    BeginMode3D(cam);
+    rlEnableDepthTest();
+    DrawPlane({center.x, std::min(0.0F, lo.y) - 0.01F, center.z}, {radius * 3.0F, radius * 3.0F}, Color{70, 74, 80, 255});
+    if (!draw_item_set_items(project, set->second, {}, 0U)) {
+        DrawCube({0.0F, 0.6F, 0.0F}, 1.2F, 1.2F, 1.2F, Color{250, 196, 75, 255});
+    }
+    EndMode3D();
+    end_game_texture_mode();
+    return &target;
 }
 
 void invalidate_building_thumbnail(EditorProject& project, std::size_t index) {

@@ -2,7 +2,7 @@
 
 Review date: 2026-10-13. Target: 0.1.0 beta.
 
-This page keeps the checks that are done apart from the work still needed before release. Use it while preparing a release candidate, and write down the commit, platform, toolchain, map, and result for each check. For everyday use, see [Using](../README.md#open-a-map) and [Edit and save](../README.md#edit-and-save). The [Downloading](../README.md#beta-builds) section explains the beta archives.
+This page keeps the checks that are done apart from the work still needed before release. Use it while preparing a release candidate, and write down the commit, platform, toolchain, map, and result for each check. For everyday use, see [Using](USAGE.md#open-a-map) and [Edit and save](USAGE.md#edit-and-save). The [Downloading](../README.md#artifact-builds) section explains the beta archives.
 
 ## Checks needed before release
 
@@ -60,7 +60,7 @@ Built-in floor catalog IDs 16 to 19 still use flat stand-in shapes. Their real c
 
 Nobody has proven that the editor draws things exactly like the game. The format notes separate rules taken from the game's code from unknown fields, but that is not a visual comparison. Native and WebGL rendering both need their own checks near the switch between interior and distant views, with see-through windows, and around objects that cast shadows.
 
-Some research pages have no binary hash or point to decompiled code kept outside this repository. [The building-canvas note](RE_editor_building_canvas.md) gives the `editor.exe` hash. Checking the other addresses needs the matching original binary; the test files cannot prove where those addresses came from.
+Some research pages have no binary hash or point to decompiled code kept outside this repository. [The building-canvas note](slop/RE_editor_building_canvas.md) gives the `editor.exe` hash. Checking the other addresses needs the matching original binary; the test files cannot prove where those addresses came from.
 
 ## Code and design review
 

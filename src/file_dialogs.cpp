@@ -29,9 +29,17 @@ bool dialog_accepted(nfdresult_t result) {
 }
 
 std::vector<std::filesystem::path> dialog_open_archive_assets() {
+    return dialog_open_files("Archive assets", "csx,sbb,sbl,png");
+}
+
+std::vector<std::filesystem::path> dialog_open_map_assets() {
+    return dialog_open_files("Buildings, blocks, and textures", "sbb,sbl,png");
+}
+
+std::vector<std::filesystem::path> dialog_open_files(const char* label, const char* extensions) {
     NFD::Guard guard;
     NFD::UniquePathSet selected;
-    const nfdu8filteritem_t filters[] = {{"Archive assets", "csx,sbb,sbl,png"}};
+    const nfdu8filteritem_t filters[] = {{label, extensions}};
     if (!dialog_accepted(NFD::OpenDialogMultiple(selected, filters, 1))) return {};
 
     nfdpathsetsize_t count = 0;

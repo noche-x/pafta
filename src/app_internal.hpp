@@ -352,10 +352,34 @@ struct ArchiveWorkspace {
     std::uint64_t map_fingerprint{};
     std::optional<CsxArchive> refill;
     std::size_t refill_step{};
+    // Files that could not be added, why, and their automatic fix if there is one.
+    struct FailedImport {
+        std::filesystem::path path;
+        std::string error;
+        std::optional<FileRepair> repair;
+    };
+    std::vector<FailedImport> failed_imports;
+};
+
+// A source file that failed to load, kept so it can be fixed later. repair is the
+// automatic fix found for it, if any.
+struct FailedAsset {
+    enum class Kind { Building, Sbl, Other };
+    Kind kind{Kind::Other};
+    std::string name;
+    std::filesystem::path source;
+    std::vector<std::uint8_t> bytes;
+    std::string message;  // the same text as its load_warnings line
+    std::optional<FileRepair> repair;
+    // Came from Import into map, not from the map folder, so it doesn't block Save
+    // and can be dismissed.
+    bool imported{};
 };
 
 struct EditorProject {
     std::filesystem::path root;
+    // Files that failed to load, with their bytes, for "Try auto-fixing".
+    std::vector<FailedAsset> failed_assets;
     // Loose files beat test.csx copies of the same asset (chosen when opening).
     bool loose_files_win{};
     // Loaded texture and unknown archive payloads survive moving or deleting the source.
@@ -500,6 +524,8 @@ struct EditorProject {
     std::vector<bool> city_block_thumbnail_ready;
     std::vector<RenderTexture2D> block_thumbnails;
     std::vector<bool> block_thumbnail_ready;
+    // Item set thumbnails by lower-case set name.
+    std::unordered_map<std::string, RenderTexture2D> item_set_thumbnails;
     // The Pieces tab preview comes from one city-block definition and the current
     // block-mesh catalog. Keep it between frames and rebuild it after edits.
     CityBlockPreviewScene cached_city_block_preview_scene;
@@ -735,6 +761,8 @@ struct EditorUi {
     bool buildblock_window_focused{};
     bool show_changes_window{};
     bool show_map_image_window{};
+    // Opens by itself when a map loads with files that failed.
+    bool show_load_problems_window{};
     // How many cells above (or below) the surface under the cursor the Road, Piece, and
     // Building tools place. Page Up/Down change it.
     int place_height_offset{};
@@ -1284,6 +1312,22 @@ std::string lower_extension(const std::filesystem::path& path);
 std::vector<std::uint8_t> normalize_packed_sbb_bytes(const std::vector<std::uint8_t>& payload);
 std::vector<std::uint8_t> normalize_packed_sbl_bytes(const std::vector<std::uint8_t>& payload);
 void require_complete_project_source(const EditorProject& project);
+// Loads failed asset `index` with its repair; false when it has none. The building
+// or block joins the map (marked changed, so Save writes it) and its load error is
+// cleared, which unblocks Save once every error is gone.
+bool apply_asset_repair(EditorProject& project, EditorUi& ui, std::size_t index, std::string& status);
+// Assets → Import into map: adds .sbb buildings, .sbl blocks and buildblocks, and
+// .png textures to the open map, replacing assets with the same name. Files that
+// fail are listed in Load problems (with a fix when there is one) and don't block
+// Save. Returns how many were added.
+std::size_t import_files_into_project(EditorProject& project, EditorUi& ui, const std::vector<std::filesystem::path>& paths,
+                                      std::string& status);
+// A plain-language explanation of a parser error, added after its text.
+std::string explain_problem(const std::string& error);
+// The list of files that failed to load, why, and a "Try auto-fixing" button for
+// each one that can be fixed (ui_archive.cpp).
+void draw_load_problems(EditorProject& project, EditorUi& ui, std::string& status);
+void draw_load_problems_window(EditorProject& project, EditorUi& ui, std::string& status);
 void promote_city(EditorProject& project);
 CsxArchive project_archive(const EditorProject& project);
 // project_archive in steps, so the archive window can fill in over several frames
@@ -1295,7 +1339,7 @@ void project_archive_finish(CsxArchive& archive);
 void import_project_archive(ArchiveWorkspace& workspace, const EditorProject& project);
 void save_archive_to(ArchiveWorkspace& workspace, std::filesystem::path path);
 bool save_archive_workspace(ArchiveWorkspace& workspace);
-void draw_csx_editor(ArchiveWorkspace& workspace, bool& open, EditorProject* project);
+void draw_csx_editor(ArchiveWorkspace& workspace, bool& open, EditorProject* project, EditorUi& ui, std::string& status);
 
 std::optional<std::filesystem::path> dropped_folder();
 std::vector<std::size_t> occupied_cell_indices(const SbbBuilding& building);
@@ -1338,6 +1382,9 @@ const RenderTexture2D* city_block_thumbnail(EditorProject& project, std::size_t 
 // Block-mesh thumbnail, drawn when first needed (ui_windows.cpp); nullptr until
 // ready.
 const RenderTexture2D* block_thumbnail(EditorProject& project, std::size_t index);
+// A 3D thumbnail of an item set's items on one cell (render_gpu.cpp); nullptr when
+// the set's .sis was not found or the thumbnail isn't drawn yet.
+const RenderTexture2D* item_set_thumbnail(EditorProject& project, const std::string& name);
 void invalidate_buildblock_preview_scene(EditorProject& project);
 const BuildblockPreviewScene& buildblock_preview_scene(EditorProject& project, std::size_t index);
 void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& status);

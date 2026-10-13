@@ -2,6 +2,7 @@
 build/
 build-debug/
 build-*/
+cmake-build-debug/
 out/
 dist/
 

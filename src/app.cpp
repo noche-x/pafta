@@ -3789,6 +3789,10 @@ void draw_viewport_context_menu(EditorProject& project, EditorUi& ui, Camera3D& 
 // destroyed. RenderTexture2D is plain data with no destructor, so this has to be done
 // by hand.
 void free_project_thumbnails(EditorProject& project) {
+    for (auto& [name, rt] : project.item_set_thumbnails) {
+        if (rt.id != 0U) UnloadRenderTexture(rt);
+    }
+    project.item_set_thumbnails.clear();
     for (auto& rt : project.building_thumbnails) {
         if (rt.id != 0U) {
             UnloadRenderTexture(rt);
@@ -5155,6 +5159,18 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                         name = std::string{stem} + "_" + std::to_string(suffix);
                     return name;
                 };
+#ifndef __EMSCRIPTEN__
+                if (ImGui::MenuItem(ICON_FA_FILE_IMPORT " Import into map...")) {
+                    try {
+                        const auto paths = dialog_open_map_assets();
+                        if (!paths.empty()) import_files_into_project(*project, ui, paths, status);
+                    } catch (const std::exception& error) {
+                        report_failure(status, std::string{"Import failed: "} + error.what());
+                    }
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Add .sbb buildings, .sbl blocks, and .png textures to this map.\nAssets with the same name are replaced.");
+                ImGui::Separator();
+#endif
                 if (ImGui::MenuItem(ICON_FA_MAP " New city", nullptr, false, !project->city)) {
                     SbcMap map{}; map.version = 12;
                     project->city = LoadedAsset<SbcMap>{project->root / "city2.sbc", "city2", map, true, true};
@@ -5258,6 +5274,7 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 ImGui::MenuItem(ICON_FA_TABLE_CELLS " Buildblock", action_shortcut_label(ui, EditorAction::WindowBuildblock).c_str(), &ui.show_buildblock_window, project.has_value());
                 ImGui::MenuItem(ICON_FA_CLOCK_ROTATE_LEFT " Changes since save", action_shortcut_label(ui, EditorAction::WindowChanges).c_str(), &ui.show_changes_window, project.has_value());
                 ImGui::MenuItem(ICON_FA_MAP " Map image", nullptr, &ui.show_map_image_window, project.has_value());
+                ImGui::MenuItem(ICON_FA_TRIANGLE_EXCLAMATION " Load problems", nullptr, &ui.show_load_problems_window, project.has_value());
                 ImGui::Separator();
                 // Preferences is under Edit. The graphics debug overlay is a developer
                 // tool, so it stays on its key only (listed under Shortcuts).
@@ -5573,7 +5590,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
             }
         }
         if (project) draw_city_upgrade_dialogs(*project, ui, status);
-        draw_csx_editor(archive_workspace, show_csx_editor, project ? &*project : nullptr);
+        draw_csx_editor(archive_workspace, show_csx_editor, project ? &*project : nullptr, ui, status);
+        if (project) draw_load_problems_window(*project, ui, status);
         static std::string shown_error;
         if (!g_failure_message.empty() && !ImGui::IsPopupOpen("Operation failed")) {
             shown_error = std::move(g_failure_message);
@@ -5968,6 +5986,8 @@ start_city_scene_rebuild(*project, scene_fingerprint);
 #endif
                 set_status(*project);
                 status = "loaded " + project->root.filename().string();
+                // Files that failed to load are listed, with fixes where there are some.
+                ui.show_load_problems_window = !project->load_warnings.empty();
                 // A newly opened map always starts in the City view.
                 ui.tab = EditorTab::City;
                 ui.city_tool = CityTool::Select;
@@ -5984,6 +6004,10 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                     if (const auto* asset = find_building_asset(*project, name)) {
                         ui.selected_building = static_cast<std::size_t>(asset - project->buildings.data());
                     }
+                }
+                if (screenshot_tab == "buildings_items") {
+                    ui.tab = EditorTab::Buildings;
+                    ui.building_tool = BuildingTool::ItemSet;
                 }
                 if (screenshot_tab == "buildings_place") {
                     ui.tab = EditorTab::Buildings;
@@ -6009,6 +6033,10 @@ start_city_scene_rebuild(*project, scene_fingerprint);
                 if (screenshot_tab == "win_preferences") ui.show_preferences_window = true;
                 if (screenshot_tab == "win_map") ui.show_map_image_window = true;
                 if (screenshot_tab == "win_csx") show_csx_editor = true;
+                if (screenshot_tab == "autofix") {
+                    for (std::size_t i = project->failed_assets.size(); i-- > 0;) apply_asset_repair(*project, ui, i, status);
+                    std::printf("autofix: %zu warnings left, %zu buildings\n", project->load_warnings.size(), project->buildings.size());
+                }
                 if (screenshot_tab == "win_shortcuts") ui.show_shortcuts_window = true;
                 if (screenshot_path && project->city && !project->city->data.buildings.empty() && screenshot_tab != "pieces") {
                     ui.city_tool = CityTool::Select;

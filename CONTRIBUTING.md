@@ -1,6 +1,6 @@
 # Contributing to Pafta
 
-Pafta is in beta. A change can affect the files people save or how a map looks in the game, so start from behavior you can check. [README.md](README.md) explains how the editor works today and its limits. [STYLE_GUIDE.md](STYLE_GUIDE.md) explains how code here is written.
+Pafta is in beta. A change can affect the files people save or how a map looks in the game, so start from behavior you can check. The [usage guide](docs/USAGE.md) explains how the editor works today and its limits. [STYLE_GUIDE.md](STYLE_GUIDE.md) explains how code here is written.
 
 ## Before you edit
 

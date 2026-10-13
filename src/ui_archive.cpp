@@ -69,6 +69,91 @@ const char* kind_label(const CsxEntry& entry) {
 
 } // namespace
 
+std::string explain_problem(const std::string& error) {
+    struct Hint { const char* match; const char* text; };
+    static constexpr Hint hints[] = {
+        {"Truncated SBB cell volume", "The file ends before all of its cells: it is shorter than the size in its header says."},
+        {"Truncated", "The file ends before the data its header promises."},
+        {"no usable name", "The archive entry has an empty name, so nothing can refer to it."},
+        {"Unsupported SBB version", "The building was saved in a format version Pafta does not read."},
+        {"exceed the supported 64-cell grid", "The building is larger than the game's 64 x 64 cell grid."},
+        {"Asset name must be", "Asset names need 1 to 51 characters with no / \\ or :."},
+        {"Expected a PNG image", "The file is not a PNG image."},
+    };
+    for (const auto& hint : hints) {
+        if (error.find(hint.match) != std::string::npos) return hint.text;
+    }
+    return {};
+}
+
+void draw_load_problems(EditorProject& project, EditorUi& ui, std::string& status) {
+    if (project.load_warnings.empty()) {
+        ImGui::TextDisabled(ICON_FA_CIRCLE_CHECK " Every file loaded.");
+        return;
+    }
+    const auto fixable = static_cast<std::size_t>(std::ranges::count_if(project.failed_assets, [](const FailedAsset& failed) {
+        return failed.repair.has_value();
+    }));
+    ImGui::TextColored(ImVec4(1.0F, 0.75F, 0.3F, 1.0F), ICON_FA_TRIANGLE_EXCLAMATION " %zu %s did not load.",
+        project.load_warnings.size(), project.load_warnings.size() == 1U ? "file" : "files");
+    if (!project.save_blocking_load_errors.empty()) {
+        ImGui::TextWrapped("Saving and writing test.csx stay off until each one is fixed or removed, so nothing is lost by accident.");
+    }
+    if (fixable > 1U) {
+        if (ImGui::Button((std::string{ICON_FA_WAND_MAGIC_SPARKLES " Try auto-fixing all ("} + std::to_string(fixable) + ")").c_str())) {
+            for (std::size_t i = project.failed_assets.size(); i-- > 0;) {
+                if (project.failed_assets[i].repair) apply_asset_repair(project, ui, i, status);
+            }
+            status = "Auto-fixed " + std::to_string(fixable) + " files. Save to keep the fixes.";
+        }
+    }
+    ImGui::PushTextWrapPos(0.0F);
+    std::optional<std::size_t> fix, dismiss;
+    for (std::size_t i = 0; i < project.failed_assets.size(); ++i) {
+        const auto& failed = project.failed_assets[i];
+        ImGui::PushID(static_cast<int>(i));
+        ImGui::Separator();
+        ImGui::TextUnformatted(failed.message.c_str());
+        if (const auto why = explain_problem(failed.message); !why.empty()) ImGui::TextUnformatted(why.c_str());
+        ImGui::TextDisabled("%s", failed.source.string().c_str());
+        if (failed.repair) {
+            if (ImGui::Button(ICON_FA_WAND_MAGIC_SPARKLES " Try auto-fixing")) fix = i;
+            ImGui::SameLine();
+            ImGui::TextDisabled("Fix: %s", failed.repair->description.c_str());
+        } else {
+            ImGui::TextDisabled(failed.imported ? "No automatic fix for this one." :
+                "No automatic fix for this one. Repair or remove the file, then reopen the map.");
+        }
+        if (failed.imported) {
+            if (failed.repair) ImGui::SameLine();
+            if (ImGui::Button("Dismiss")) dismiss = i;
+        }
+        ImGui::PopID();
+    }
+    // Warnings without a kept file (for example a broken archive or item set).
+    for (const auto& warning : project.load_warnings) {
+        if (std::ranges::any_of(project.failed_assets, [&](const FailedAsset& failed) { return failed.message == warning; })) continue;
+        ImGui::Separator();
+        ImGui::TextUnformatted(warning.c_str());
+    }
+    ImGui::PopTextWrapPos();
+    if (fix) apply_asset_repair(project, ui, *fix, status);
+    else if (dismiss) {
+        const auto message = project.failed_assets[*dismiss].message;
+        project.failed_assets.erase(project.failed_assets.begin() + static_cast<std::ptrdiff_t>(*dismiss));
+        if (const auto it = std::ranges::find(project.load_warnings, message); it != project.load_warnings.end()) project.load_warnings.erase(it);
+    }
+}
+
+void draw_load_problems_window(EditorProject& project, EditorUi& ui, std::string& status) {
+    if (!ui.show_load_problems_window) return;
+    ImGui::SetNextWindowSize(ImVec2(560.0F, 380.0F), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin(ICON_FA_TRIANGLE_EXCLAMATION " Load problems###LoadProblems", &ui.show_load_problems_window)) {
+        draw_load_problems(project, ui, status);
+    }
+    ImGui::End();
+}
+
 void import_project_archive(ArchiveWorkspace& workspace, const EditorProject& project) {
     workspace.archive = project_archive(project);
     workspace.selected.clear();
@@ -122,7 +207,7 @@ bool save_archive_workspace(ArchiveWorkspace& workspace) {
 // This workspace has its own archive. It follows the open map (refilled a few
 // entries per frame whenever the map's assets change) until you add, remove, or
 // rename something here; after that it keeps your edits until you reload it.
-void draw_csx_editor(ArchiveWorkspace& workspace, bool& open, EditorProject* project) {
+void draw_csx_editor(ArchiveWorkspace& workspace, bool& open, EditorProject* project, EditorUi& ui, std::string& status) {
     auto& archive = workspace.archive;
     auto& input_path = workspace.input_path;
     auto& output_path = workspace.output_path;
@@ -219,9 +304,9 @@ void draw_csx_editor(ArchiveWorkspace& workspace, bool& open, EditorProject* pro
     const auto put = [](auto& bytes, std::size_t at, std::uint32_t value) {
         for (unsigned i = 0; i < 4; ++i) bytes[at + i] = static_cast<std::uint8_t>(value >> (8 * i));
     };
-    const auto import = [&](const std::filesystem::path& path) {
+    const auto import = [&](const std::filesystem::path& path, std::optional<std::vector<std::uint8_t>> repaired = std::nullopt) {
         const auto extension = lower_extension(path);
-        auto bytes = read_file_bytes(path);
+        auto bytes = repaired ? std::move(*repaired) : read_file_bytes(path);
         if (extension == ".csx") {
             auto loaded = parse_csx(bytes);
             if (loaded.magic != 0xc5f17e01U || loaded.entries.size() != loaded.entry_count)
@@ -267,6 +352,27 @@ void draw_csx_editor(ArchiveWorkspace& workspace, bool& open, EditorProject* pro
         }
         edited_by_hand();
         message = "Added " + path.filename().string();
+    };
+    // Adds each file on its own, so one bad file doesn't stop the rest. A file that
+    // fails is listed under "Could not add" with the reason and a fix if there is one.
+    const auto add_files = [&](const std::vector<std::filesystem::path>& paths) {
+        std::size_t added = 0;
+        for (const auto& path : paths) {
+            try {
+                import(path);
+                ++added;
+            } catch (const std::exception& error) {
+                ArchiveWorkspace::FailedImport failed{path, error.what(), std::nullopt};
+                if (lower_extension(path) == ".sbb") {
+                    try { failed.repair = repair_sbb(read_file_bytes(path)); } catch (const std::exception&) {}
+                }
+                std::erase_if(workspace.failed_imports, [&](const auto& other) { return other.path == path; });
+                workspace.failed_imports.push_back(std::move(failed));
+            }
+        }
+        if (added != paths.size()) {
+            message = "Added " + std::to_string(added) + " of " + std::to_string(paths.size()) + " files. See \"Could not add\" above the list.";
+        }
     };
     const auto remove_selected = [&] {
         std::sort(selected.rbegin(), selected.rend());
@@ -334,17 +440,31 @@ void draw_csx_editor(ArchiveWorkspace& workspace, bool& open, EditorProject* pro
         ImGui::SameLine();
     }
 #ifndef __EMSCRIPTEN__
-    if (ImGui::Button(ICON_FA_PLUS " Add files...")) file_action([&] {
+    if (project != nullptr) {
+        // Into the map itself: the building shows in Assets right away, and the list
+        // here refreshes from the map.
+        if (ImGui::Button(ICON_FA_FILE_IMPORT " Import into map...")) file_action([&] {
+            const auto paths = dialog_open_map_assets();
+            if (paths.empty()) return;
+            import_files_into_project(*project, ui, paths, status);
+            message = status;
+            workspace.follows_map = true;
+            workspace.map_fingerprint = 0;
+        });
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Add buildings, blocks, and textures to the open map.\nThey show up in Assets right away and are saved with the map.");
+        ImGui::SameLine();
+    }
+    if (ImGui::Button(ICON_FA_PLUS " Add to archive only...")) file_action([&] {
         const auto paths = dialog_open_archive_assets();
-        for (const auto& path : paths) import(path);
+        add_files(paths);
     });
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Add CSX, SBB, SBL, or PNG files");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Add CSX, SBB, SBL, or PNG files to this archive only.\nThe open map does not get them; use Import into map for that.");
     ImGui::SameLine();
 #else
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0F);
     ImGui::InputTextWithHint("##input_file", "File path", input_path.data(), input_path.size());
     ImGui::SameLine();
-    if (ImGui::Button("Add file")) file_action([&] { import(input_path.data()); });
+    if (ImGui::Button("Add file")) file_action([&] { add_files({std::filesystem::path{input_path.data()}}); });
     ImGui::SameLine();
 #endif
     if (ImGui::Button(ICON_FA_ERASER " Clear")) ImGui::OpenPopup("Clear archive?");
@@ -369,6 +489,76 @@ void draw_csx_editor(ArchiveWorkspace& workspace, bool& open, EditorProject* pro
         const auto fraction = static_cast<float>(workspace.refill_step) / static_cast<float>(steps);
         const auto label = "Reading map assets " + std::to_string(workspace.refill_step) + " / " + std::to_string(steps);
         ImGui::ProgressBar(fraction, ImVec2(-FLT_MIN, 0.0F), label.c_str());
+    }
+
+    // Files from Add files that could not be added, why, and fixes.
+    if (!workspace.failed_imports.empty()) {
+        const auto header = std::string{ICON_FA_CIRCLE_XMARK " Could not add "} + std::to_string(workspace.failed_imports.size()) +
+            (workspace.failed_imports.size() == 1U ? " file" : " files") + "###failed_imports";
+        if (ImGui::CollapsingHeader(header.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
+            std::optional<std::size_t> fix, dismiss;
+            const auto fixable = static_cast<std::size_t>(std::ranges::count_if(workspace.failed_imports, [](const auto& f) { return f.repair.has_value(); }));
+            if (fixable > 1U && ImGui::Button((std::string{ICON_FA_WAND_MAGIC_SPARKLES " Try auto-fixing all ("} + std::to_string(fixable) + ")").c_str())) {
+                fix = workspace.failed_imports.size();  // all
+            }
+            ImGui::PushTextWrapPos(0.0F);
+            for (std::size_t i = 0; i < workspace.failed_imports.size(); ++i) {
+                const auto& failed = workspace.failed_imports[i];
+                ImGui::PushID(static_cast<int>(i));
+                ImGui::Separator();
+                ImGui::Text("%s: %s", failed.path.filename().string().c_str(), failed.error.c_str());
+                if (const auto why = explain_problem(failed.error); !why.empty()) ImGui::TextUnformatted(why.c_str());
+                if (failed.repair) {
+                    ImGui::TextDisabled("Fix: %s. The file on disk is not changed.", failed.repair->description.c_str());
+                    if (ImGui::Button(ICON_FA_WAND_MAGIC_SPARKLES " Try auto-fixing")) fix = i;
+                    ImGui::SameLine();
+                } else {
+                    ImGui::TextDisabled("No automatic fix for this one.");
+                }
+                if (ImGui::Button("Dismiss")) dismiss = i;
+                ImGui::PopID();
+            }
+            ImGui::PopTextWrapPos();
+            const auto apply = [&](std::size_t i) {
+                auto& failed = workspace.failed_imports[i];
+                try {
+                    import(failed.path, failed.repair->bytes);
+                    message = "Added " + failed.path.filename().string() + " (" + failed.repair->description + ")";
+                    return true;
+                } catch (const std::exception& error) {
+                    failed.error = std::string{"the fix did not work: "} + error.what();
+                    failed.repair.reset();
+                    return false;
+                }
+            };
+            if (fix && *fix == workspace.failed_imports.size()) {
+                for (std::size_t i = workspace.failed_imports.size(); i-- > 0;) {
+                    if (workspace.failed_imports[i].repair && apply(i)) workspace.failed_imports.erase(workspace.failed_imports.begin() + static_cast<std::ptrdiff_t>(i));
+                }
+            } else if (fix && apply(*fix)) {
+                workspace.failed_imports.erase(workspace.failed_imports.begin() + static_cast<std::ptrdiff_t>(*fix));
+            } else if (dismiss) {
+                workspace.failed_imports.erase(workspace.failed_imports.begin() + static_cast<std::ptrdiff_t>(*dismiss));
+            }
+        }
+    }
+
+    // Why files are missing from the list, and fixes for them.
+    if (project != nullptr && !project->load_warnings.empty()) {
+        const auto header = std::string{ICON_FA_TRIANGLE_EXCLAMATION " "} + std::to_string(project->load_warnings.size()) +
+            (project->load_warnings.size() == 1U ? " file did not load" : " files did not load") + "###load_problems";
+        if (ImGui::CollapsingHeader(header.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (ImGui::BeginChild("##load_problems", ImVec2(0.0F, ImGui::GetTextLineHeightWithSpacing() * 7.0F), ImGuiChildFlags_Borders)) {
+                const auto before = project->load_warnings.size();
+                draw_load_problems(*project, ui, status);
+                // A fix changes the map's assets, so follow the map again.
+                if (project->load_warnings.size() != before) {
+                    workspace.follows_map = true;
+                    workspace.map_fingerprint = 0;
+                }
+            }
+            ImGui::EndChild();
+        }
     }
 
     // Filter: matches the name or the type.

@@ -478,10 +478,65 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
 
     if (ImGui::CollapsingHeader("Item sets", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::TextDisabled("Names stored in this building. The game reads definitions from data/itemset/*.sis.");
+        // Removing a name clears the blocks that place it and renumbers the blocks that
+        // place a later name, since blocks store the name's position in this list.
+        const auto remove_item_set = [&](std::size_t index) {
+            for (auto& cell : building.cells) {
+                if (!is_sbb_item_set_payload(cell.item_set_index)) continue;
+                const auto used = sbb_item_set_name_index(cell.item_set_index);
+                if (used == index) cell.item_set_index = 0U;
+                else if (used > index) cell.item_set_index = (cell.item_set_index & ~0x3ffU) | (used - 1U);
+                else continue;
+                refresh_sbb_cell_payloads(cell);
+            }
+            building.item_set_names.erase(building.item_set_names.begin() + static_cast<std::ptrdiff_t>(index));
+            if (ui.selected_item_set >= index && ui.selected_item_set > 0U) --ui.selected_item_set;
+            mark_building_changed(project, ui);
+        };
+        std::optional<std::size_t> remove;
         for (std::size_t i = 0; i < building.item_set_names.size(); ++i) {
-            const auto label = std::to_string(i) + "  " + building.item_set_names[i];
-            if (ImGui::Selectable(label.c_str(), ui.selected_item_set == i)) ui.selected_item_set = i;
+            ImGui::PushID(static_cast<int>(i));
+            const auto uses = static_cast<std::size_t>(std::ranges::count_if(building.cells, [&](const SbbCell& cell) {
+                return cell.occupied && is_sbb_item_set_payload(cell.item_set_index) && sbb_item_set_name_index(cell.item_set_index) == i;
+            }));
+            const auto label = std::to_string(i) + "  " + building.item_set_names[i] + (uses ? "  (" + std::to_string(uses) + " placed)" : "");
+            // A small preview of the set; hover the row for a bigger one.
+            const float thumb = ImGui::GetFrameHeight() * 1.4F;
+            const auto* preview = item_set_thumbnail(project, building.item_set_names[i]);
+            if (preview != nullptr) {
+                ImGui::Image(ImTextureID(preview->texture.id), ImVec2(thumb, thumb), ImVec2(0.0F, 1.0F), ImVec2(1.0F, 0.0F));
+            } else {
+                ImGui::Dummy(ImVec2(thumb, thumb));
+            }
+            ImGui::SameLine();
+            if (ImGui::Selectable(label.c_str(), ui.selected_item_set == i, ImGuiSelectableFlags_AllowOverlap, ImVec2(0.0F, thumb))) ui.selected_item_set = i;
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::BeginTooltip();
+                ImGui::TextUnformatted(building.item_set_names[i].c_str());
+                if (preview != nullptr) {
+                    ImGui::Image(ImTextureID(preview->texture.id), ImVec2(192.0F, 192.0F), ImVec2(0.0F, 1.0F), ImVec2(1.0F, 0.0F));
+                } else {
+                    ImGui::TextDisabled("No %s.sis found next to the map, so no preview", building.item_set_names[i].c_str());
+                }
+                ImGui::EndTooltip();
+            }
+            if (ImGui::BeginPopupContextItem("##item_set_menu")) {
+                if (ImGui::MenuItem(ICON_FA_OBJECT_GROUP " Place this set")) {
+                    ui.selected_item_set = i;
+                    ui.clear_item_set = false;
+                    ui.building_tool = BuildingTool::ItemSet;
+                }
+                if (ImGui::MenuItem(ICON_FA_TRASH " Remove")) remove = i;
+                ImGui::EndPopup();
+            }
+            ImGui::SameLine(ImGui::GetContentRegionMax().x - ImGui::GetFrameHeight());
+            if (ImGui::SmallButton(ICON_FA_XMARK)) remove = i;
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(uses ? "Remove this set and clear the %zu blocks that place it" : "Remove this set", uses);
+            }
+            ImGui::PopID();
         }
+        if (remove) remove_item_set(*remove);
         const auto add_name = [&](std::string_view name) {
             if (lower_name(name).ends_with(".sis")) name.remove_suffix(4);
             if (name.empty() || name.size() > 63U || name == "." || name == ".." ||
@@ -509,11 +564,16 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
         if (project.item_set_catalog.empty()) {
             ImGui::TextDisabled("No local .sis files found. Enter a name below.");
         } else {
-            catalog_combo("##item_set_catalog", project.item_set_catalog, ui.item_set_catalog_add);
-            ImGui::SameLine();
-            ImGui::BeginDisabled(building.item_set_names.size() >= 1024U);
-            if (ImGui::Button("Add##item_set_catalog")) add_name(project.item_set_catalog[ui.item_set_catalog_add]);
-            ImGui::EndDisabled();
+            // Every .sis found, as previews; click one to add it to this building.
+            static std::array<char, 128> catalog_search{};
+            const auto picked = search_grid("item_set_catalog", catalog_search, project.item_set_catalog.size(),
+                project.item_set_catalog.size(), 56.0F, 150.0F,
+                [&](std::size_t i) -> const std::string& { return project.item_set_catalog[i]; },
+                [&](std::size_t i) {
+                    const auto* t = item_set_thumbnail(project, project.item_set_catalog[i]);
+                    return std::pair{t != nullptr ? t->texture.id : 0U, true};
+                });
+            if (picked && building.item_set_names.size() < 1024U) add_name(project.item_set_catalog[*picked]);
         }
         ImGui::InputTextWithHint("##new_item_set_name", "Other item-set name", ui.new_item_set_name.data(), ui.new_item_set_name.size());
         ImGui::SameLine();
@@ -528,7 +588,15 @@ void draw_building_inspector(EditorProject& project, EditorUi& ui, std::string& 
         ImGui::SameLine();
         if (ImGui::RadioButton("Clear", ui.clear_item_set)) ui.clear_item_set = true;
         if (!ui.clear_item_set) {
-            catalog_combo("##item_set_to_place", building.item_set_names, ui.selected_item_set);
+            static std::array<char, 128> place_search{};
+            const auto picked = search_grid("item_set_to_place", place_search, building.item_set_names.size(),
+                ui.selected_item_set, 56.0F, 150.0F,
+                [&](std::size_t i) -> const std::string& { return building.item_set_names[i]; },
+                [&](std::size_t i) {
+                    const auto* t = item_set_thumbnail(project, building.item_set_names[i]);
+                    return std::pair{t != nullptr ? t->texture.id : 0U, true};
+                });
+            if (picked) ui.selected_item_set = *picked;
             static constexpr std::array<const char*, 4> rotations{"0\xC2\xB0", "90\xC2\xB0", "180\xC2\xB0", "270\xC2\xB0"};
             int rotation = static_cast<int>(ui.item_set_rotation & 3U);
             field_label("Rotation");

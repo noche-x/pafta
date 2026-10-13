@@ -419,6 +419,18 @@ SbcMap parse_sbc_file(const std::filesystem::path& path);
 SblTemplate parse_sbl(const std::vector<std::uint8_t>& bytes);
 SblTemplate parse_sbl_file(const std::filesystem::path& path);
 CsxArchive parse_csx(const std::vector<std::uint8_t>& bytes);
+// A fix for a file that fails to parse: the repaired bytes and what changed.
+struct FileRepair {
+    std::vector<std::uint8_t> bytes;
+    std::string description;
+};
+// An SBB whose cell volume stops early (the header and name tables are complete,
+// only cells at the end are missing) is resaved the way editor.exe resaves it: the
+// missing cells empty, version 14, and the end marker (SaveBuilding_SBB @1400548d0
+// writes every cell, then 1 and a group count from @1400563d0). Older buildings
+// such as lamar-motel are one cell short. nullopt when there is nothing to fix or
+// the damage is somewhere else.
+std::optional<FileRepair> repair_sbb(const std::vector<std::uint8_t>& bytes);
 std::vector<SisItem> parse_sis(const std::vector<std::uint8_t>& bytes);
 It3Mesh parse_it3(const std::vector<std::uint8_t>& bytes);
 CsxArchive parse_csx_file(const std::filesystem::path& path);

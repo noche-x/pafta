@@ -2899,6 +2899,43 @@ void patches_sbb_cells() {
     assert(reparsed.cells[1].placed_flag() == 56);
 }
 
+void repairs_sbb_with_short_cell_volume() {
+    pafta::SbbBuilding building{};
+    building.version = 14;
+    building.size_x = 2;
+    building.size_y = 2;
+    building.size_z = 1;
+    building.materials = {"concrete"};
+    building.cells.resize(9);
+    for (std::size_t i = 0; i < building.cells.size(); ++i) {
+        building.cells[i].index = i;
+        building.cells[i].x = static_cast<std::uint32_t>(i % 3U);
+        building.cells[i].z = static_cast<std::uint32_t>(i / 3U);
+    }
+    building.cells[0].exterior_block() = 0x40000000U;
+    auto bytes = pafta::rebuild_sbb(building);
+    // Cut the last cell, like the shipped lamar-motel.sbb.
+    bytes.resize(bytes.size() - 0x3c);
+    bool rejected = false;
+    try { (void)pafta::parse_sbb(bytes); } catch (const std::exception&) { rejected = true; }
+    assert(rejected);
+    const auto repair = pafta::repair_sbb(bytes);
+    assert(repair.has_value());
+    // The same bytes editor.exe writes: the full file with its end marker.
+    assert(repair->bytes == pafta::rebuild_sbb(building));
+    const auto repaired = pafta::parse_sbb(repair->bytes);
+    assert(repaired.version == 14U);
+    assert(repaired.lod_marker == 1U);
+    assert(repaired.cells.size() == 9U);
+    assert(repaired.cells[0].exterior_block() == 0x40000000U);
+    assert(!repaired.cells[8].occupied);
+    // A complete file has nothing to repair; damage in the tables is not guessed at.
+    assert(!pafta::repair_sbb(pafta::rebuild_sbb(building)).has_value());
+    auto broken = pafta::rebuild_sbb(building);
+    broken.resize(0x70);
+    assert(!pafta::repair_sbb(broken).has_value());
+}
+
 void rebuilds_sbb_as_native_v14_with_lod_tail() {
     const auto bytes = pafta::read_file_bytes(fixture_root() / "server/data/test2/building/test.sbb");
     auto building = pafta::parse_sbb(bytes);
@@ -3833,6 +3870,7 @@ int main(int argc, char** argv) {
     if (with_fixtures) parses_sbb_fixture();
     if (with_fixtures) rebuilds_sbb_keeps_native_dimensions();
     parses_sbb_v12_without_anchor_words();
+    repairs_sbb_with_short_cell_volume();
     parses_sbb_cell_words_in_native_file_order();
     parses_sbb_piece_payload_index_from_low_10_bits();
     rejects_archive_amplification_and_portal_overflow();

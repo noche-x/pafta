@@ -13,7 +13,7 @@
 namespace pafta::app_internal {
 namespace {
 
-// Limits found in subrosa.exe (see docs/RE_render_shader_spec.md and the notes on
+// Limits found in subrosa.exe (see docs/slop/RE_render_shader_spec.md and the notes on
 // CitySbc_Load @0xd5a50 / Sbb_LoadFromFile @0x26830 / _createarea @0x4db20).
 // "Sectors" are the 8x8x8-cell blocks the world sets up when needed.
 constexpr int kMaxIntersections = 1024;   // file array 0x2e48687c..0x2e48987c, 12 B each

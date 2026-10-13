@@ -13,7 +13,7 @@ These pages describe the binary layouts that `src/formats.cpp` reads and writes.
 
 [building_render_spec.md](building_render_spec.md) explains how SBB cells and SBL records turn into geometry. It does not replace the byte layouts above.
 
-Game function names and addresses come from earlier research. The game's executables and decompiled code are not in this checkout. The [building-canvas note](../RE_editor_building_canvas.md) gives the hash of the `editor.exe` it used; these pages do not name every binary. You can check Pafta's own code against its source and test files. Checking a rule against the game needs the same binary and the research behind it.
+Game function names and addresses come from earlier research. The game's executables and decompiled code are not in this checkout. The [building-canvas note](../slop/RE_editor_building_canvas.md) gives the hash of the `editor.exe` it used; these pages do not name every binary. You can check Pafta's own code against its source and test files. Checking a rule against the game needs the same binary and the research behind it.
 
 ## How sure we are
 
