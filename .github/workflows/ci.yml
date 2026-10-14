@@ -48,7 +48,7 @@ jobs:
           mkdir -p dist/package
           cmake --install "build/${{ matrix.preset }}" --config Release --prefix dist/package --component Pafta
           printf 'Platform: %s\nArchitecture: %s\nSource revision: %s\n' '${{ matrix.platform }}' '${{ runner.arch }}' "$GITHUB_SHA" > dist/package/BUILD_INFO.txt
-          (cd dist/package && cmake -E tar cf ../pafta-${{ matrix.platform }}.zip --format=zip pafta* BUILD_INFO.txt LICENSE README.md CONTRIBUTING.md STYLE_GUIDE.md THIRD_PARTY_NOTICES.md docs licenses)
+          (cd dist/package && cmake -E tar cf ../pafta-${{ matrix.platform }}.zip --format=zip pafta* ${{ matrix.platform == 'macos' && 'Pafta.app' || '' }} assets BUILD_INFO.txt LICENSE README.md CONTRIBUTING.md STYLE_GUIDE.md THIRD_PARTY_NOTICES.md docs licenses)
           mkdir -p dist/smoke
           (cd dist/smoke && cmake -E tar xf ../pafta-${{ matrix.platform }}.zip)
           python -c "import struct; from pathlib import Path; Path('dist/smoke/smoke.csx').write_bytes(struct.pack('<III', 0, 13, 1) + bytes([1]) + struct.pack('<III52s', 0, 12, 1, b'smoke'))"
@@ -145,11 +145,13 @@ jobs:
           mkdir -p dist/site
           cp build/web/pafta_web.html dist/site/index.html
           cp build/web/pafta_web.js build/web/pafta_web.wasm dist/site/
+          mkdir -p dist/site/assets/branding
+          cp assets/branding/pafta.png dist/site/assets/branding/
           cp LICENSE README.md CONTRIBUTING.md STYLE_GUIDE.md THIRD_PARTY_NOTICES.md dist/site/
           cp -R docs licenses dist/site/
           touch dist/site/.nojekyll
           test ! -e build/web/pafta_web.data
-          (cd dist/site && cmake -E tar cf ../pafta-web.zip --format=zip index.html pafta_web.js pafta_web.wasm .nojekyll LICENSE README.md CONTRIBUTING.md STYLE_GUIDE.md THIRD_PARTY_NOTICES.md docs licenses)
+          (cd dist/site && cmake -E tar cf ../pafta-web.zip --format=zip assets index.html pafta_web.js pafta_web.wasm .nojekyll LICENSE README.md CONTRIBUTING.md STYLE_GUIDE.md THIRD_PARTY_NOTICES.md docs licenses)
       - name: Upload browser build
         uses: actions/upload-artifact@v4
         with:

@@ -514,23 +514,23 @@ void test_city_scene_adoption() {
         return built;
     };
     project.city_scene_current_fingerprint = 1U;
-    require(adopt_city_scene_result(project, scene(10.0F), 1U, true), "initial city scene was not accepted");
+    require(adopt_city_scene_result(project, {scene(10.0F), {}}, 1U, true), "initial city scene was not accepted");
     project.city_scene_current_fingerprint = 2U;
-    require(adopt_city_scene_result(project, MapScene{}, 2U, false), "edited road scene was not accepted");
+    require(adopt_city_scene_result(project, {MapScene{}, {}}, 2U, false), "edited road scene was not accepted");
     require(!project.city_scene_cache_complete && project.city_scene_terrain_fingerprint == 1U &&
         project.city_scene_cache.terrain->heights[0] == 10.0F, "fast roads lost the previous terrain or skipped full rebuilding");
-    require(!adopt_city_scene_result(project, scene(99.0F), 1U, true) && project.city_scene_cache_fingerprint == 2U,
+    require(!adopt_city_scene_result(project, {scene(99.0F), {}}, 1U, true) && project.city_scene_cache_fingerprint == 2U,
         "a stale full scene replaced a newer edit");
 
     // Undo can return to a terrain revision that is already uploaded. Its fast road
     // geometry still needs a complete result to restore the road shadow buffers.
     project.city_scene_current_fingerprint = 1U;
-    require(adopt_city_scene_result(project, MapScene{}, 1U, false) && !project.city_scene_cache_complete,
+    require(adopt_city_scene_result(project, {MapScene{}, {}}, 1U, false) && !project.city_scene_cache_complete,
         "rapid undo incorrectly marked a road-only scene complete");
-    require(!adopt_city_scene_result(project, scene(99.0F), 2U, true), "the undone edit was accepted after undo");
-    require(adopt_city_scene_result(project, scene(10.0F), 1U, true) && project.city_scene_cache_complete,
+    require(!adopt_city_scene_result(project, {scene(99.0F), {}}, 2U, true), "the undone edit was accepted after undo");
+    require(adopt_city_scene_result(project, {scene(10.0F), {}}, 1U, true) && project.city_scene_cache_complete,
         "the complete undo result was not accepted");
-    require(!adopt_city_scene_result(project, MapScene{}, 1U, false) && project.city_scene_cache_complete &&
+    require(!adopt_city_scene_result(project, {MapScene{}, {}}, 1U, false) && project.city_scene_cache_complete &&
         project.city_scene_cache.terrain->heights[0] == 10.0F, "a late fast scene downgraded the complete result");
 }
 

@@ -14,7 +14,7 @@ cmake -S "$repo_dir" -B "$build_dir" \
   -DPAFTA_BUILD_TESTS=ON \
   -DPAFTA_ENABLE_COVERAGE=ON \
   "$@"
-cmake --build "$build_dir" --target pafta pafta_tests binary_export_tests editor_state_tests editor_workflow_tests mesh_export_tests --parallel
+cmake --build "$build_dir" --target pafta pafta_tests binary_export_tests editor_state_tests editor_workflow_tests selection_tests project_file_jobs_tests mesh_export_tests --parallel
 
 mkdir -p "$build_dir/profiles"
 rm -f "$build_dir"/profiles/*.profraw

@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace pafta {
 
@@ -145,6 +146,13 @@ struct BuildingRenderBuffer {
 // Partition terrain once on the scene worker; the rendering thread skips whole chunks.
 void build_terrain_draw_chunks(BuildingRenderBuffer& buffer);
 bool terrain_bounds_visible(Vec3 lo, Vec3 hi, Vec3 camera, float distance, const ViewFrustumPlanes& planes);
+// One 128-unit landscape chunk at `step` units per sample, for the camera-following
+// terrain detail (the game's Terrain_RebuildChunkSlot). Heights come from the
+// terrain's sampled area, and the island's height outside it.
+struct CityTerrain;
+BuildingRenderBuffer build_terrain_chunk_mesh(const CityTerrain& terrain, float chunk_x, float chunk_z, std::int32_t step, float unit_size);
+// The sample step the scene's fixed terrain mesh uses for the chunk at chunk_x, chunk_z.
+std::int32_t terrain_fixed_step(const CityTerrain& terrain, float chunk_x, float chunk_z);
 
 // Bakes the buffer's shadow volume, which works for any light direction (see the
 // shadow volume shader in render_gpu.cpp). CPU work only, safe on worker threads.
@@ -283,6 +291,9 @@ struct CityTerrain {
     float sample_spacing{};
     std::vector<float> heights;
     BuildingRenderBuffer mesh;
+    // Tile cells (CityCornerStampMap keys) where the land-use mask cuts the ground away.
+    std::unordered_set<std::uint64_t> covered_cells;
+    bool city_map{true};
 };
 
 struct CityTrafficLightPole {

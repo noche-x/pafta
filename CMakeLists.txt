@@ -181,6 +181,19 @@ configure_file("${CMAKE_CURRENT_BINARY_DIR}/generated/editor_font.cpp.in"
   "${CMAKE_CURRENT_BINARY_DIR}/generated/editor_font.cpp" COPYONLY)
 set(PAFTA_FONT_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/editor_font.cpp")
 
+# Embed the logo so the window and About view also work outside the install folder.
+set(PAFTA_LOGO_FILE "${CMAKE_CURRENT_SOURCE_DIR}/assets/branding/pafta.png")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PAFTA_LOGO_FILE}")
+file(READ "${PAFTA_LOGO_FILE}" pafta_logo_hex HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," pafta_logo_bytes "${pafta_logo_hex}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/editor_logo.cpp.in"
+  "#include <cstddef>\n"
+  "extern const unsigned char pafta_editor_logo[] = {${pafta_logo_bytes}};\n"
+  "extern const std::size_t pafta_editor_logo_size = sizeof(pafta_editor_logo);\n")
+configure_file("${CMAKE_CURRENT_BINARY_DIR}/generated/editor_logo.cpp.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/editor_logo.cpp" COPYONLY)
+set(PAFTA_LOGO_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/editor_logo.cpp")
+
 add_library(pafta_core
   src/buildblock_catalog.cpp
   src/editor_state.cpp
@@ -221,6 +234,7 @@ if(NOT EMSCRIPTEN)
     src/ui_widgets.cpp
     src/viewport.cpp
     ${PAFTA_FONT_SOURCE}
+    ${PAFTA_LOGO_SOURCE}
   )
   target_include_directories(pafta_app SYSTEM PRIVATE
     "${tinygltf_SOURCE_DIR}"
@@ -228,9 +242,29 @@ if(NOT EMSCRIPTEN)
   target_link_libraries(pafta_app PUBLIC pafta_core imgui_rlimgui raylib nfd)
   add_executable(pafta src/main.cpp)
   target_link_libraries(pafta PRIVATE pafta_app)
+  if(WIN32)
+    enable_language(RC)
+    configure_file(assets/branding/pafta.rc.in generated/pafta.rc @ONLY)
+    target_sources(pafta PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated/pafta.rc")
+  elseif(APPLE)
+    add_executable(pafta_macos MACOSX_BUNDLE src/main.cpp assets/branding/pafta.icns)
+    target_link_libraries(pafta_macos PRIVATE pafta_app)
+    add_dependencies(pafta pafta_macos)
+    set_source_files_properties(assets/branding/pafta.icns PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+    set_target_properties(pafta_macos PROPERTIES
+      OUTPUT_NAME Pafta
+      MACOSX_BUNDLE_BUNDLE_NAME Pafta
+      MACOSX_BUNDLE_GUI_IDENTIFIER im.noche.pafta
+      MACOSX_BUNDLE_ICON_FILE pafta.icns
+      MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+      MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}")
+  endif()
   if(PAFTA_ENABLE_COVERAGE)
     pafta_enable_coverage(pafta_app)
     pafta_enable_coverage(pafta)
+    if(TARGET pafta_macos)
+      pafta_enable_coverage(pafta_macos)
+    endif()
   endif()
   if(PAFTA_ENABLE_PROFILER)
     target_compile_definitions(pafta_app PRIVATE
@@ -246,6 +280,7 @@ if(NOT EMSCRIPTEN)
 endif()
 
 if(PAFTA_BUILD_WEB)
+  configure_file(assets/branding/pafta.png assets/branding/pafta.png COPYONLY)
   # The browser build uses the same app, panels, viewport, and renderer as the
   # desktop one. Only the OS file dialogs and glTF export are swapped for
   # browser-friendly versions in app.cpp and web_main.cpp.
@@ -264,6 +299,7 @@ if(PAFTA_BUILD_WEB)
     src/ui_widgets.cpp
     src/viewport.cpp
     ${PAFTA_FONT_SOURCE}
+    ${PAFTA_LOGO_SOURCE}
   )
   target_link_libraries(pafta_web PRIVATE pafta_core imgui_rlimgui raylib)
   target_compile_definitions(pafta_web PRIVATE PAFTA_WEB=1)
@@ -453,7 +489,7 @@ if(PAFTA_BUILD_FUZZERS)
   endforeach()
 endif()
 
-foreach(target pafta_core pafta_app pafta pafta_web pafta_tests binary_export_tests
+foreach(target pafta_core pafta_app pafta pafta_macos pafta_web pafta_tests binary_export_tests
     editor_state_tests editor_workflow_tests selection_tests project_file_jobs_tests mesh_export_tests fuzz_sbb fuzz_sbc fuzz_sbl fuzz_csx)
   if(TARGET ${target})
     if(PAFTA_ENABLE_SANITIZERS)
@@ -472,6 +508,11 @@ endforeach()
 # Local and CI beta packaging use the same install component.
 if(NOT EMSCRIPTEN)
   install(TARGETS pafta RUNTIME DESTINATION . COMPONENT Pafta)
+  if(APPLE)
+    install(TARGETS pafta_macos BUNDLE DESTINATION . COMPONENT Pafta)
+  endif()
+  install(DIRECTORY assets/branding/ DESTINATION assets/branding COMPONENT Pafta
+    FILES_MATCHING PATTERN "*.png")
   install(FILES LICENSE README.md CONTRIBUTING.md STYLE_GUIDE.md THIRD_PARTY_NOTICES.md DESTINATION . COMPONENT Pafta)
   install(DIRECTORY docs/ DESTINATION docs COMPONENT Pafta)
   install(DIRECTORY licenses/ DESTINATION licenses COMPONENT Pafta)

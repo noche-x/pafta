@@ -47,6 +47,7 @@ void commit_city_edits(EditorProject& project) {
             }
         }
         project.redo_stack.clear();
+        project.last_edit_history = -1;
         record_action(project, std::move(label));
         project.city_baseline.reset();
     }
@@ -106,6 +107,7 @@ void commit_asset_edits(EditorProject& project, const EditorUi& ui) {
                 baseline.reset();
             } else if (changed) {
                 record_action(project, "edit " + baseline->name);
+                project.last_edit_history = static_cast<int>(kind);
                 auto& undo = project.asset_undo_stacks[kind];
                 undo.push_back(std::move(*baseline));
                 if (undo.size() > kMaxUndo) {
@@ -215,8 +217,11 @@ void step_asset_history(EditorProject& project, EditorUi& ui, std::string& statu
 }
 
 // The asset history the current context edits, or nullopt for city history.
-std::optional<std::size_t> active_asset_history(const EditorUi& ui) {
+std::optional<std::size_t> active_asset_history(const EditorProject& project, const EditorUi& ui) {
     if (ui.buildblock_window_focused || ui.tab == EditorTab::Buildblocks) return 1U;
+    // The Buildblock window floats over every tab. After clicking back into the view,
+    // its edits still undo first when they were the last edit made.
+    if (ui.show_buildblock_window && project.last_edit_history == 1) return 1U;
     if (ui.tab == EditorTab::Buildings) return 0U;
     if (ui.tab == EditorTab::Blocks) return 2U;
     return std::nullopt;
@@ -248,14 +253,14 @@ void commit_pending_edits(EditorProject& project, const EditorUi& ui) {
 }
 
 bool can_undo(const EditorProject& project, const EditorUi& ui, bool redo) {
-    if (const auto kind = active_asset_history(ui)) {
+    if (const auto kind = active_asset_history(project, ui)) {
         return !(redo ? project.asset_redo_stacks[*kind] : project.asset_undo_stacks[*kind]).empty();
     }
     return !(redo ? project.redo_stack : project.undo_stack).empty();
 }
 
 void undo_edit(EditorProject& project, EditorUi& ui, std::string& status, bool redo) {
-    if (const auto kind = active_asset_history(ui)) {
+    if (const auto kind = active_asset_history(project, ui)) {
         commit_asset_edits(project, ui);
         step_asset_history(project, ui, status, *kind, redo);
     } else if (redo) {

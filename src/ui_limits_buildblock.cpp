@@ -95,10 +95,10 @@ constexpr ImU32 kColSelected = IM_COL32(255, 230, 90, 255);
 
 const char* kind_name(int kind) {
     switch (kind) {
-        case 0: return "Face bounds";
+        case 0: return "Opening";
         case 1: return "Window";
         case 2: return "Beam";
-        default: return "Door";
+        default: return "Door marker";
     }
 }
 
@@ -187,10 +187,18 @@ void draw_buildblock_layer(ImDrawList* dl, ImVec2 min, float side, const SblLaye
     }
     for (const auto& window : layer.windows) {
         const auto a = at(window.x, window.y + window.height), b = at(window.x + window.width, window.y);
-        dl->AddRectFilled(a, b, IM_COL32(120, 175, 225, 150));
-        // A highlight across the glass so windows read as glass at a glance.
-        dl->AddLine(ImVec2(a.x + (b.x - a.x) * 0.2F, b.y), ImVec2(a.x + (b.x - a.x) * 0.6F, a.y), IM_COL32(230, 245, 255, 120), 1.5F);
-        dl->AddRect(a, b, IM_COL32(50, 70, 90, 255));
+        // Glass only shows inside the opening; the wall covers the rest, so that part
+        // is just outlined in red.
+        const float gx0 = std::max(window.x, x), gx1 = std::min(window.x + window.width, x + w);
+        const float gy0 = std::max(window.y, y), gy1 = std::min(window.y + window.height, y + h);
+        if (gx1 > gx0 && gy1 > gy0) {
+            const auto ga = at(gx0, gy1), gb = at(gx1, gy0);
+            dl->AddRectFilled(ga, gb, IM_COL32(120, 175, 225, 150));
+            // A highlight across the glass so windows read as glass at a glance.
+            dl->AddLine(ImVec2(ga.x + (gb.x - ga.x) * 0.2F, gb.y), ImVec2(ga.x + (gb.x - ga.x) * 0.6F, ga.y), IM_COL32(230, 245, 255, 120), 1.5F);
+        }
+        const bool inside = gx0 == window.x && gx1 == window.x + window.width && gy0 == window.y && gy1 == window.y + window.height;
+        dl->AddRect(a, b, inside ? IM_COL32(50, 70, 90, 255) : IM_COL32(230, 70, 60, 255), 0.0F, 0, inside ? 1.0F : 2.0F);
     }
     for (const auto& door : layer.doors) {
         // A door record is a point (where the doorway is), drawn as a small door.
@@ -210,6 +218,48 @@ bool buildblock_layer_button(const char* id, const SblLayer& layer, float size, 
     if (selected) dl->AddRect(min, ImVec2(min.x + size, min.y + size), kColSelected, 0.0F, 0, 3.0F);
     else if (ImGui::IsItemHovered()) dl->AddRect(min, ImVec2(min.x + size, min.y + size), IM_COL32(120, 200, 255, 255), 0.0F, 0, 2.0F);
     return pressed;
+}
+
+void make_buildblock_doorway(SblLayer& layer) {
+    // The shipped doorway (test.sbl face 6): an interior opening from the room floor
+    // (1/16 up), with no glass in it.
+    layer.portal_type = 1U;
+    layer.bounds = {11.0F / 32.0F, 10.0F / 32.0F, 1.0F / 16.0F, 19.0F / 32.0F};
+    layer.windows.clear();
+}
+
+void add_buildblock_window(SblLayer& layer, float cx, float cy) {
+    // The first window fills the opening, as in the shipped buildblocks; later ones
+    // are a quarter cell at (cx, cy), and the opening grows to show them.
+    if (layer.windows.empty() && layer.bounds[1] > 0.0F && layer.bounds[3] > 0.0F) {
+        layer.windows.push_back({0, layer.bounds[0], layer.bounds[1], layer.bounds[2], layer.bounds[3]});
+        return;
+    }
+    const auto place = [](float c) { return std::clamp(c - 0.125F, 0.0F, 0.75F); };
+    layer.windows.push_back({0, place(cx), 0.25F, place(cy), 0.25F});
+    grow_buildblock_opening(layer);
+}
+
+bool grow_buildblock_opening(SblLayer& layer) {
+    const bool empty = layer.bounds[1] <= 0.0F || layer.bounds[3] <= 0.0F;
+    float x0 = empty ? 1.0F : layer.bounds[0], x1 = empty ? 0.0F : layer.bounds[0] + layer.bounds[1];
+    float y0 = empty ? 1.0F : layer.bounds[2], y1 = empty ? 0.0F : layer.bounds[2] + layer.bounds[3];
+    for (const auto& window : layer.windows) {
+        x0 = std::min(x0, window.x); x1 = std::max(x1, window.x + window.width);
+        y0 = std::min(y0, window.y); y1 = std::max(y1, window.y + window.height);
+    }
+    if (x1 <= x0 || y1 <= y0) return false;
+    const std::array<float, 4> grown{x0, x1 - x0, y0, y1 - y0};
+    if (grown == layer.bounds) return false;
+    layer.bounds = grown;
+    return true;
+}
+
+int buildblock_hidden_windows(const SblLayer& layer) {
+    const float x = layer.bounds[0], y = layer.bounds[2];
+    return static_cast<int>(std::ranges::count_if(layer.windows, [&](const SblPortalRect& w) {
+        return w.x < x || w.y < y || w.x + w.width > x + layer.bounds[1] || w.y + w.height > y + layer.bounds[3];
+    }));
 }
 
 namespace {
@@ -254,18 +304,14 @@ bool delete_item(SblLayer& layer, EditorUi& ui) {
     return true;
 }
 
-// Adds a window, beam, or door centred on (cx, cy), or in the middle of the face.
+// Adds a window or beam centred on (cx, cy), or in the middle of the face.
 bool add_item(SblLayer& layer, EditorUi& ui, int kind, float cx = 0.5F, float cy = 0.5F) {
-    const auto clamp01 = [](float v, float size) { return std::clamp(v - size * 0.5F, 0.0F, 1.0F - size); };
     if (kind == 1 && layer.windows.size() < 16) {
-        layer.windows.push_back({0, clamp01(cx, 0.25F), 0.25F, clamp01(cy, 0.25F), 0.25F});
+        add_buildblock_window(layer, cx, cy);
         select_item(ui, 1, static_cast<int>(layer.windows.size()) - 1);
     } else if (kind == 2 && layer.beams.size() < 16) {
-        layer.beams.push_back({0, 0.0F, 1.0F, clamp01(cy, 0.0625F), 0.0625F});
+        layer.beams.push_back({0, 0.0F, 1.0F, std::clamp(cy - 0.03125F, 0.0F, 0.9375F), 0.0625F});
         select_item(ui, 2, static_cast<int>(layer.beams.size()) - 1);
-    } else if (kind == 3 && layer.doors.size() < 2) {
-        layer.doors.push_back({0, std::clamp(cx, 0.0F, 1.0F), std::clamp(cy, 0.0F, 1.0F)});
-        select_item(ui, 3, static_cast<int>(layer.doors.size()) - 1);
     } else {
         return false;
     }
@@ -328,10 +374,10 @@ void draw_buildblock_face_editor(EditorProject& project, EditorUi& ui) {
     if (layer.portal_type <= 1U) {
         int type = static_cast<int>(layer.portal_type);
         changed |= ImGui::RadioButton("Exterior", &type, 0);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("A wall with an outside face; windows show on every side.");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("A wall with an outside face. Its opening is a window hole; put glass in it with Window.");
         ImGui::SameLine();
         changed |= ImGui::RadioButton("Interior", &type, 1);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("An inside opening such as a doorway: no outside face, mirrored on the south and west sides.");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("A doorway or inside opening: no outside face, mirrored on the south and west sides.");
         layer.portal_type = static_cast<std::uint32_t>(type);
     } else {
         ImGui::TextDisabled("Portal type %u", layer.portal_type);
@@ -345,9 +391,12 @@ void draw_buildblock_face_editor(EditorProject& project, EditorUi& ui) {
     if (ImGui::Button(ICON_FA_GRIP_LINES " Beam")) changed |= add_item(layer, ui, 2);
     ImGui::EndDisabled();
     ImGui::SameLine();
-    ImGui::BeginDisabled(layer.doors.size() >= 2);
-    if (ImGui::Button(ICON_FA_DOOR_OPEN " Door")) changed |= add_item(layer, ui, 3, 0.5F, layer.bounds[2]);
-    ImGui::EndDisabled();
+    if (ImGui::Button(ICON_FA_DOOR_OPEN " Doorway")) {
+        make_buildblock_doorway(layer);
+        select_item(ui, 0, 0);
+        changed = true;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Make this face a doorway: an Interior opening from the floor, with no glass.");
     ImGui::SameLine();
     const char* snap_items[] = {"Free", "1/8", "1/16", "1/32"};
     int snap_index = ui.bb_snap_steps == 0 ? 0 : ui.bb_snap_steps == 8 ? 1 : ui.bb_snap_steps == 16 ? 2 : 3;
@@ -362,7 +411,17 @@ void draw_buildblock_face_editor(EditorProject& project, EditorUi& ui) {
         ImGui::SetTooltip("Click an item to select it; drag it to move, drag a corner to resize.\n"
                           "Drag the opening's edge to change the wall's opening.\n"
                           "Right-click for more. Delete removes, Ctrl+D copies, arrows nudge.\n"
-                          "Grey: wall. Blue glass: window. Darker strips: beams. Purple: door.");
+                          "The blue-edged opening is the hole in the wall. Windows are glass inside it;\n"
+                          "glass outside the opening is hidden by the wall (red outline).\n"
+                          "From far away the game shows the whole opening as reflective glass.\n"
+                          "Grey: wall. Blue glass: window. Darker strips: beams.\n"
+                          "Purple: old door marker (the game ignores these).");
+    }
+    if (const int hidden = buildblock_hidden_windows(layer); hidden > 0) {
+        ImGui::TextColored(ImVec4(1.0F, 0.55F, 0.45F, 1.0F), ICON_FA_TRIANGLE_EXCLAMATION " %d window%s outside the opening; the wall hides that glass.",
+            hidden, hidden == 1 ? " reaches" : "s reach");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Grow opening to fit")) changed |= grow_buildblock_opening(layer);
     }
 
     // The selected item's numbers, all in cell fractions.
@@ -393,7 +452,8 @@ void draw_buildblock_face_editor(EditorProject& project, EditorUi& ui) {
     } else if (ui.bb_selected_kind == 3 && static_cast<std::size_t>(ui.bb_selected_index) < layer.doors.size()) {
         auto& door = layer.doors[static_cast<std::size_t>(ui.bb_selected_index)];
         ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("Door");
+        ImGui::TextUnformatted("Door marker");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Stored in the file but never read by the game. Use Doorway for a real door opening.");
         ImGui::SameLine();
         std::array<float, 2> v{door.x, door.y};
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10.0F);
@@ -616,7 +676,12 @@ void draw_buildblock_face_canvas(EditorProject& project, EditorUi& ui) {
         }
         if (ImGui::MenuItem(ICON_FA_WINDOW_MAXIMIZE " Add window here", nullptr, false, layer.windows.size() < 16)) changed |= add_item(layer, ui, 1, mx, my);
         if (ImGui::MenuItem(ICON_FA_GRIP_LINES " Add beam here", nullptr, false, layer.beams.size() < 16)) changed |= add_item(layer, ui, 2, mx, my);
-        if (ImGui::MenuItem(ICON_FA_DOOR_OPEN " Add door here", nullptr, false, layer.doors.size() < 2)) changed |= add_item(layer, ui, 3, mx, my);
+        if (ImGui::MenuItem(ICON_FA_DOOR_OPEN " Make doorway")) {
+            make_buildblock_doorway(layer);
+            select_item(ui, 0, 0);
+            changed = true;
+        }
+        if (buildblock_hidden_windows(layer) > 0 && ImGui::MenuItem("Grow opening to fit windows")) changed |= grow_buildblock_opening(layer);
         ImGui::Separator();
         if (ImGui::MenuItem("Opening fills the face")) {
             layer.bounds = {0.0F, 1.0F, 0.0F, 1.0F};

@@ -531,6 +531,7 @@ bool select_building_cell_by_index(const SbbBuilding& building, EditorUi& ui, st
         }
         if (i == cell_index || cell.index == cell_index) {
             ui.selected_building_cell = occupied_position;
+            ui.building_cell_picked = true;
             return true;
         }
         ++occupied_position;

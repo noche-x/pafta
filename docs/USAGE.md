@@ -90,7 +90,7 @@ Building, Road and Piece placement supports a surface height offset or a locked 
 
 While you lay a road, the preview draws the road the click will make, with the game's own road tiles and markings. Green means the game builds it cleanly. Red means it cannot: the slope does not fit, the road leaves the game's map area, it runs over another road (red boxes), or a building or piece covers part of it (orange boxes). Existing roads that the new road splits or reshapes are tinted yellow and listed in the cursor readout.
 
-To move a road junction, drag it with the Select tool, or select it and use the arrow keys. Roads stay straight: a road along the move stretches or shrinks, and a road across it carries its other junction along. The preview uses the same colours, and tints the road tiles that the move removes dark red. A move that would shrink a road below two cells is refused.
+To move a road junction, click its crossing (or the end of a road) with the Select tool and drag it, drag the arrows of its gizmo (the green arrow changes its level), or use the arrow keys. Roads stay straight: a road along the move stretches or shrinks, and a road across it carries its other junction along. The preview uses the same colours, and tints the road tiles that the move removes dark red. A move that would shrink a road below two cells is refused.
 
 Esc ends a road, or cancels a junction or gizmo drag.
 
@@ -98,17 +98,21 @@ Esc ends a road, or cancels a junction or gizmo drag.
 
 - Select picks a block.
 - Add block fills the cell next to it.
-- Paint applies the chosen material.
+- Paint applies the chosen material, or with Wall type, a wall type to one side of a block.
 - Anchor moves the building's anchor point.
 - Item set places or clears an item set on the block you click.
+
+In Wall type mode, the yellow panel shows the side a click sets. Clicking a wall sets that wall. Clicking a floor, a piece, or an open side sets the side of that block nearest the click, so you can add a wall where there is none. A wall between two blocks is stored in one of them; if that block has no record yet, Pafta adds an empty one to hold it.
+
+An interior piece replaces the block's room, as it does in the game: that block has no room walls or floor. Its sides can still take wall types for the rooms next to it.
 
 To use an item set, first add its `.sis` name to the building in Properties, then pick a rotation. Placed sets show their items from `item/*.it3` without textures. A set with no item meshes shows as a yellow diamond. Save writes the set names and positions into the building data in `test.csx`. It does not copy the `.sis` or `.it3` files.
 
 The floor control shows one floor or the whole building. A room's Floor setting (in Add block and on the selected block) leaves out its floor, which also removes the ceiling of the room below, so stacked rooms join into one tall room. editor.exe always writes a floor.
 
-The Buildblock window (Ctrl+L) draws each face as the game builds it: grey wall around the opening, glass windows, beams, and door markers. Drag items and corners on the square canvas; right-click to add, copy, or delete. Exterior and Interior set the face's portal type, as the same buttons do in editor.exe.
+The Buildblock window (Ctrl+L) draws each face as the game builds it: grey wall around the opening, glass windows, and beams. The opening (blue edge) is the one hole in the wall. Windows are glass panes inside it, so glass outside the opening is hidden by the wall; the editor outlines that part in red and offers Grow opening to fit. From far away the game shows the whole opening as reflective glass. Doorway turns a face into an Interior opening from the floor with no glass, which is how the shipped buildblocks make doors. The game never reads door records, so old ones show as purple markers you can delete. Drag items and corners on the square canvas; right-click to add, copy, or delete. Exterior and Interior set the face's portal type, as the same buttons do in editor.exe. A new buildblock starts with face 1 as a window, face 2 as a doorway, and the other faces as plain walls.
 
-Block mode's toolbar has Add block, Add box, Add patch and Paint faces. Paint chooses a texture slot from 0 to 7 for authored patches and boxes; the preview's slot textures show how a placed piece will look. Assets lists meshes and textures, with Import and New block actions. Export .sbl writes the selected block as a loose SBL file.
+Block mode's toolbar has Select, Add box, Add patch and Paint faces; Assets -> New block makes a new block. A patch with Stored UVs shows its UVs over its slot texture in Properties: drag a point to move it, or empty space to move them all. Paint chooses a texture slot from 0 to 7 for authored patches and boxes; the preview's slot textures show how a placed piece will look. Assets lists meshes and textures, with Import and New block actions. Export .sbl writes the selected block as a loose SBL file.
 
 The Piece tool's Assets panel lists the map's presets or all meshes, including imported SBL meshes and the solid cube. Choose a mesh and its slot textures, then stamp it into the city.
 
@@ -117,6 +121,8 @@ A piece is a mesh with eight slot textures. The map's presets are stored in `cit
 The Block toolbar shows the paint slot's texture name and thumbnail. Assets -> Textures changes its preview texture. SBL faces store slot numbers; the building cell or city piece chooses the actual textures when placing that block. Switching block assets cancels an unfinished transform before new patches or boxes are added.
 
 In Block mode, drag the arrows to move the selected patch or box, the white cubes to resize a box, and the orange dots to move patch points. G, S, and R move, scale, and rotate; X, Y, or Z locks an axis; a click or Enter keeps the change and Esc cancels it.
+
+Preferences -> Rendering -> Terrain detail chooses how the ground is meshed. Like the game (the default) samples the ground near the camera every unit and gets coarser at 512, 768, 1024, 1536, 2048 and 3072 units, as the game does, so hills meet buildings the way they do in the game. Fixed builds one mesh with detail only near the city's centre, which is lighter. Detail distance scales those distances, and Finest step sets the nearest sample spacing.
 
 View -> Interiors chooses when buildings show their rooms: never, up close like the game, or only for the selected buildings. The Block and Buildblock editors show the fields of the selected record. Windows -> Map image opens a top-down view of the map. File -> CSX archive lists the map's assets and refreshes itself as you edit. It has a filter, Shift and Ctrl selection, hover previews, and Extract all, and it writes `test.csx`, the only archive name the game reads. To add a building, block, or texture to the map, use Assets -> Import into map (or Import into map in the archive window); it shows up in Assets right away and is saved with the map. Add to archive only changes the archive workspace, not the map. Files that fail to load or import are listed in Windows -> Load problems, with Try auto-fixing where a fix is known.
 

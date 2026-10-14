@@ -397,8 +397,9 @@ std::vector<NamedBuildblockTemplate> build_buildblock_templates(const EditorProj
 void ensure_render_input_cache(EditorProject& project) {
     if (!project.render_input_cache_valid) {
         PAFTA_PROFILE_BLOCK("rebuild render input cache");
-        project.cached_block_meshes = build_block_meshes(project);
-        project.cached_buildblock_templates = build_buildblock_templates(project);
+        // Shared read-only with workers, which keep the snapshot they started with.
+        project.cached_block_meshes = std::make_shared<const std::vector<NamedBlockMesh>>(build_block_meshes(project));
+        project.cached_buildblock_templates = std::make_shared<const std::vector<NamedBuildblockTemplate>>(build_buildblock_templates(project));
         project.render_input_cache_valid = true;
     }
     if (!project.grid_texture_names_valid) {
@@ -414,14 +415,24 @@ void invalidate_render_input_cache(EditorProject& project) {
     project.road_edit_preview.key = 0;
 }
 
-const std::vector<NamedBlockMesh>& block_meshes(EditorProject& project) {
+std::shared_ptr<const std::vector<NamedBlockMesh>> shared_block_meshes(EditorProject& project) {
     ensure_render_input_cache(project);
     return project.cached_block_meshes;
 }
 
-const std::vector<NamedBuildblockTemplate>& buildblock_templates(EditorProject& project) {
+std::shared_ptr<const std::vector<NamedBuildblockTemplate>> shared_buildblock_templates(EditorProject& project) {
     ensure_render_input_cache(project);
     return project.cached_buildblock_templates;
+}
+
+const std::vector<NamedBlockMesh>& block_meshes(EditorProject& project) {
+    ensure_render_input_cache(project);
+    return *project.cached_block_meshes;
+}
+
+const std::vector<NamedBuildblockTemplate>& buildblock_templates(EditorProject& project) {
+    ensure_render_input_cache(project);
+    return *project.cached_buildblock_templates;
 }
 
 const std::vector<std::string>& project_grid_texture_names(EditorProject& project) {
@@ -503,6 +514,7 @@ void edit_building(EditorProject& project, EditorUi& ui, std::size_t asset_index
     if (asset_index >= project.buildings.size()) return;
     ui.selected_building = asset_index;
     ui.selected_building_cell = 0;
+    ui.building_cell_picked = false;
     ui.tab = EditorTab::Buildings;
     ui.building_tool = BuildingTool::Select;
     ui.gizmo_active = GizmoAxis::None;
@@ -801,8 +813,13 @@ void start_city_scene_rebuild(EditorProject& project, std::uint64_t fingerprint,
         project.city_scene_build_target_fingerprint = fingerprint;
     }
     const auto generation = ++project.city_scene_build_generation;
+    // The worker also packs the road and terrain meshes for upload, so the render
+    // thread only copies them to the GPU. The terrain is skipped when the uploaded one
+    // is still current.
+    const auto uploaded_terrain = project.terrain_gpu_valid ? std::optional{project.terrain_gpu_fingerprint} : std::nullopt;
     auto build_scene = [map = std::move(map_copy), owned = std::move(sources.owned), resolved = std::move(sources.resolved), generation,
-                        auto_generated = project_is_auto_generated(project), roads_only]() {
+                        auto_generated = project_is_auto_generated(project), roads_only, uploaded_terrain,
+                        revision = project.city_building_revision]() {
             PAFTA_PROFILE_THREAD("City scene rebuild");
             PAFTA_PROFILE_BLOCK("build async map scene");
             std::vector<const SbbBuilding*> placement_buildings;
@@ -811,11 +828,21 @@ void start_city_scene_rebuild(EditorProject& project, std::uint64_t fingerprint,
                 placement_buildings.push_back(resolved[i] != 0U ? &(*owned)[resolved[i] - 1U] : nullptr);
             }
             (void)generation;
-            return build_map_scene(map, placement_buildings, auto_generated, true,
-                roads_only ? MapSceneBuild::RoadsOnly : MapSceneBuild::Complete);
+            CitySceneBuild built{build_map_scene(map, placement_buildings, auto_generated, true,
+                roads_only ? MapSceneBuild::RoadsOnly : MapSceneBuild::Complete), {}};
+            const auto& tiles = built.scene.city_tile_buffer;
+            if (!tiles.triangles.empty()) built.models.tiles = prepare_gpu_mesh(tiles, true);
+            if (!tiles.shadow_vertices.empty()) built.models.tile_shadows = prepare_shadow_volume(tiles, true);
+            built.models.terrain_fingerprint = city_terrain_fingerprint(map, revision);
+            if (built.scene.terrain && uploaded_terrain != built.models.terrain_fingerprint) {
+                built.models.terrain = prepare_gpu_mesh(built.scene.terrain->mesh, false);
+            }
+            return built;
         };
 #ifdef __EMSCRIPTEN__
-    auto scene = build_scene();
+    auto built = build_scene();
+    auto& scene = built.scene;
+    project.city_prepared_models = std::move(built.models);
     if (roads_only) scene.terrain = std::move(project.city_scene_cache.terrain);
     else project.city_scene_terrain_fingerprint = fingerprint;
     project.city_scene_cache = std::move(scene);
@@ -1208,7 +1235,10 @@ void place_building_item_set(EditorProject& project, EditorUi& ui, std::size_t c
     auto& cell = building.cells[cell_index];
     const auto occupied = occupied_cell_indices(building);
     const auto selected = std::ranges::find(occupied, cell_index);
-    if (selected != occupied.end()) ui.selected_building_cell = static_cast<std::size_t>(selected - occupied.begin());
+    if (selected != occupied.end()) {
+        ui.selected_building_cell = static_cast<std::size_t>(selected - occupied.begin());
+        ui.building_cell_picked = true;
+    }
     std::uint32_t value = 0U;
     if (!ui.clear_item_set) {
         const auto packed = sbb_item_set_payload(ui.selected_item_set, ui.item_set_rotation);
@@ -1251,46 +1281,88 @@ void paint_building_face(EditorProject& project, EditorUi& ui, std::size_t cell_
     status = std::string(slot >= 8U ? "interior" : "exterior") + " face painted " + name;
 }
 
+// The side of a building cell a Wall type click would set, as a see-through panel.
+void draw_building_side_highlight(const SbbBuilding& building, std::size_t cell_index, int side) {
+    if (cell_index >= building.cells.size()) return;
+    constexpr float unit = 4.0F;
+    const auto& cell = building.cells[cell_index];
+    const float x0 = (static_cast<float>(cell.x) - static_cast<float>(building.anchor_x)) * unit;
+    const float y0 = (static_cast<float>(cell.y) - static_cast<float>(building.anchor_y)) * unit;
+    const float z0 = (static_cast<float>(cell.z) - static_cast<float>(building.anchor_z)) * unit;
+    const float a = side == 1 ? x0 + unit : x0, b = side == 2 ? z0 + unit : z0;
+    const bool along_x = side == 0 || side == 2;
+    const Vector3 p0{a, y0, b};
+    const Vector3 p1{along_x ? a + unit : a, y0, along_x ? b : b + unit};
+    const Vector3 p2{p1.x, y0 + unit, p1.z};
+    const Vector3 p3{a, y0 + unit, b};
+    const Color fill{255, 214, 0, 90}, edge{255, 214, 0, 255};
+    DrawTriangle3D(p0, p1, p2, fill); DrawTriangle3D(p0, p2, p3, fill);
+    DrawTriangle3D(p2, p1, p0, fill); DrawTriangle3D(p3, p2, p0, fill);
+    DrawLine3D(p0, p1, edge); DrawLine3D(p1, p2, edge); DrawLine3D(p2, p3, edge); DrawLine3D(p3, p0, edge);
+}
+
+// The cell side (0 N, 1 E, 2 S, 3 W) a Wall type click sets. A wall face sets its
+// own side. Anything else (a floor, a piece, an open side) sets the cell edge nearest
+// the click, so a room's open side or a piece cell's side can get a wall too.
+int building_pick_side(const SbbBuilding& building, const BuildingFacePick& pick) {
+    const auto& cell = building.cells[pick.cell_index];
+    const auto face = pick.slot % 8U;
+    const bool piece = (pick.slot >= 8U ? cell.interior_block() : cell.exterior_block()) & 0x80000000U;
+    if (!piece && face >= 1U && face <= 4U) {
+        // Shell slots 1..4 are S/W/N/E and room slots 9..12 are N/E/S/W.
+        static constexpr std::array<int, 4> shell_side{2, 3, 0, 1};
+        return pick.slot >= 8U ? static_cast<int>(face) - 1 : shell_side[face - 1U];
+    }
+    constexpr float unit = 4.0F;
+    const auto fx = pick.hit_world.x / unit + static_cast<float>(building.anchor_x) - static_cast<float>(cell.x);
+    const auto fz = pick.hit_world.z / unit + static_cast<float>(building.anchor_z) - static_cast<float>(cell.z);
+    const std::array<float, 4> distance{fz, 1.0F - fx, 1.0F - fz, fx};
+    return static_cast<int>(std::ranges::min_element(distance) - distance.begin());
+}
+
 // Paint Wall type: writes ui.paint_code into the side-code word the renderer
-// reads for the clicked wall. Its outside face and its room face use the same word
+// reads for one side of a cell. Its outside face and its room face use the same word
 // (Sbb_BuildBuildingConnectivityMetadata and the room key): north is the cell's
 // +0x0c, west its +0x10, east the +x cell's +0x10, and south the +z cell's +0x0c.
-// Shell slots 1..4 are S/W/N/E and room slots 9..12 are N/E/S/W.
-// A layer code also points the cell at the chosen buildblock.
-void paint_building_side_code(EditorProject& project, EditorUi& ui, std::size_t cell_index, std::uint32_t slot, std::string& status) {
+// A layer code also points the cell at the chosen buildblock. When the east or south
+// neighbour has no cell record yet, an empty one (no blocks) is added to hold it.
+void paint_building_side_code(EditorProject& project, EditorUi& ui, std::size_t cell_index, int side, std::string& status) {
     if (project.buildings.empty()) return;
     ui.selected_building = std::min(ui.selected_building, project.buildings.size() - 1U);
     auto& building = project.buildings[ui.selected_building].data;
-    if (cell_index >= building.cells.size()) return;
-    const auto face = slot % 8U;
-    if (face < 1U || face > 4U) {
-        status = "only walls take a wall type";
+    if (cell_index >= building.cells.size() || side < 0 || side > 3) return;
+    if (ui.paint_code >= 3U && building.block_names.empty()) {
+        status = "add a buildblock to this building first";
         return;
     }
-    // 0 N, 1 E, 2 S, 3 W
-    static constexpr std::array<int, 4> shell_side{2, 3, 0, 1};
-    const int side = slot >= 8U ? static_cast<int>(face) - 1 : shell_side[face - 1U];
-    auto& cell = building.cells[cell_index];
-    SbbCell* target = &cell;
-    std::size_t word = SbbCell::exterior_portal_face_word;
-    if (side == 3) word = SbbCell::interior_portal_face_word;
-    if (side == 1) {
-        target = building_cell_at(building, cell.x + 1, cell.y, cell.z);
-        word = SbbCell::interior_portal_face_word;
-    }
-    if (side == 2) target = building_cell_at(building, cell.x, cell.y, cell.z + 1);
-    if (target == nullptr) {
-        status = "this wall's type is stored in the neighbouring cell; place a block there first";
-        return;
-    }
-    if (ui.paint_code >= 3U) {
-        if (building.block_names.empty()) {
-            status = "add a buildblock to this building first";
+    const auto x = building.cells[cell_index].x, y = building.cells[cell_index].y, z = building.cells[cell_index].z;
+    std::size_t target = cell_index;
+    std::size_t word = side == 0 || side == 2 ? SbbCell::exterior_portal_face_word : SbbCell::interior_portal_face_word;
+    if (side == 1 || side == 2) {
+        const auto nx = side == 1 ? x + 1U : x, nz = side == 2 ? z + 1U : z;
+        if (nx >= supported_sbb_grid_side || nz >= supported_sbb_grid_side) {
+            status = "this wall's neighbouring cell would be outside the 64-cell building grid";
             return;
         }
-        cell.cell_type() = static_cast<std::uint32_t>(std::min(ui.block_config.buildblock_index, building.block_names.size() - 1U));
+        if (const auto* neighbour = building_cell_at(building, nx, y, nz)) {
+            target = static_cast<std::size_t>(neighbour - building.cells.data());
+        } else {
+            SbbCell blank{};
+            blank.index = building.cells.size();
+            blank.x = nx;
+            blank.y = y;
+            blank.z = nz;
+            blank.shorts.fill(0xffffU);
+            building.cells.push_back(blank);
+            target = building.cells.size() - 1U;
+        }
     }
-    target->words[word] = (target->words[word] & ~0xfU) | ui.paint_code;
+    if (ui.paint_code >= 3U) {
+        building.cells[cell_index].cell_type() =
+            static_cast<std::uint32_t>(std::min(ui.block_config.buildblock_index, building.block_names.size() - 1U));
+    }
+    auto& value = building.cells[target].words[word];
+    value = (value & ~0xfU) | ui.paint_code;
     mark_building_changed(project, ui);
     status = "wall type set to " + std::to_string(ui.paint_code);
 }
@@ -1846,6 +1918,45 @@ bool move_city_junction(SbcMap& map, std::size_t node, std::int32_t dx, std::int
     return true;
 }
 
+// Moves a junction to `target`. Its level changes alone (its roads slope to meet it);
+// X and Z go through move_city_junction. False, with the map unchanged, when refused.
+bool move_city_junction_to(SbcMap& map, std::size_t node, CityGridPoint target) {
+    if (node >= map.intersections.size()) return false;
+    const auto saved = map.intersections;
+    map.intersections[node].y = target.y;
+    if (move_city_junction(map, node, target.x - saved[node].x, target.z - saved[node].z)) return true;
+    map.intersections = saved;
+    return false;
+}
+
+// Moves a road, both its junctions, by dx/dy/dz cells, under move_city_junction's rules.
+bool move_city_road(SbcMap& map, std::size_t street_index, std::int32_t dx, std::int32_t dy, std::int32_t dz) {
+    if (street_index >= map.streets.size()) return false;
+    const auto& street = map.streets[street_index];
+    if (street.from_intersection < 0 || street.to_intersection < 0 ||
+        static_cast<std::size_t>(std::max(street.from_intersection, street.to_intersection)) >= map.intersections.size()) return false;
+    const auto saved = map.intersections;
+    for (const auto end : {street.from_intersection, street.to_intersection}) {
+        const auto& start = saved[static_cast<std::size_t>(end)];
+        if (!move_city_junction_to(map, static_cast<std::size_t>(end), {start.x + dx, start.y + dy, start.z + dz})) {
+            map.intersections = saved;
+            return false;
+        }
+    }
+    return true;
+}
+
+// Applies the Select tool's junction or road drag (ui.node_drag_target) to `map`.
+bool apply_road_drag(SbcMap& map, const EditorUi& ui) {
+    if (!ui.node_drag || !ui.node_drag_target || *ui.node_drag >= map.intersections.size()) return false;
+    const auto start = map.intersections[*ui.node_drag];
+    if (ui.road_drag) {
+        return move_city_road(map, *ui.road_drag, ui.node_drag_target->x - start.x, ui.node_drag_target->y - start.y,
+            ui.node_drag_target->z - start.z);
+    }
+    return move_city_junction_to(map, *ui.node_drag, *ui.node_drag_target);
+}
+
 // Ends the current chain of roads (Esc, or a change of mode or selection).
 void end_road_chain(EditorUi& ui) {
     ui.pending_road_start.reset();
@@ -2254,28 +2365,92 @@ struct GizmoLayout {
     float arm_length{};
 };
 
-GizmoLayout building_gizmo_layout(const SbcBuilding& placement, const Camera3D& camera, Vector2 viewport_size, Vector3 offset = {}) {
+// The rotation dot's angle (radians, atan2(z, x)) for a rotation in quarter turns. A
+// quarter turn takes +X to +Z (native_city_building_rotation_basis).
+float gizmo_rotation_angle(std::int32_t rotation) {
+    return PI * 0.25F + static_cast<float>(rotation & 3) * PI * 0.5F;
+}
+
+// The gizmo around `base` (a point on the ground), sized to stay the same on screen.
+// The rotation dot sits on the ring at `angle`.
+GizmoLayout gizmo_layout_at(Vector3 base, float angle, const Camera3D& camera, Vector2 viewport_size) {
     constexpr auto unit_size = 4.0F;
-    auto o = native_city_building_render_origin(placement, unit_size);
-    o.x += offset.x; o.y += offset.y; o.z += offset.z;
-    const Vector3 point{o.x, o.y, o.z};
-    const auto distance = Vector3Distance(camera.position, point);
-    (void)distance;
-    const auto arm = std::max(1.0F, view_half_height(camera, point) * 180.0F / std::max(1.0F, viewport_size.y));
-    const Vector3 origin{o.x, o.y + unit_size * 0.5F, o.z};
+    const auto arm = std::max(1.0F, view_half_height(camera, base) * 180.0F / std::max(1.0F, viewport_size.y));
+    const Vector3 origin{base.x, base.y + unit_size * 0.5F, base.z};
     const float p0 = arm * 0.3F;
     const float p1 = arm * 0.6F;
+    const float ring = arm * 0.7F;
     return GizmoLayout{
         origin,
         {origin.x + arm, origin.y, origin.z},
         {origin.x, origin.y + arm, origin.z},
         {origin.x, origin.y, origin.z + arm},
-        {origin.x + arm * 0.7F, origin.y, origin.z + arm * 0.7F},
+        {origin.x + std::cos(angle) * ring, origin.y, origin.z + std::sin(angle) * ring},
         {Vector3{origin.x + p0, origin.y, origin.z + p0}, Vector3{origin.x + p1, origin.y, origin.z + p0},
          Vector3{origin.x + p1, origin.y, origin.z + p1}, Vector3{origin.x + p0, origin.y, origin.z + p1}},
         arm * .065F,
         arm,
     };
+}
+
+GizmoLayout building_gizmo_layout(const SbcBuilding& placement, const Camera3D& camera, Vector2 viewport_size, Vector3 offset = {},
+    std::optional<float> angle = std::nullopt) {
+    constexpr auto unit_size = 4.0F;
+    const auto o = native_city_building_render_origin(placement, unit_size);
+    return gizmo_layout_at({o.x + offset.x, o.y + offset.y, o.z + offset.z}, angle.value_or(gizmo_rotation_angle(placement.rotation)),
+        camera, viewport_size);
+}
+
+// The move gizmo on a road junction, on top of its crossing.
+// It sits at the middle of the junction's crossing tiles, which is not always its grid
+// point; `offset` (from junction_gizmo_offset) keeps that while the junction moves.
+GizmoLayout junction_gizmo_layout(CityGridPoint node, Vector3 offset, const Camera3D& camera, Vector2 viewport_size) {
+    constexpr auto unit_size = 4.0F;
+    return gizmo_layout_at({static_cast<float>(node.x) * unit_size + offset.x, static_cast<float>(node.y) * unit_size + offset.y,
+        static_cast<float>(node.z) * unit_size + offset.z}, 0.0F, camera, viewport_size);
+}
+
+// From a junction's grid point to the middle of its drawn crossing (zero for a road's end).
+Vector3 junction_gizmo_offset(const SbcMap& map, const MapScene& scene, std::size_t index) {
+    if (index >= map.intersections.size()) return {};
+    Vector3 sum{};
+    float count = 0.0F;
+    for (const auto& tile : scene.city_tiles) {
+        if (tile.intersection_index != static_cast<std::int32_t>(index) || tile.street_index >= 0 || tile.kind != CityTileKind::Road) continue;
+        sum.x += (static_cast<float>(tile.x) + 0.5F) * scene.unit_size;
+        sum.z += (static_cast<float>(tile.z) + 0.5F) * scene.unit_size;
+        count += 1.0F;
+    }
+    if (count == 0.0F) return {};
+    const auto& node = map.intersections[index];
+    return {sum.x / count - static_cast<float>(node.x) * scene.unit_size, 0.0F, sum.z / count - static_cast<float>(node.z) * scene.unit_size};
+}
+
+// What the Select tool's move gizmo moves: the selected junction, or the selected road
+// (both its junctions). Drags measure from `node` (a road's first junction); the gizmo
+// sits `offset` from it, in the middle of the crossing or the road.
+struct RoadGizmoTarget {
+    std::size_t node{};
+    std::optional<std::size_t> street;
+    Vector3 offset{};
+};
+
+std::optional<RoadGizmoTarget> road_gizmo_target(const EditorProject& project, const EditorUi& ui) {
+    if (!project.city || ui.tab != EditorTab::City || ui.city_tool != CityTool::Select) return std::nullopt;
+    const auto& map = project.city->data;
+    if (ui.city_selection == CitySelectionKind::Node && ui.selected_city_intersection < map.intersections.size()) {
+        return RoadGizmoTarget{ui.selected_city_intersection, std::nullopt,
+            junction_gizmo_offset(map, project.city_scene_cache, ui.selected_city_intersection)};
+    }
+    if (ui.city_selection != CitySelectionKind::Road || ui.selected_city_street >= map.streets.size()) return std::nullopt;
+    const auto& street = map.streets[ui.selected_city_street];
+    if (street.from_intersection < 0 || street.to_intersection < 0 ||
+        static_cast<std::size_t>(std::max(street.from_intersection, street.to_intersection)) >= map.intersections.size()) return std::nullopt;
+    const auto& a = map.intersections[static_cast<std::size_t>(street.from_intersection)];
+    const auto& b = map.intersections[static_cast<std::size_t>(street.to_intersection)];
+    constexpr float unit = 4.0F;
+    return RoadGizmoTarget{static_cast<std::size_t>(street.from_intersection), ui.selected_city_street,
+        {static_cast<float>(b.x - a.x) * unit * 0.5F, static_cast<float>(b.y - a.y) * unit * 0.5F, static_cast<float>(b.z - a.z) * unit * 0.5F}};
 }
 
 // What a click would select in the city view. A building or piece the ray passes
@@ -2785,12 +2960,8 @@ void erase_city_thing_under_cursor(
 // The gizmo handle under the cursor, measured in viewport pixels. Hit areas on
 // the screen keep the gizmo easy to grab at every zoom and match the arrows you
 // see, instead of only testing tiny 3D spheres at their tips.
-GizmoAxis pick_building_gizmo(
-    const Camera3D& camera,
-    Vector2 viewport_mouse_pos,
-    Vector2 viewport_size,
-    const SbcBuilding& placement, bool allow_rotation = true, Vector3 offset = {}) {
-    const auto layout = building_gizmo_layout(placement, camera, viewport_size, offset);
+GizmoAxis pick_gizmo(const GizmoLayout& layout, const Camera3D& camera, Vector2 viewport_mouse_pos, Vector2 viewport_size,
+    bool allow_rotation) {
     const auto width = static_cast<int>(std::max(1.0F, viewport_size.x));
     const auto height = static_cast<int>(std::max(1.0F, viewport_size.y));
     // The forward direction, to ignore points behind the camera. GetWorldToScreenEx
@@ -2906,13 +3077,21 @@ GizmoAxis pick_building_gizmo(
     return best;
 }
 
-void draw_building_gizmo(const SbcBuilding& placement, GizmoAxis active, const Camera3D& camera, Vector2 viewport_size, bool allow_rotation = true, Vector3 offset = {}) {
-    // A transform gizmo like ImGuizmo's: it stays the same size on screen and has axis
-    // arrows with cone tips, a see-through XZ plane square, and a Y rotation ring. The
-    // handle under the mouse or in use turns yellow. Everything draws over the scene.
+GizmoAxis pick_building_gizmo(
+    const Camera3D& camera,
+    Vector2 viewport_mouse_pos,
+    Vector2 viewport_size,
+    const SbcBuilding& placement, bool allow_rotation = true, Vector3 offset = {}) {
+    return pick_gizmo(building_gizmo_layout(placement, camera, viewport_size, offset), camera, viewport_mouse_pos, viewport_size, allow_rotation);
+}
+
+// A transform gizmo like ImGuizmo's: it stays the same size on screen and has axis
+// arrows with cone tips, a see-through XZ plane square, and a Y rotation ring whose
+// dot shows the current rotation. The handle under the mouse or in use turns yellow.
+// Everything draws over the scene.
+void draw_gizmo(const GizmoLayout& layout, GizmoAxis active, bool allow_rotation) {
     rlDrawRenderBatchActive();
     rlDisableDepthTest();
-    const auto layout = building_gizmo_layout(placement, camera, viewport_size, offset);
     const Color highlight{255, 214, 0, 255};
     const auto axis_color = [&](GizmoAxis axis, Color base) {
         return active == axis ? highlight : base;
@@ -2964,12 +3143,18 @@ void draw_building_gizmo(const SbcBuilding& placement, GizmoAxis active, const C
             const Vector3 p1{layout.origin.x + std::cos(a1) * ring, layout.origin.y, layout.origin.z + std::sin(a1) * ring};
             DrawCylinderEx(p0, p1, r * 0.18F, r * 0.18F, 6, color);
         }
+        DrawCylinderEx(layout.origin, layout.tip_rot, r * 0.12F, r * 0.12F, 6, color);
         DrawSphere(layout.tip_rot, r * 0.6F, color);
     }
     // The centre point.
     DrawSphere(layout.origin, r * 0.5F, active == GizmoAxis::None ? Color{235, 235, 235, 255} : highlight);
     rlDrawRenderBatchActive();
     rlEnableDepthTest();
+}
+
+void draw_building_gizmo(const SbcBuilding& placement, GizmoAxis active, const Camera3D& camera, Vector2 viewport_size, bool allow_rotation = true,
+    Vector3 offset = {}, std::optional<float> angle = std::nullopt) {
+    draw_gizmo(building_gizmo_layout(placement, camera, viewport_size, offset, angle), active, allow_rotation);
 }
 
 // During a gizmo drag, turns the cursor's ground (or vertical) position into a grid
@@ -3042,6 +3227,8 @@ void apply_building_gizmo_drag(
             const auto start_angle = std::atan2(start_ray.position.z + start_ray.direction.z * start_t - origin.z,
                 start_ray.position.x + start_ray.direction.x * start_t - origin.x);
             const auto delta = std::remainder(angle - start_angle, 2.0F * PI);
+            // The dot follows the cursor; the building snaps to quarter turns.
+            ui.gizmo_rotate_angle = gizmo_rotation_angle(ui.gizmo_drag_origin_rot) + delta;
             placement.rotation = (ui.gizmo_drag_origin_rot + static_cast<int>(std::lround(delta / (PI * .5F))) + 4) & 3;
             const auto moved_center = city_building_center(project, placement);
             placement.x += static_cast<int>(std::lround((pivot.x - moved_center.x) / unit_size));
@@ -3630,12 +3817,15 @@ std::string draw_road_lay_preview(EditorProject& project, EditorUi& ui, std::opt
     // Dragging a junction (Select tool) previews the move.
     if (ui.node_drag && ui.node_drag_target && *ui.node_drag < map.intersections.size()) {
         const auto& node = map.intersections[*ui.node_drag];
-        const auto dx = ui.node_drag_target->x - node.x, dz = ui.node_drag_target->z - node.z;
-        if (dx == 0 && dz == 0) return {};
+        const auto dx = ui.node_drag_target->x - node.x, dy = ui.node_drag_target->y - node.y, dz = ui.node_drag_target->z - node.z;
+        if (dx == 0 && dy == 0 && dz == 0) return {};
+        // Only what the road preview reads: junctions, roads, and the buildings over them.
         SbcMap moved;
-        moved.version = map.version; moved.intersections = map.intersections; moved.streets = map.streets;
-        if (!move_city_junction(moved, *ui.node_drag, dx, dz)) return "!Move junction: a road would shrink to nothing or turn around.";
-        return draw_road_edit_preview(project, ui, moved, "Move junction by " + std::to_string(dx) + ", " + std::to_string(dz) + " cells");
+        moved.version = map.version; moved.intersections = map.intersections; moved.streets = map.streets; moved.buildings = map.buildings;
+        const auto* what = ui.road_drag ? "Move road" : "Move junction";
+        if (!apply_road_drag(moved, ui)) return std::string{"!"} + what + ": a road would shrink to nothing or turn around.";
+        return draw_road_edit_preview(project, ui, moved, std::string{what} + " by " + std::to_string(dx) + ", " + std::to_string(dy) + ", " +
+            std::to_string(dz) + " cells");
     }
     if (ui.city_tool != CityTool::Road) return {};
     const auto ground = [&](std::int32_t gx, std::int32_t gz, std::int32_t fallback_level) {
@@ -3674,7 +3864,7 @@ struct FocusTarget {
     float radius{};
 };
 
-std::optional<FocusTarget> focus_target_for_selection(const EditorProject& project, const EditorUi& ui) {
+std::optional<FocusTarget> focus_target_for_selection(EditorProject& project, const EditorUi& ui) {
     constexpr float unit = 4.0F;
     // Move back far enough that a bounding sphere of half-size r fits a vertical field
     // of view of about 55 degrees, with a little room: r / sin(fov/2) * margin.
@@ -3736,9 +3926,38 @@ std::optional<FocusTarget> focus_target_for_selection(const EditorProject& proje
             const auto& n = map.intersections[std::min(ui.selected_city_intersection, map.intersections.size() - 1U)];
             return FocusTarget{{static_cast<float>(n.x) * unit, static_cast<float>(n.y) * unit, static_cast<float>(n.z) * unit}, fit_radius(unit * 2.0F)};
         }
+    } else if (ui.tab == EditorTab::Buildblocks && !project.buildblocks.empty()) {
+        // Every face of the buildblock preview, with its doors.
+        const auto& scene = buildblock_preview_scene(project, std::min(ui.selected_buildblock, project.buildblocks.size() - 1U));
+        Vector3 lo{FLT_MAX, FLT_MAX, FLT_MAX}, hi{-FLT_MAX, -FLT_MAX, -FLT_MAX};
+        for (const auto& rect : scene.rects) {
+            lo = Vector3Min(lo, {rect.center.x - rect.size.x * 0.5F, rect.center.y - rect.size.y * 0.5F, rect.center.z - rect.size.z * 0.5F});
+            hi = Vector3Max(hi, {rect.center.x + rect.size.x * 0.5F, rect.center.y + rect.size.y * 0.5F, rect.center.z + rect.size.z * 0.5F});
+        }
+        for (const auto& door : scene.doors) {
+            lo = Vector3Min(lo, {door.position.x, door.position.y, door.position.z});
+            hi = Vector3Max(hi, {door.position.x, door.position.y, door.position.z});
+        }
+        if (lo.x <= hi.x) {
+            return FocusTarget{Vector3Scale(Vector3Add(lo, hi), 0.5F), std::max(unit, Vector3Distance(lo, hi) * 0.5F / 0.46F * 1.25F)};
+        }
+    } else if (ui.tab == EditorTab::Blocks) {
+        if (const auto bounds = block_focus_bounds(project, ui)) {
+            return FocusTarget{Vector3Scale(Vector3Add(bounds->first, bounds->second), 0.5F),
+                std::max(unit * 1.5F, Vector3Distance(bounds->first, bounds->second) * 0.5F / 0.46F * 1.25F)};
+        }
     } else if (ui.tab == EditorTab::Buildings && !project.buildings.empty()) {
-        // Frame the whole building, centred on its mesh.
         const auto& building = project.buildings[std::min(ui.selected_building, project.buildings.size() - 1U)].data;
+        // The picked block, in the edit view's space (cells from the anchor).
+        const auto occupied = occupied_cell_indices(building);
+        if (ui.building_cell_picked && !occupied.empty()) {
+            const auto& cell = building.cells[occupied[std::min(ui.selected_building_cell, occupied.size() - 1U)]];
+            const Vector3 center{(static_cast<float>(cell.x) - static_cast<float>(building.anchor_x) + 0.5F) * unit,
+                (static_cast<float>(cell.y) - static_cast<float>(building.anchor_y) + 0.5F) * unit,
+                (static_cast<float>(cell.z) - static_cast<float>(building.anchor_z) + 0.5F) * unit};
+            return FocusTarget{center, unit * 4.0F};
+        }
+        // Else the whole building, centred on its mesh.
         const Vector3 center{
             (static_cast<float>(building.size_x) * 0.5F - static_cast<float>(building.anchor_x)) * unit,
             (static_cast<float>(building.size_z) * 0.5F - static_cast<float>(building.anchor_y)) * unit,
@@ -3802,6 +4021,9 @@ void focus_current_selection(EditorProject& project, EditorUi& ui, Camera3D& cam
         start_focus_animation(ui, camera, target->point, target->radius);
         return;
     }
+    // Nothing to frame: the whole city in the City view, and otherwise stay put
+    // (framing the city from another mode moved the view away from its asset).
+    if (ui.tab != EditorTab::City) return;
     Camera3D framed = camera;
     focus_camera_on_city(framed, project);
     start_focus_animation(ui, camera, framed.target, 130.0F);
@@ -4048,9 +4270,9 @@ void handle_editor_hotkeys(
         }
         if (!occupied.empty() && action_pressed(ui, EditorAction::NextCell)) {
             if (shift) {
-                ui.selected_building_cell = ui.selected_building_cell == 0U ? occupied.size() - 1U : ui.selected_building_cell - 1U;
+                ui.selected_building_cell = ui.selected_building_cell == 0U ? occupied.size() - 1U : ui.selected_building_cell - 1U; ui.building_cell_picked = true;
             } else {
-                ui.selected_building_cell = (ui.selected_building_cell + 1U) % occupied.size();
+                ui.selected_building_cell = (ui.selected_building_cell + 1U) % occupied.size(); ui.building_cell_picked = true;
             }
         }
     } else if (ui.tab == EditorTab::Blocks && !project.blocks.empty()) {
@@ -4454,6 +4676,9 @@ void present_parsing_frame(const std::filesystem::path& folder) {
 
 } // namespace pafta::app_internal
 
+extern const unsigned char pafta_editor_logo[];
+extern const std::size_t pafta_editor_logo_size;
+
 namespace pafta {
 
 int run_editor_app() {
@@ -4463,6 +4688,10 @@ int run_editor_app() {
     // shapes, so multisampling the window only cost memory.
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     InitWindow(1440, 900, "Pafta v" PAFTA_VERSION);
+    Image logo_image = LoadImageFromMemory(".png", pafta_editor_logo, static_cast<int>(pafta_editor_logo_size));
+    SetWindowIcon(logo_image);
+    const Texture2D logo_texture = LoadTextureFromImage(logo_image);
+    UnloadImage(logo_image);
     SetWindowMinSize(1100, 700);
     // PAFTA_BENCH=N: no frame limit. Once the scene has settled, time N frames, print
     // the averages, and exit. Use it with PAFTA_AUTOLOAD.
@@ -4610,6 +4839,9 @@ int run_editor_app() {
         g_render_settings.building_distance = ui.building_distance;
         if (g_render_settings.terrain_distance != ui.terrain_distance) invalidate_environment_cubemap();
         g_render_settings.terrain_distance = ui.terrain_distance;
+        g_render_settings.terrain_follow_camera = ui.terrain_follow_camera;
+        g_render_settings.terrain_detail_scale = ui.terrain_detail_scale;
+        g_render_settings.terrain_finest_step = ui.terrain_finest_step;
         g_render_settings.half_textures = ui.half_textures;
         g_render_settings.near_lod = ui.near_lod;
         // Selected-only interiors: the placements whose rooms are drawn at any distance.
@@ -4774,11 +5006,15 @@ int run_editor_app() {
         static Vector2 right_click_at{};
         static double right_click_time = 0.0;
         static float right_click_moved = 0.0F;
+        // raylib centres the cursor when it locks or frees it; put it back where the
+        // right press was, so the context menu opens there and the mouse doesn't jump.
+        static Vector2 right_click_screen{};
         bool viewport_menu_requested = false;
         if (is_viewport_hovered && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && ui.block_transform == BlockTransform::None) {
             right_click_at = viewport_mouse_pos;
             right_click_time = GetTime();
             right_click_moved = 0.0F;
+            right_click_screen = GetMousePosition();
             set_camera_perspective(camera);
             DisableCursor();
         }
@@ -4789,6 +5025,9 @@ int run_editor_app() {
         }
         if (IsMouseButtonReleased(MOUSE_BUTTON_RIGHT) && IsCursorHidden()) {
             EnableCursor();
+            SetMousePosition(static_cast<int>(right_click_screen.x), static_cast<int>(right_click_screen.y));
+            io.MousePos = ImVec2(right_click_screen.x, right_click_screen.y);
+            viewport_mouse_pos = get_viewport_mouse_position(viewport_origin, last_viewport_size);
             viewport_menu_requested = right_click_moved < 6.0F && GetTime() - right_click_time < 0.4;
         }
         if (IsCursorHidden()) {
@@ -4892,7 +5131,7 @@ int run_editor_app() {
             bool working = project && (project->render_build_in_progress || !project->pending_gpu_upload_indices.empty() ||
                 project->city_scene_build_in_progress || !project->city_scene_gpu_valid ||
                 project->city_scene_current_fingerprint != project->city_scene_cache_fingerprint ||
-                !project->building_near_jobs.empty() || project->portal_rebuild_future.has_value() ||
+                !project->building_near_jobs.empty() || project->portal_rebuild_future.has_value() || !project->terrain_detail_jobs.empty() || !project->building_rebuild_jobs.empty() || project->building_floor_preview_job.valid() ||
                 project->city_roads_build_future.has_value() || project->placement_override_build_future.has_value() ||
                 !project->placement_override_uploads.empty() || !project->pending_roads.tiles.empty());
             working = working || (project && ui.tab == EditorTab::City &&
@@ -5006,8 +5245,18 @@ int run_editor_app() {
                             if (project->city_tile_gpu_fingerprint != project->city_scene_cache.city_tile_fingerprint ||
                                 (!project->city_tile_gpu_shadows_valid && road_shadows_ready) || project->city_road_cells_filtered) {
                                 unload_city_render_model(project->city_tile_gpu_model);
-                                project->city_tile_gpu_model =
-                                    upload_city_tile_model(project->city_scene_cache.city_tile_buffer, *project, road_shadows_ready);
+                                auto& prepared = project->city_prepared_models;
+                                const auto& tiles = project->city_scene_cache.city_tile_buffer;
+                                if (!prepared.tiles) prepared.tiles = prepare_gpu_mesh(tiles, true);
+                                if (road_shadows_ready && !prepared.tile_shadows) prepared.tile_shadows = prepare_shadow_volume(tiles, true);
+                                project->city_tile_gpu_model = upload_city_tile_model(tiles, *prepared.tiles,
+                                    road_shadows_ready ? &*prepared.tile_shadows : nullptr, *project);
+                                free_in_background(std::move(prepared.tiles));
+                                free_in_background(std::move(prepared.tile_shadows));
+                                prepared.tiles.reset();
+                                prepared.tile_shadows.reset();
+                                free_in_background(std::move(project->city_scene_cache.city_tile_buffer.shadow_vertices));
+                                free_in_background(std::move(project->city_scene_cache.city_tile_buffer.shadow_indices));
                                 release_shadow_volume(project->city_scene_cache.city_tile_buffer);
                                 project->city_tile_gpu_fingerprint = project->city_scene_cache.city_tile_fingerprint;
                                 project->city_tile_gpu_shadows_valid = road_shadows_ready;
@@ -5015,13 +5264,19 @@ int run_editor_app() {
                                 project->city_road_visibility_fingerprint = scene_fingerprint;
                             }
 
-                            const auto terrain_fp = city_terrain_fingerprint(project->city->data, project->city_building_revision);
+                            auto& prepared = project->city_prepared_models;
+                            const auto terrain_fp = project->city_scene_terrain_fingerprint == scene_fingerprint && prepared.terrain_fingerprint != 0U
+                                ? prepared.terrain_fingerprint
+                                : city_terrain_fingerprint(project->city->data, project->city_building_revision);
                             if (project->city_scene_terrain_fingerprint == scene_fingerprint &&
                                 (!project->terrain_gpu_valid || terrain_fp != project->terrain_gpu_fingerprint)) {
                                 unload_city_render_model(project->terrain_gpu_model);
                                 if (project->city_scene_cache.terrain.has_value()) {
-                                    project->terrain_gpu_model =
-                                        upload_city_terrain_model(project->city_scene_cache.terrain->mesh, *project);
+                                    const auto& mesh = project->city_scene_cache.terrain->mesh;
+                                    if (!prepared.terrain) prepared.terrain = prepare_gpu_mesh(mesh, false);
+                                    project->terrain_gpu_model = upload_city_terrain_model(mesh, *prepared.terrain, *project);
+                                    free_in_background(std::move(prepared.terrain));
+                                    prepared.terrain.reset();
                                 }
                                 project->terrain_gpu_fingerprint = terrain_fp;
                                 project->terrain_gpu_valid = true;
@@ -5031,6 +5286,7 @@ int run_editor_app() {
                         }
                         const auto& city_scene = project->city_scene_cache;
                         const bool game_preview = ui.render_roads;
+                        if (ui.render_terrain) update_terrain_detail(*project, camera.position);
                         draw_city_scene(*project, city_scene, selected_street, game_preview, ui.render_terrain);
                         if (!game_preview) {
                             draw_city_editor_overlay(*project, city_scene);
@@ -5154,6 +5410,7 @@ int run_editor_app() {
                             // The cell under the cursor, for the hover outline.
                             ui.building_hover_cell.reset();
                             ui.building_hover_face.reset();
+                            ui.building_hover_side.reset();
                             if (is_viewport_hovered && !IsCursorHidden()) {
                                 // The face that is really under the cursor, from the edit view's mesh.
                                 const auto pr = get_viewport_mouse_ray(camera, viewport_mouse_pos, last_viewport_size);
@@ -5162,6 +5419,9 @@ int run_editor_app() {
                                 if (const auto pick = pick_building_face(project->building_floor_preview_render_buffer, ro, rd)) {
                                     ui.building_hover_cell = pick->cell_index;
                                     ui.building_hover_face = pick->slot;
+                                    if (pick->cell_index < project->buildings[ui.selected_building].data.cells.size()) {
+                                        ui.building_hover_side = building_pick_side(project->buildings[ui.selected_building].data, *pick);
+                                    }
                                 }
                             }
                             auto& preview_model = building_tool_floor_preview_model(*project, ui.selected_building, preview_floor,
@@ -5173,7 +5433,10 @@ int run_editor_app() {
                                 selected,
                                 static_cast<std::uint32_t>(std::max(0, ui.building_view_floor)));
                             draw_building_item_set_guides(*project, project->buildings[ui.selected_building].data, preview_floor);
-                            if (ui.building_tool == BuildingTool::PaintTexture &&
+                            if (ui.building_tool == BuildingTool::PaintTexture && ui.paint_side_code &&
+                                ui.building_hover_cell.has_value() && ui.building_hover_side.has_value()) {
+                                draw_building_side_highlight(project->buildings[ui.selected_building].data, *ui.building_hover_cell, *ui.building_hover_side);
+                            } else if (ui.building_tool == BuildingTool::PaintTexture &&
                                 ui.building_hover_cell.has_value() && ui.building_hover_face.has_value()) {
                                 draw_building_face_highlight(project->building_floor_preview_render_buffer,
                                     *ui.building_hover_cell, *ui.building_hover_face);
@@ -5371,6 +5634,13 @@ int run_editor_app() {
                         gizmo_hit = pick_building_gizmo(camera, viewport_mouse_pos, last_viewport_size, project->city->data.buildings[sel], true,
                             city_building_gizmo_offset(*project, project->city->data.buildings[sel]));
                     }
+                    GizmoAxis junction_hit = GizmoAxis::None;
+                    const auto road_target = road_gizmo_target(*project, ui);
+                    if (road_target) {
+                        const auto& node = project->city->data.intersections[road_target->node];
+                        junction_hit = pick_gizmo(junction_gizmo_layout({node.x, node.y, node.z}, road_target->offset, camera, last_viewport_size),
+                            camera, viewport_mouse_pos, last_viewport_size, false);
+                    }
                     const auto clicked = pick_city_any(*project, project->city_scene_cache, ray_origin, ray_dir);
                     const bool double_click = clicked.kind == CitySelectionKind::Building &&
                         ui.last_clicked_building == clicked.index && GetTime() - ui.last_building_click_time < 0.3 &&
@@ -5396,10 +5666,18 @@ int run_editor_app() {
                                 ui.gizmo_start_buildings.emplace_back(index, project->city->data.buildings[index]);
                         if (std::none_of(ui.gizmo_start_buildings.begin(), ui.gizmo_start_buildings.end(), [&](const auto& saved) { return saved.first == ui.selected_city_building; }))
                             ui.gizmo_start_buildings.emplace_back(ui.selected_city_building, placement);
+                    } else if (junction_hit != GizmoAxis::None) {
+                        ui.node_drag = road_target->node;
+                        ui.road_drag = road_target->street;
+                        ui.node_drag_axis = junction_hit;
+                        ui.node_drag_mouse = viewport_mouse_pos;
+                        ui.node_drag_target.reset();
                     } else if (clicked.kind == CitySelectionKind::Node && !IsKeyDown(KEY_LEFT_SHIFT) && !IsKeyDown(KEY_LEFT_CONTROL)) {
-                        // Grabbing a junction selects it and starts dragging it.
+                        // Grabbing a junction's crossing selects it and drags it along the ground.
                         select_city_thing(*project, ui, clicked, false, ray_origin, ray_dir, status);
                         ui.node_drag = clicked.index;
+                        ui.road_drag.reset();
+                        ui.node_drag_axis = GizmoAxis::MoveXZ;
                         ui.node_drag_mouse = viewport_mouse_pos;
                         ui.node_drag_target.reset();
                     } else {
@@ -5466,9 +5744,14 @@ int run_editor_app() {
                         } else if (ui.building_tool == BuildingTool::ItemSet) {
                             place_building_item_set(*project, ui, pick->cell_index, status);
                         } else {
-                            if (ui.paint_side_code) paint_building_side_code(*project, ui, pick->cell_index, pick->slot, status);
-                            else paint_building_face(*project, ui, pick->cell_index, pick->slot, status);
-                            ui.drag_paint_face = std::pair{pick->cell_index, pick->slot};
+                            if (ui.paint_side_code) {
+                                const auto side = building_pick_side(project->buildings[ui.selected_building].data, *pick);
+                                paint_building_side_code(*project, ui, pick->cell_index, side, status);
+                                ui.drag_paint_face = std::pair{pick->cell_index, static_cast<std::uint32_t>(side)};
+                            } else {
+                                paint_building_face(*project, ui, pick->cell_index, pick->slot, status);
+                                ui.drag_paint_face = std::pair{pick->cell_index, pick->slot};
+                            }
                         }
                     } else {
                         if (ui.building_tool == BuildingTool::PlaceBlock && std::abs(rd.y) > 0.0001F) {
@@ -5518,6 +5801,7 @@ int run_editor_app() {
             }
             if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
                 ui.gizmo_active = GizmoAxis::None;
+                ui.gizmo_rotate_angle.reset();
             }
         }
 
@@ -5527,33 +5811,56 @@ int run_editor_app() {
             auto& map = project->city->data;
             if (*ui.node_drag >= map.intersections.size() || IsKeyPressed(KEY_ESCAPE)) {
                 ui.node_drag.reset();
+                ui.road_drag.reset();
                 ui.node_drag_target.reset();
             } else if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
                 if (ui.node_drag_target || Vector2Distance(viewport_mouse_pos, ui.node_drag_mouse) > 4.0F) {
                     const auto& node = map.intersections[*ui.node_drag];
-                    const float unit = project->city_scene_cache_valid ? project->city_scene_cache.unit_size : 4.0F;
-                    const auto ray = get_viewport_mouse_ray(camera, viewport_mouse_pos, last_viewport_size);
-                    if (const auto hit = ray_horizontal_plane_hit({ray.position.x, ray.position.y, ray.position.z},
-                            {ray.direction.x, ray.direction.y, ray.direction.z}, static_cast<float>(node.y + 1) * unit)) {
-                        ui.node_drag_target = CityGridPoint{static_cast<std::int32_t>(std::lround(hit->x / unit)), node.y,
-                            static_cast<std::int32_t>(std::lround(hit->z / unit))};
+                    constexpr float unit = 4.0F;
+                    CityGridPoint target{node.x, node.y, node.z};
+                    if (ui.node_drag_axis == GizmoAxis::MoveXZ) {
+                        // How far the cursor moved on the junction's level since the press.
+                        const auto plane_hit = [&](Vector2 mouse) {
+                            const auto ray = get_viewport_mouse_ray(camera, mouse, last_viewport_size);
+                            return ray_horizontal_plane_hit({ray.position.x, ray.position.y, ray.position.z},
+                                {ray.direction.x, ray.direction.y, ray.direction.z}, static_cast<float>(node.y) * unit);
+                        };
+                        const auto now = plane_hit(viewport_mouse_pos), start = plane_hit(ui.node_drag_mouse);
+                        if (now && start) {
+                            target.x += static_cast<std::int32_t>(std::lround((now->x - start->x) / unit));
+                            target.z += static_cast<std::int32_t>(std::lround((now->z - start->z) / unit));
+                        }
+                    } else {
+                        // Along one gizmo arrow: the cursor's movement along the arrow on screen.
+                        const auto layout = junction_gizmo_layout(target, {}, camera, last_viewport_size);
+                        const auto tip = ui.node_drag_axis == GizmoAxis::MoveX ? layout.tip_x
+                            : ui.node_drag_axis == GizmoAxis::MoveY ? layout.tip_y : layout.tip_z;
+                        const auto w = static_cast<int>(last_viewport_size.x), h = static_cast<int>(last_viewport_size.y);
+                        const auto axis = Vector2Subtract(GetWorldToScreenEx(tip, camera, w, h), GetWorldToScreenEx(layout.origin, camera, w, h));
+                        const auto length2 = Vector2LengthSqr(axis);
+                        if (length2 > 1.0F) {
+                            const auto delta = static_cast<std::int32_t>(std::lround(
+                                Vector2DotProduct(Vector2Subtract(viewport_mouse_pos, ui.node_drag_mouse), axis) / length2 * layout.arm_length / unit));
+                            (ui.node_drag_axis == GizmoAxis::MoveX ? target.x : ui.node_drag_axis == GizmoAxis::MoveY ? target.y : target.z) += delta;
+                        }
                     }
+                    ui.node_drag_target = target;
                 }
             } else {
                 if (ui.node_drag_target) {
                     const auto& node = map.intersections[*ui.node_drag];
-                    const auto dx = ui.node_drag_target->x - node.x, dz = ui.node_drag_target->z - node.z;
-                    if (dx != 0 || dz != 0) {
-                        begin_city_action(*project, ui, "move junction");
-                        if (move_city_junction(map, *ui.node_drag, dx, dz)) {
+                    if (!(*ui.node_drag_target == CityGridPoint{node.x, node.y, node.z})) {
+                        begin_city_action(*project, ui, ui.road_drag ? "move road" : "move junction");
+                        if (apply_road_drag(map, ui)) {
                             invalidate_portal_render_models(*project);
                             ui.city_dirty = true;
                         } else {
-                            status = "can't move the junction there: a road would shrink to nothing or turn around";
+                            status = "can't move it there: a road would shrink to nothing or turn around";
                         }
                     }
                 }
                 ui.node_drag.reset();
+                ui.road_drag.reset();
                 ui.node_drag_target.reset();
             }
         }
@@ -5680,11 +5987,12 @@ int run_editor_app() {
                 const Vec3 ro{pick_ray.position.x, pick_ray.position.y, pick_ray.position.z};
                 const Vec3 rd{pick_ray.direction.x, pick_ray.direction.y, pick_ray.direction.z};
                 (void)pick_floor;
-                (void)building;
                 if (const auto pick = pick_building_face(project->building_floor_preview_render_buffer, ro, rd)) {
-                    const std::pair face{pick->cell_index, pick->slot};
+                    // Wall types are painted per cell side, faces per texture slot.
+                    const std::pair face{pick->cell_index, ui.paint_side_code
+                        ? static_cast<std::uint32_t>(building_pick_side(building, *pick)) : pick->slot};
                     if (ui.drag_paint_face != face) {
-                        if (ui.paint_side_code) paint_building_side_code(*project, ui, pick->cell_index, pick->slot, status);
+                        if (ui.paint_side_code) paint_building_side_code(*project, ui, pick->cell_index, static_cast<int>(face.second), status);
                         else paint_building_face(*project, ui, pick->cell_index, pick->slot, status);
                         ui.drag_paint_face = face;
                     }
@@ -5808,10 +6116,13 @@ int run_editor_app() {
                 }
                 if (ImGui::MenuItem(ICON_FA_TABLE_CELLS " New buildblock")) {
                     SblTemplate model{}; model.version = 1;
+                    // Like the shipped files: 16 faces (the game always reads 16), unused
+                    // ones empty (a plain wall). Face 1 starts as a window, face 2 as a doorway.
                     model.layers.resize(16);
-                    for (std::size_t i = 0; i < model.layers.size(); ++i) {
-                        model.layers[i].index = i; model.layers[i].bounds = {0, 1, 0, 1};
-                    }
+                    for (std::size_t i = 0; i < model.layers.size(); ++i) model.layers[i].index = i;
+                    model.layers[0].bounds = {0.25F, 0.5F, 0.25F, 0.5F};
+                    add_buildblock_window(model.layers[0], 0.5F, 0.5F);
+                    make_buildblock_doorway(model.layers[1]);
                     const auto name = unique_name("buildblock", "buildblock", ".sbl", project->buildblocks);
                     project->buildblock_bytes.push_back(rebuild_sbl_buildblock(model));
                     project->buildblocks.push_back({project->root / "buildblock" / (name + ".sbl"), name, model, true, true});
@@ -6087,7 +6398,16 @@ int run_editor_app() {
                         const auto offset = city_building_gizmo_offset(*project, placement);
                         const auto hovered = ui.gizmo_active != GizmoAxis::None ? ui.gizmo_active :
                             (is_viewport_hovered ? pick_building_gizmo(camera, viewport_mouse_pos, last_viewport_size, placement, true, offset) : GizmoAxis::None);
-                        draw_building_gizmo(placement, hovered, camera, last_viewport_size, true, offset);
+                        draw_building_gizmo(placement, hovered, camera, last_viewport_size, true, offset,
+                            ui.gizmo_active == GizmoAxis::Rotate ? ui.gizmo_rotate_angle : std::nullopt);
+                    } else if (const auto road_target = road_gizmo_target(*project, ui)) {
+                        // The junction's or road's move gizmo, where a drag would put it.
+                        const auto& node = project->city->data.intersections[road_target->node];
+                        const auto at = ui.node_drag && ui.node_drag_target ? *ui.node_drag_target : CityGridPoint{node.x, node.y, node.z};
+                        const auto layout = junction_gizmo_layout(at, road_target->offset, camera, last_viewport_size);
+                        const auto hovered = ui.node_drag ? ui.node_drag_axis
+                            : is_viewport_hovered ? pick_gizmo(layout, camera, viewport_mouse_pos, last_viewport_size, false) : GizmoAxis::None;
+                        draw_gizmo(layout, hovered, false);
                     } else if (ui.tab == EditorTab::Blocks) {
                         draw_block_editor_handles(*project, ui, camera);
                     } else if (ui.tab == EditorTab::Buildings && !project->buildings.empty() &&
@@ -6177,6 +6497,8 @@ int run_editor_app() {
             ImGui::SetNextWindowSize(ImVec2(420.0F, 0.0F), ImGuiCond_Appearing);
             if (ImGui::Begin("About Pafta", &ui.show_about_window,
                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking)) {
+                ImGui::SetCursorPosX((ImGui::GetWindowWidth() - 192.0F) * 0.5F);
+                rlImGuiImageSize(&logo_texture, 192, 192);
                 ImGui::TextUnformatted("Pafta v" PAFTA_VERSION);
                 ImGui::TextUnformatted("Sub Rosa map editor");
                 ImGui::Separator();
@@ -6791,6 +7113,7 @@ int run_editor_app() {
     if (IsCursorHidden()) {
         EnableCursor();
     }
+    UnloadTexture(logo_texture);
     rlImGuiShutdown();
     CloseWindow();
     return 0;

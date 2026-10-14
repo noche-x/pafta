@@ -186,6 +186,8 @@ void draw_block_tool_panel(EditorProject& project, EditorUi& ui) {
         if (cfg.interior) {
             if (cfg.interior_piece) {
                 piece_picker("interior_piece", cfg.interior_piece_block);
+                ImGui::TextWrapped("A piece replaces this cell's room, as in the game: no room walls or floor here. "
+                                   "Paint > Wall type can still give its sides walls for the rooms next to it.");
             } else if (!building.block_names.empty()) {
                 ImGui::TextUnformatted("Room walls from buildblock");
                 buildblock_picker(project, building, cfg.buildblock_index);
@@ -214,6 +216,10 @@ void draw_block_tool_panel(EditorProject& project, EditorUi& ui) {
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("On: a click writes the enabled layers into the block you click, e.g. to add a room to a shell.\n"
                               "Off: a click adds a block in the empty cell in front of the face.");
+        }
+        if (cfg.apply_to_clicked && cfg.exterior) {
+            ImGui::TextColored(ImVec4(1.0F, 0.8F, 0.2F, 1.0F), "Also replaces the clicked block's shell and its textures.");
+            ImGui::TextWrapped("Untick Exterior to change only the inside.");
         }
         if (!cfg.exterior && !cfg.interior) ImGui::TextColored(ImVec4(1.0F, 0.8F, 0.2F, 1.0F), "Tick Exterior or Interior to place.");
     }
@@ -662,16 +668,24 @@ void draw_buildblock_inspector(EditorProject& project, EditorUi& ui, std::string
             ImGui::PopID();
             return edit;
         };
+        ImGui::TextDisabled("Opening (the hole in the wall; windows are glass inside it)");
         changed |= rectangle("face", layer.bounds[0], layer.bounds[2], layer.bounds[1], layer.bounds[3]);
-        // Only how portal type 1 mirrors is understood; keep any other value as it is.
+        // Only portal types 0 and 1 are understood; keep any other value as it is.
         if (layer.portal_type <= 1) {
-            bool mirrored = layer.portal_type == 1;
-            if (ImGui::Checkbox("Mirror on opposite sides", &mirrored)) { layer.portal_type = mirrored ? 1 : 0; changed = true; }
+            int type = static_cast<int>(layer.portal_type);
+            changed |= ImGui::RadioButton("Exterior", &type, 0);
+            ImGui::SameLine();
+            changed |= ImGui::RadioButton("Interior (doorway)", &type, 1);
+            layer.portal_type = static_cast<std::uint32_t>(type);
         }
-        if (ImGui::CollapsingHeader("Doors", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::BeginDisabled(layer.doors.size() >= 2);
-            if (ImGui::Button("Add door")) { layer.doors.push_back({0, .5F, 0}); changed = true; }
-            ImGui::EndDisabled();
+        if (ImGui::Button("Make doorway")) { make_buildblock_doorway(layer); changed = true; }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("An Interior opening from the floor, with no glass.");
+        if (const int hidden = buildblock_hidden_windows(layer); hidden > 0) {
+            ImGui::TextColored(ImVec4(1.0F, 0.55F, 0.45F, 1.0F), "%d window(s) outside the opening are hidden by the wall.", hidden);
+            if (ImGui::Button("Grow opening to fit")) changed |= grow_buildblock_opening(layer);
+        }
+        // The game never reads door records; show old ones so they can be removed.
+        if (!layer.doors.empty() && ImGui::CollapsingHeader("Door markers (unused by the game)")) {
             for (std::size_t i = 0; i < layer.doors.size();) {
                 ImGui::PushID(static_cast<int>(i));
                 float position[]{layer.doors[i].x, layer.doors[i].y};
@@ -687,7 +701,11 @@ void draw_buildblock_inspector(EditorProject& project, EditorUi& ui, std::string
             ImGui::PushID(label);
             if (ImGui::CollapsingHeader(label, ImGuiTreeNodeFlags_DefaultOpen)) {
                 ImGui::BeginDisabled(rects.size() >= 16);
-                if (ImGui::Button("Add")) { rects.push_back({0, .25F, .5F, .25F, .5F}); changed = true; }
+                if (ImGui::Button("Add")) {
+                    if (&rects == &layer.windows) add_buildblock_window(layer, .5F, .5F);
+                    else rects.push_back({0, 0, 1, .5F, .0625F});
+                    changed = true;
+                }
                 ImGui::EndDisabled();
                 for (std::size_t i = 0; i < rects.size();) {
                     ImGui::PushID(static_cast<int>(i));

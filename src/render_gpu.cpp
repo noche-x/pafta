@@ -634,6 +634,7 @@ void invalidate_city_block_preview_scene(EditorProject& project) {
 
 void service_render_rebuild(EditorProject& project) {
     PAFTA_PROFILE_FUNCTION();
+    service_building_rebuilds(project);
     project.placement_override_upload_budget = 1;
     if (project.render_buffers_dirty && !project.render_build_in_progress) {
 #ifdef __EMSCRIPTEN__
@@ -953,12 +954,6 @@ constexpr GLuint kAttribTexCoord = 1;
 constexpr GLuint kAttribNormal = 2;
 constexpr GLuint kAttribInstance = 3;
 
-struct GpuVertex {
-    float position[3];
-    float uv[3];  // u, v, road-marking overlay layer
-    float normal[3];
-};
-
 // Uploads interleaved vertices and 32-bit indices into a new VAO. Its per-instance
 // attributes (divisor 1) are pointed at the instance stream for each draw.
 GpuMesh upload_gpu_vertices(const std::vector<GpuVertex>& vertices, const std::vector<std::uint32_t>& indices) {
@@ -1070,15 +1065,17 @@ GpuMesh upload_shadow_volume(const std::vector<ShadowVertex>& vertices, const st
 // over shared vertices; flat-shaded surfaces work theirs out in the shader instead.
 // flat_faces makes three separate vertices per triangle with the face normal, for
 // surfaces lit by the vertex normal that need to keep hard edges.
-GpuMesh upload_gpu_mesh(const BuildingRenderBuffer& buffer, const std::function<void(GpuMeshPart&)>& describe_part, bool flat_faces = false) {
-    std::vector<GpuVertex> vertices(flat_faces ? 0U : buffer.vertices.size());
+PreparedGpuMesh prepare_gpu_mesh(const BuildingRenderBuffer& buffer, bool flat_faces) {
+    PreparedGpuMesh prepared;
+    auto& vertices = prepared.vertices;
+    vertices.resize(flat_faces ? 0U : buffer.vertices.size());
     for (std::size_t i = 0; i < vertices.size(); ++i) {
         const auto& v = buffer.vertices[i];
         vertices[i] = {{v.position.x, v.position.y, v.position.z}, {v.u, v.v, v.layer}, {0.0F, 0.0F, 0.0F}};
     }
-    std::vector<std::uint32_t> indices;
+    auto& indices = prepared.indices;
     indices.reserve(buffer.triangles.size() * 3U);
-    std::vector<GpuMeshPart> parts;
+    auto& parts = prepared.parts;
     const auto count = buffer.terrain_chunks.empty() ? buffer.material_runs.size() : buffer.terrain_chunks.size();
     for (std::size_t i = 0; i < count; ++i) {
         const auto& run = buffer.terrain_chunks.empty() ? buffer.material_runs[i] : buffer.terrain_chunks[i].run;
@@ -1124,7 +1121,6 @@ GpuMesh upload_gpu_mesh(const BuildingRenderBuffer& buffer, const std::function<
         }
         part.index_count = static_cast<std::uint32_t>(indices.size()) - part.first_index;
         if (part.index_count == 0U) continue;
-        describe_part(part);
         parts.push_back(part);
     }
     for (auto& v : vertices) {
@@ -1134,9 +1130,18 @@ GpuMesh upload_gpu_mesh(const BuildingRenderBuffer& buffer, const std::function<
         v.normal[1] = unit.y;
         v.normal[2] = unit.z;
     }
-    auto mesh = upload_gpu_vertices(vertices, indices);
-    mesh.parts = std::move(parts);
+    return prepared;
+}
+
+GpuMesh upload_prepared_gpu_mesh(const PreparedGpuMesh& prepared, const std::function<void(GpuMeshPart&)>& describe_part) {
+    auto mesh = upload_gpu_vertices(prepared.vertices, prepared.indices);
+    mesh.parts = prepared.parts;
+    for (auto& part : mesh.parts) describe_part(part);
     return mesh;
+}
+
+GpuMesh upload_gpu_mesh(const BuildingRenderBuffer& buffer, const std::function<void(GpuMeshPart&)>& describe_part, bool flat_faces = false) {
+    return upload_prepared_gpu_mesh(prepare_gpu_mesh(buffer, flat_faces), describe_part);
 }
 
 // Retain uploaded vertices and remove stale cells from the index stream. This is
@@ -1194,19 +1199,19 @@ void describe_textured_part(GpuMeshPart& part, const Texture2D* texture, const T
 
 GpuBuildingRenderModel upload_city_buffer_model(
     const BuildingRenderBuffer& buffer,
+    const PreparedGpuMesh& prepared,
     const EditorProject& project,
-    bool flat_faces,
     const std::function<Color(std::uint32_t)>& color_for_material) {
     GpuBuildingRenderModel model;
     // No wire_lines: city surfaces never draw wires.
-    model.mesh = upload_gpu_mesh(buffer, [&](GpuMeshPart& part) {
+    model.mesh = upload_prepared_gpu_mesh(prepared, [&](GpuMeshPart& part) {
         describe_textured_part(part,
             texture_for_buffer_material(project, buffer, part.material_id),
             material_texture_for_buffer_material(project, buffer, part.material_id));
         // City surfaces tint their texture with the material colour (the terrain
         // uses it as the generated landscape colour map).
         part.color = color_for_material(part.material_id);
-    }, flat_faces);
+    });
     model.uploaded_bytes = model.mesh.vertex_count * sizeof(GpuVertex) + model.mesh.index_count * sizeof(std::uint32_t);
     return model;
 }
@@ -1214,7 +1219,7 @@ GpuBuildingRenderModel upload_city_buffer_model(
 // chunked: for large world-space volumes (roads, pieces). Their triangles are
 // grouped into 256-unit ground chunks, one part each with its own bounds, so draws
 // can skip the chunks that are out of view.
-void build_shadow_volume(GpuBuildingRenderModel& model, const BuildingRenderBuffer& buffer, bool chunked = false) {
+PreparedShadowVolume prepare_shadow_volume(const BuildingRenderBuffer& buffer, bool chunked) {
     // Workers bake the volume together with the buffer (bake_shadow_volume). Small
     // buffers built on this thread are baked here.
     const BuildingRenderBuffer* baked = &buffer;
@@ -1225,11 +1230,13 @@ void build_shadow_volume(GpuBuildingRenderModel& model, const BuildingRenderBuff
         bake_shadow_volume(local);
         baked = &local;
     }
-    model.shadow_top = baked->shadow_top;
+    PreparedShadowVolume prepared;
+    prepared.top = baked->shadow_top;
+    prepared.vertices = pack_shadow_vertices(baked->shadow_vertices);
     if (!chunked) {
-        model.shadow_volume = upload_shadow_volume(pack_shadow_vertices(baked->shadow_vertices), baked->shadow_indices);
-        if (!model.shadow_volume.empty()) model.shadow_volume.parts.push_back({0U, model.shadow_volume.index_count});
-        return;
+        prepared.indices = baked->shadow_indices;
+        prepared.parts.push_back({0U, static_cast<std::uint32_t>(prepared.indices.size())});
+        return prepared;
     }
     const auto& positions = baked->shadow_vertices;  // 9 floats per vertex, position first
     const auto& source = baked->shadow_indices;
@@ -1266,8 +1273,19 @@ void build_shadow_volume(GpuBuildingRenderModel& model, const BuildingRenderBuff
         }
         part.index_count += 3U;
     }
-    model.shadow_volume = upload_shadow_volume(pack_shadow_vertices(positions), indices);
-    if (!model.shadow_volume.empty()) model.shadow_volume.parts = std::move(parts);
+    prepared.indices = std::move(indices);
+    prepared.parts = std::move(parts);
+    return prepared;
+}
+
+void upload_prepared_shadow_volume(GpuBuildingRenderModel& model, const PreparedShadowVolume& prepared) {
+    model.shadow_top = prepared.top;
+    model.shadow_volume = upload_shadow_volume(prepared.vertices, prepared.indices);
+    if (!model.shadow_volume.empty()) model.shadow_volume.parts = prepared.parts;
+}
+
+void build_shadow_volume(GpuBuildingRenderModel& model, const BuildingRenderBuffer& buffer, bool chunked = false) {
+    upload_prepared_shadow_volume(model, prepare_shadow_volume(buffer, chunked));
 }
 
 namespace {
@@ -1408,17 +1426,22 @@ void release_free_memory() {
 #endif
 }
 
-GpuBuildingRenderModel upload_building_render_model(const BuildingRenderBuffer& buffer, const SbbBuilding& building, const EditorProject& project) {
+GpuBuildingRenderModel upload_building_render_model(const PreparedGpuMesh& mesh, const PreparedShadowVolume& shadow,
+    const SbbBuilding& building, const EditorProject& project) {
     GpuBuildingRenderModel model;
     // No wire_lines: building models are never drawn with wires.
-    build_shadow_volume(model, buffer);
-    model.mesh = upload_gpu_mesh(buffer, [&](GpuMeshPart& part) {
+    upload_prepared_shadow_volume(model, shadow);
+    model.mesh = upload_prepared_gpu_mesh(mesh, [&](GpuMeshPart& part) {
         describe_textured_part(part,
             texture_for_material(project, building, part.material_id),
             material_texture_for_material(project, building, part.material_id));
     });
     model.uploaded_bytes = model.mesh.vertex_count * sizeof(GpuVertex) + model.mesh.index_count * sizeof(std::uint32_t);
     return model;
+}
+
+GpuBuildingRenderModel upload_building_render_model(const BuildingRenderBuffer& buffer, const SbbBuilding& building, const EditorProject& project) {
+    return upload_building_render_model(prepare_gpu_mesh(buffer, false), prepare_shadow_volume(buffer, false), building, project);
 }
 
 Vector3 transform_buffer_vertex(Vec3 value, Vector3 origin, std::int32_t rotation) {
@@ -1984,6 +2007,17 @@ void draw_gpu_mesh_instances(const GpuMesh& mesh, const std::vector<Matrix>& tra
     draw_gpu_mesh_batch({{&mesh, transforms}}, surface);
 }
 
+namespace {
+// The 128-unit landscape chunk a point is in, as a key.
+std::uint64_t terrain_chunk_key(float x, float z) {
+    return static_cast<std::uint64_t>(static_cast<std::uint32_t>(static_cast<std::int32_t>(std::floor(x / 128.0F)))) << 32U |
+        static_cast<std::uint32_t>(static_cast<std::int32_t>(std::floor(z / 128.0F)));
+}
+// While the city terrain draws: its chunks that camera detail chunks replace.
+const std::unordered_set<std::uint64_t>* g_terrain_replaced = nullptr;
+} // namespace
+
+
 void draw_gpu_mesh_batch(const std::vector<GpuMeshDraw>& draws, GpuSurface surface, GpuPartFilter filter) {
     std::size_t total_instances = 0;
     for (const auto& draw : draws) {
@@ -2092,6 +2126,9 @@ void draw_gpu_mesh_batch(const std::vector<GpuMeshDraw>& draws, GpuSurface surfa
         }
         const auto instances = static_cast<GLsizei>(draw.transforms.size());
         const auto terrain_visible = [&](const GpuMeshPart& part) {
+            if (part.has_bounds && g_terrain_replaced != nullptr &&
+                g_terrain_replaced->contains(terrain_chunk_key((part.bounds_min.x + part.bounds_max.x) * 0.5F,
+                    (part.bounds_min.z + part.bounds_max.z) * 0.5F))) return false;
             return !part.has_bounds || terrain_bounds_visible(
                 {part.bounds_min.x, part.bounds_min.y, part.bounds_min.z}, {part.bounds_max.x, part.bounds_max.y, part.bounds_max.z},
                 {g_surface_camera.x, g_surface_camera.y, g_surface_camera.z}, g_render_settings.terrain_distance, terrain_planes);
@@ -2867,9 +2904,14 @@ void draw_city_intersection_mask(const MapScene& scene, std::size_t intersection
                 if (tile.intersection_index == static_cast<std::int32_t>(intersection)) cells.insert(cell_key(tile.x, tile.y, tile.z));
             }
         }
-        // Tile cells run from y*4+0.25 to y*4+4.25.
+        // Tile cells run from y*4+0.25 to y*4+4.25. Only the crossing's top faces count:
+        // with its sides and bottom the outline drew the whole slab, which looked shifted
+        // toward the camera. A top face's centre sits exactly on its cell's top boundary.
+        const auto level = (p.y - 0.25F) / 4.0F;
+        const auto top = std::round(level);
+        if (std::abs(level - top) > 0.01F) return false;
         return cells.contains(cell_key(static_cast<std::int32_t>(std::floor(p.x / 4.0F)),
-            static_cast<std::int32_t>(std::floor((p.y - 0.25F) / 4.0F)), static_cast<std::int32_t>(std::floor(p.z / 4.0F))));
+            static_cast<std::int32_t>(top) - 1, static_cast<std::int32_t>(std::floor(p.z / 4.0F))));
     });
     draw_mask_triangles(points, {});
 }
@@ -3243,10 +3285,13 @@ void draw_block_mesh_textured(const EditorProject& project, const SblBlockMesh& 
         Color{220, 190, 90, 255}, Color{170, 110, 200, 255}, Color{90, 190, 190, 255}, Color{150, 150, 110, 255}};
     rlDrawRenderBatchActive();
     rlDisableBackfaceCulling();
+    // rlgl keeps a draw call's texture only in QUADS mode: rlBegin with another mode
+    // resets it to the white default texture, and a batch that fills up mid-shape
+    // flushes it. So each face reserves its vertices first, then sets the texture
+    // and draws quads (a triangle repeats its last corner).
     for (std::uint32_t slot = 0; slot < 8U; ++slot) {
         const auto* texture = textures[slot].empty() ? nullptr : find_project_texture(project, textures[slot]);
-        rlSetTexture(texture != nullptr ? texture->id : rlGetTextureIdDefault());
-        rlBegin(RL_TRIANGLES);
+        const auto texture_id = texture != nullptr ? texture->id : rlGetTextureIdDefault();
         for (const auto& face : mesh.faces) {
             if (face.vertices.size() < 3) continue;
             std::vector<Vector3> points;
@@ -3266,20 +3311,24 @@ void draw_block_mesh_textured(const EditorProject& project, const SblBlockMesh& 
             // Simple facing light so the shape reads without the game's lighting.
             const float light = 0.6F + 0.3F * std::fabs(n.y) + 0.1F * std::fabs(n.x);
             const auto base = texture != nullptr ? WHITE : kSlotColors[slot];
-            rlColor4ub(static_cast<unsigned char>(static_cast<float>(base.r) * light), static_cast<unsigned char>(static_cast<float>(base.g) * light),
-                static_cast<unsigned char>(static_cast<float>(base.b) * light), alpha);
             const auto vertex = [&](std::size_t i) {
                 const auto uv = i < uvs.size() ? uvs[i] : Vec2f{};
                 rlTexCoord2f(uv.u, uv.v);
                 rlVertex3f(points[i].x, points[i].y, points[i].z);
             };
+            rlCheckRenderBatchLimit(static_cast<int>(4U * (points.size() - 2U)));
+            rlSetTexture(texture_id);
+            rlBegin(RL_QUADS);
+            rlColor4ub(static_cast<unsigned char>(static_cast<float>(base.r) * light), static_cast<unsigned char>(static_cast<float>(base.g) * light),
+                static_cast<unsigned char>(static_cast<float>(base.b) * light), alpha);
             for (std::size_t k = 1; k + 1 < points.size(); ++k) {
                 vertex(0);
                 vertex(k);
                 vertex(k + 1);
+                vertex(k + 1);
             }
+            rlEnd();
         }
-        rlEnd();
     }
     rlSetTexture(0);
     rlDrawRenderBatchActive();
@@ -3475,6 +3524,7 @@ void rebuild_single_building_render(EditorProject& project, std::size_t index) {
     if (project.building_gpu_models.size() != project.buildings.size()) {
         project.building_gpu_models.resize(project.buildings.size());
     }
+#ifdef __EMSCRIPTEN__
     const auto blocks = block_meshes(project);
     const auto templates = buildblock_templates(project);
     project.building_render_buffers[index] =
@@ -3482,6 +3532,53 @@ void rebuild_single_building_render(EditorProject& project, std::size_t index) {
     project.building_gpu_models[index] =
         upload_building_render_model(project.building_render_buffers[index], project.buildings[index].data, project);
     keep_pick_data_only(project.building_render_buffers[index]);
+#else
+    // Built on a worker; the old model keeps drawing until service_building_rebuilds
+    // uploads the new one. An edit while it runs queues one more build.
+    auto& job = project.building_rebuild_jobs[index];
+    if (job.built.valid()) {
+        job.again = true;
+        return;
+    }
+    job.name = project.buildings[index].name;
+    job.again = false;
+    job.built = std::async(std::launch::async, [building = project.buildings[index].data, blocks = shared_block_meshes(project),
+                                                   templates = shared_buildblock_templates(project)] {
+        PreparedRenderBuild built;
+        built.buffer = build_city_building_full_render_buffer(building, *blocks, *templates, BuildingLod::Far);
+        built.mesh = prepare_gpu_mesh(built.buffer, false);
+        built.shadow = prepare_shadow_volume(built.buffer, false);
+        keep_pick_data_only(built.buffer);
+        return built;
+    });
+#endif
+}
+
+void service_building_rebuilds(EditorProject& project) {
+    auto& jobs = project.building_rebuild_jobs;
+    std::vector<std::size_t> again_indices;  // relaunched after the loop: inserting can rehash
+    for (auto it = jobs.begin(); it != jobs.end();) {
+        if (it->second.built.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
+            ++it;
+            continue;
+        }
+        const auto index = it->first;
+        auto built = it->second.built.get();
+        const auto name = std::move(it->second.name);
+        const bool again = it->second.again;
+        it = jobs.erase(it);
+        // Skip a result whose building was removed or renamed meanwhile.
+        if (index < project.buildings.size() && project.buildings[index].name == name && index < project.building_gpu_models.size() &&
+            index < project.building_render_buffers.size()) {
+            // Even when another edit came in, this is newer than what is shown.
+            project.building_gpu_models[index] = upload_building_render_model(built.mesh, built.shadow, project.buildings[index].data, project);
+            std::swap(project.building_render_buffers[index], built.buffer);
+            invalidate_building_thumbnail(project, index);
+            if (again) again_indices.push_back(index);
+        }
+        free_in_background(std::move(built));
+    }
+    for (const auto index : again_indices) rebuild_single_building_render(project, index);
 }
 
 const RenderTexture2D* building_thumbnail(EditorProject& project, std::size_t index) {
@@ -3683,7 +3780,7 @@ const GpuMesh* building_near_mesh(EditorProject& project, std::size_t asset_inde
         if (!stale) {
             const auto& building = project.buildings[asset_index].data;
             EditorProject::NearBuildingModel model;
-            model.mesh = upload_gpu_mesh(built.mesh, [&](GpuMeshPart& part) {
+            model.mesh = upload_prepared_gpu_mesh(built.mesh, [&](GpuMeshPart& part) {
                 describe_textured_part(part,
                     texture_for_material(project, building, part.material_id),
                     material_texture_for_material(project, building, part.material_id));
@@ -3692,6 +3789,7 @@ const GpuMesh* building_near_mesh(EditorProject& project, std::size_t asset_inde
             if (!model.room_shadow_volume.empty()) model.room_shadow_volume.parts.push_back({0U, model.room_shadow_volume.index_count});
             model.last_used = GetTime();
             model.far_vao = far_vao;
+            free_in_background(std::move(built));
             return &project.building_near_models.insert_or_assign(asset_index, std::move(model)).first->second.mesh;
         }
     }
@@ -3703,9 +3801,9 @@ const GpuMesh* building_near_mesh(EditorProject& project, std::size_t asset_inde
 #else
         std::launch::async,
 #endif
-        [building = project.buildings[asset_index].data, blocks = block_meshes(project), templates = buildblock_templates(project)] {
+        [building = project.buildings[asset_index].data, blocks = shared_block_meshes(project), templates = shared_buildblock_templates(project)] {
             PAFTA_PROFILE_THREAD("Near building build");
-            auto buffer = build_city_building_full_render_buffer(building, blocks, templates, BuildingLod::Near);
+            auto buffer = build_city_building_full_render_buffer(building, *blocks, *templates, BuildingLod::Near);
             BuildingRenderBuffer rooms;
             rooms.vertices = buffer.vertices;
             for (auto triangle : buffer.triangles) {
@@ -3714,7 +3812,7 @@ const GpuMesh* building_near_mesh(EditorProject& project, std::size_t asset_inde
                 rooms.triangles.push_back(triangle);
             }
             EditorProject::NearBuildingBuffers built;
-            built.mesh = std::move(buffer);
+            built.mesh = prepare_gpu_mesh(buffer, false);
             if (!rooms.triangles.empty()) {
                 bake_shadow_volume(rooms);
                 built.room_shadow_vertices = pack_shadow_vertices(rooms.shadow_vertices);
@@ -3741,7 +3839,7 @@ void refresh_placement_override_models(EditorProject& project) {
             project.placement_override_build_future.reset();
 #else
             project.placement_override_build_future->wait_for(std::chrono::milliseconds{0}) == std::future_status::ready) {
-            project.placement_override_build_future->get();
+            static_cast<void>(project.placement_override_build_future->get());
             project.placement_override_build_future.reset();
 #endif
         }
@@ -3806,29 +3904,37 @@ void refresh_placement_override_models(EditorProject& project) {
             std::launch::async,
 #endif
             [map = std::move(map), owned = std::move(owned), indices = asset_indices,
-             blocks = block_meshes(project), templates = buildblock_templates(project),
+             blocks = shared_block_meshes(project), templates = shared_buildblock_templates(project),
              dropped = dropped == nullptr ? std::vector<std::vector<std::size_t>>{} : *dropped] {
                 PAFTA_PROFILE_THREAD("Placement override rebuild");
                 std::vector<const SbbBuilding*> buildings;
                 buildings.reserve(indices.size());
                 for (const auto index : indices) buildings.push_back(index ? &*owned[*index] : nullptr);
-                return build_placement_override_render_buffers(map, buildings, blocks, templates, dropped);
+                std::vector<EditorProject::PreparedPlacementOverride> prepared;
+                for (auto& built : build_placement_override_render_buffers(map, buildings, *blocks, *templates, dropped)) {
+                    auto mesh = prepare_gpu_mesh(built.buffer, false);
+                    auto shadow = prepare_shadow_volume(built.buffer, false);
+                    built.buffer = {};
+                    prepared.push_back({std::move(built), std::move(mesh), std::move(shadow)});
+                }
+                return prepared;
             });
     }
     if (project.placement_override_fingerprint != fingerprint || project.placement_override_upload_budget <= 0 ||
         project.placement_override_upload_cursor >= project.placement_override_uploads.size()) return;
     --project.placement_override_upload_budget;
-    auto& built = project.placement_override_uploads[project.placement_override_upload_cursor++];
+    auto& prepared = project.placement_override_uploads[project.placement_override_upload_cursor++];
+    const auto& built = prepared.built;
     const auto i = built.placement_index;
     const auto asset_index = asset_indices.at(i);
     if (!asset_index) throw std::runtime_error("Placement override lost its building asset before upload");
     project.placement_override_models.emplace(i,
-        upload_building_render_model(built.buffer, project.buildings[*asset_index].data, project));
+        upload_building_render_model(prepared.mesh, prepared.shadow, project.buildings[*asset_index].data, project));
     const auto& p = project.city->data.buildings[i];
     append_render_log(project, "placement " + std::to_string(i) + " " + p.name + " at " + std::to_string(p.x) + "," +
         std::to_string(p.y) + "," + std::to_string(p.z) + ": " + std::to_string(built.overwritten_cells) +
         " cells overwritten by later placements, " + std::to_string(built.dropped_cells) + " past the game's world storage");
-    built.buffer = {};
+    free_in_background(std::move(prepared));
     if (project.placement_override_upload_cursor == project.placement_override_uploads.size()) {
         project.placement_override_uploads.clear();
         project.placement_override_upload_cursor = 0;
@@ -4012,17 +4118,22 @@ void composite_city_shadows(Vector2 viewport_size) {
     glEnable(GL_DEPTH_TEST);
 }
 
-GpuBuildingRenderModel upload_portal_render_model(const BuildingRenderBuffer& buffer, const EditorProject& project, bool textured) {
+GpuBuildingRenderModel upload_portal_render_model(const BuildingRenderBuffer& buffer, const PreparedGpuMesh& mesh,
+    const PreparedShadowVolume& shadow, const EditorProject& project, bool textured) {
     GpuBuildingRenderModel model;
     model.wire_lines = buffer.wire_lines;
-    build_shadow_volume(model, buffer, true);
-    model.mesh = upload_gpu_mesh(buffer, [&](GpuMeshPart& part) {
+    upload_prepared_shadow_volume(model, shadow);
+    model.mesh = upload_prepared_gpu_mesh(mesh, [&](GpuMeshPart& part) {
         describe_textured_part(part,
             textured ? texture_for_buffer_material(project, buffer, part.material_id) : nullptr,
             material_texture_for_buffer_material(project, buffer, part.material_id));
     });
     model.uploaded_bytes = model.mesh.vertex_count * sizeof(GpuVertex) + model.mesh.index_count * sizeof(std::uint32_t);
     return model;
+}
+
+GpuBuildingRenderModel upload_portal_render_model(const BuildingRenderBuffer& buffer, const EditorProject& project, bool textured) {
+    return upload_portal_render_model(buffer, prepare_gpu_mesh(buffer, false), prepare_shadow_volume(buffer, true), project, textured);
 }
 
 std::vector<SbcPortal> portal_cell_sources(const SbcMap& map) {
@@ -4085,8 +4196,8 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
 #else
         auto map = project.city->data;
         project.portal_build_sources = portal_cell_sources(map);
-        const auto blocks_copy = blocks;
-        const auto bb_copy = bb_templates;
+        const auto blocks_copy = shared_block_meshes(project);
+        const auto bb_copy = shared_buildblock_templates(project);
         const auto tex_copy = tex_names;
         auto sources = snapshot_city_buildings(project);
         project.portal_rebuild_in_progress = true;
@@ -4099,9 +4210,13 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
             std::vector<const SbbBuilding*> buildings;
             buildings.reserve(sources.resolved.size());
             for (const auto index : sources.resolved) buildings.push_back(index == 0U ? nullptr : &sources.owned->at(index - 1U));
-            auto buffer = build_native_portal_render_buffer(map, blocks_copy, std::nullopt, bb_copy, tex_copy, buildings);
-            bake_shadow_volume(buffer);
-            return buffer;
+            PreparedRenderBuild built;
+            built.buffer = build_native_portal_render_buffer(map, *blocks_copy, std::nullopt, *bb_copy, tex_copy, buildings);
+            bake_shadow_volume(built.buffer);
+            built.mesh = prepare_gpu_mesh(built.buffer, false);
+            built.shadow = prepare_shadow_volume(built.buffer, true);
+            release_shadow_volume(built.buffer);
+            return built;
         });
 #endif
         PAFTA_PROFILE_END_BLOCK;
@@ -4109,20 +4224,20 @@ GpuBuildingRenderModel& portal_render_model(EditorProject& project, bool texture
     if (project.portal_rebuild_future.has_value() &&
         project.portal_rebuild_future->wait_for(std::chrono::milliseconds{0}) == std::future_status::ready) {
         PAFTA_PROFILE_BLOCK("portal_render_model adopt async rebuild");
-        auto buffer = project.portal_rebuild_future->get();
+        auto built = project.portal_rebuild_future->get();
         project.portal_rebuild_future.reset();
         project.portal_rebuild_in_progress = false;
         // An edit or texture-mode change while the worker ran needs a new build.
         // Keep the last accepted mesh until that one is ready.
         if (!project.portal_render_dirty && project.portal_render_textured == textured) {
-            project.portal_render_buffer = std::move(buffer);
-            project.portal_gpu_model = upload_portal_render_model(project.portal_render_buffer, project, textured);
+            free_in_background(std::exchange(project.portal_render_buffer, std::move(built.buffer)));
+            project.portal_gpu_model = upload_portal_render_model(project.portal_render_buffer, built.mesh, built.shadow, project, textured);
             project.portal_render_sources = std::move(project.portal_build_sources);
             project.portal_cells_filtered = false;
             project.pending_pieces.clear();
             project.portal_visibility_fingerprint = project.city_scene_current_fingerprint;
-            release_shadow_volume(project.portal_render_buffer);
         }
+        free_in_background(std::move(built));
         PAFTA_PROFILE_END_BLOCK;
     }
     if (project.portal_visibility_fingerprint != project.city_scene_current_fingerprint) {
@@ -4160,10 +4275,46 @@ GpuBuildingRenderModel& building_tool_floor_preview_model(
     std::optional<std::uint32_t> floor,
     bool roofs
 ) {
-    if (project.building_floor_preview_dirty ||
-        project.building_floor_preview_building != building_index ||
-        project.building_floor_preview_floor != floor ||
-        project.building_floor_preview_roofs != roofs) {
+    const bool same_view = project.building_floor_preview_building == building_index &&
+        project.building_floor_preview_floor == floor && project.building_floor_preview_roofs == roofs;
+#ifndef __EMSCRIPTEN__
+    // An edit to the shown building rebuilds on a worker; the old mesh draws (and is
+    // picked) until the new one arrives. Cells an edit removed stop being picked now.
+    auto& job = project.building_floor_preview_job;
+    if (job.valid() && job.wait_for(std::chrono::seconds{0}) == std::future_status::ready) {
+        auto built = job.get();
+        // Even when another edit came in, this is newer than what is shown.
+        if (project.building_floor_preview_job_view == std::tuple{building_index, floor, roofs} && same_view) {
+            project.building_floor_preview_gpu_model = upload_building_render_model(built.mesh, built.shadow, project.buildings[building_index].data, project);
+            std::swap(project.building_floor_preview_render_buffer, built.buffer);
+        }
+        if (project.building_floor_preview_again) project.building_floor_preview_dirty = true;
+        project.building_floor_preview_again = false;
+        free_in_background(std::move(built));
+    }
+    if (project.building_floor_preview_dirty && same_view) {
+        if (job.valid()) {
+            project.building_floor_preview_again = true;
+        } else {
+            const auto cell_count = project.buildings[building_index].data.cells.size();
+            for (auto& triangle : project.building_floor_preview_render_buffer.triangles) {
+                if (triangle.cell != 0xffffffffU && triangle.cell >= cell_count) triangle.cell = 0xffffffffU;
+            }
+            project.building_floor_preview_job_view = {building_index, floor, roofs};
+            job = std::async(std::launch::async, [building = project.buildings[building_index].data, blocks = shared_block_meshes(project),
+                                                     templates = shared_buildblock_templates(project), floor, roofs] {
+                PreparedRenderBuild built;
+                built.buffer = select_building_lod(build_native_building_render_buffer(building, *blocks, *templates, floor, roofs), BuildingLod::Near);
+                built.mesh = prepare_gpu_mesh(built.buffer, false);
+                built.shadow = prepare_shadow_volume(built.buffer, false);
+                release_shadow_volume(built.buffer);
+                return built;
+            });
+        }
+        project.building_floor_preview_dirty = false;
+    }
+#endif
+    if (project.building_floor_preview_dirty || !same_view) {
         const auto& blocks = block_meshes(project);
         const auto& templates = buildblock_templates(project);
         project.building_floor_preview_render_buffer = select_building_lod(build_native_building_render_buffer(
@@ -4283,12 +4434,19 @@ void unload_city_render_model(GpuBuildingRenderModel& model) {
 }
 
 GpuBuildingRenderModel upload_city_tile_model(const BuildingRenderBuffer& buffer, const EditorProject& project, bool shadows) {
+    std::optional<PreparedShadowVolume> shadow;
+    if (shadows) shadow = prepare_shadow_volume(buffer, true);
+    return upload_city_tile_model(buffer, prepare_gpu_mesh(buffer, true), shadow ? &*shadow : nullptr, project);
+}
+
+GpuBuildingRenderModel upload_city_tile_model(const BuildingRenderBuffer& buffer, const PreparedGpuMesh& prepared,
+    const PreparedShadowVolume* shadow, const EditorProject& project) {
     // The game draws road textures without tint. The colour only stands in for a texture
     // the map folder doesn't have.
-    auto model = upload_city_buffer_model(buffer, project, true, [&buffer](std::uint32_t material) {
+    auto model = upload_city_buffer_model(buffer, prepared, project, [&buffer](std::uint32_t material) {
         return city_tile_material_color(buffer, material);
     });
-    if (shadows) build_shadow_volume(model, buffer, true);
+    if (shadow != nullptr) upload_prepared_shadow_volume(model, *shadow);
     for (auto& part : model.mesh.parts) {
         if (part.texture != 0U) part.color = WHITE;
     }
@@ -4328,12 +4486,110 @@ Texture2D landscape_detail_texture() {
 }
 
 GpuBuildingRenderModel upload_city_terrain_model(const BuildingRenderBuffer& buffer, const EditorProject& project) {
-    auto model = upload_city_buffer_model(buffer, project, false, [&buffer](std::uint32_t material) {
+    return upload_city_terrain_model(buffer, prepare_gpu_mesh(buffer, false), project);
+}
+
+GpuBuildingRenderModel upload_city_terrain_model(const BuildingRenderBuffer& buffer, const PreparedGpuMesh& prepared, const EditorProject& project) {
+    auto model = upload_city_buffer_model(buffer, prepared, project, [&buffer](std::uint32_t material) {
         return terrain_material_color(buffer, material);
     });
     // Landscape: the generated detail map times the flat generated colour map.
     for (auto& part : model.mesh.parts) part.texture = landscape_detail_texture().id;
     return model;
+}
+
+void update_terrain_detail(EditorProject& project, Vector3 camera) {
+    auto& chunks = project.terrain_detail_chunks;
+    const auto* terrain = project.city_scene_cache_valid && project.city_scene_cache.terrain.has_value()
+        ? &*project.city_scene_cache.terrain : nullptr;
+    if (terrain == nullptr || !project.terrain_gpu_valid || !g_render_settings.terrain_follow_camera) {
+        chunks.clear();
+        return;
+    }
+    if (project.terrain_detail_fingerprint != project.terrain_gpu_fingerprint) {
+        // Keep drawing the old chunks until their rebuilds arrive.
+        for (auto& [key, chunk] : chunks) chunk.step = 0;
+        project.terrain_detail_fingerprint = project.terrain_gpu_fingerprint;
+    }
+    // Terrain_SelectAndRefreshVisibleChunkSlotsAroundPoint @d26a0: each 128-unit chunk
+    // gets a level by the squared distance from the camera to its centre (512, 768,
+    // 1024, 1536, 2048, 3072 units; the constants at 0x278aec..0x278b08), and level n
+    // samples every 1 << n units (Terrain_RebuildChunkSlot @d0c10). Chunks the fixed
+    // mesh already draws as finely are left to it.
+    constexpr std::array<float, 6> kLevelDistance{512.0F, 768.0F, 1024.0F, 1536.0F, 2048.0F, 3072.0F};
+    const float scale = std::max(0.1F, g_render_settings.terrain_detail_scale);
+    const auto finest = std::max(1, g_render_settings.terrain_finest_step);
+    const float reach = kLevelDistance.back() * scale;
+    std::unordered_map<std::uint64_t, std::pair<std::int32_t, float>> wanted;  // step, distance
+    const auto first_x = static_cast<std::int32_t>(std::floor((camera.x - reach) / 128.0F));
+    const auto last_x = static_cast<std::int32_t>(std::floor((camera.x + reach) / 128.0F));
+    const auto first_z = static_cast<std::int32_t>(std::floor((camera.z - reach) / 128.0F));
+    const auto last_z = static_cast<std::int32_t>(std::floor((camera.z + reach) / 128.0F));
+    for (auto cz = std::max(first_z, -32); cz <= std::min(last_z, 95); ++cz) {
+        for (auto cx = std::max(first_x, -32); cx <= std::min(last_x, 95); ++cx) {
+            const float chunk_x = static_cast<float>(cx) * 128.0F, chunk_z = static_cast<float>(cz) * 128.0F;
+            const float dx = camera.x - (chunk_x + 64.0F), dz = camera.z - (chunk_z + 64.0F);
+            const float dy = camera.y - terrain_height_at(*terrain, chunk_x + 64.0F, chunk_z + 64.0F);
+            const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+            std::int32_t level = 0;
+            while (level < static_cast<std::int32_t>(kLevelDistance.size()) && distance >= kLevelDistance[static_cast<std::size_t>(level)] * scale) ++level;
+            const auto step = std::max(finest, 1 << level);
+            if (step >= terrain_fixed_step(*terrain, chunk_x, chunk_z)) continue;
+            wanted[terrain_chunk_key(chunk_x + 64.0F, chunk_z + 64.0F)] = {step, distance};
+        }
+    }
+    std::erase_if(chunks, [&](const auto& entry) { return !wanted.contains(entry.first); });
+    // Build the nearest missing or changed chunks, a few per frame.
+    std::vector<std::pair<float, std::uint64_t>> pending;
+    for (const auto& [key, want] : wanted) {
+        const auto found = chunks.find(key);
+        if (found == chunks.end() || found->second.step != want.first) pending.emplace_back(want.second, key);
+    }
+    std::ranges::sort(pending);
+    const auto unit = project.city_scene_cache.unit_size;
+    const auto build = [terrain, unit](std::uint64_t key, std::int32_t step) {
+        const auto chunk_x = static_cast<float>(static_cast<std::int32_t>(key >> 32U)) * 128.0F;
+        const auto chunk_z = static_cast<float>(static_cast<std::int32_t>(static_cast<std::uint32_t>(key))) * 128.0F;
+        auto buffer = build_terrain_chunk_mesh(*terrain, chunk_x, chunk_z, step, unit);
+        auto prepared = prepare_gpu_mesh(buffer, false);
+        return std::pair{std::move(buffer), std::move(prepared)};
+    };
+#ifdef __EMSCRIPTEN__
+    // No worker threads on the web: build a few per frame here.
+    const auto started = std::chrono::steady_clock::now();
+    for (const auto& [distance, key] : pending) {
+        if (std::chrono::steady_clock::now() - started > std::chrono::milliseconds(6)) break;
+        const auto step = wanted.at(key).first;
+        const auto [buffer, prepared] = build(key, step);
+        auto& chunk = chunks[key];
+        chunk.step = step;
+        chunk.model = upload_city_terrain_model(buffer, prepared, project);
+    }
+#else
+    // Workers build the chunks, nearest first, a few at a time; this thread only
+    // uploads the finished ones. adopt_city_scene_result waits for them before it
+    // replaces the terrain they read.
+    auto& jobs = project.terrain_detail_jobs;
+    for (auto it = jobs.begin(); it != jobs.end();) {
+        if (it->second.mesh.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
+            ++it;
+            continue;
+        }
+        const auto [buffer, prepared] = it->second.mesh.get();
+        if (const auto want = wanted.find(it->first); want != wanted.end() && want->second.first == it->second.step) {
+            auto& chunk = chunks[it->first];
+            chunk.step = it->second.step;
+            chunk.model = upload_city_terrain_model(buffer, prepared, project);
+        }
+        it = jobs.erase(it);
+    }
+    for (const auto& [distance, key] : pending) {
+        if (jobs.size() >= 4U) break;
+        if (jobs.contains(key)) continue;
+        const auto step = wanted.at(key).first;
+        jobs.emplace(key, EditorProject::TerrainDetailJob{step, std::async(std::launch::async, build, key, step)});
+    }
+#endif
 }
 
 void update_city_road_visibility(EditorProject& project) {
@@ -4382,17 +4638,22 @@ void update_city_road_visibility(EditorProject& project) {
     project.city_road_visibility_fingerprint = project.city_scene_current_fingerprint;
 }
 
-bool adopt_city_scene_result(EditorProject& project, MapScene scene, std::uint64_t fingerprint, bool complete) {
+bool adopt_city_scene_result(EditorProject& project, CitySceneBuild built, std::uint64_t fingerprint, bool complete) {
     if (fingerprint != project.city_scene_current_fingerprint) return false;
+    auto& scene = built.scene;
+    // Terrain detail workers read the terrain this replaces.
+    for (auto& [key, job] : project.terrain_detail_jobs) job.mesh.wait();
+    project.terrain_detail_jobs.clear();
     // A late fast result must not replace an already accepted complete result.
     if (!complete && project.city_scene_cache_valid && project.city_scene_cache_fingerprint == fingerprint) return false;
     if (complete) project.city_scene_terrain_fingerprint = fingerprint;
     else scene.terrain = std::move(project.city_scene_cache.terrain);
-    project.city_scene_cache = std::move(scene);
+    free_in_background(std::exchange(project.city_scene_cache, std::move(scene)));
     project.city_scene_cache_fingerprint = fingerprint;
     project.city_scene_cache_valid = true;
     project.city_scene_cache_complete = complete;
     project.city_scene_gpu_valid = false;
+    project.city_prepared_models = std::move(built.models);
     return true;
 }
 
@@ -4413,7 +4674,35 @@ void draw_city_scene(
 
     if (render_terrain) {
         GfxDebugMaybeTimer timer{GfxDebugTimingPhase::TerrainDraw};
+        // The fixed mesh, without the chunks the camera's detail chunks replace.
+        std::unordered_set<std::uint64_t> replaced;
+        for (const auto& [key, chunk] : project.terrain_detail_chunks) {
+            if (!chunk.model.empty()) replaced.insert(key);
+        }
+        g_terrain_replaced = &replaced;
         draw_uploaded_city_model(project.terrain_gpu_model, true);
+        g_terrain_replaced = nullptr;
+        // The detail chunks in one batch, with the terrain's depth bias (draw_uploaded_city_model).
+        std::vector<GpuMeshDraw> detail;
+        detail.reserve(project.terrain_detail_chunks.size());
+        static const std::vector<Matrix> identity{MatrixIdentity()};
+        for (auto& [key, chunk] : project.terrain_detail_chunks) {
+            if (!chunk.model.empty()) detail.push_back({&chunk.model.mesh, identity});
+        }
+        if (!detail.empty()) {
+            rlDrawRenderBatchActive();
+            GLfloat offset_factor = 0.0F, offset_units = 0.0F;
+            const auto offset_enabled = glIsEnabled(GL_POLYGON_OFFSET_FILL);
+            glGetFloatv(GL_POLYGON_OFFSET_FACTOR, &offset_factor);
+            glGetFloatv(GL_POLYGON_OFFSET_UNITS, &offset_units);
+            glEnable(GL_POLYGON_OFFSET_FILL);
+            glPolygonOffset(1.0F, 4.0F);
+            set_game_render_depth_output(true);
+            draw_gpu_mesh_batch(detail, GpuSurface::Terrain);
+            set_game_render_depth_output(false);
+            glPolygonOffset(offset_factor, offset_units);
+            if (offset_enabled == GL_FALSE) glDisable(GL_POLYGON_OFFSET_FILL);
+        }
     }
 
     {

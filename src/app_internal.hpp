@@ -23,6 +23,8 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -294,6 +296,11 @@ struct RenderSettings {
     std::vector<std::size_t> interior_placements;
     float building_distance{0.0F}; // 0 = draw every placement
     float terrain_distance{0.0F};
+    // Terrain detail: true follows the camera like the game (Terrain_SelectAndRefresh-
+    // VisibleChunkSlotsAroundPoint), false keeps only the mesh built with the scene.
+    bool terrain_follow_camera{true};
+    float terrain_detail_scale{1.0F};  // multiplies the game's detail distances
+    std::int32_t terrain_finest_step{1}; // world units between the nearest samples
     bool half_textures{false};     // halve texture resolution at load
     bool street_objects{true};     // traffic lights and street signs
     bool live_reflections{true};   // recapture the sky reflection as the camera moves
@@ -357,6 +364,56 @@ struct ShadowVertex {
     std::uint8_t pad;
 };
 static_assert(sizeof(ShadowVertex) == 20);
+
+// The CPU half of a GPU mesh (interleaved vertices, indices, material parts) and of a
+// shadow volume. Workers make these; the render thread only uploads them.
+struct GpuVertex {
+    float position[3];
+    float uv[3];  // u, v, road-marking overlay layer
+    float normal[3];
+};
+struct PreparedGpuMesh {
+    std::vector<GpuVertex> vertices;
+    std::vector<std::uint32_t> indices;
+    std::vector<GpuMeshPart> parts;  // textures are filled in at upload
+};
+struct PreparedShadowVolume {
+    std::vector<ShadowVertex> vertices;
+    std::vector<std::uint32_t> indices;
+    std::vector<GpuMeshPart> parts;
+    float top{};
+};
+// What a city scene worker hands back: the scene, and its road and terrain meshes
+// ready to upload. The terrain is only prepared when its inputs changed.
+struct PreparedCityModels {
+    std::optional<PreparedGpuMesh> tiles;
+    std::optional<PreparedShadowVolume> tile_shadows;
+    std::optional<PreparedGpuMesh> terrain;
+    std::uint64_t terrain_fingerprint{};
+};
+// A worker-built render buffer with its mesh and shadow volume packed for upload.
+struct PreparedRenderBuild {
+    BuildingRenderBuffer buffer;
+    PreparedGpuMesh mesh;
+    PreparedShadowVolume shadow;
+};
+struct CitySceneBuild {
+    MapScene scene;
+    PreparedCityModels models;
+};
+// Destroys a big value on a short-lived thread: freeing a few hundred MB of mesh
+// buffers took 25 ms on the render thread.
+template <typename T>
+void free_in_background(T&& value) {
+#ifdef __EMSCRIPTEN__
+    [[maybe_unused]] auto dropped = std::move(value);
+#else
+    std::thread([held = std::move(value)] {}).detach();
+#endif
+}
+PreparedGpuMesh prepare_gpu_mesh(const BuildingRenderBuffer& buffer, bool flat_faces);
+// chunked: one part per 256-unit ground chunk, for view culling.
+PreparedShadowVolume prepare_shadow_volume(const BuildingRenderBuffer& buffer, bool chunked);
 
 struct ArchiveFileJobs;
 
@@ -440,8 +497,8 @@ struct EditorProject {
     std::vector<LoadedTexture> material_textures;
     // Mesh and template inputs are rebuilt after asset edits. CSX texture numbers
     // follow the archive order on disk and have their own cache, filled at load.
-    std::vector<NamedBlockMesh> cached_block_meshes;
-    std::vector<NamedBuildblockTemplate> cached_buildblock_templates;
+    std::shared_ptr<const std::vector<NamedBlockMesh>> cached_block_meshes;
+    std::shared_ptr<const std::vector<NamedBuildblockTemplate>> cached_buildblock_templates;
     std::vector<std::string> cached_grid_texture_names;
     bool render_input_cache_valid{false};
     bool grid_texture_names_valid{false};
@@ -458,6 +515,9 @@ struct EditorProject {
     std::optional<std::uint32_t> building_floor_preview_floor{};
     bool building_floor_preview_roofs{true};
     bool building_floor_preview_dirty{true};
+    std::future<PreparedRenderBuild> building_floor_preview_job;
+    bool building_floor_preview_again{};
+    std::tuple<std::size_t, std::optional<std::uint32_t>, bool> building_floor_preview_job_view;
     bool render_buffers_dirty{true};
     // True while the user is in the middle of a gesture (button held or gizmo drag).
     // Whole-scene rebuilds wait for it to end so dragging stays smooth.
@@ -493,7 +553,7 @@ struct EditorProject {
     // Near meshes and room volumes are built on a worker (baking took over 100 ms for a
     // skyscraper). The main thread only uploads the result.
     struct NearBuildingBuffers {
-        BuildingRenderBuffer mesh;
+        PreparedGpuMesh mesh;
         std::vector<ShadowVertex> room_shadow_vertices;
         std::vector<std::uint32_t> room_shadow_indices;
     };
@@ -504,8 +564,13 @@ struct EditorProject {
     std::unordered_map<std::size_t, NearBuildingJob> building_near_jobs;
     std::uint64_t placement_override_fingerprint{};
     std::uint64_t placement_override_build_target_fingerprint{};
-    std::optional<std::future<std::vector<PlacementOverrideRenderBuffer>>> placement_override_build_future;
-    std::vector<PlacementOverrideRenderBuffer> placement_override_uploads;
+    struct PreparedPlacementOverride {
+        PlacementOverrideRenderBuffer built;
+        PreparedGpuMesh mesh;
+        PreparedShadowVolume shadow;
+    };
+    std::optional<std::future<std::vector<PreparedPlacementOverride>>> placement_override_build_future;
+    std::vector<PreparedPlacementOverride> placement_override_uploads;
     std::size_t placement_override_upload_cursor{};
     int placement_override_upload_budget{};
     bool placement_assets_dirty{true};
@@ -526,9 +591,11 @@ struct EditorProject {
     bool city_scene_build_in_progress{};
     std::uint64_t city_scene_build_generation{};
     std::uint64_t city_scene_build_target_fingerprint{};
-    std::optional<std::future<MapScene>> city_scene_build_future;
+    std::optional<std::future<CitySceneBuild>> city_scene_build_future;
     // Road geometry does not wait for the terrain heightfield or shadow bake.
-    std::optional<std::future<MapScene>> city_roads_build_future;
+    std::optional<std::future<CitySceneBuild>> city_roads_build_future;
+    // The adopted scene's meshes, prepared by its worker and waiting for upload.
+    PreparedCityModels city_prepared_models;
     std::uint64_t city_roads_build_target_fingerprint{};
     std::uint64_t city_road_visibility_fingerprint{};
     bool city_road_cells_filtered{};
@@ -537,6 +604,21 @@ struct EditorProject {
     // scene rebuild instead of sending every triangle in immediate mode each frame.
     GpuBuildingRenderModel city_tile_gpu_model;
     GpuBuildingRenderModel terrain_gpu_model;
+    // Camera-following terrain detail: 128-unit chunks at the game's detail levels, by
+    // chunk key (update_terrain_detail). They replace the same chunks of terrain_gpu_model.
+    struct TerrainDetailChunk {
+        std::int32_t step{};
+        GpuBuildingRenderModel model;
+    };
+    std::unordered_map<std::uint64_t, TerrainDetailChunk> terrain_detail_chunks;
+    // Chunks being built on workers. They read city_scene_cache.terrain, so they are
+    // declared after it (destroyed, and so waited for, first).
+    struct TerrainDetailJob {
+        std::int32_t step{};
+        std::future<std::pair<BuildingRenderBuffer, PreparedGpuMesh>> mesh;
+    };
+    std::unordered_map<std::uint64_t, TerrainDetailJob> terrain_detail_jobs;
+    std::uint64_t terrain_detail_fingerprint{};
     bool city_scene_gpu_valid{false};
     // The terrain mesh is uploaded separately from the road and curb tiles. It only
     // needs uploading again when something that affects terrain changes
@@ -553,7 +635,14 @@ struct EditorProject {
     // a worker so placing a piece never stutters. The old mesh keeps showing until the
     // new buffer is ready and uploaded on the main thread.
     bool portal_rebuild_in_progress{};
-    std::optional<std::future<BuildingRenderBuffer>> portal_rebuild_future;
+    std::optional<std::future<PreparedRenderBuild>> portal_rebuild_future;
+    // One building's mesh rebuilding after an edit (rebuild_single_building_render).
+    struct BuildingRebuildJob {
+        std::string name;
+        bool again{};
+        std::future<PreparedRenderBuild> built;
+    };
+    std::unordered_map<std::size_t, BuildingRebuildJob> building_rebuild_jobs;
     std::vector<SbcPortal> portal_build_sources;
     std::vector<SbcPortal> portal_render_sources;
     std::uint64_t portal_visibility_fingerprint{};
@@ -638,6 +727,8 @@ struct EditorProject {
     std::array<std::vector<AssetSnapshot>, 3> asset_undo_stacks;
     std::array<std::vector<AssetSnapshot>, 3> asset_redo_stacks;
     std::array<std::optional<AssetSnapshot>, 3> asset_baselines;
+    // Which history the last edit went to: -1 city, else the asset_baselines kind.
+    int last_edit_history{-1};
     // The undo_stack depth at the last save or load. Entries above it are the "changes
     // since last save" list. Empty once the saved state has left the history (dropped by
     // the undo limit, or thrown away by editing after undoing past the save).
@@ -979,6 +1070,8 @@ struct EditorUi {
     std::optional<std::size_t> node_drag;
     Vector2 node_drag_mouse{};
     std::optional<CityGridPoint> node_drag_target;
+    std::optional<std::size_t> road_drag; // set when the drag moves a whole road; node_drag is then its first junction
+    GizmoAxis node_drag_axis{GizmoAxis::MoveXZ}; // the gizmo handle, or MoveXZ when the crossing itself was grabbed
     BuildingTool building_tool{BuildingTool::Select};
     std::size_t selected_item_set{};
     std::size_t item_set_catalog_add{};
@@ -1054,6 +1147,9 @@ struct EditorUi {
     bool render_roads{true};
     bool render_terrain{true};
     float terrain_distance{0.0F};
+    bool terrain_follow_camera{true};
+    float terrain_detail_scale{1.0F};
+    int terrain_finest_step{1};
     // Performance settings (Preferences): see RenderSettings.
     bool near_lod{true};
     // Draw rooms only for the selected city buildings, at any distance.
@@ -1079,10 +1175,13 @@ struct EditorUi {
     bool live_reflections{true};
     int anisotropy{16};
     std::size_t selected_building_cell{};
+    // Whether a block was picked in the Building view (F then frames it, not the whole building).
+    bool building_cell_picked{};
     // Hover in the building view: the index of the cell under the cursor this frame
     // (for the outline), worked out every frame; nullopt when there is none.
     std::optional<std::size_t> building_hover_cell;
     std::optional<std::uint32_t> building_hover_face;
+    std::optional<int> building_hover_side; // the side (0 N, 1 E, 2 S, 3 W) a Wall type click would set
     std::size_t selected_building_field{};
     // Buildings tab view: false shows the whole building, true only building_view_floor.
     bool building_view_floor_only{false};
@@ -1139,6 +1238,8 @@ struct EditorUi {
     std::int32_t gizmo_drag_origin_z{};
     std::int32_t gizmo_drag_origin_y{};
     std::int32_t gizmo_drag_origin_rot{};
+    // During a rotate drag: where the ring's dot follows the cursor (radians, atan2(z, x)).
+    std::optional<float> gizmo_rotate_angle;
 };
 
 std::string lower_name(std::string_view value);
@@ -1226,6 +1327,14 @@ void draw_buildblock_face_editor(EditorProject& project, EditorUi& ui);
 void draw_buildblock_layer(ImDrawList* draw_list, ImVec2 min, float side, const SblLayer& layer);
 bool buildblock_layer_button(const char* id, const SblLayer& layer, float size, bool selected);
 void draw_buildblock_face_canvas(EditorProject& project, EditorUi& ui);
+// A face's opening (bounds) is the one hole in the wall; window records are glass
+// panes the game only draws inside it, and door records are never read
+// (BuildblockTemplate_LoadFromSbl is their only user). These keep faces in that shape.
+void make_buildblock_doorway(SblLayer& layer);
+void add_buildblock_window(SblLayer& layer, float cx, float cy);
+// Grows the opening to cover every window; false when nothing changed.
+bool grow_buildblock_opening(SblLayer& layer);
+int buildblock_hidden_windows(const SblLayer& layer);
 // ui_workspace.cpp: the Toolbar, Assets, Outliner, and Properties windows, which
 // change with the current context. draw_viewport_overlays draws the tool hint and map
 // warnings over the scene canvas; call it inside the canvas window.
@@ -1366,6 +1475,9 @@ std::vector<std::string> build_grid_texture_names(const EditorProject& project);
 void ensure_render_input_cache(EditorProject& project);
 void invalidate_render_input_cache(EditorProject& project);
 const std::vector<NamedBlockMesh>& block_meshes(EditorProject& project);
+// The same caches as shared snapshots, for workers to hold without copying.
+std::shared_ptr<const std::vector<NamedBlockMesh>> shared_block_meshes(EditorProject& project);
+std::shared_ptr<const std::vector<NamedBuildblockTemplate>> shared_buildblock_templates(EditorProject& project);
 const std::vector<NamedBuildblockTemplate>& buildblock_templates(EditorProject& project);
 const std::vector<std::string>& project_grid_texture_names(EditorProject& project);
 void set_status(EditorProject& project);
@@ -1427,15 +1539,21 @@ void draw_city_piece_voxels(
     std::optional<std::size_t> selected_portal = std::nullopt,
     bool draw_wires = false,
     bool isolate_selected = false);
+// Builds and drops the camera-following terrain detail chunks for this camera (a few
+// chunks per frame, nearest first).
+void update_terrain_detail(EditorProject& project, Vector3 camera);
 GpuBuildingRenderModel upload_city_tile_model(const BuildingRenderBuffer& buffer, const EditorProject& project, bool shadows = true);
 GpuBuildingRenderModel upload_city_terrain_model(const BuildingRenderBuffer& buffer, const EditorProject& project);
+GpuBuildingRenderModel upload_city_tile_model(const BuildingRenderBuffer& buffer, const PreparedGpuMesh& prepared,
+    const PreparedShadowVolume* shadow, const EditorProject& project);
+GpuBuildingRenderModel upload_city_terrain_model(const BuildingRenderBuffer& buffer, const PreparedGpuMesh& prepared, const EditorProject& project);
 struct PlacedBuildingSnapshot {
     std::shared_ptr<const std::vector<SbbBuilding>> owned;
     std::vector<std::size_t> resolved; // index+1; zero means the asset is missing
 };
 PlacedBuildingSnapshot snapshot_city_buildings(EditorProject& project);
 void update_city_road_visibility(EditorProject& project);
-bool adopt_city_scene_result(EditorProject& project, MapScene scene, std::uint64_t fingerprint, bool complete);
+bool adopt_city_scene_result(EditorProject& project, CitySceneBuild built, std::uint64_t fingerprint, bool complete);
 void unload_city_render_model(GpuBuildingRenderModel& model);
 void draw_city_scene(
     EditorProject& project,
@@ -1576,6 +1694,7 @@ void mark_block_changed(EditorProject& project, EditorUi& ui, SblBlockMesh& bloc
 const RenderTexture2D* building_thumbnail(EditorProject& project, std::size_t index);
 void invalidate_building_thumbnail(EditorProject& project, std::size_t index);
 void rebuild_single_building_render(EditorProject& project, std::size_t index);
+void service_building_rebuilds(EditorProject& project);
 const RenderTexture2D* city_block_thumbnail(EditorProject& project, std::size_t index);
 // The Piece tool brush's mesh name; empty for the solid cube (app.cpp).
 std::string piece_brush_mesh_name(const EditorProject& project, const EditorUi& ui);
@@ -1584,6 +1703,14 @@ std::string piece_brush_mesh_name(const EditorProject& project, const EditorUi& 
 // on); roads along the move stretch or shrink. Returns false, leaving the map as it
 // was, when a road would shrink to less than two cells or turn around.
 bool move_city_junction(SbcMap& map, std::size_t node, std::int32_t dx, std::int32_t dz);
+// Moves a junction to `target`: its level alone, and X/Z through move_city_junction.
+bool move_city_junction_to(SbcMap& map, std::size_t node, CityGridPoint target);
+// Moves a road, both its junctions, by dx/dy/dz cells, under move_city_junction's rules.
+bool move_city_road(SbcMap& map, std::size_t street_index, std::int32_t dx, std::int32_t dy, std::int32_t dz);
+// Wall type painting: the cell side (0 N, 1 E, 2 S, 3 W) a click sets, and setting it
+// to ui.paint_code (adding an empty neighbour cell record when the side is stored there).
+int building_pick_side(const SbbBuilding& building, const BuildingFacePick& pick);
+void paint_building_side_code(EditorProject& project, EditorUi& ui, std::size_t cell_index, int side, std::string& status);
 // Draws the road preview mesh in front of the city's road at the same place.
 void draw_road_preview_model(GpuBuildingRenderModel& model);
 // The map's piece (city block, layer) with this mesh and textures; added if missing.
@@ -1631,6 +1758,9 @@ void add_block_box(EditorProject& project, EditorUi& ui);
 void block_editor_press(EditorProject& project, EditorUi& ui, const Camera3D& camera, Vector2 mouse, Vector2 viewport_size);
 void block_editor_update(EditorProject& project, EditorUi& ui, const Camera3D& camera, Vector2 mouse, Vector2 viewport_size, bool hovered);
 void start_block_transform(EditorProject& project, EditorUi& ui, BlockTransform mode, Vector2 mouse);
+// What F frames in the Blocks tab: the picked points or surface, else the whole block
+// (min and max corners, in view units).
+std::optional<std::pair<Vector3, Vector3>> block_focus_bounds(const EditorProject& project, const EditorUi& ui);
 void frame_block_camera(const EditorProject& project, const EditorUi& ui, Camera3D& camera);
 void draw_buildblock_inspector(EditorProject& project, EditorUi& ui, std::string& status);
 void draw_struct_inspector_header(const char* file_type, const char* struct_name, const std::string& record_name);

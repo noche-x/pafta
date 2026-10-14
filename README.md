@@ -1,6 +1,10 @@
 # Pafta
 
-Pafta (prounounced PAHF-tah) is a map editor for Sub Rosa, written in C++23.
+<p align="center">
+  <img src="assets/branding/pafta.png" alt="Pafta logo" width="256" height="256">
+</p>
+
+Pafta (pronounced PAHF-tah) is a map editor for Sub Rosa, written in C++23.
 
 Pafta is in beta. Backup your maps before working on them with Pafta, and test saved maps in Sub Rosa before you share them. The editor view can look different from the game.
 
@@ -13,7 +17,7 @@ Pafta is in beta. Backup your maps before working on them with Pafta, and test s
 
 ## Artifact builds
 
-GitHub CI makes `pafta-linux.zip`, `pafta-macos.zip`, `pafta-windows.zip`, `pafta-web.zip`, and the matching `pafta-source.tar.gz`. Unzip the desktop archive and run `pafta` (`pafta.exe` on Windows).
+GitHub CI makes `pafta-linux.zip`, `pafta-macos.zip`, `pafta-windows.zip`, `pafta-web.zip`, and the matching `pafta-source.tar.gz`. Unzip the desktop archive and run `pafta` (`pafta.exe` on Windows). On macOS, you can also open `Pafta.app`.
 
 The browser build has to be served over HTTP. Open its `index.html`. [docs/WEB_BUILD.md](docs/WEB_BUILD.md) explains how to serve it locally and how to deploy it. [docs/BETA_RELEASE.md](docs/BETA_RELEASE.md) lists the release checks and known limits.
 

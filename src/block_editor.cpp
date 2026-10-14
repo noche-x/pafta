@@ -90,8 +90,90 @@ void map_patch_uvs(SblAuthoredPatch& patch, const auto& mapping) {
     }
 }
 
-void draw_patch_uv_tools(SblAuthoredPatch& patch, bool& changed) {
+// The patch's stored UVs drawn over its texture (tiled). Drag a point to move it, or
+// empty space to move them all. A flat patch moves its corners; the inner points follow.
+bool draw_patch_uv_canvas(SblAuthoredPatch& patch, const Texture2D* texture) {
+    if (patch.control_points.size() != 16U) return false;
+    auto& points = patch.control_points;
+    const bool flat = patch_is_flat(patch);
+    static constexpr std::array<std::size_t, 4> kCorners{0, 3, 15, 12};
+    const auto editable = [&](std::size_t i) { return !flat || std::ranges::find(kCorners, i) != kCorners.end(); };
+    // The view covers the 0-1 square and every point, and holds still during a drag.
+    static int dragging = -1;  // a point, -2 for all of them, -1 for none
+    static float view_u = 0.0F, view_v = 0.0F, view_span = 1.0F;
+    if (dragging == -1) {
+        float u0 = 0.0F, v0 = 0.0F, u1 = 1.0F, v1 = 1.0F;
+        for (const auto& p : points) {
+            u0 = std::min(u0, p.u); u1 = std::max(u1, p.u);
+            v0 = std::min(v0, p.v); v1 = std::max(v1, p.v);
+        }
+        view_span = std::max(u1 - u0, v1 - v0) * 1.2F;
+        view_u = (u0 + u1 - view_span) * 0.5F;
+        view_v = (v0 + v1 - view_span) * 0.5F;
+    }
+    const float side = std::max(80.0F, ImGui::GetContentRegionAvail().x);
+    const auto origin = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##uv_canvas", ImVec2(side, side));
+    const bool hovered = ImGui::IsItemHovered(), active = ImGui::IsItemActive();
+    const auto at = [&](float u, float v) {
+        return ImVec2(origin.x + (u - view_u) / view_span * side, origin.y + (v - view_v) / view_span * side);
+    };
+    auto* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(origin, ImVec2(origin.x + side, origin.y + side), IM_COL32(40, 44, 50, 255));
+    if (texture != nullptr) {
+        // The texture repeats, so the view's UV range shows it tiled.
+        draw->AddImage(ImTextureID(texture->id), origin, ImVec2(origin.x + side, origin.y + side), ImVec2(view_u, view_v),
+            ImVec2(view_u + view_span, view_v + view_span), IM_COL32(255, 255, 255, 170));
+    }
+    draw->AddRect(at(0.0F, 0.0F), at(1.0F, 1.0F), IM_COL32(255, 255, 255, 90));
+    for (std::size_t row = 0; row < 4; ++row) {
+        for (std::size_t column = 0; column < 4; ++column) {
+            const auto& p = points[row * 4 + column];
+            if (column < 3) draw->AddLine(at(p.u, p.v), at(points[row * 4 + column + 1].u, points[row * 4 + column + 1].v), IM_COL32(255, 170, 60, 220), 1.5F);
+            if (row < 3) draw->AddLine(at(p.u, p.v), at(points[(row + 1) * 4 + column].u, points[(row + 1) * 4 + column].v), IM_COL32(255, 170, 60, 220), 1.5F);
+        }
+    }
+    const auto mouse = ImGui::GetIO().MousePos;
+    int hover = -1;
+    float best = 8.0F;
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        if (!editable(i)) continue;
+        const auto p = at(points[i].u, points[i].v);
+        const auto d = std::hypot(p.x - mouse.x, p.y - mouse.y);
+        if (hovered && d < best) { best = d; hover = static_cast<int>(i); }
+    }
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        if (!editable(i)) continue;
+        const bool lit = static_cast<int>(i) == hover || static_cast<int>(i) == dragging;
+        draw->AddCircleFilled(at(points[i].u, points[i].v), lit ? 6.0F : 4.5F, lit ? IM_COL32(255, 230, 90, 255) : IM_COL32(255, 150, 60, 255));
+    }
+    if (ImGui::IsItemActivated()) dragging = hover >= 0 ? hover : -2;
+    bool changed = false;
+    if (active && dragging != -1) {
+        const auto delta = ImGui::GetIO().MouseDelta;
+        const float du = delta.x / side * view_span, dv = delta.y / side * view_span;
+        if (du != 0.0F || dv != 0.0F) {
+            for (std::size_t i = 0; i < points.size(); ++i) {
+                if (dragging == -2 || static_cast<int>(i) == dragging) {
+                    points[i].u += du;
+                    points[i].v += dv;
+                }
+            }
+            if (flat && dragging >= 0) {
+                const auto corners = patch_corners(patch);
+                set_patch_quad(patch, corners[0], corners[1], corners[2], corners[3], patch_corner_uvs(patch));
+            }
+            changed = true;
+        }
+    }
+    if (!active) dragging = -1;
+    if (hovered) ImGui::SetTooltip(hover >= 0 ? "Drag to move this UV" : "Drag to move all UVs");
+    return changed;
+}
+
+void draw_patch_uv_tools(SblAuthoredPatch& patch, const Texture2D* texture, bool& changed) {
     if (ImGui::CollapsingHeader("UVs (stored)", ImGuiTreeNodeFlags_DefaultOpen)) {
+        changed |= draw_patch_uv_canvas(patch, texture);
         if (patch_is_flat(patch)) {
             auto corners = patch_corners(patch);
             auto uvs = patch_corner_uvs(patch);
@@ -316,7 +398,7 @@ bool slot_combo(const char* id, std::uint32_t& material) {
     return true;
 }
 
-void draw_patch_properties(SblBlockMesh& block, SblAuthoredPatch& patch, bool& changed) {
+void draw_patch_properties(SblBlockMesh& block, SblAuthoredPatch& patch, const Texture2D* texture, bool& changed) {
     field_label("Texture");
     changed |= slot_combo("##patch_slot", patch.normal_flag_a);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Which of the 8 textures of the building cell that places this block.");
@@ -334,7 +416,7 @@ void draw_patch_properties(SblBlockMesh& block, SblAuthoredPatch& patch, bool& c
                           "Stored: uses each control point's u, v.");
     }
     if (patch.normal_flag_b == 0U && (patch.normal_flag_a & 0xf0000U) == 0U) {
-        draw_patch_uv_tools(patch, changed);
+        draw_patch_uv_tools(patch, texture, changed);
     } else {
         ImGui::TextWrapped("UVs are projected from the facing: one texture repeat per cell, lined up with the walls. "
                            "Choose Stored UVs to set them yourself.");
@@ -619,7 +701,12 @@ void draw_block_inspector(EditorProject& project, EditorUi& ui, std::string& sta
                 : "Surfaces: drag an arrow to move, a white cube to resize a box, an orange dot to move a point. "
                   "G moves, S scales, R rotates (X/Y/Z lock an axis, click or Enter keeps, Esc cancels, Shift skips snapping). "
                   "Arrow keys and PgUp/PgDn nudge 1/8 cell. Tab switches to points.");
-            if (patch_selected) draw_patch_properties(*block, block->authored_patches[ui.block_element_index], changed);
+            if (patch_selected) {
+                auto& patch = block->authored_patches[ui.block_element_index];
+                // The view's texture for the patch's slot (View > Slot textures).
+                const auto& name = ui.block_slot_textures[std::min<std::size_t>(patch.normal_flag_a & 0xffffU, 7U)];
+                draw_patch_properties(*block, patch, name.empty() ? nullptr : find_project_texture(project, name), changed);
+            }
             else draw_box_properties(block->lights[ui.block_element_index], changed);
         } else {
             ImGui::TextDisabled("Click a surface in the view, or pick one above.");
@@ -1344,6 +1431,28 @@ void draw_block_editor_handles(EditorProject& project, const EditorUi& ui, const
             DrawSphere(at, length * kUnit * 0.04F, handle_color(handle.id, Color{255, 150, 60, 255}));
         }
     }
+}
+
+std::optional<std::pair<Vector3, Vector3>> block_focus_bounds(const EditorProject& project, const EditorUi& ui) {
+    if (project.blocks.empty()) return std::nullopt;
+    auto block = project.blocks[std::min(ui.selected_block, project.blocks.size() - 1U)].data;
+    Vector3 lo{FLT_MAX, FLT_MAX, FLT_MAX}, hi{-FLT_MAX, -FLT_MAX, -FLT_MAX};
+    const auto add = [&](Vec3f p) {
+        lo = Vector3Min(lo, {p.x * kUnit, p.y * kUnit, p.z * kUnit});
+        hi = Vector3Max(hi, {p.x * kUnit, p.y * kUnit, p.z * kUnit});
+    };
+    // The picked points, else the picked surface, else every face of the block.
+    auto refs = ui.block_selected_vertices;
+    if (refs.empty() && ui.block_element != BlockElementKind::None) refs = element_vertices(block, ui.block_element, ui.block_element_index);
+    for (auto* point : points_of(block, refs)) add(*point);
+    if (lo.x > hi.x) {
+        for (const auto& face : block.faces) for (const auto& v : face.vertices) add(v);
+    }
+    if (lo.x > hi.x) {
+        add({0.0F, 0.0F, 0.0F});
+        add({static_cast<float>(block.width), static_cast<float>(block.height), static_cast<float>(block.depth)});
+    }
+    return std::pair{lo, hi};
 }
 
 void frame_block_camera(const EditorProject& project, const EditorUi& ui, Camera3D& camera) {

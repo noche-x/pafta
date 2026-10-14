@@ -3131,6 +3131,49 @@ BuildingRenderBuffer build_city_tile_render_buffer(const std::vector<CityTileCel
     return buffer;
 }
 
+// One landscape chunk's grid at `step` units per sample into `mesh`. Quads under a
+// road, piece or building tile are left out: the tile's top is the ground there, and
+// terrain at the same height flickers against it. A quad is only left out when all
+// four of its corners are covered, so the cut follows the tile outline without holes.
+template <typename Height, typename Covered>
+void append_terrain_chunk(BuildingRenderBuffer& mesh, float chunk_x, float chunk_z, std::int32_t step, float unit_size,
+    const Height& height, const Covered& covered) {
+    constexpr std::int32_t chunk_size = 128;
+    const auto side = chunk_size / step + 1;
+    const auto first_vertex = static_cast<std::uint32_t>(mesh.vertices.size());
+    for (auto z = 0; z < side; ++z) {
+        for (auto x = 0; x < side; ++x) {
+            const auto world_x = chunk_x + static_cast<float>(x * step);
+            const auto world_z = chunk_z + static_cast<float>(z * step);
+            mesh.vertices.push_back({{world_x, height(world_x, world_z) - city_terrain_mesh_y_offset, world_z}, world_x / 32.0F, 1.0F - world_z / 32.0F});
+        }
+    }
+    const auto cell_of = [&](float wx, float wz) {
+        return covered(static_cast<std::int32_t>(std::floor(wx / unit_size)), static_cast<std::int32_t>(std::floor(wz / unit_size)));
+    };
+    for (auto z = 0; z < side - 1; ++z) {
+        for (auto x = 0; x < side - 1; ++x) {
+            const auto quad_min_x = chunk_x + static_cast<float>(x * step);
+            const auto quad_min_z = chunk_z + static_cast<float>(z * step);
+            const auto quad_max_x = quad_min_x + static_cast<float>(step);
+            const auto quad_max_z = quad_min_z + static_cast<float>(step);
+            // Sample just inside each corner, so a quad that touches a tile's edge finds
+            // the cell it really overlaps.
+            constexpr auto eps = 0.01F;
+            if (cell_of(quad_min_x + eps, quad_min_z + eps) && cell_of(quad_max_x - eps, quad_min_z + eps) &&
+                cell_of(quad_min_x + eps, quad_max_z - eps) && cell_of(quad_max_x - eps, quad_max_z - eps)) {
+                continue;
+            }
+            const auto i0 = first_vertex + static_cast<std::uint32_t>(z * side + x);
+            const auto i1 = i0 + 1U;
+            const auto i3 = first_vertex + static_cast<std::uint32_t>((z + 1) * side + x);
+            const auto i2 = i3 + 1U;
+            mesh.triangles.push_back({{i0, i1, i2}, 0U, false});
+            mesh.triangles.push_back({{i0, i2, i3}, 0U, false});
+        }
+    }
+}
+
 std::optional<CityTerrain> build_city_terrain(
     const SbcMap& map,
     const NativeCityGraph& expanded_graph,
@@ -3193,6 +3236,7 @@ std::optional<CityTerrain> build_city_terrain(
 #endif
         {},
         {},
+        {},
     };
 
     // The game's one-unit heightfield: the base island, then the fixed intersection
@@ -3246,22 +3290,7 @@ std::optional<CityTerrain> build_city_terrain(
     constexpr float landscape_min = -4096.0F;
     constexpr float landscape_max = landscape_min + 16384.0F;
     constexpr std::int32_t chunk_size = 128;
-    const auto focus_x = (terrain.min_x + terrain.max_x) * 0.5F;
-    const auto focus_z = (terrain.min_z + terrain.max_z) * 0.5F;
-    auto lod_step = [&](float chunk_x, float chunk_z) {
-        const auto dx = chunk_x + 64.0F - focus_x;
-        const auto dz = chunk_z + 64.0F - focus_z;
-        const auto distance = std::sqrt(dx * dx + dz * dz);
-        // The game only streams the sub-chunks the camera can see. This editor mesh
-        // stays loaded, so the game's near-detail distances would add up to about five
-        // million uploaded vertices and make the UI slow to respond. Keep the whole
-        // 0x4000 world, but only use high detail near the city.
-        if (distance < 256.0F) return 4;
-        if (distance < 512.0F) return 8;
-        if (distance < 1024.0F) return 16;
-        if (distance < 2048.0F) return 32;
-        return 64;
-    };
+    auto lod_step = [&](float chunk_x, float chunk_z) { return terrain_fixed_step(terrain, chunk_x, chunk_z); };
     auto render_height = terrain_height;
 
     // Chunk rows build in parallel into their own buffers, then join in row order.
@@ -3271,51 +3300,7 @@ std::optional<CityTerrain> build_city_terrain(
         auto& mesh = rows[static_cast<std::size_t>(row)];
         const auto chunk_z = landscape_min + static_cast<float>(row * chunk_size);
         for (auto chunk_x = landscape_min; chunk_x < landscape_max; chunk_x += static_cast<float>(chunk_size)) {
-            const auto step = lod_step(chunk_x, chunk_z);
-            const auto side = chunk_size / step + 1;
-            const auto first_vertex = static_cast<std::uint32_t>(mesh.vertices.size());
-            for (auto z = 0; z < side; ++z) {
-                for (auto x = 0; x < side; ++x) {
-                    const auto world_x = chunk_x + static_cast<float>(x * step);
-                    const auto world_z = chunk_z + static_cast<float>(z * step);
-                    mesh.vertices.push_back({
-                        {world_x, render_height(world_x, world_z) - city_terrain_mesh_y_offset, world_z},
-                        world_x/32.0F,
-                        1.0F-world_z/32.0F});
-                }
-            }
-            for (auto z = 0; z < side - 1; ++z) {
-                for (auto x = 0; x < side - 1; ++x) {
-                    // Skip terrain quads under a road or curb tile. The tile's top is the
-                    // ground there, and a terrain plane at the same height flickers against
-                    // it. Check the four corners and only skip when all of them are covered,
-                    // so the cut follows the tile's outline without leaving holes.
-                    const auto quad_min_x = chunk_x + static_cast<float>(x * step);
-                    const auto quad_min_z = chunk_z + static_cast<float>(z * step);
-                    const auto quad_max_x = quad_min_x + static_cast<float>(step);
-                    const auto quad_max_z = quad_min_z + static_cast<float>(step);
-                    const auto cell_of = [&](float wx, float wz) {
-                        return cell_covered(
-                            static_cast<std::int32_t>(std::floor(wx / unit_size)),
-                            static_cast<std::int32_t>(std::floor(wz / unit_size)));
-                    };
-                    // Sample just inside each corner, so a quad that touches a tile's edge
-                    // finds the cell it really overlaps.
-                    constexpr auto eps = 0.01F;
-                    if (cell_of(quad_min_x + eps, quad_min_z + eps) &&
-                        cell_of(quad_max_x - eps, quad_min_z + eps) &&
-                        cell_of(quad_min_x + eps, quad_max_z - eps) &&
-                        cell_of(quad_max_x - eps, quad_max_z - eps)) {
-                        continue;
-                    }
-                    const auto i0 = first_vertex + static_cast<std::uint32_t>(z * side + x);
-                    const auto i1 = i0 + 1U;
-                    const auto i3 = first_vertex + static_cast<std::uint32_t>((z + 1) * side + x);
-                    const auto i2 = i3 + 1U;
-                    mesh.triangles.push_back({{i0, i1, i2}, 0U, false});
-                    mesh.triangles.push_back({{i0, i2, i3}, 0U, false});
-                }
-            }
+            append_terrain_chunk(mesh, chunk_x, chunk_z, lod_step(chunk_x, chunk_z), unit_size, render_height, cell_covered);
         }
     });
     std::size_t vertex_total = 0, triangle_total = 0;
@@ -3334,6 +3319,8 @@ std::optional<CityTerrain> build_city_terrain(
 
     sort_triangles_into_native_material_runs(terrain.mesh);
     build_terrain_draw_chunks(terrain.mesh);
+    terrain.covered_cells.insert(stamps.masked.begin(), stamps.masked.end());
+    terrain.city_map = !stamps.disabled;
     return terrain;
 }
 
@@ -4338,6 +4325,38 @@ std::optional<Vec3> ray_ground_hit(const Vec3& ray_origin, const Vec3& ray_dir) 
     return add_scaled(ray_origin, ray_dir, t);
 }
 
+std::int32_t terrain_fixed_step(const CityTerrain& terrain, float chunk_x, float chunk_z) {
+    // The game only streams the sub-chunks the camera can see, at camera-distance
+    // detail. This mesh stays loaded, so the game's near-detail distances would add up
+    // to about five million uploaded vertices. Keep the whole 0x4000 world, with high
+    // detail only near the city; update_terrain_detail adds the camera's detail on top.
+    const auto dx = chunk_x + 64.0F - (terrain.min_x + terrain.max_x) * 0.5F;
+    const auto dz = chunk_z + 64.0F - (terrain.min_z + terrain.max_z) * 0.5F;
+    const auto distance = std::sqrt(dx * dx + dz * dz);
+    if (distance < 256.0F) return 4;
+    if (distance < 512.0F) return 8;
+    if (distance < 1024.0F) return 16;
+    if (distance < 2048.0F) return 32;
+    return 64;
+}
+
+BuildingRenderBuffer build_terrain_chunk_mesh(const CityTerrain& terrain, float chunk_x, float chunk_z, std::int32_t step, float unit_size) {
+    BuildingRenderBuffer mesh;
+    mesh.unit_size = unit_size;
+    mesh.material_names.push_back("city_terrain_grass");
+    const auto height = [&](float x, float z) {
+        return x >= terrain.min_x && x <= terrain.max_x && z >= terrain.min_z && z <= terrain.max_z
+            ? terrain_height_at(terrain, x, z) : native_like_city_terrain_height(x, z, terrain.city_map);
+    };
+    const auto covered = [&](std::int32_t gx, std::int32_t gz) {
+        return terrain.covered_cells.contains(CityCornerStampMap::key(gx, gz));
+    };
+    append_terrain_chunk(mesh, chunk_x, chunk_z, std::max(1, step), unit_size, height, covered);
+    sort_triangles_into_native_material_runs(mesh);
+    build_terrain_draw_chunks(mesh);
+    return mesh;
+}
+
 std::optional<Vec3> ray_terrain_hit(const CityTerrain& terrain, const Vec3& ray_origin, const Vec3& ray_dir) {
     if (terrain.heights.empty() || terrain.sample_count_x <= 0 || terrain.sample_count_z <= 0 ||
         terrain.sample_spacing <= 0.0F) {
@@ -4481,46 +4500,63 @@ std::optional<CityPiecePick> pick_city_piece(
     return nearest;
 }
 
+namespace {
+
+// The junction whose drawn crossing tiles the ray reaches first, and how far along the
+// ray. A junction is picked by the road square you see, not a marker inside it.
+std::optional<std::pair<std::size_t, float>> pick_junction_tile(
+    const SbcMap& map, const MapScene& scene, const Vec3& ray_origin, const Vec3& ray_dir) {
+    // A cached scene can keep drawing after an edit, but must not select a junction
+    // that moved.
+    std::vector<bool> current(map.intersections.size(), false);
+    for (const auto& intersection : scene.intersections) {
+        if (intersection.source_index < map.intersections.size() && intersection.source == map.intersections[intersection.source_index]) {
+            current[intersection.source_index] = true;
+        }
+    }
+    std::optional<std::pair<std::size_t, float>> nearest;
+    const auto unit = scene.unit_size;
+    for (const auto& tile : scene.city_tiles) {
+        if (tile.intersection_index < 0 || tile.street_index >= 0 ||
+            static_cast<std::size_t>(tile.intersection_index) >= current.size() || !current[static_cast<std::size_t>(tile.intersection_index)]) {
+            continue;
+        }
+        const Vec3 box_min{static_cast<float>(tile.x) * unit, tile.base_y, static_cast<float>(tile.z) * unit};
+        const Vec3 box_max{box_min.x + unit, tile.base_y + unit, box_min.z + unit};
+        const auto t = ray_aabb_intersection_t(ray_origin, ray_dir, box_min, box_max);
+        if (t.has_value() && (!nearest || *t < nearest->second)) nearest = std::pair{static_cast<std::size_t>(tile.intersection_index), *t};
+    }
+    // A road's end has no crossing tiles (the road runs over its junction), so each
+    // junction also has a pad as wide as its widest road, at the road's surface.
+    std::vector<std::int32_t> half_width(map.intersections.size(), 0);
+    for (const auto& street : map.streets) {
+        for (const auto end : {street.from_intersection, street.to_intersection}) {
+            if (end >= 0 && static_cast<std::size_t>(end) < half_width.size()) {
+                half_width[static_cast<std::size_t>(end)] = std::max({half_width[static_cast<std::size_t>(end)], street.left_width, street.right_width});
+            }
+        }
+    }
+    for (std::size_t i = 0; i < map.intersections.size(); ++i) {
+        if (!current[i] || half_width[i] == 0) continue;
+        const auto& node = map.intersections[i];
+        const auto w = static_cast<float>(half_width[i]) * unit;
+        const Vec3 box_min{static_cast<float>(node.x) * unit - w, static_cast<float>(node.y - 1) * unit, static_cast<float>(node.z) * unit - w};
+        const Vec3 box_max{static_cast<float>(node.x) * unit + w, static_cast<float>(node.y) * unit + 0.5F, static_cast<float>(node.z) * unit + w};
+        const auto t = ray_aabb_intersection_t(ray_origin, ray_dir, box_min, box_max);
+        if (t.has_value() && (!nearest || *t < nearest->second)) nearest = std::pair{i, *t};
+    }
+    return nearest;
+}
+
+} // namespace
+
 std::optional<std::size_t> pick_city_intersection(
     const SbcMap& map,
     const MapScene& scene,
     const Vec3& ray_origin,
     const Vec3& ray_dir) {
-    constexpr float marker_size = 2.0F;
-    // Make the pick target a bit bigger than the drawn marker, so the small node cube is
-    // easy to grab, but not so big that it covers the road running through it (a
-    // full-cell box made roads impossible to select near their ends). The combined
-    // picker (pick_city_road_or_node) breaks ties between nodes and roads by distance
-    // from the camera, so this only needs to be easy to click, not greedy.
-    const auto half = marker_size * 0.85F;
-
-    std::optional<std::size_t> nearest;
-    auto nearest_t = std::numeric_limits<float>::max();
-    for (const auto& intersection : scene.intersections) {
-        const auto index = intersection.source_index;
-        if (index >= map.intersections.size() || intersection.source != map.intersections[index]) {
-            continue;
-        }
-
-        const Vec3 center{
-            intersection.position.x,
-            static_cast<float>(intersection.source.y) * scene.unit_size,
-            intersection.position.z,
-        };
-        const auto t = ray_aabb_intersection_t(
-            ray_origin,
-            ray_dir,
-            {center.x - half, center.y - half, center.z - half},
-            {center.x + half, center.y + half, center.z + half});
-        if (!t.has_value() || *t >= nearest_t) {
-            continue;
-        }
-
-        nearest = index;
-        nearest_t = *t;
-    }
-
-    return nearest;
+    const auto hit = pick_junction_tile(map, scene, ray_origin, ray_dir);
+    return hit ? std::optional<std::size_t>{hit->first} : std::nullopt;
 }
 
 std::optional<CityRoadPick> pick_city_road_or_node(
@@ -4528,30 +4564,7 @@ std::optional<CityRoadPick> pick_city_road_or_node(
     const MapScene& scene,
     const Vec3& ray_origin,
     const Vec3& ray_dir) {
-    // Node candidate: the distance along the ray to the closest node marker box.
-    constexpr float marker_size = 2.0F;
-    const auto node_half = marker_size * 0.85F;
-    std::optional<std::size_t> node_index;
-    float node_t = std::numeric_limits<float>::max();
-    for (const auto& intersection : scene.intersections) {
-        const auto index = intersection.source_index;
-        if (index >= map.intersections.size() || intersection.source != map.intersections[index]) {
-            continue;
-        }
-        const Vec3 center{
-            intersection.position.x,
-            static_cast<float>(intersection.source.y) * scene.unit_size,
-            intersection.position.z,
-        };
-        const auto t = ray_aabb_intersection_t(
-            ray_origin, ray_dir,
-            {center.x - node_half, center.y - node_half, center.z - node_half},
-            {center.x + node_half, center.y + node_half, center.z + node_half});
-        if (t.has_value() && *t < node_t) {
-            node_t = *t;
-            node_index = index;
-        }
-    }
+    const auto node = pick_junction_tile(map, scene, ray_origin, ray_dir);
 
     // Check each street once before going through its tiles. A cached scene can keep
     // drawing after an edit, but must not select a record that moved or changed.
@@ -4561,8 +4574,7 @@ std::optional<CityRoadPick> pick_city_road_or_node(
             current_roads[road.source_index] = true;
         }
     }
-    // The closest drawn road tile gives the street it belongs to. Intersection tiles
-    // belong to no street and fall through to node picking.
+    // The closest drawn road tile gives the street it belongs to.
     std::optional<std::size_t> road_index;
     float road_t = std::numeric_limits<float>::max();
     const auto unit = scene.unit_size;
@@ -4581,10 +4593,9 @@ std::optional<CityRoadPick> pick_city_road_or_node(
         }
     }
 
-    // Whichever the ray reaches first wins. A small bias lets a direct click on a node
-    // win when the node box and the road overlap (the node sits on the road).
-    if (node_index.has_value() && (!road_index.has_value() || node_t <= road_t + scene.unit_size * 0.25F)) {
-        return CityRoadPick{CityRoadPick::Kind::Node, *node_index};
+    // Whichever tile the ray reaches first wins.
+    if (node.has_value() && (!road_index.has_value() || node->second <= road_t)) {
+        return CityRoadPick{CityRoadPick::Kind::Node, node->first};
     }
     if (road_index.has_value()) {
         return CityRoadPick{CityRoadPick::Kind::Road, *road_index};

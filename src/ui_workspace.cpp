@@ -367,12 +367,11 @@ void draw_toolbar_window(EditorProject* project, EditorUi& ui, Camera3D& camera,
         } else if (ui.tab == EditorTab::Blocks) {
             if (tool_button(ICON_FA_ARROW_POINTER, !ui.block_paint_faces, ui, "Select block surfaces")) ui.block_paint_faces = false;
             ImGui::SameLine();
-            if (tool_button(ICON_FA_CUBE, false, ui, "Add block")) create_new_block(*project, ui, status);
-            ImGui::SameLine();
+            // New blocks come from Assets > New block; these add to the open block.
             ImGui::BeginDisabled(project->blocks.empty());
-            if (tool_button(ICON_FA_SQUARE_PLUS, false, ui, "Add box to the open block")) add_block_box(*project, ui);
+            if (tool_button(ICON_FA_CUBE, false, ui, "Add box: a solid box surface")) add_block_box(*project, ui);
             ImGui::SameLine();
-            if (tool_button(ICON_FA_VECTOR_SQUARE, false, ui, "Add patch to the open block")) add_block_patch(*project, ui);
+            if (tool_button(ICON_FA_VECTOR_SQUARE, false, ui, "Add patch: a flat or curved surface")) add_block_patch(*project, ui);
             ImGui::SameLine();
             if (tool_button(ICON_FA_PAINTBRUSH, ui.block_paint_faces, ui, "Paint faces with a texture slot")) {
                 ui.block_paint_faces = true;
@@ -706,7 +705,16 @@ void draw_place_height(EditorUi& ui) {
 void draw_properties_window(EditorProject* project, EditorUi& ui, std::string& status) {
     if (!ui.show_properties_window) return;
     std::string context;
-    if (project != nullptr && project->city && ui.tab == EditorTab::City) {
+    if (project != nullptr && project->city && ui.tab == EditorTab::City && ui.city_tool != CityTool::Select) {
+        // A placement tool's settings replace the selection's.
+        switch (ui.city_tool) {
+            case CityTool::Building: context = "Place building"; break;
+            case CityTool::Road: context = "Lay road"; break;
+            case CityTool::Piece: context = "Place piece"; break;
+            case CityTool::Erase: context = "Erase"; break;
+            default: break;
+        }
+    } else if (project != nullptr && project->city && ui.tab == EditorTab::City) {
         switch (ui.city_selection) {
             case CitySelectionKind::Building:
                 if (ui.selected_city_building < project->city->data.buildings.size()) {
@@ -743,22 +751,11 @@ void draw_properties_window(EditorProject* project, EditorUi& ui, std::string& s
                 }
             }
         }
-        // The placement height belongs to the tool, so it shows even while something
-        // is selected (the tool section below only shows when nothing is).
-        if (project->city && ui.city_selection != CitySelectionKind::None &&
-            (ui.city_tool == CityTool::Road || ui.city_tool == CityTool::Piece || ui.city_tool == CityTool::Building)) {
-            if (ImGui::CollapsingHeader("Placing", ImGuiTreeNodeFlags_DefaultOpen)) {
-                if (ui.city_tool == CityTool::Road) {
-                    ImGui::SetNextItemWidth(-FLT_MIN);
-                    ImGui::SliderInt("##new_road_width_selected", &ui.new_road_width, 2, 24, "Width: %d cells");
-                }
-                draw_place_height(ui);
-            }
-            }
         if (!project->city) {
             ImGui::TextDisabled("No city layout loaded.");
-        } else if (ui.city_selection == CitySelectionKind::None) {
-            // With nothing selected, describe what the active tool will do.
+        } else if (ui.city_selection == CitySelectionKind::None || ui.city_tool != CityTool::Select) {
+            // A placement tool shows what it will do; the selection's details show
+            // with the Select tool.
             if (ui.city_tool == CityTool::Building && !project->buildings.empty()) {
                 const auto& tmpl = project->buildings[std::min(ui.place_building_template, project->buildings.size() - 1U)];
                 if (ImGui::CollapsingHeader("Placing", ImGuiTreeNodeFlags_DefaultOpen)) {

@@ -578,6 +578,12 @@ void load_preferences(EditorUi& ui) {
             read_bool(ui.remember_load_order);
         } else if (key == "render.terrain_distance") {
             read_float(ui.terrain_distance, 0.0F, 20000.0F);
+        } else if (key == "render.terrain_follow_camera") {
+            read_bool(ui.terrain_follow_camera);
+        } else if (key == "render.terrain_detail_scale") {
+            read_float(ui.terrain_detail_scale, 0.25F, 4.0F);
+        } else if (key == "render.terrain_finest_step") {
+            read_int(ui.terrain_finest_step, 1, 4);
         } else if (key == "load.loose_first") {
             read_bool(ui.loose_files_win);
         } else if (key == "export.mesh_folder") {
@@ -648,6 +654,9 @@ void save_preferences(const EditorUi& ui) {
     out << "export.mesh_folder=" << ui.mesh_export_folder << '\n';
     out << "load.remember_order=" << (ui.remember_load_order ? 1 : 0) << '\n';
     out << "render.terrain_distance=" << ui.terrain_distance << '\n';
+    out << "render.terrain_follow_camera=" << (ui.terrain_follow_camera ? 1 : 0) << '\n';
+    out << "render.terrain_detail_scale=" << ui.terrain_detail_scale << '\n';
+    out << "render.terrain_finest_step=" << ui.terrain_finest_step << '\n';
     out << "load.loose_first=" << (ui.loose_files_win ? 1 : 0) << '\n';
     out << "view.coordinates=" << (ui.show_coordinates ? 1 : 0) << '\n';
     out << "map.street_labels=" << (ui.map_menu.street_labels ? 1 : 0) << '\n';
@@ -968,6 +977,33 @@ void draw_preferences_contents(EditorUi& ui) {
         field_label("Terrain distance");
         changed |= ImGui::SliderFloat("##terrain_distance", &ui.terrain_distance, 0.0F, 12000.0F, ui.terrain_distance == 0.0F ? "Unlimited" : "%.0f");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Terrain beyond this camera distance is hidden. Zero draws all terrain.");
+        ImGui::BeginDisabled(!ui.render_terrain);
+        int detail = ui.terrain_follow_camera ? 0 : 1;
+        field_label("Terrain detail");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::Combo("##terrain_detail", &detail, "Like the game (follows the camera)\0Fixed (lighter)\0")) {
+            ui.terrain_follow_camera = detail == 0;
+            changed = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Like the game: ground near the camera is sampled every unit, getting coarser\n"
+                              "at 512, 768, 1024, 1536, 2048 and 3072 units, as the game does.\n"
+                              "Fixed: one mesh, detailed only near the city's centre. Uses less memory.");
+        }
+        ImGui::BeginDisabled(!ui.terrain_follow_camera);
+        field_label("Detail distance");
+        changed |= ImGui::SliderFloat("##terrain_detail_scale", &ui.terrain_detail_scale, 0.25F, 4.0F, "%.2fx");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Multiplies the game's detail distances. 1x matches the game.");
+        field_label("Finest step");
+        int finest = ui.terrain_finest_step == 1 ? 0 : ui.terrain_finest_step == 2 ? 1 : 2;
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::Combo("##terrain_finest_step", &finest, "1 unit (game)\0002 units\0004 units\0")) {
+            ui.terrain_finest_step = 1 << finest;
+            changed = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("The spacing of the nearest ground samples. Larger is lighter.");
+        ImGui::EndDisabled();
+        ImGui::EndDisabled();
         changed |= ImGui::Checkbox("Shadows", &ui.render_shadows);
         ImGui::SameLine();
         changed |= ImGui::Checkbox("Sky", &ui.render_sky);

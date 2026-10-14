@@ -265,6 +265,9 @@ void test_move_junction() {
     const auto before = map.intersections;
     require(!move_city_junction(map, 1, -23, 0) && map.intersections == before, "a move that collapses a road was applied");
     require(!move_city_junction(map, 1, -30, 0) && map.intersections == before, "a move that turns a road around was applied");
+    // Moving a whole road moves both its junctions; the roads it meets stretch.
+    require(move_city_road(map, 1, 2, 1, 0) && map.intersections[1].x == 26 && map.intersections[2].x == 26 &&
+        map.intersections[1].y == 1 && map.intersections[2].y == 1 && map.intersections[0].x == 0, "moving a road did not move both its junctions");
 }
 
 // The road edit preview finds the tiles a new road adds, and the ones it lays over a
@@ -336,6 +339,93 @@ void test_preview_matches_full_roads() {
         "local preview added a tile that the full road scene does not contain");
 }
 
+// A junction is picked by its visible crossing from above, not by a marker buried in
+// the road, and the middle of a road still picks the road.
+void test_pick_junction_from_above() {
+    SbcMap map; map.version = 12;
+    map.intersections = {{0, 0, 1, 0}, {1, 40, 1, 0}};
+    map.streets = {{0, 0, 1, 0, 2, 2, "road"}};
+    const auto scene = build_map_scene(map);
+    const auto down = [&](float x, float z) { return pick_city_road_or_node(map, scene, {x, 200.0F, z}, {0.0F, -1.0F, 0.0F}); };
+    const auto corner = down(2.5F, 2.5F); // inside the crossing, away from the junction's centre point
+    require(corner && corner->kind == CityRoadPick::Kind::Node && corner->index == 0U, "clicking a junction's crossing did not pick it");
+    const auto middle = down(80.0F, 0.5F);
+    require(middle && middle->kind == CityRoadPick::Kind::Road, "the middle of a road did not pick the road");
+    require(move_city_junction_to(map, 1, {40, 3, 0}) && map.intersections[1].y == 3 && map.intersections[0].y == 1,
+        "raising a junction moved more than that junction");
+}
+
+// Wall type painting: a floor click sets the nearest side, and a side stored in a
+// neighbour cell the building has no record for adds an empty record to hold it.
+void test_paint_wall_side() {
+    EditorProject project;
+    SbbBuilding building;
+    SbbCell cell{};
+    cell.shorts.fill(0xffffU);
+    building.cells.push_back(cell);
+    project.buildings.push_back({{}, "b", building});
+    EditorUi ui;
+    ui.paint_code = 1U;
+    const auto& cells = project.buildings[0].data.cells;
+    // A click on the floor near the cell's +X edge.
+    require(building_pick_side(project.buildings[0].data, {0, 0, {3.6F, 0.25F, 2.0F}, 0.0F}) == 1, "a floor click did not pick the nearest side");
+    std::string status;
+    paint_building_side_code(project, ui, 0, 1, status);
+    require(cells.size() == 2U && cells[1].x == 1U && (cells[1].words[SbbCell::interior_portal_face_word] & 0xfU) == 1U && !cells[1].occupied,
+        "the east wall was not stored in a new empty neighbour cell: " + status);
+    paint_building_side_code(project, ui, 0, 0, status);
+    require(cells.size() == 2U && (cells[0].words[SbbCell::exterior_portal_face_word] & 0xfU) == 1U, "the north wall was not stored in the cell");
+}
+
+// Camera terrain detail: a chunk has (128 / step + 1)^2 samples, and covered tile
+// cells cut their ground away.
+void test_terrain_detail_chunk() {
+    CityTerrain terrain;
+    terrain.city_map = false;
+    const auto fine = build_terrain_chunk_mesh(terrain, 0.0F, 0.0F, 1, 4.0F);
+    require(fine.vertices.size() == 129U * 129U && fine.triangles.size() == 128U * 128U * 2U, "a step-1 chunk is not a full 1-unit grid");
+    const auto coarse = build_terrain_chunk_mesh(terrain, 0.0F, 0.0F, 64, 4.0F);
+    require(coarse.vertices.size() == 9U && coarse.triangles.size() == 8U, "a step-64 chunk is not a 2x2 grid");
+    terrain.covered_cells.insert(0U);  // tile cell (0, 0): world 0..4 on both axes
+    const auto cut = build_terrain_chunk_mesh(terrain, 0.0F, 0.0F, 1, 4.0F);
+    require(cut.triangles.size() == fine.triangles.size() - 4U * 4U * 2U, "a covered tile cell still has ground");
+}
+
+// Buildblock faces: windows are glass inside the opening, so adding one keeps it
+// visible, and a doorway is an Interior opening with no glass.
+void test_buildblock_window_and_doorway() {
+    SblLayer layer{};
+    layer.bounds = {0.25F, 0.5F, 0.25F, 0.5F};
+    add_buildblock_window(layer, 0.5F, 0.5F);
+    require(layer.windows.size() == 1U && layer.windows[0].x == 0.25F && layer.windows[0].width == 0.5F, "the first window does not fill the opening");
+    add_buildblock_window(layer, 0.9F, 0.9F);
+    require(buildblock_hidden_windows(layer) == 0 && layer.bounds[0] + layer.bounds[1] == 1.0F, "the opening did not grow to show a new window");
+    layer.windows[1].y = 0.0F;
+    require(buildblock_hidden_windows(layer) == 1 && grow_buildblock_opening(layer) && layer.bounds[2] == 0.0F, "a window below the opening was not fixed");
+    make_buildblock_doorway(layer);
+    require(layer.portal_type == 1U && layer.windows.empty() && layer.bounds[2] == 1.0F / 16.0F, "doorway is not an interior opening from the floor");
+}
+
+// An edit in the floating Buildblock window undoes there even after the view (City
+// tab) took focus.
+void test_buildblock_window_undo() {
+    EditorProject project;
+    EditorUi ui;
+    SblTemplate model{};
+    model.layers.resize(1);
+    model.layers[0].bounds = {0.25F, 0.5F, 0.25F, 0.5F};
+    project.buildblocks.push_back({"bb.sbl", "bb", model});
+    ui.tab = EditorTab::City;
+    ui.show_buildblock_window = true;
+    commit_pending_edits(project, ui);
+    project.buildblocks[0].data.layers[0].bounds[0] = 0.5F;
+    mark_buildblock_changed(project, ui);
+    commit_pending_edits(project, ui);
+    std::string status;
+    undo_edit(project, ui, status, false);
+    require(project.buildblocks[0].data.layers[0].bounds[0] == 0.25F, "Undo in the City tab skipped the Buildblock window's edit: " + status);
+}
+
 int main() {
     ImGui::CreateContext();
     try {
@@ -349,6 +439,11 @@ int main() {
         test_erase_hover_preserves_previous_group();
         test_move_junction();
         test_road_edit_overlaps();
+        test_pick_junction_from_above();
+        test_paint_wall_side();
+        test_terrain_detail_chunk();
+        test_buildblock_window_and_doorway();
+        test_buildblock_window_undo();
         test_ramp_end_curbs();
         test_preview_matches_full_roads();
         ImGui::DestroyContext();
