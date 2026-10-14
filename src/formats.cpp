@@ -442,6 +442,8 @@ std::vector<SblBlockFace> build_exterior_block_faces(std::uint32_t width, std::u
     return faces;
 }
 
+constexpr std::uint64_t kMaxSblPatchFaces = 65536;
+
 std::uint32_t clamp_bezier_tess(std::uint32_t tess) {
     return std::clamp(tess, 1U, 128U);
 }
@@ -704,12 +706,17 @@ std::optional<SblBlockMesh> read_sbl_block_mesh(const BinaryReader& reader) {
     std::vector<SblAuthoredPatch> authored_patches;
     authored_patches.reserve(authored_face_count);
     auto offset = std::size_t{44};
+    // Shipped blocks tessellate to at most 576 patch faces; 1024 patches at 128 x 128
+    // would be 16.8 million.
+    auto patch_face_total = std::uint64_t{0};
     for (std::uint32_t face = 0; face < authored_face_count; ++face) {
         const auto face_offset = offset;
         const auto column_order = reader.u32(offset);
         const auto column_tess = reader.u32(offset + 4);
         const auto row_order = reader.u32(offset + 8);
         const auto row_tess = reader.u32(offset + 12);
+        patch_face_total += std::uint64_t{clamp_bezier_tess(column_tess)} * clamp_bezier_tess(row_tess);
+        if (patch_face_total > kMaxSblPatchFaces) throw std::runtime_error("SBL patches exceed 65536 faces");
         const auto normal_flag_a = reader.u32(offset + 16);
         const auto normal_flag_b = reader.u32(offset + 20);
         offset += 24;

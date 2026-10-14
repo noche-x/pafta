@@ -41,7 +41,7 @@ Each control point is 20 bytes:
 
 In the game's memory each record is `0x15c` bytes. The extra four bytes only exist at runtime, not in the file, so readers must step `0x158` bytes per patch.
 
-Pafta rejects more than `0x400` patches or a patch that is cut off, and it caps the subdivision when building preview triangles. These are Pafta's limits, not confirmed limits of the game.
+Pafta rejects more than `0x400` patches, a patch that is cut off, or patches that together subdivide into more than 65,536 faces (shipped blocks reach 576). It caps each patch's subdivision at 128 by 128 when building preview triangles. These are Pafta's limits, not confirmed limits of the game.
 
 ## Version-2 boxes
 

@@ -309,6 +309,15 @@ void tests_malformed_files() {
     sbl = pafta::write_sbl_block(block);
     put_word(sbl, 44, 1);
     rejects([&] { (void)pafta::parse_sbl(sbl); }, "missing SBL box");
+    auto dense = block;
+    pafta::SblAuthoredPatch patch{};
+    patch.column_tess = patch.row_tess = 128;
+    patch.control_points.resize(16);
+    dense.authored_patches.assign(4, patch);
+    (void)pafta::parse_sbl(pafta::write_sbl_block(dense));
+    dense.authored_patches.push_back(patch);
+    sbl = pafta::write_sbl_block(dense);
+    rejects([&] { (void)pafta::parse_sbl(sbl); }, "SBL patches over the face limit");
     pafta::SblTemplate buildblock{};
     buildblock.layers.resize(1);
     sbl = pafta::rebuild_sbl_buildblock(buildblock);

@@ -4966,8 +4966,7 @@ int run_editor_app() {
 #ifdef __EMSCRIPTEN__
         if (g_web_uploaded_folder.has_value()) {
             if (pending_load_folder) release_web_project(*pending_load_folder);
-            pending_load_folder = std::move(g_web_uploaded_folder);
-            g_web_uploaded_folder.reset();
+            pending_load_folder = std::exchange(g_web_uploaded_folder, std::nullopt);
             load_choice_approved = false;
         }
 #endif
@@ -5275,8 +5274,7 @@ int run_editor_app() {
                                     const auto& mesh = project->city_scene_cache.terrain->mesh;
                                     if (!prepared.terrain) prepared.terrain = prepare_gpu_mesh(mesh, false);
                                     project->terrain_gpu_model = upload_city_terrain_model(mesh, *prepared.terrain, *project);
-                                    free_in_background(std::move(prepared.terrain));
-                                    prepared.terrain.reset();
+                                    free_in_background(std::exchange(prepared.terrain, std::nullopt));
                                 }
                                 project->terrain_gpu_fingerprint = terrain_fp;
                                 project->terrain_gpu_valid = true;
@@ -6520,8 +6518,7 @@ int run_editor_app() {
         }
         if (pending_load_folder && ui.controls_chosen && ui.remember_load_order) load_choice_approved = true;
         if (pending_load_folder && ui.controls_chosen && !load_choice_folder && !load_choice_approved) {
-            load_choice_folder = std::move(pending_load_folder);
-            pending_load_folder.reset();
+            load_choice_folder = std::exchange(pending_load_folder, std::nullopt);
             ImGui::OpenPopup("Open map");
         }
         if (load_choice_folder && ImGui::BeginPopupModal("Open map", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -6531,8 +6528,7 @@ int run_editor_app() {
             if (ImGui::RadioButton("Loose building, block, buildblock and texture files", ui.loose_files_win)) ui.loose_files_win = true;
             ImGui::Checkbox("Do not ask again", &ui.remember_load_order);
             if (ImGui::Button("Open")) {
-                pending_load_folder = std::move(load_choice_folder);
-                load_choice_folder.reset();
+                pending_load_folder = std::exchange(load_choice_folder, std::nullopt);
                 load_choice_approved = true;
                 save_preferences(ui);
                 ImGui::CloseCurrentPopup();
@@ -6993,8 +6989,10 @@ int run_editor_app() {
                 release_web_project(project->root);
             }
             unload_preview_views(ui);
-            project = std::move(project_to_open);
-            project_to_open.reset();
+            // Destroy the old map first: optional's move-assign would replace its terrain
+            // while terrain detail workers still read it. Its destructor waits for them.
+            project.reset();
+            project = std::exchange(project_to_open, std::nullopt);
             open_project_approved = false;
             ui.city_dirty = ui.building_dirty = ui.block_dirty = ui.buildblock_dirty = false;
             ui.city_selection = CitySelectionKind::None;

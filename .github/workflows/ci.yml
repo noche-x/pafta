@@ -192,6 +192,39 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@v4
 
+  nightly-release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: [build-test, coverage, native-quality, web]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: nightly-release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pafta-*
+          path: release-assets
+          merge-multiple: true
+      - name: Publish latest successful build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # An older run can finish after a newer run; keep the newer packages.
+          release_tags=$(gh release list --limit 1000 --json tagName --jq '.[].tagName')
+          if grep -qx nightly <<< "$release_tags"; then
+            published_run=$(gh release view nightly --json body --jq '.body' | sed -n 's/^Build run: \([0-9]*\)$/\1/p')
+            if [ -n "$published_run" ] && [ "$published_run" -ge "$GITHUB_RUN_NUMBER" ]; then
+              exit 0
+            fi
+          else
+            gh release create nightly --target "$GITHUB_SHA" --title "Latest development build" --prerelease --notes "Build run: $GITHUB_RUN_NUMBER"
+          fi
+          gh release upload nightly release-assets/pafta-*.zip release-assets/pafta-source.tar.gz --clobber
+          gh release edit nightly --notes "Build run: $GITHUB_RUN_NUMBER"
+
   draft-release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [build-test, coverage, native-quality, web]
