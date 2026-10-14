@@ -4,7 +4,7 @@ On desktop, choose `File > Export Mesh...` to export the Building, Block, or Cit
 
 ## Axes (checked against the Blender add-on)
 
-Noche's fork of the Blender add-on (`github.com/noche-x/io_scene_subrosa`, checked out at `/Users/noche/repos/blender_subrosa/io_scene_subrosa`) shows how Sub Rosa axes map to Blender axes. The fork handles the model formats (.cmc/.cmo/.it3/.itm/.sbv/.sit/.srv/.tst) but not .sbb/.sbl/.sbc. We only use it as a reference for the axes, not as a format to copy:
+Noche's fork of the Blender add-on (`github.com/noche-x/io_scene_subrosa`) shows how Sub Rosa axes map to Blender axes. The fork handles the model formats (.cmc/.cmo/.it3/.itm/.sbv/.sit/.srv/.tst) but not .sbb/.sbl/.sbc. We only use it as a reference for the axes, not as a format to copy:
 
 - Import (`shared.py:40`): file `(x, y, z)` -> Blender `(x, z, y)`.
 - Export (`export_sbv.py:244,260,279`): Blender `(x, y, z)` -> file `(x, z, y)`.

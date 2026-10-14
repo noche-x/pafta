@@ -12,7 +12,7 @@ their selected metadata was checked before the control queries.
 ## Native editor
 
 - Selected program: `/codex_temp/editor.exe`, x86-64 Windows PE.
-- Source file: `/Users/noche/Downloads/editor.exe`, 1,124,864 bytes.
+- Source file: `editor.exe`, 1,124,864 bytes.
 - Source SHA-256: `957af3bd6ea6e990aecbd1f9ba49887a7d1312bee8f6931b12c272087f4608eb`.
 - Movement function: `FUN_14006a870`, at `0x14006a870`.
 - Ghidra decompilation checks WASD at key-state base `0x1663b96e0`, offsets

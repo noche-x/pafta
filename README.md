@@ -4,6 +4,8 @@
   <img src="assets/branding/pafta.png" alt="Pafta logo" width="256" height="256">
 </p>
 
+[![Build, test, and package Pafta](https://github.com/noche-x/pafta/actions/workflows/ci.yml/badge.svg)](https://github.com/noche-x/pafta/actions/workflows/ci.yml)
+
 Pafta (pronounced PAHF-tah) is a map editor for Sub Rosa, written in C++23.
 
 Pafta is in beta. Backup your maps before working on them with Pafta, and test saved maps in Sub Rosa before you share them. The editor view can look different from the game.
