@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "editor_state.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cmath>
 #include <iostream>
@@ -72,6 +73,24 @@ void test_locked_placement_plane() {
     require(upward && upward->y == -4, "negative locked Y levels did not work");
 }
 
+void test_brush_shapes() {
+    const auto box = pafta::brush_box_cells({3, 2, 5}, {1, 9, 6});
+    require(box.size() == 6 && std::ranges::all_of(box, [](const auto& c) { return c[1] == 2; }),
+        "box brush did not fill the rectangle on its start level");
+    require(pafta::brush_box_cells({0, 0, 0}, {500, 0, 0}).size() == static_cast<std::size_t>(pafta::kMaxBrushSide),
+        "box brush was not capped");
+    require(pafta::brush_disc_cells({0, 0, 0}, 0).size() == 1, "radius 0 disc is not one cell");
+    const auto disc = pafta::brush_disc_cells({0, 4, 0}, 2);
+    require(disc.size() == 21, "radius 2 disc has the wrong cells");
+
+    // An L of three cells on level 0 with outside walls, a floor, and a wall upstairs.
+    const std::vector<pafta::BrushFace> faces{
+        {{0, 0, 0}, 1}, {{1, 0, 0}, 3}, {{1, 0, 1}, 4}, {{0, 0, 0}, 0}, {{0, 1, 0}, 1}, {{5, 0, 5}, 1}, {{0, 0, 0}, 9}};
+    require(pafta::brush_face_loop(faces, 0) == std::vector<std::size_t>{0, 1, 2},
+        "wall loop did not stay on its level, layer, kind, and connected cells");
+    require(pafta::brush_face_loop(faces, 3) == std::vector<std::size_t>{3}, "floor loop picked up walls");
+}
+
 } // namespace
 
 int main() {
@@ -79,6 +98,7 @@ int main() {
         test_building_grid_expansion();
         test_control_presets();
         test_locked_placement_plane();
+        test_brush_shapes();
         std::cout << "Editor state tests passed\n";
         return 0;
     } catch (const std::exception& error) {

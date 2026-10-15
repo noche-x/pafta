@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 cmake_minimum_required(VERSION 3.24)
 
-project(pafta VERSION 0.1.0 LANGUAGES CXX)
+project(pafta VERSION 0.1.1 LANGUAGES CXX)
 
 # Product name and version shown in the window title and menu bar.
 add_compile_definitions(PAFTA_VERSION="${PROJECT_VERSION}")

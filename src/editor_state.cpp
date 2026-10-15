@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <map>
+#include <set>
 #include <stdexcept>
 #include <utility>
 
@@ -85,6 +87,54 @@ std::optional<Vec3> ray_horizontal_plane_hit(Vec3 origin, Vec3 direction, float 
     const auto distance = (y - origin.y) / direction.y;
     if (distance < 0.0F) return std::nullopt;
     return Vec3{origin.x + direction.x * distance, y, origin.z + direction.z * distance};
+}
+
+std::vector<GridCell> brush_box_cells(GridCell a, GridCell b) {
+    const auto x1 = std::clamp(b[0], a[0] - kMaxBrushSide + 1, a[0] + kMaxBrushSide - 1);
+    const auto z1 = std::clamp(b[2], a[2] - kMaxBrushSide + 1, a[2] + kMaxBrushSide - 1);
+    std::vector<GridCell> cells;
+    for (auto x = std::min(a[0], x1); x <= std::max(a[0], x1); ++x)
+        for (auto z = std::min(a[2], z1); z <= std::max(a[2], z1); ++z) cells.push_back({x, a[1], z});
+    return cells;
+}
+
+std::vector<GridCell> brush_disc_cells(GridCell center, int radius) {
+    radius = std::clamp(radius, 0, kMaxBrushSide / 2);
+    std::vector<GridCell> cells;
+    for (int dx = -radius; dx <= radius; ++dx)
+        for (int dz = -radius; dz <= radius; ++dz)
+            // + radius keeps the rim cells a circle drawn at that radius mostly covers.
+            if (dx * dx + dz * dz <= radius * radius + radius) cells.push_back({center[0] + dx, center[1], center[2] + dz});
+    return cells;
+}
+
+std::vector<std::size_t> brush_face_loop(const std::vector<BrushFace>& faces, std::size_t start) {
+    if (start >= faces.size()) return {};
+    const auto kind = [](std::uint32_t slot) {
+        const auto face = slot % 8U;
+        return (slot >= 8U ? 16U : 0U) + (face >= 1U && face <= 4U ? 1U : face);
+    };
+    const auto level = faces[start].cell[1];
+    const auto wanted = kind(faces[start].slot);
+    std::map<GridCell, std::vector<std::size_t>> by_cell;
+    for (std::size_t i = 0; i < faces.size(); ++i)
+        if (faces[i].cell[1] == level && kind(faces[i].slot) == wanted) by_cell[faces[i].cell].push_back(i);
+    std::set<GridCell> seen{faces[start].cell};
+    std::vector<GridCell> todo{faces[start].cell};
+    std::vector<std::size_t> loop;
+    while (!todo.empty()) {
+        const auto cell = todo.back();
+        todo.pop_back();
+        const auto& here = by_cell[cell];
+        loop.insert(loop.end(), here.begin(), here.end());
+        for (int dx = -1; dx <= 1; ++dx)
+            for (int dz = -1; dz <= 1; ++dz) {
+                const GridCell next{cell[0] + dx, level, cell[2] + dz};
+                if (by_cell.contains(next) && seen.insert(next).second) todo.push_back(next);
+            }
+    }
+    std::ranges::sort(loop);
+    return loop;
 }
 
 } // namespace pafta

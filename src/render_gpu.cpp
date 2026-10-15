@@ -802,6 +802,14 @@ const Texture2D* find_project_material_texture(const EditorProject& project, std
     return match == project.material_textures.end() ? nullptr : &match->texture;
 }
 
+// Generated world textures (terrain colour and detail, slot 0 concrete) follow the
+// texture filtering setting like loaded ones.
+std::vector<unsigned int> g_generated_world_textures;
+void register_generated_world_texture(const Texture2D& texture) {
+    rlTextureParameters(texture.id, RL_TEXTURE_FILTER_ANISOTROPIC, g_render_settings.anisotropy);
+    g_generated_world_textures.push_back(texture.id);
+}
+
 const Texture2D& generated_game_landscape_color_texture() {
     static Texture2D texture = [] {
         // client/src/hooks/landscapeGenerateTexture.hpp recreates the game's generated
@@ -814,7 +822,7 @@ const Texture2D& generated_game_landscape_color_texture() {
         GenTextureMipmaps(&loaded);
         SetTextureWrap(loaded, TEXTURE_WRAP_REPEAT);
         SetTextureFilter(loaded, TEXTURE_FILTER_TRILINEAR);
-        SetTextureFilter(loaded, TEXTURE_FILTER_ANISOTROPIC_16X);
+        register_generated_world_texture(loaded);
         g_generated_texture_bytes += gpu_texture_bytes(loaded);
         return loaded;
     }();
@@ -872,6 +880,7 @@ const Texture2D& game_slot0_texture(bool material) {
             GenTextureMipmaps(t);
             SetTextureWrap(*t, TEXTURE_WRAP_REPEAT);
             SetTextureFilter(*t, TEXTURE_FILTER_TRILINEAR);
+            register_generated_world_texture(*t);
         }
         g_generated_texture_bytes += gpu_texture_bytes(color_texture) + gpu_texture_bytes(material_texture);
         return std::array<Texture2D, 2>{color_texture, material_texture};
@@ -1416,6 +1425,7 @@ void apply_texture_anisotropy(EditorProject& project, int level) {
     for (auto* textures : {&project.textures, &project.material_textures}) {
         for (const auto& loaded : *textures) rlTextureParameters(loaded.texture.id, RL_TEXTURE_FILTER_ANISOTROPIC, level);
     }
+    for (const auto id : g_generated_world_textures) rlTextureParameters(id, RL_TEXTURE_FILTER_ANISOTROPIC, level);
 }
 
 void release_free_memory() {
@@ -2985,6 +2995,8 @@ namespace {
 struct GridView {
     Vector3 position{};
     float pixels_per_radian{800.0F};
+    // Orthographic views: world units per pixel, the same everywhere (0 = perspective).
+    float ortho_units_per_pixel{};
 };
 GridView g_grid_view;
 
@@ -3024,6 +3036,7 @@ float grid_fade(const WorkGrid& grid, float x, float z) {
 void emit_work_grid(const WorkGrid& grid, float alpha_scale) {
     rlBegin(RL_TRIANGLES);
     const auto half_width = [&](Vector3 p, float pixels) {
+        if (g_grid_view.ortho_units_per_pixel > 0.0F) return 0.5F * pixels * g_grid_view.ortho_units_per_pixel;
         const auto distance = std::max(0.5F, Vector3Distance(p, g_grid_view.position));
         return 0.5F * pixels * distance / g_grid_view.pixels_per_radian;
     };
@@ -3091,6 +3104,8 @@ void set_grid_view(const Camera3D& camera, float viewport_height) {
     g_grid_view.position = camera.position;
     const auto half_fov = std::tan(camera.fovy * DEG2RAD * 0.5F);
     g_grid_view.pixels_per_radian = viewport_height * 0.5F / std::max(half_fov, 1e-3F);
+    // raylib's orthographic fovy is the view's height in world units.
+    g_grid_view.ortho_units_per_pixel = camera.projection == CAMERA_ORTHOGRAPHIC ? camera.fovy / std::max(viewport_height, 1.0F) : 0.0F;
 }
 
 void draw_sbb_scene_for_app(
@@ -4479,6 +4494,7 @@ Texture2D landscape_detail_texture() {
         GenTextureMipmaps(&loaded);
         SetTextureWrap(loaded, TEXTURE_WRAP_REPEAT);
         SetTextureFilter(loaded, TEXTURE_FILTER_TRILINEAR);
+        register_generated_world_texture(loaded);
         g_generated_texture_bytes += gpu_texture_bytes(loaded);
         return loaded;
     }();

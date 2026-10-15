@@ -2251,8 +2251,6 @@ float native_like_city_terrain_height(float world_x, float world_z, bool city_ma
 
 namespace {
 
-constexpr auto city_terrain_mesh_y_offset = 0.05F;
-
 // Runs row(0..rows-1) across the CPU cores (in order in the web build).
 template <typename F>
 void parallel_rows(std::int32_t rows, F&& row) {
@@ -3131,6 +3129,9 @@ BuildingRenderBuffer build_city_tile_render_buffer(const std::vector<CityTileCel
     return buffer;
 }
 
+// How far world cells (roads, pieces) sit above their stamped level.
+constexpr float kWorldCellLift = 0.25F;
+
 // One landscape chunk's grid at `step` units per sample into `mesh`. Quads under a
 // road, piece or building tile are left out: the tile's top is the ground there, and
 // terrain at the same height flickers against it. A quad is only left out when all
@@ -3145,7 +3146,13 @@ void append_terrain_chunk(BuildingRenderBuffer& mesh, float chunk_x, float chunk
         for (auto x = 0; x < side; ++x) {
             const auto world_x = chunk_x + static_cast<float>(x * step);
             const auto world_z = chunk_z + static_cast<float>(z * step);
-            mesh.vertices.push_back({{world_x, height(world_x, world_z) - city_terrain_mesh_y_offset, world_z}, world_x / 32.0F, 1.0F - world_z / 32.0F});
+            // World cells (roads, pieces) sit 0.25 above their stamped level. The whole
+            // ground sits there too, so it stays flat and meets their floors; at the
+            // stamped height the void under a piece showed as a black band at its base.
+            // A depth bias when drawing keeps it behind coplanar floors
+            // (draw_uploaded_city_model).
+            // ponytail: matches the game's look; the game's own landscape offset isn't traced.
+            mesh.vertices.push_back({{world_x, height(world_x, world_z) + kWorldCellLift, world_z}, world_x / 32.0F, 1.0F - world_z / 32.0F});
         }
     }
     const auto cell_of = [&](float wx, float wz) {
@@ -3867,8 +3874,9 @@ BuildingRenderBuffer build_native_building_render_buffer(
                 if (w == 0U && (wall_code(code_at(-1, 1, true)) || wall_code(code_at(0, 1, false)))) codes[3] = 2U;
             }
             const auto* above = floor.has_value() ? nullptr : find_cell_at(cell_lookup, cell.x, cell.y + 1U, cell.z);
-            const bool ceiling = above == nullptr || !above->occupied || above->exterior_block() == 0U ||
-                above->interior_block() == 0U || above->placed_flag() != 0U;
+            // Hiding roofs hides the top rooms' ceilings too, or they would still cover the rooms.
+            const bool ceiling = roofs && (above == nullptr || !above->occupied || above->exterior_block() == 0U ||
+                above->interior_block() == 0U || above->placed_flag() != 0U);
             add_native_interior_room(buffer, vertex_indices, cell, codes, ceiling, template_file, cx, cy, cz);
             // The room tags its own slots; here the cell is its position.
             for (; tagged < buffer.triangles.size(); ++tagged) buffer.triangles[tagged].cell = cell_index;

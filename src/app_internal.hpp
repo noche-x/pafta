@@ -803,6 +803,19 @@ enum class BuildingTool {
     Anchor,
 };
 
+// How Add Block, Paint, and Piece apply. Single: one per click. Drag: hold and move
+// to keep going. Box: fill the rectangle from press to release (Paint: the faces in a
+// screen rectangle). Circle: hold to stamp a disc. Loop (Paint only): the connected
+// faces of the clicked kind on that level, like Blender's loop select.
+enum class BrushMode { Single, Drag, Box, Circle, Loop };
+
+// Where Add Block aims: a cell counted from the anchor, and the cell whose face the
+// cursor is on (none over empty space or on a locked level).
+struct BuildingBrushTarget {
+    GridCell cell{};
+    std::optional<std::size_t> face_cell;
+};
+
 // Settings for the Place Block tool, like editor.exe's block panel and its building
 // tool (BuildingTool_WriteCellFromCurrentSelection @1400672a0). You choose whether
 // the placed cell gets an outside shell, an inside shell, or both (neither means
@@ -855,6 +868,8 @@ struct CityGridPoint {
         return a.x == b.x && a.y == b.y && a.z == b.z;
     }
 };
+inline GridCell grid_cell(CityGridPoint point) { return {point.x, point.y, point.z}; }
+inline CityGridPoint grid_point(GridCell cell) { return {cell[0], cell[1], cell[2]}; }
 
 // Editor actions whose keys can be changed. The order is the order shown in
 // Preferences.
@@ -1100,13 +1115,22 @@ struct EditorUi {
     std::uint32_t paint_code{1};
     // Click and hold to keep placing: the last grid cell a held drag placed in, so
     // dragging across cells places quickly without placing in the same cell every
-    // frame. Reset when the mouse is released. {INT32_MIN} means nothing placed yet in
-    // this drag.
+    // frame (building cells count from the anchor). Reset when the mouse is released.
     std::optional<CityGridPoint> drag_stamp_cell;
     // Building cells the current Add Block drag filled (cleared on release).
     std::vector<std::size_t> stroke_block_cells;
     // The cell and face slot the Paint drag painted last (cleared on release).
     std::optional<std::pair<std::size_t, std::uint32_t>> drag_paint_face;
+    // Each brush tool keeps its own mode; brush_radius sizes Circle.
+    BrushMode place_brush{BrushMode::Drag};
+    BrushMode paint_brush{BrushMode::Drag};
+    BrushMode piece_brush{BrushMode::Drag};
+    int brush_radius{2};
+    // Box: the cell where the press started (Paint: box_select_start on screen).
+    std::optional<CityGridPoint> brush_box_start;
+    bool paint_box_active{};
+    // Add Block places on building_view_floor's level instead of against faces.
+    bool building_level_locked{};
     std::size_t selected_city_street{};
     std::size_t selected_city_intersection{};
     std::size_t selected_city_building{};
@@ -1710,6 +1734,21 @@ bool move_city_road(SbcMap& map, std::size_t street_index, std::int32_t dx, std:
 // Wall type painting: the cell side (0 N, 1 E, 2 S, 3 W) a click sets, and setting it
 // to ui.paint_code (adding an empty neighbour cell record when the side is stored there).
 int building_pick_side(const SbbBuilding& building, const BuildingFacePick& pick);
+// The brush the active tool uses, or nullptr when it has none.
+BrushMode* active_brush(EditorUi& ui);
+std::optional<std::size_t> fill_building_cell(EditorProject& project, EditorUi& ui, GridCell at, std::string& status);
+std::optional<BuildingBrushTarget> building_brush_target(const EditorProject& project, const EditorUi& ui,
+    Vec3 ro, Vec3 rd, std::optional<std::int32_t> level);
+std::optional<std::int32_t> building_locked_level(const EditorProject& project, const EditorUi& ui);
+std::vector<GridCell> brush_stamp_cells(BrushMode mode, GridCell center, int radius);
+// Outlines the cells a brush will fill, one box around them all when `merged`.
+void draw_brush_cells(const std::vector<GridCell>& cells, float unit, Color color, bool merged);
+void stamp_building_cells(EditorProject& project, EditorUi& ui, const std::vector<GridCell>& cells, std::string& status);
+// Paint's Box and Loop: paint every listed (cell, slot) face, whose centre picks the
+// wall side in Wall type mode.
+void paint_building_faces(EditorProject& project, EditorUi& ui, const std::vector<BuildingFacePick>& faces, std::string& status);
+// Every drawn face of the edit view once, with its centre in hit_world.
+std::vector<BuildingFacePick> building_view_faces(const BuildingRenderBuffer& buffer);
 void paint_building_side_code(EditorProject& project, EditorUi& ui, std::size_t cell_index, int side, std::string& status);
 // Draws the road preview mesh in front of the city's road at the same place.
 void draw_road_preview_model(GpuBuildingRenderModel& model);

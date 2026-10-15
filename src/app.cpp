@@ -1164,41 +1164,24 @@ void apply_block_config(SbbCell& cell, const BlockToolConfig& config, SbbBuildin
     refresh_sbb_cell_payloads(cell);
 }
 
-// Place Block: fills the empty cell in front of the face you clicked with the
-// current block settings (outside and inside shells, buildblock, textures).
-// Returns the new cell's index, or nullopt when nothing was placed.
-std::optional<std::size_t> place_building_block(EditorProject& project, EditorUi& ui, const BuildingFacePick& pick, Vec3 ray_dir,
-                                                float unit_size, std::string& status) {
-    if (project.buildings.empty()) {
-        return std::nullopt;
-    }
+// Add Block at one cell, counted from the anchor like the edit view. Fills an empty
+// cell with the current block settings (outside and inside shells, buildblock,
+// textures), or rewrites a filled one when "write into the clicked block" is on.
+// Returns the cell's index, or nullopt when nothing was placed.
+std::optional<std::size_t> fill_building_cell(EditorProject& project, EditorUi& ui, GridCell at, std::string& status) {
+    if (project.buildings.empty()) return std::nullopt;
     ui.selected_building = std::min(ui.selected_building, project.buildings.size() - 1U);
     auto& building = project.buildings[ui.selected_building].data;
     if (!ui.block_config.exterior && !ui.block_config.interior) {
         status = "enable Exterior or Interior in the block panel first";
         return std::nullopt;
     }
-    if (pick.cell_index >= building.cells.size()) {
-        return std::nullopt;
-    }
     if (const auto problem = block_config_problem(building, ui.block_config, project); !problem.empty()) {
         status = problem;
         return std::nullopt;
     }
-    if (ui.block_config.apply_to_clicked) {
-        auto& clicked = building.cells[pick.cell_index];
-        apply_block_config(clicked, ui.block_config, building, project);
-        mark_building_changed(project, ui);
-        status = "changed block at [" + std::to_string(clicked.x) + "," + std::to_string(clicked.y) + "," + std::to_string(clicked.z) + "]";
-        return pick.cell_index;
-    }
-    // The empty cell in front of the clicked face: one step back along the ray from
-    // the hit, in cells relative to the anchor (the edit view's space).
-    const Vec3 front{pick.hit_world.x - ray_dir.x * 0.05F, pick.hit_world.y - ray_dir.y * 0.05F, pick.hit_world.z - ray_dir.z * 0.05F};
-    const std::int64_t nx = static_cast<std::int64_t>(std::floor(front.x / unit_size)) + building.anchor_x;
-    const std::int64_t ny = static_cast<std::int64_t>(std::floor(front.y / unit_size)) + building.anchor_y;
-    const std::int64_t nz = static_cast<std::int64_t>(std::floor(front.z / unit_size)) + building.anchor_z;
-    const auto coordinate = shift_sbb_grid_for_cell(building, nx, ny, nz);
+    const auto coordinate = shift_sbb_grid_for_cell(building, at[0] + std::int64_t{building.anchor_x},
+        at[1] + std::int64_t{building.anchor_y}, at[2] + std::int64_t{building.anchor_z});
     if (!coordinate) {
         status = "placement would exceed the supported 64-cell building grid";
         return std::nullopt;
@@ -1215,14 +1198,112 @@ std::optional<std::size_t> place_building_block(EditorProject& project, EditorUi
         building.cells.push_back(cell);
         target = &building.cells.back();
     }
-    if (target->occupied) {
-        status = "neighbour cell already filled";
+    if (target->occupied && !ui.block_config.apply_to_clicked) {
+        status = "that cell is already filled";
         return std::nullopt;
     }
     apply_block_config(*target, ui.block_config, building, project);
     mark_building_changed(project, ui);
     status = "placed block at [" + std::to_string(target->x) + "," + std::to_string(target->y) + "," + std::to_string(target->z) + "]";
     return static_cast<std::size_t>(target - building.cells.data());
+}
+
+// The cell Add Block aims at, counted from the anchor. With a level, the cursor's
+// cell on that level's floor. Otherwise the empty cell in front of the face under the
+// cursor (the face's own cell when writing into it), or, over empty space, the shown
+// floor (or the anchor's level).
+std::optional<BuildingBrushTarget> building_brush_target(const EditorProject& project, const EditorUi& ui,
+    Vec3 ro, Vec3 rd, std::optional<std::int32_t> level) {
+    const auto& building = project.buildings[std::min(ui.selected_building, project.buildings.size() - 1U)].data;
+    constexpr float unit = 4.0F;
+    const auto cell_of = [](float world) { return static_cast<std::int32_t>(std::floor(world / unit)); };
+    const auto on_level = [&](std::int32_t y) -> std::optional<BuildingBrushTarget> {
+        const auto hit = ray_horizontal_plane_hit(ro, rd, static_cast<float>(y) * unit);
+        if (!hit) return std::nullopt;
+        return BuildingBrushTarget{{cell_of(hit->x), y, cell_of(hit->z)}, std::nullopt};
+    };
+    if (level) return on_level(*level);
+    const auto pick = pick_building_face(project.building_floor_preview_render_buffer, ro, rd);
+    if (pick && pick->cell_index < building.cells.size()) {
+        if (ui.block_config.apply_to_clicked) {
+            const auto& cell = building.cells[pick->cell_index];
+            return BuildingBrushTarget{{static_cast<std::int32_t>(cell.x) - static_cast<std::int32_t>(building.anchor_x),
+                static_cast<std::int32_t>(cell.y) - static_cast<std::int32_t>(building.anchor_y),
+                static_cast<std::int32_t>(cell.z) - static_cast<std::int32_t>(building.anchor_z)}, pick->cell_index};
+        }
+        // One step back along the ray from the hit.
+        const auto& hit = pick->hit_world;
+        return BuildingBrushTarget{{cell_of(hit.x - rd.x * 0.05F), cell_of(hit.y - rd.y * 0.05F), cell_of(hit.z - rd.z * 0.05F)},
+            pick->cell_index};
+    }
+    const auto floor = ui.building_view_floor_only ? std::max(0, ui.building_view_floor) : static_cast<int>(building.anchor_y);
+    return on_level(floor - static_cast<std::int32_t>(building.anchor_y));
+}
+
+// The level Add Block is locked to (counted from the anchor), when it is.
+std::optional<std::int32_t> building_locked_level(const EditorProject& project, const EditorUi& ui) {
+    if (!ui.building_level_locked || project.buildings.empty()) return std::nullopt;
+    const auto& building = project.buildings[std::min(ui.selected_building, project.buildings.size() - 1U)].data;
+    return std::max(0, ui.building_view_floor) - static_cast<std::int32_t>(building.anchor_y);
+}
+
+// The cells a brush stamp at `center` covers: a disc for Circle, else the one cell.
+std::vector<GridCell> brush_stamp_cells(BrushMode mode, GridCell center, int radius) {
+    return mode == BrushMode::Circle ? brush_disc_cells(center, radius) : std::vector<GridCell>{center};
+}
+
+void draw_brush_cells(const std::vector<GridCell>& cells, float unit, Color color, bool merged) {
+    const auto box = [&](GridCell lo, GridCell hi) {
+        DrawBoundingBox({{static_cast<float>(lo[0]) * unit, static_cast<float>(lo[1]) * unit, static_cast<float>(lo[2]) * unit},
+            {static_cast<float>(hi[0] + 1) * unit, static_cast<float>(hi[1] + 1) * unit, static_cast<float>(hi[2] + 1) * unit}}, color);
+    };
+    if (cells.empty()) return;
+    if (!merged) {
+        for (const auto& cell : cells) box(cell, cell);
+        return;
+    }
+    auto lo = cells.front(), hi = cells.front();
+    for (const auto& cell : cells)
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            lo[axis] = std::min(lo[axis], cell[axis]);
+            hi[axis] = std::max(hi[axis], cell[axis]);
+        }
+    box(lo, hi);
+}
+
+// Add Block's stamp: fills each cell, remembering them for the drag.
+void stamp_building_cells(EditorProject& project, EditorUi& ui, const std::vector<GridCell>& cells, std::string& status) {
+    std::size_t placed = 0;
+    for (const auto& cell : cells) {
+        if (const auto index = fill_building_cell(project, ui, cell, status)) {
+            ui.stroke_block_cells.push_back(*index);
+            ++placed;
+        }
+    }
+    if (cells.size() > 1U && placed > 0U) status = "placed " + std::to_string(placed) + " blocks";
+}
+
+BrushMode* active_brush(EditorUi& ui) {
+    if (ui.tab == EditorTab::Buildings && ui.building_tool == BuildingTool::PlaceBlock) return &ui.place_brush;
+    if (ui.tab == EditorTab::Buildings && ui.building_tool == BuildingTool::PaintTexture) return &ui.paint_brush;
+    if (ui.tab == EditorTab::City && ui.city_tool == CityTool::Piece) return &ui.piece_brush;
+    return nullptr;
+}
+
+std::vector<BuildingFacePick> building_view_faces(const BuildingRenderBuffer& buffer) {
+    std::vector<BuildingFacePick> faces;
+    std::unordered_map<std::uint64_t, std::size_t> seen;
+    for (const auto& tri : buffer.triangles) {
+        if (tri.cell == 0xffffffffU) continue;
+        if (!seen.emplace((std::uint64_t{tri.cell} << 32U) | tri.slot, faces.size()).second) continue;
+        Vec3 center{};
+        for (const auto index : tri.indices) {
+            const auto& p = buffer.vertices[index].position;
+            center = {center.x + p.x / 3.0F, center.y + p.y / 3.0F, center.z + p.z / 3.0F};
+        }
+        faces.push_back({tri.cell, tri.slot, center, 0.0F});
+    }
+    return faces;
 }
 
 void place_building_item_set(EditorProject& project, EditorUi& ui, std::size_t cell_index, std::string& status) {
@@ -1365,6 +1446,21 @@ void paint_building_side_code(EditorProject& project, EditorUi& ui, std::size_t 
     value = (value & ~0xfU) | ui.paint_code;
     mark_building_changed(project, ui);
     status = "wall type set to " + std::to_string(ui.paint_code);
+}
+
+void paint_building_faces(EditorProject& project, EditorUi& ui, const std::vector<BuildingFacePick>& faces, std::string& status) {
+    if (project.buildings.empty()) return;
+    const auto& building = project.buildings[std::min(ui.selected_building, project.buildings.size() - 1U)].data;
+    std::vector<std::pair<std::size_t, std::uint32_t>> done;
+    for (const auto& face : faces) {
+        if (face.cell_index >= building.cells.size()) continue;
+        const std::pair key{face.cell_index, ui.paint_side_code ? static_cast<std::uint32_t>(building_pick_side(building, face)) : face.slot};
+        if (std::ranges::find(done, key) != done.end()) continue;
+        done.push_back(key);
+        if (ui.paint_side_code) paint_building_side_code(project, ui, key.first, static_cast<int>(key.second), status);
+        else paint_building_face(project, ui, key.first, key.second, status);
+    }
+    if (done.size() > 1U) status = "painted " + std::to_string(done.size()) + (ui.paint_side_code ? " walls" : " faces");
 }
 
 BoundingBox city_building_bounds(const SbcBuilding& placement, const SbbBuilding& asset, float unit);
@@ -4111,6 +4207,13 @@ void handle_editor_hotkeys(
             if (action_pressed(ui, action)) ui.building_tool = tool;
         }
     }
+    if (ui.tab == EditorTab::Blocks) {
+        if (action_pressed(ui, EditorAction::ToolSelect)) ui.block_paint_faces = false;
+        if (action_pressed(ui, EditorAction::ToolBuilding)) {
+            ui.block_paint_faces = true;
+            ui.block_vertex_mode = false;
+        }
+    }
     if (ui.tab == EditorTab::City) {
         const std::pair<EditorAction, CityTool> tool_actions[] = {
             {EditorAction::ToolSelect, CityTool::Select}, {EditorAction::ToolBuilding, CityTool::Building},
@@ -5167,6 +5270,18 @@ int run_editor_app() {
             clear_game_render_packed_depth();
             clear_game_render_shadow_factor();
 
+            // Depth steps grow with distance squared over the near plane, so a fixed
+            // 0.05 near plane z-fights a few hundred units out (reversed-Z would fix it,
+            // but needs glClipControl, which macOS GL 4.1 and WebGL lack). Nothing is
+            // nearer than the ground below the camera, so the near plane follows the
+            // height above it. Orthographic depth is linear and keeps the small one.
+            float near_plane = 0.05F;
+            if (camera.projection == CAMERA_PERSPECTIVE) {
+                const float ground = ui.tab == EditorTab::City && project && project->city && project->city_scene_cache.terrain
+                    ? terrain_height_at(*project->city_scene_cache.terrain, camera.position.x, camera.position.z) : 0.0F;
+                near_plane = std::clamp((camera.position.y - ground) * 0.02F, 0.05F, 16.0F);
+            }
+            rlSetClipPlanes(near_plane, 100000.0);
             BeginMode3D(camera);
             set_game_world_time(ui.world_time_hours);
             set_game_surface_camera(camera.position);
@@ -5388,6 +5503,15 @@ int run_editor_app() {
                                     static_cast<std::int32_t>(ui.selected_piece_rotation & 3U));
                                 draw_piece_ghost(nullptr, *cell, static_cast<std::int32_t>(ui.selected_piece_rotation & 3U));
                                 draw_city_edit_grid(*cell, city_scene, Color{91, 166, 206, 255}, true);
+                                if (ui.piece_brush == BrushMode::Circle && !ui.brush_box_start) {
+                                    draw_brush_cells(brush_disc_cells(grid_cell(*cell), ui.brush_radius), city_scene.unit_size, Color{91, 166, 206, 200}, false);
+                                }
+                            }
+                            if (ui.brush_box_start) {
+                                const auto start = grid_cell(*ui.brush_box_start);
+                                if (const auto end = city_grid_point_on_plane_under_mouse(camera, viewport_mouse_pos, last_viewport_size, start[1], true)) {
+                                    draw_brush_cells(brush_box_cells(start, grid_cell(*end)), city_scene.unit_size, Color{91, 166, 206, 255}, true);
+                                }
                             }
                         }
                         ui.road_preview_info = draw_road_lay_preview(*project, ui, city_cursor);
@@ -5439,6 +5563,25 @@ int run_editor_app() {
                                 draw_building_face_highlight(project->building_floor_preview_render_buffer,
                                     *ui.building_hover_cell, *ui.building_hover_face);
                             }
+                            // Add Block's outline: the cells the next click (or the box) fills.
+                            if (ui.building_tool == BuildingTool::PlaceBlock && is_viewport_hovered && !IsCursorHidden()) {
+                                const auto ray = get_viewport_mouse_ray(camera, viewport_mouse_pos, last_viewport_size);
+                                const Vec3 ro{ray.position.x, ray.position.y, ray.position.z};
+                                const Vec3 rd{ray.direction.x, ray.direction.y, ray.direction.z};
+                                constexpr Color brush_color{120, 220, 140, 255};
+                                if (ui.brush_box_start) {
+                                    const auto start = grid_cell(*ui.brush_box_start);
+                                    if (const auto end = building_brush_target(*project, ui, ro, rd, start[1])) {
+                                        draw_brush_cells(brush_box_cells(start, end->cell), 4.0F, brush_color, true);
+                                    }
+                                } else {
+                                    auto level = building_locked_level(*project, ui);
+                                    if (!level && ui.place_brush == BrushMode::Circle && ui.drag_stamp_cell) level = ui.drag_stamp_cell->y;
+                                    if (const auto target = building_brush_target(*project, ui, ro, rd, level)) {
+                                        draw_brush_cells(brush_stamp_cells(ui.place_brush, target->cell, ui.brush_radius), 4.0F, brush_color, false);
+                                    }
+                                }
+                            }
                         }
                     } else if (ui.tab == EditorTab::Pieces && project->city && !project->city->data.city_blocks.empty()) {
                         if (!project->city->data.portals.empty()) {
@@ -5466,6 +5609,8 @@ int run_editor_app() {
                 }
             }
             EndMode3D();
+            // Previews and thumbnails keep the small near plane for close-ups.
+            rlSetClipPlanes(0.05, 100000.0);
             if (ui.render_shadows && ui.tab == EditorTab::City && project && project->city) {
                 composite_city_shadows(render_size);
             }
@@ -5690,9 +5835,10 @@ int run_editor_app() {
                     ui.place_click_pending = true;
                     ui.place_click_start = viewport_mouse_pos;
                 } else if (ui.city_tool == CityTool::Piece) {
-                    // Starts the drag stroke, which stays on this cell's layer.
+                    // Starts the drag stroke, which stays on this cell's layer. Box fills on release.
                     if (const auto cell = city_placement_point_under_mouse(*project, ui, camera, viewport_mouse_pos, last_viewport_size, true)) {
-                        set_city_piece_voxel(*project, ui, *cell);
+                        if (ui.piece_brush == BrushMode::Box) ui.brush_box_start = *cell;
+                        else for (const auto& c : brush_stamp_cells(ui.piece_brush, grid_cell(*cell), ui.brush_radius)) set_city_piece_voxel(*project, ui, grid_point(c));
                         ui.drag_stamp_cell = *cell;
                     }
                 } else if (ui.city_tool == CityTool::Erase) {
@@ -5723,65 +5869,48 @@ int run_editor_app() {
                     const auto pick_ray = get_viewport_mouse_ray(camera, viewport_mouse_pos, last_viewport_size);
                     const Vec3 ro{pick_ray.position.x, pick_ray.position.y, pick_ray.position.z};
                     const Vec3 rd{pick_ray.direction.x, pick_ray.direction.y, pick_ray.direction.z};
-                    constexpr float unit_size = 4.0F;
-                    const auto pick = pick_building_face(project->building_floor_preview_render_buffer, ro, rd);
-                    if (pick.has_value()) {
-                        if (ui.building_tool == BuildingTool::PlaceBlock) {
-                            ui.stroke_block_cells.clear();
-                            if (const auto placed = place_building_block(*project, ui, *pick, rd, unit_size, status)) {
-                                ui.stroke_block_cells.push_back(*placed);
-                            }
-                            // Mark this cell for the drag, so the hold-to-stamp pass below
-                            // doesn't place a second block in the same neighbouring cell
-                            // in this same frame.
-                            ui.drag_stamp_cell = CityGridPoint{
-                                static_cast<std::int32_t>(building.cells[pick->cell_index].x),
-                                static_cast<std::int32_t>(building.cells[pick->cell_index].y),
-                                static_cast<std::int32_t>(building.cells[pick->cell_index].z),
-                            };
-                        } else if (ui.building_tool == BuildingTool::ItemSet) {
-                            place_building_item_set(*project, ui, pick->cell_index, status);
-                        } else {
-                            if (ui.paint_side_code) {
-                                const auto side = building_pick_side(project->buildings[ui.selected_building].data, *pick);
-                                paint_building_side_code(*project, ui, pick->cell_index, side, status);
-                                ui.drag_paint_face = std::pair{pick->cell_index, static_cast<std::uint32_t>(side)};
+                    if (ui.building_tool == BuildingTool::PlaceBlock) {
+                        ui.stroke_block_cells.clear();
+                        if (const auto target = building_brush_target(*project, ui, ro, rd, building_locked_level(*project, ui))) {
+                            // Box fills on release; the others stamp now.
+                            if (ui.place_brush == BrushMode::Box) {
+                                ui.brush_box_start = grid_point(target->cell);
                             } else {
-                                paint_building_face(*project, ui, pick->cell_index, pick->slot, status);
-                                ui.drag_paint_face = std::pair{pick->cell_index, pick->slot};
+                                stamp_building_cells(*project, ui, brush_stamp_cells(ui.place_brush, target->cell, ui.brush_radius), status);
                             }
+                            ui.drag_stamp_cell = grid_point(target->cell);
                         }
-                    } else {
-                        if (ui.building_tool == BuildingTool::PlaceBlock && std::abs(rd.y) > 0.0001F) {
-                            auto& edited = project->buildings[ui.selected_building].data;
-                            const auto floor = pick_floor.value_or(edited.anchor_y);
-                            const float plane_y = (static_cast<float>(floor) - edited.anchor_y) * unit_size;
-                            const float t = (plane_y - ro.y) / rd.y;
-                            const auto x = static_cast<int>(std::floor((ro.x + rd.x * t) / unit_size)) + static_cast<int>(edited.anchor_x);
-                            const auto z = static_cast<int>(std::floor((ro.z + rd.z * t) / unit_size)) + static_cast<int>(edited.anchor_z);
-                            if (t >= 0 && x >= 0 && z >= 0 && (ui.block_config.exterior || ui.block_config.interior)) {
-                                const auto problem = block_config_problem(edited, ui.block_config, *project);
-                                if (x >= static_cast<int>(supported_sbb_grid_side) ||
-                                    z >= static_cast<int>(supported_sbb_grid_side) || floor >= supported_sbb_grid_side) {
-                                    status = "placement would exceed the supported 64-cell building grid";
-                                } else if (!problem.empty()) {
-                                    status = problem;
-                                } else {
-                                    auto* cell = building_cell_at(edited, x, floor, z);
-                                    if (!cell) {
-                                        SbbCell fresh{};
-                                        fresh.index = edited.cells.size(); fresh.x = x; fresh.y = floor; fresh.z = z;
-                                        fresh.shorts.fill(0xffffU);
-                                        edited.cells.push_back(fresh); cell = &edited.cells.back();
-                                    }
-                                    apply_block_config(*cell, ui.block_config, edited, *project);
-                                    ui.stroke_block_cells.assign(1, static_cast<std::size_t>(cell - edited.cells.data()));
-                                    mark_building_changed(*project, ui);
-                                }
+                    } else if (ui.building_tool == BuildingTool::PaintTexture && ui.paint_brush == BrushMode::Box) {
+                        ui.paint_box_active = true;
+                        ui.box_select_start = viewport_mouse_pos;
+                    } else if (const auto pick = pick_building_face(project->building_floor_preview_render_buffer, ro, rd)) {
+                        if (ui.building_tool == BuildingTool::ItemSet) {
+                            place_building_item_set(*project, ui, pick->cell_index, status);
+                        } else if (ui.paint_brush == BrushMode::Loop) {
+                            const auto faces = building_view_faces(project->building_floor_preview_render_buffer);
+                            std::vector<BrushFace> loop_faces;
+                            std::size_t start = 0;
+                            for (std::size_t i = 0; i < faces.size(); ++i) {
+                                const auto& cell = building.cells[faces[i].cell_index];
+                                loop_faces.push_back({{static_cast<std::int32_t>(cell.x), static_cast<std::int32_t>(cell.y),
+                                    static_cast<std::int32_t>(cell.z)}, faces[i].slot});
+                                if (faces[i].cell_index == pick->cell_index && faces[i].slot == pick->slot) start = i;
                             }
-                        } else if (ui.building_tool == BuildingTool::ItemSet) {
-                            status = "Click a block to place or clear its item set.";
-                        } else status = "Click a block face to paint.";
+                            std::vector<BuildingFacePick> loop;
+                            for (const auto i : brush_face_loop(loop_faces, start)) loop.push_back(faces[i]);
+                            paint_building_faces(*project, ui, loop, status);
+                        } else if (ui.paint_side_code) {
+                            const auto side = building_pick_side(building, *pick);
+                            paint_building_side_code(*project, ui, pick->cell_index, side, status);
+                            ui.drag_paint_face = std::pair{pick->cell_index, static_cast<std::uint32_t>(side)};
+                        } else {
+                            paint_building_face(*project, ui, pick->cell_index, pick->slot, status);
+                            ui.drag_paint_face = std::pair{pick->cell_index, pick->slot};
+                        }
+                    } else if (ui.building_tool == BuildingTool::ItemSet) {
+                        status = "Click a block to place or clear its item set.";
+                    } else {
+                        status = "Click a block face to paint.";
                     }
                 }
             }
@@ -5911,6 +6040,47 @@ int run_editor_app() {
             ui.box_select_active = false;
         }
 
+        // Box brushes fill on release: Add Block and Piece the cells from the press to
+        // the cursor on the press's level, Paint the visible faces in the screen box.
+        if (IsKeyPressed(KEY_ESCAPE)) {
+            ui.brush_box_start.reset();
+            ui.paint_box_active = false;
+        }
+        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT) && project && ui.brush_box_start) {
+            const auto start = grid_cell(*ui.brush_box_start);
+            if (ui.tab == EditorTab::City && project->city && ui.city_tool == CityTool::Piece) {
+                if (const auto end = city_grid_point_on_plane_under_mouse(camera, viewport_mouse_pos, last_viewport_size, start[1], true)) {
+                    begin_city_action(*project, ui, "place pieces");
+                    for (const auto& cell : brush_box_cells(start, grid_cell(*end))) set_city_piece_voxel(*project, ui, grid_point(cell));
+                }
+            } else if (ui.tab == EditorTab::Buildings && !project->buildings.empty() && ui.building_tool == BuildingTool::PlaceBlock) {
+                const auto ray = get_viewport_mouse_ray(camera, viewport_mouse_pos, last_viewport_size);
+                if (const auto end = building_brush_target(*project, ui, {ray.position.x, ray.position.y, ray.position.z},
+                        {ray.direction.x, ray.direction.y, ray.direction.z}, start[1])) {
+                    stamp_building_cells(*project, ui, brush_box_cells(start, end->cell), status);
+                }
+            }
+        }
+        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT) && project && ui.paint_box_active && ui.tab == EditorTab::Buildings &&
+            !project->buildings.empty()) {
+            const auto lo = Vector2{std::min(ui.box_select_start.x, viewport_mouse_pos.x), std::min(ui.box_select_start.y, viewport_mouse_pos.y)};
+            const auto hi = Vector2{std::max(ui.box_select_start.x, viewport_mouse_pos.x), std::max(ui.box_select_start.y, viewport_mouse_pos.y)};
+            const auto& buffer = project->building_floor_preview_render_buffer;
+            const Vec3 eye{camera.position.x, camera.position.y, camera.position.z};
+            std::vector<BuildingFacePick> inside;
+            // ponytail: one brute-force pick per face in the box; use buffer.pick_grid if big boxes stall.
+            for (const auto& face : building_view_faces(buffer)) {
+                const auto screen = GetWorldToScreenEx({face.hit_world.x, face.hit_world.y, face.hit_world.z}, camera,
+                    static_cast<int>(last_viewport_size.x), static_cast<int>(last_viewport_size.y));
+                if (screen.x < lo.x || screen.x > hi.x || screen.y < lo.y || screen.y > hi.y) continue;
+                // Only faces the camera sees: the first hit toward the centre must be this face.
+                const Vec3 to{face.hit_world.x - eye.x, face.hit_world.y - eye.y, face.hit_world.z - eye.z};
+                const auto hit = pick_building_face(buffer, eye, to);
+                if (hit && hit->cell_index == face.cell_index && hit->slot == face.slot) inside.push_back(face);
+            }
+            paint_building_faces(*project, ui, inside, status);
+        }
+
         // Click and hold to keep placing with the placement tools: while the button
         // is held and the cursor moves into a new grid cell, place again. drag_stamp_cell
         // stops a held drag from placing in the same cell every frame, so dragging
@@ -5919,11 +6089,14 @@ int run_editor_app() {
             ui.drag_stamp_cell.reset();
             ui.stroke_block_cells.clear();
             ui.drag_paint_face.reset();
+            ui.brush_box_start.reset();
+            ui.paint_box_active = false;
         }
         if (show_3d_viewport && project && is_viewport_hovered && !IsCursorHidden() &&
             IsMouseButtonDown(MOUSE_BUTTON_LEFT) && ui.gizmo_active == GizmoAxis::None && ui.camera_drag == CameraDrag::None) {
-            if (ui.tab == EditorTab::City && project->city &&
-                (ui.city_tool == CityTool::Piece || ui.city_tool == CityTool::Erase)) {
+            const bool piece_stroke = ui.city_tool == CityTool::Piece &&
+                (ui.piece_brush == BrushMode::Drag || ui.piece_brush == BrushMode::Circle);
+            if (ui.tab == EditorTab::City && project->city && (piece_stroke || ui.city_tool == CityTool::Erase)) {
                 const auto ray = get_viewport_mouse_ray(camera, viewport_mouse_pos, last_viewport_size);
                 std::optional<CityGridPoint> cursor;
                 if (ui.city_tool == CityTool::Erase) {
@@ -5931,8 +6104,7 @@ int run_editor_app() {
                 } else if (ui.drag_stamp_cell.has_value()) {
                     // A stroke stays on its first cell's layer, so dragging over the
                     // pieces it just placed doesn't stack new ones on top.
-                    cursor = city_placement_point_under_mouse(*project, ui, camera, viewport_mouse_pos, last_viewport_size, true);
-                    if (cursor.has_value() && cursor->y != ui.drag_stamp_cell->y) cursor.reset();
+                    cursor = city_grid_point_on_plane_under_mouse(camera, viewport_mouse_pos, last_viewport_size, ui.drag_stamp_cell->y, true);
                 }
                 if (cursor.has_value() && (!ui.drag_stamp_cell.has_value() || !(*ui.drag_stamp_cell == *cursor))) {
                     if (ui.city_tool == CityTool::Erase) {
@@ -5940,51 +6112,35 @@ int run_editor_app() {
                         const Vec3 rd{ray.direction.x, ray.direction.y, ray.direction.z};
                         erase_city_thing_under_cursor(*project, ui, project->city_scene_cache, ro, rd, status);
                     } else {
-                        set_city_piece_voxel(*project, ui, *cursor);
+                        for (const auto& c : brush_stamp_cells(ui.piece_brush, grid_cell(*cursor), ui.brush_radius)) set_city_piece_voxel(*project, ui, grid_point(c));
                     }
                     ui.drag_stamp_cell = *cursor;
                 }
-            } else if (ui.tab == EditorTab::Buildings && !project->buildings.empty() &&
-                       ui.building_tool == BuildingTool::PlaceBlock) {
-                const std::optional<std::uint32_t> pick_floor = ui.building_view_floor_only
-                    ? std::optional<std::uint32_t>(static_cast<std::uint32_t>(std::max(0, ui.building_view_floor)))
-                    : std::nullopt;
-                ui.selected_building = std::min(ui.selected_building, project->buildings.size() - 1U);
-                const auto& building = project->buildings[ui.selected_building].data;
+            } else if (ui.tab == EditorTab::Buildings && !project->buildings.empty() && ui.building_tool == BuildingTool::PlaceBlock &&
+                       (ui.place_brush == BrushMode::Drag || ui.place_brush == BrushMode::Circle) && ui.drag_stamp_cell.has_value()) {
                 const auto pick_ray = get_viewport_mouse_ray(camera, viewport_mouse_pos, last_viewport_size);
                 const Vec3 ro{pick_ray.position.x, pick_ray.position.y, pick_ray.position.z};
                 const Vec3 rd{pick_ray.direction.x, pick_ray.direction.y, pick_ray.direction.z};
-                constexpr float unit_size = 4.0F;
-                (void)pick_floor;
-                const auto pick = pick_building_face(project->building_floor_preview_render_buffer, ro, rd);
-                if (pick.has_value()) {
-                    const CityGridPoint cell{
-                        static_cast<std::int32_t>(building.cells[pick->cell_index].x),
-                        static_cast<std::int32_t>(building.cells[pick->cell_index].y),
-                        static_cast<std::int32_t>(building.cells[pick->cell_index].z),
-                    };
-                    // Never build onto a block this drag placed. The cursor stays on it,
-                    // so that would grow a column toward the camera every frame.
-                    const bool placed_this_drag = std::ranges::find(ui.stroke_block_cells, pick->cell_index) != ui.stroke_block_cells.end();
-                    if (!placed_this_drag && (!ui.drag_stamp_cell.has_value() || !(*ui.drag_stamp_cell == cell))) {
-                        if (const auto placed = place_building_block(*project, ui, *pick, rd, unit_size, status)) {
-                            ui.stroke_block_cells.push_back(*placed);
-                        }
-                        ui.drag_stamp_cell = cell;
-                    }
+                // A circle stays on its first level; a drag follows the faces unless locked.
+                auto level = building_locked_level(*project, ui);
+                if (!level && ui.place_brush == BrushMode::Circle) level = ui.drag_stamp_cell->y;
+                const auto target = building_brush_target(*project, ui, ro, rd, level);
+                // Never build onto a block this drag placed. The cursor stays on it,
+                // so that would grow a column toward the camera every frame.
+                const bool on_stroke = target && target->face_cell &&
+                    std::ranges::find(ui.stroke_block_cells, *target->face_cell) != ui.stroke_block_cells.end();
+                if (target && !on_stroke && !(*ui.drag_stamp_cell == grid_point(target->cell))) {
+                    stamp_building_cells(*project, ui, brush_stamp_cells(ui.place_brush, target->cell, ui.brush_radius), status);
+                    ui.drag_stamp_cell = grid_point(target->cell);
                 }
             } else if (ui.tab == EditorTab::Buildings && !project->buildings.empty() &&
-                       ui.building_tool == BuildingTool::PaintTexture) {
+                       ui.building_tool == BuildingTool::PaintTexture && ui.paint_brush == BrushMode::Drag && ui.drag_paint_face) {
                 // Drag to paint every face the cursor passes over, once each.
-                const std::optional<std::uint32_t> pick_floor = ui.building_view_floor_only
-                    ? std::optional<std::uint32_t>(static_cast<std::uint32_t>(std::max(0, ui.building_view_floor)))
-                    : std::nullopt;
                 ui.selected_building = std::min(ui.selected_building, project->buildings.size() - 1U);
                 const auto& building = project->buildings[ui.selected_building].data;
                 const auto pick_ray = get_viewport_mouse_ray(camera, viewport_mouse_pos, last_viewport_size);
                 const Vec3 ro{pick_ray.position.x, pick_ray.position.y, pick_ray.position.z};
                 const Vec3 rd{pick_ray.direction.x, pick_ray.direction.y, pick_ray.direction.z};
-                (void)pick_floor;
                 if (const auto pick = pick_building_face(project->building_floor_preview_render_buffer, ro, rd)) {
                     // Wall types are painted per cell side, faces per texture slot.
                     const std::pair face{pick->cell_index, ui.paint_side_code
@@ -6453,7 +6609,7 @@ int run_editor_app() {
 
                 // The box selection rectangle (drawn in screen space over the
                 // image while a box drag is going on).
-                if (ui.box_select_active && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                if ((ui.box_select_active || ui.paint_box_active) && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
                     const ImVec2 p0{min_pos.x + ui.box_select_start.x, min_pos.y + ui.box_select_start.y};
                     const ImVec2 p1{min_pos.x + viewport_mouse_pos.x, min_pos.y + viewport_mouse_pos.y};
                     auto* dl = ImGui::GetWindowDrawList();

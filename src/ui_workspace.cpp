@@ -158,6 +158,91 @@ void toolbar_divider() {
     ImGui::SameLine();
 }
 
+// One row of tool buttons, the same in every mode: the number keys 1-5 pick them.
+template <typename ToolT>
+struct ToolEntry {
+    const char* icon;
+    ToolT tool;
+    const char* tip;
+};
+constexpr EditorAction kToolKeys[] = {EditorAction::ToolSelect, EditorAction::ToolBuilding, EditorAction::ToolRoad,
+    EditorAction::ToolPiece, EditorAction::ToolErase};
+
+template <typename ToolT, std::size_t N>
+bool tool_row(const ToolEntry<ToolT> (&tools)[N], ToolT& current, const EditorUi& ui) {
+    bool changed = false;
+    for (std::size_t t = 0; t < N; ++t) {
+        if (t != 0) ImGui::SameLine();
+        if (tool_button(tools[t].icon, current == tools[t].tool, ui, tools[t].tip, kToolKeys[t]) && current != tools[t].tool) {
+            current = tools[t].tool;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+// A level with - and + buttons.
+bool level_stepper(const char* label, int& level, int lo, int hi) {
+    bool changed = false;
+    ImGui::PushID(label);
+    if (ImGui::Button(ICON_FA_MINUS, ImVec2(kToolButton, kToolButton)) && level > lo) { --level; changed = true; }
+    ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("%s %d", label, level);
+    ImGui::SameLine();
+    if (ImGui::Button(ICON_FA_PLUS, ImVec2(kToolButton, kToolButton)) && level < hi) { ++level; changed = true; }
+    ImGui::PopID();
+    return changed;
+}
+
+// The brush strip shared by Add Block, Paint, and Piece: how a click applies, the
+// circle's size, and the level lock. Every brush tool draws the same strip.
+void brush_strip(EditorUi& ui) {
+    auto* brush = active_brush(ui);
+    if (brush == nullptr && !(ui.tab == EditorTab::City && (ui.city_tool == CityTool::Road || ui.city_tool == CityTool::Building))) return;
+    toolbar_divider();
+    if (brush != nullptr) {
+        const bool paint = brush == &ui.paint_brush;
+        struct Mode { const char* icon; BrushMode mode; const char* tip; };
+        const Mode modes[] = {
+            {ICON_FA_HAND_POINTER, BrushMode::Single, "Single: one per click"},
+            {ICON_FA_SIGNATURE, BrushMode::Drag, "Drag: hold and move to keep going"},
+            {ICON_FA_BORDER_ALL, BrushMode::Box, paint ? "Box: drag a rectangle; paints the faces you can see in it"
+                                                        : "Box: drag from one corner to the other to fill it"},
+            paint ? Mode{ICON_FA_RING, BrushMode::Loop, "Loop: paints the connected faces of the clicked kind on that floor"}
+                  : Mode{ICON_FA_CIRCLE_DOT, BrushMode::Circle, "Circle: hold to stamp a disc"},
+        };
+        for (std::size_t m = 0; m < std::size(modes); ++m) {
+            if (m != 0) ImGui::SameLine();
+            if (tool_button(modes[m].icon, *brush == modes[m].mode, ui, modes[m].tip)) *brush = modes[m].mode;
+        }
+        if (*brush == BrushMode::Circle) {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(90.0F);
+            ImGui::SliderInt("##brush_radius", &ui.brush_radius, 1, 16, "Radius %d");
+        }
+        if (paint) return;
+    }
+    // Level lock: building mode locks to the shown floor (stepped in the view group).
+    ImGui::SameLine();
+    if (ui.tab == EditorTab::Buildings) {
+        if (tool_button(ui.building_level_locked ? ICON_FA_LOCK : ICON_FA_LOCK_OPEN, ui.building_level_locked, ui,
+                "Lock the level: place on the chosen floor instead of against faces")) {
+            ui.building_level_locked = !ui.building_level_locked;
+        }
+        return;
+    }
+    if (tool_button(ui.place_height_locked ? ICON_FA_LOCK : ICON_FA_LOCK_OPEN, ui.place_height_locked, ui,
+            "Lock the level: place on one Y level instead of on the surface (Page Up/Down change it)")) {
+        ui.place_height_locked = !ui.place_height_locked;
+        save_preferences(ui);
+    }
+    if (ui.place_height_locked) {
+        ImGui::SameLine();
+        if (level_stepper("Y", ui.place_height_y, -512, 512)) save_preferences(ui);
+    }
+}
+
 // The Piece tool's brush: a preview, its mesh, and its eight slot textures. The
 // textures and mesh can be changed freely; placing reuses the map's piece that
 // matches, or adds one to city2.sbc.
@@ -223,8 +308,9 @@ const char* tool_hint(const EditorUi& ui) {
     if (ui.tab == EditorTab::Buildings) {
         switch (ui.building_tool) {
             case BuildingTool::Select: return "Click a block to select it. Delete removes it; Tab cycles blocks.";
-            case BuildingTool::PlaceBlock: return "Click a face to add a block against it; drag to keep adding.";
-            case BuildingTool::PaintTexture: return ui.paint_side_code ? "Pick a wall type in Properties, then click walls." : "Pick a material in Properties, then click or drag over faces.";
+            case BuildingTool::PlaceBlock: return "Click a face to add a block against it. Brush: single, drag, box, or circle; the lock keeps it on one floor.";
+            case BuildingTool::PaintTexture: return ui.paint_side_code ? "Pick a wall type in Properties, then click walls. Brush: single, drag, box, or loop."
+                                                                       : "Pick a material in Properties, then click faces. Brush: single, drag, box, or loop.";
             case BuildingTool::ItemSet: return "Pick an item set in Properties, then click a block. Delete clears the selected block's set.";
             case BuildingTool::Anchor: return "Drag an arrow to move the building's anchor. Esc cancels.";
         }
@@ -235,7 +321,7 @@ const char* tool_hint(const EditorUi& ui) {
         case CityTool::Building: return "Pick a building below; the outline shows where it lands. R turns it, click to place.";
         case CityTool::Road: return ui.pending_road_start ? "Click to lay the next straight segment. Esc or clicking the end finishes."
                                                           : "Click to start a road.";
-        case CityTool::Piece: return "Pick a piece below; the ghost shows where it lands. R turns it, click or drag to stamp.";
+        case CityTool::Piece: return "Pick a piece below; the ghost shows where it lands. R turns it. Brush: single, drag, box, or circle.";
         case CityTool::Erase: return "Click or drag over the red-highlighted building, road, or piece to delete it.";
     }
     return "";
@@ -290,22 +376,17 @@ void draw_toolbar_window(EditorProject* project, EditorUi& ui, Camera3D& camera,
             ui.requested_tab = EditorTab::Blocks;
             }
         toolbar_divider();
+        // Every mode: tools, then the brush strip, then view toggles, then undo.
         if (ui.tab == EditorTab::City && project->city) {
-            struct Tool { const char* icon; CityTool tool; const char* tip; EditorAction action; };
-            constexpr Tool tools[] = {
-                {ICON_FA_ARROW_POINTER, CityTool::Select, "Select", EditorAction::ToolSelect},
-                {ICON_FA_HOUSE, CityTool::Building, "Place building", EditorAction::ToolBuilding},
-                {ICON_FA_ROAD, CityTool::Road, "Lay road", EditorAction::ToolRoad},
-                {ICON_FA_CUBE, CityTool::Piece, "Stamp piece", EditorAction::ToolPiece},
-                {ICON_FA_ERASER, CityTool::Erase, "Erase", EditorAction::ToolErase},
+            static constexpr ToolEntry<CityTool> tools[] = {
+                {ICON_FA_ARROW_POINTER, CityTool::Select, "Select"},
+                {ICON_FA_HOUSE, CityTool::Building, "Place building"},
+                {ICON_FA_ROAD, CityTool::Road, "Lay road"},
+                {ICON_FA_CUBE, CityTool::Piece, "Place pieces"},
+                {ICON_FA_ERASER, CityTool::Erase, "Erase"},
             };
-            for (std::size_t t = 0; t < std::size(tools); ++t) {
-                if (t != 0) ImGui::SameLine();
-                if (tool_button(tools[t].icon, ui.city_tool == tools[t].tool, ui, tools[t].tip, tools[t].action)) {
-                    ui.city_tool = tools[t].tool;
-                    if (ui.city_tool != CityTool::Road) ui.pending_road_start.reset();
-                }
-            }
+            if (tool_row(tools, ui.city_tool, ui) && ui.city_tool != CityTool::Road) ui.pending_road_start.reset();
+            brush_strip(ui);
             toolbar_divider();
             if (tool_button(ICON_FA_EYE, ui.render_roads, ui, "Game preview: terrain and finished roads")) ui.render_roads = true;
             ImGui::SameLine();
@@ -318,41 +399,27 @@ void draw_toolbar_window(EditorProject* project, EditorUi& ui, Camera3D& camera,
             ImGui::AlignTextToFramePadding();
             ImGui::TextDisabled("No city layout. Use Assets > New city.");
         } else if (ui.tab == EditorTab::Buildings && !project->buildings.empty()) {
-            struct Tool { const char* icon; BuildingTool tool; const char* tip; };
-            constexpr Tool tools[] = {
+            static constexpr ToolEntry<BuildingTool> tools[] = {
                 {ICON_FA_ARROW_POINTER, BuildingTool::Select, "Select block"},
-                {ICON_FA_SQUARE_PLUS, BuildingTool::PlaceBlock, "Add block"},
+                {ICON_FA_SQUARE_PLUS, BuildingTool::PlaceBlock, "Add blocks"},
                 {ICON_FA_PAINTBRUSH, BuildingTool::PaintTexture, "Paint faces"},
                 {ICON_FA_ANCHOR, BuildingTool::Anchor, "Move anchor"},
                 {ICON_FA_OBJECT_GROUP, BuildingTool::ItemSet, "Place item set"},
             };
-            const EditorAction keys[] = {EditorAction::ToolSelect, EditorAction::ToolBuilding, EditorAction::ToolRoad,
-                EditorAction::ToolPiece, EditorAction::ToolErase};
-            for (std::size_t t = 0; t < std::size(tools); ++t) {
-                if (t != 0) ImGui::SameLine();
-                if (tool_button(tools[t].icon, ui.building_tool == tools[t].tool, ui, tools[t].tip, keys[t])) ui.building_tool = tools[t].tool;
-            }
+            tool_row(tools, ui.building_tool, ui);
+            brush_strip(ui);
             toolbar_divider();
-            // The whole building, or one floor, changed with - and +.
+            // The whole building, or one floor; the floor is also Add Block's locked level.
             ui.selected_building = std::min(ui.selected_building, project->buildings.size() - 1U);
             const int max_floor = std::max(0, static_cast<int>(project->buildings[ui.selected_building].data.size_z) - 1);
             if (tool_button(ICON_FA_LAYER_GROUP, ui.building_view_floor_only, ui, "Show one floor at a time")) {
                 ui.building_view_floor_only = !ui.building_view_floor_only;
                 project->building_floor_preview_dirty = true;
             }
-            if (ui.building_view_floor_only) {
-                ui.building_view_floor = std::clamp(ui.building_view_floor, 0, max_floor);
+            if (ui.building_view_floor_only || (ui.building_level_locked && ui.building_tool == BuildingTool::PlaceBlock)) {
+                ui.building_view_floor = std::clamp(ui.building_view_floor, 0, ui.building_view_floor_only ? max_floor : max_floor + 1);
                 ImGui::SameLine();
-                if (ImGui::Button(ICON_FA_MINUS, ImVec2(kToolButton, kToolButton)) && ui.building_view_floor > 0) {
-                    --ui.building_view_floor;
-                    project->building_floor_preview_dirty = true;
-                }
-                ImGui::SameLine();
-                ImGui::AlignTextToFramePadding();
-                ImGui::Text("Floor %d/%d", ui.building_view_floor, max_floor);
-                ImGui::SameLine();
-                if (ImGui::Button(ICON_FA_PLUS, ImVec2(kToolButton, kToolButton)) && ui.building_view_floor < max_floor) {
-                    ++ui.building_view_floor;
+                if (level_stepper("Floor", ui.building_view_floor, 0, ui.building_view_floor_only ? max_floor : max_floor + 1)) {
                     project->building_floor_preview_dirty = true;
                 }
             }
@@ -365,18 +432,17 @@ void draw_toolbar_window(EditorProject* project, EditorUi& ui, Camera3D& camera,
                 ui.show_buildblock_window = !ui.show_buildblock_window;
             }
         } else if (ui.tab == EditorTab::Blocks) {
-            if (tool_button(ICON_FA_ARROW_POINTER, !ui.block_paint_faces, ui, "Select block surfaces")) ui.block_paint_faces = false;
-            ImGui::SameLine();
-            // New blocks come from Assets > New block; these add to the open block.
             ImGui::BeginDisabled(project->blocks.empty());
+            static constexpr ToolEntry<bool> tools[] = {
+                {ICON_FA_ARROW_POINTER, false, "Select block surfaces"},
+                {ICON_FA_PAINTBRUSH, true, "Paint faces with a texture slot"},
+            };
+            if (tool_row(tools, ui.block_paint_faces, ui) && ui.block_paint_faces) ui.block_vertex_mode = false;
+            toolbar_divider();
+            // New blocks come from Assets > New block; these add to the open block.
             if (tool_button(ICON_FA_CUBE, false, ui, "Add box: a solid box surface")) add_block_box(*project, ui);
             ImGui::SameLine();
             if (tool_button(ICON_FA_VECTOR_SQUARE, false, ui, "Add patch: a flat or curved surface")) add_block_patch(*project, ui);
-            ImGui::SameLine();
-            if (tool_button(ICON_FA_PAINTBRUSH, ui.block_paint_faces, ui, "Paint faces with a texture slot")) {
-                ui.block_paint_faces = true;
-                ui.block_vertex_mode = false;
-            }
             ImGui::EndDisabled();
         }
         if (ui.tab == EditorTab::Blocks && ui.block_paint_faces) draw_block_paint_texture(*project, ui);

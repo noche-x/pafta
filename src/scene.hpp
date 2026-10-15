@@ -443,8 +443,8 @@ SbbScene build_sbb_scene(
     const std::vector<NamedBuildblockTemplate>& buildblock_templates);
 // The building mesh as the game draws it (city placement, editor view, export).
 // `floor` keeps only that cell level, like the building editor's single-floor view.
-// roofs = false leaves out every outer face that points up, so you can see the rooms
-// from above.
+// roofs = false leaves out every outer face that points up and the rooms' own
+// ceilings, so you can see into the rooms from above.
 BuildingRenderBuffer build_native_building_render_buffer(
     const SbbBuilding& building,
     const std::vector<NamedBlockMesh>& block_meshes,
